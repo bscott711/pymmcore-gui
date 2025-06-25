@@ -7,7 +7,6 @@ try:
 except PackageNotFoundError:
     __version__ = "uninstalled"
 
-import pymmcore  # noqa: F401, I001
 from ._app import create_mmgui
 from ._main_window import MicroManagerGUI
 from .actions import ActionInfo, CoreAction, WidgetAction
