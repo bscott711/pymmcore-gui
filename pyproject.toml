@@ -92,6 +92,7 @@ allow-direct-references = true
 # same as console_scripts entry point
 [project.scripts]
 mmgui = "pymmcore_gui.__main__:main"
+microscope-control = "pymmcore_gui.asi_z_stack.__main__:main"
 
 [project.urls]
 homepage = "https://github.com/tlambert03/pymmcore-gui"

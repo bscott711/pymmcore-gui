@@ -76,7 +76,8 @@ class NDVPreview(ImagePreviewBase):
             buffer_dtype = core_dtype
 
         self._viewer.data = self._buffer = RingBuffer(
-        max_capacity=100, dtype=buffer_dtype)
+            max_capacity=100, dtype=buffer_dtype
+        )
         # END OF CHANGE
         self._viewer.display_model.visible_axes = (1, 2)
         if core_dtype[1][-1] == 3:  # RGB
