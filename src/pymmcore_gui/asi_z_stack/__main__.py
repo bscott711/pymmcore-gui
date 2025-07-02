@@ -7,6 +7,7 @@ from threading import Thread
 
 import useq
 from pymmcore_plus import CMMCorePlus
+from pymmcore_plus.metadata import frame_metadata
 from qtpy.QtWidgets import QApplication
 
 from pymmcore_gui import MicroManagerGUI, WidgetAction
@@ -95,6 +96,23 @@ def main():
     mmc.mda.events.sequenceFinished.connect(_cleanup_after_acquisition, thread="main")
 
     main_win = MicroManagerGUI()
+
+    # FIX: Reconnect the frameReady signal to execute in the main GUI thread.
+    # This prevents the application from crashing when the viewer tries to update
+    # its display from the background acquisition thread.
+    viewer = getattr(main_win, "viewer", None)
+    if viewer:
+        # The `psygnal` library allows disconnecting a slot by providing the function
+        mmc.mda.events.frameReady.disconnect(viewer._on_frame_ready)
+        # Reconnect with `thread="main"` to force the update to happen in the GUI thread
+        mmc.mda.events.frameReady.connect(viewer._on_frame_ready, thread="main")
+    else:
+        print(
+            "\nWARNING: Could not find the 'viewer' attribute on MicroManagerGUI."
+            " The frameReady signal could not be safely reconnected."
+            " The application may still crash.\n"
+        )
+
     mda_widget = main_win.get_widget(WidgetAction.MDA_WIDGET)
     if not mda_widget:
         raise RuntimeError("Could not find MDA widget in the GUI.")
@@ -149,7 +167,7 @@ def main():
                 HW.galvo_a_label, "SPIMScanDuration(ms)", HW.line_scan_duration_ms
             )
 
-            mmc.mda.events.sequenceStarted.emit(sequence, {})  # Pass empty meta dict
+            mmc.mda.events.sequenceStarted.emit(sequence, {})
             mmc.initializeCircularBuffer()
             mmc.startSequenceAcquisition(HW.camera_a_label, num_slices, 0, True)
             print(f"Camera sequence started, waiting for {num_slices} triggers.")
@@ -173,7 +191,8 @@ def main():
                         f"  - Acquired image {images_collected + 1}/{num_slices} "
                         f"for event {event.index}"
                     )
-                    mmc.mda.events.frameReady.emit(tagged_img.pix, event)
+                    meta = frame_metadata(mmc, mda_event=event)
+                    mmc.mda.events.frameReady.emit(tagged_img.pix, event, meta)
                     images_collected += 1
                 elif not mmc.isSequenceRunning() and images_collected < num_slices:
                     raise RuntimeError(
