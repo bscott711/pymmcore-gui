@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import suppress
 from typing import TYPE_CHECKING
 
 import ndv
@@ -25,8 +26,11 @@ class NDVPreview(ImagePreviewBase):
         If False (default) the preview is suppressed while an MDA is running.
     camera_label :
         Optional label identifying the physical camera this preview is dedicated
-        to (e.g. ``"Camera-1"``). When *None* the preview handles whatever camera
-        is currently active, including composite multicam data.
+        to (e.g. ``"Camera-1"``).  When set the preview operates in *managed*
+        mode: it does NOT independently respond to ``imageSnapped`` or streaming-
+        start events — the ``NDVViewersManager`` dispatches data directly by
+        calling ``append()``.  When *None* the preview handles whatever camera is
+        currently active (composite / legacy path).
     """
 
     def __init__(
@@ -37,11 +41,17 @@ class NDVPreview(ImagePreviewBase):
         use_with_mda: bool = False,
         camera_label: str | None = None,
     ):
-        super().__init__(parent, mmcore, use_with_mda=use_with_mda)
+        # Set camera_label BEFORE super().__init__() because the base class
+        # calls self.attach() which inspects this attribute.
         self.camera_label = camera_label
+
+        super().__init__(parent, mmcore, use_with_mda=use_with_mda)
+
         self._viewer = ndv.ArrayViewer()
         self._buffer: np.ndarray | None = None
-        self.process_events_on_update = True
+        # Disable per-append processEvents for managed previews — the manager
+        # calls QApplication.processEvents() once after dispatching to all cameras.
+        self.process_events_on_update = camera_label is None
 
         qwdg = self._viewer.widget()
         qwdg.setParent(self)
@@ -49,6 +59,73 @@ class NDVPreview(ImagePreviewBase):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(qwdg)
+
+    # ------------------------------------------------------------------
+    # Event connection — selective for managed (per-camera) mode
+    # ------------------------------------------------------------------
+
+    def attach(self, core: CMMCorePlus) -> None:
+        """Attach to core events.
+
+        In *managed* mode (``camera_label`` is not None) we skip
+        ``imageSnapped`` and streaming-start signals — the
+        ``NDVViewersManager`` owns those.  We still connect stop/exposure/ROI
+        events that are safe to handle independently.
+        """
+        if self.camera_label is None:
+            # Composite / unmanaged mode — full event attachment via base class.
+            super().attach(core)
+            return
+
+        # Managed per-camera mode: disconnect from previous core if any.
+        if self._mmc is not None:
+            self.detach()
+
+        ev = core.events
+        # Timer stop/restart when streaming stops or exposure changes.
+        ev.sequenceAcquisitionStopped.connect(self._on_streaming_stop)
+        ev.exposureChanged.connect(self._on_exposure_changed)
+        # Config / ROI changes still apply.
+        ev.systemConfigurationLoaded.connect(self._on_system_config_loaded)
+        ev.roiSet.connect(self._on_roi_set)
+        ev.propertyChanged.connect(self._on_property_changed)
+        # Track MDA state so use_with_mda can be respected.
+        core.mda.events.sequenceStarted.connect(
+            lambda: setattr(self, "_is_mda_running", True)
+        )
+        core.mda.events.sequenceFinished.connect(
+            lambda: setattr(self, "_is_mda_running", False)
+        )
+        self._mmc = core
+
+        # NOT connected in managed mode:
+        #   imageSnapped              → manager calls append() directly
+        #   continuousSequenceAcquisitionStarted → manager calls _on_streaming_start()
+        #   sequenceAcquisitionStarted           → same
+
+    def detach(self) -> None:
+        """Detach from core events, handling managed and unmanaged modes."""
+        if self.camera_label is None:
+            super().detach()
+            return
+
+        if self._mmc is None:
+            return
+
+        ev, self._mmc = self._mmc.events, None
+        for sig, slot in [
+            (ev.sequenceAcquisitionStopped, self._on_streaming_stop),
+            (ev.exposureChanged, self._on_exposure_changed),
+            (ev.systemConfigurationLoaded, self._on_system_config_loaded),
+            (ev.roiSet, self._on_roi_set),
+            (ev.propertyChanged, self._on_property_changed),
+        ]:
+            with suppress(Exception):
+                sig.disconnect(slot)
+
+    # ------------------------------------------------------------------
+    # Data ingestion
+    # ------------------------------------------------------------------
 
     def append(self, data: np.ndarray) -> None:
         if (
@@ -64,6 +141,10 @@ class NDVPreview(ImagePreviewBase):
 
         if self.process_events_on_update:
             QApplication.processEvents()
+
+    # ------------------------------------------------------------------
+    # Shape / dtype helpers
+    # ------------------------------------------------------------------
 
     @property
     def dtype_shape(self) -> tuple[str, tuple[int, ...]] | None:
