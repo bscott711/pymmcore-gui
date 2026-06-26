@@ -1,21 +1,17 @@
-# src/microscope/asi_z_stack/common.py
+# src/pymmcore_gui/asi_z_stack/common.py
 from dataclasses import dataclass
-
 
 @dataclass
 class AcquisitionSettings:
     """Stores all user-configurable acquisition parameters."""
-
     num_slices: int = 3
     step_size_um: float = 1.0
     laser_trig_duration_ms: float = 10.0
     camera_exposure_ms: float = 10.0
 
-
 @dataclass
 class HardwareConstants:
     """Stores fixed hardware configuration and constants."""
-
     cfg_path: str = "hardware_profiles/20250701-SingleChannelOPM.cfg"
     galvo_a_label: str = "Scanner:AB:33"
     piezo_a_label: str = "PiezoStage:P:34"
@@ -30,3 +26,10 @@ class HardwareConstants:
     plogic_bnc3_addr: int = 35
     pulses_per_ms: float = 4.0
     plogic_laser_preset_num: int = 30
+    
+    # Extended parameters for SPIM Z-stack calculations
+    slice_calibration_slope_um_per_deg: float = 100.0
+    line_scans_per_slice: int = 1
+    delay_before_scan_ms: float = 0.0
+    line_scan_duration_ms: float = 1.0
+    delay_before_side_ms: float = 0.0
