@@ -1488,6 +1488,7 @@ dependencies = [
     { name = "pyright" },
     { name = "pyyaml" },
     { name = "qtconsole" },
+    { name = "rendercanvas" },
     { name = "rich" },
     { name = "sentry-sdk" },
     { name = "superqt", extra = ["cmap", "iconify"] },
@@ -1530,12 +1531,13 @@ requires-dist = [
     { name = "ndv", extras = ["vispy"], specifier = ">=0.4.0" },
     { name = "pydantic-settings", specifier = ">=2.7.1" },
     { name = "pymmcore-plus", extras = ["cli"], specifier = ">=0.13.2" },
-    { name = "pymmcore-widgets", git = "https://github.com/bscott711/pymmcore-widgets.git?branch=main" },
+    { name = "pymmcore-widgets", editable = "../pymmcore-widgets" },
     { name = "pyqt6", specifier = "==6.9.0" },
     { name = "pyqt6ads", specifier = ">=4.4.0.post2" },
     { name = "pyright", specifier = ">=1.1.393" },
     { name = "pyyaml", specifier = ">=6.0.2" },
     { name = "qtconsole", specifier = ">=5.6.1" },
+    { name = "rendercanvas", specifier = ">=2.6.3" },
     { name = "rich" },
     { name = "sentry-sdk", specifier = ">=2.20.0" },
     { name = "superqt", extras = ["cmap", "iconify"], git = "https://github.com/bscott711/superqt.git?branch=main" },
@@ -1601,8 +1603,7 @@ cli = [
 
 [[package]]
 name = "pymmcore-widgets"
-version = "0.1.dev321+g2f1324089"
-source = { git = "https://github.com/bscott711/pymmcore-widgets.git?branch=main#2f132408931cbe47afe49fb75a5334d779c353ec" }
+source = { editable = "../pymmcore-widgets" }
 dependencies = [
     { name = "pymmcore-plus", extra = ["cli"] },
     { name = "pyopengl", marker = "sys_platform == 'darwin'" },
@@ -1611,6 +1612,68 @@ dependencies = [
     { name = "superqt", extra = ["cmap", "iconify", "quantity"] },
     { name = "useq-schema" },
     { name = "vispy" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "numpy", marker = "python_full_version < '3.13' and extra == 'pyside2'", specifier = "<2" },
+    { name = "numpy", marker = "extra == 'pyside2'" },
+    { name = "pymmcore-plus", extras = ["cli"], specifier = ">=0.14.0" },
+    { name = "pyopengl", marker = "sys_platform == 'darwin'", specifier = ">=3.1.9" },
+    { name = "pyqt5", marker = "extra == 'pyqt5'", specifier = ">=5.15.11" },
+    { name = "pyqt6", marker = "extra == 'pyqt6'", specifier = ">=6.4.2" },
+    { name = "pyside2", marker = "extra == 'pyside2'", specifier = ">=5.15.2.1" },
+    { name = "pyside6", marker = "extra == 'pyside6'", specifier = ">=6.9.0" },
+    { name = "qtpy", specifier = ">=2.0" },
+    { name = "shapely", specifier = ">=2.0.7" },
+    { name = "superqt", extras = ["cmap", "iconify", "quantity"], specifier = ">=0.7.1" },
+    { name = "useq-schema", specifier = ">=0.7.3" },
+    { name = "vispy", specifier = ">=0.15.0" },
+]
+provides-extras = ["pyqt5", "pyqt6", "pyside2", "pyside6"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "ipython", specifier = ">=8.18.1" },
+    { name = "mkdocs", specifier = ">=1.6.1" },
+    { name = "mkdocs-gen-files", specifier = ">=0.5.0" },
+    { name = "mkdocs-literate-nav", specifier = ">=0.6.2" },
+    { name = "mkdocs-material", specifier = ">=9.6.12" },
+    { name = "mkdocs-section-index", specifier = ">=0.3.10" },
+    { name = "mkdocs-video", specifier = ">=1.5.0" },
+    { name = "mkdocstrings-python", specifier = ">=1.16.10" },
+    { name = "mypy", specifier = ">=1.15.0" },
+    { name = "numcodecs", specifier = ">0.12.0,<0.16" },
+    { name = "numcodecs", marker = "python_full_version >= '3.13'", specifier = ">0.14.0,<0.16" },
+    { name = "pdbpp", marker = "sys_platform != 'win32'", specifier = ">=0.11.6" },
+    { name = "pre-commit-uv", specifier = ">=4.1.0" },
+    { name = "pyqt6", specifier = ">=6.9.0" },
+    { name = "pytest", specifier = ">=8.3.5" },
+    { name = "pytest-cov", specifier = ">=6.1.1" },
+    { name = "pytest-qt", specifier = ">=4.4.0" },
+    { name = "pyyaml", specifier = ">=6.0.2" },
+    { name = "rich", specifier = ">=14.0.0" },
+    { name = "ruff", specifier = ">=0.11.8" },
+    { name = "types-shapely", specifier = ">=2.1.0.20250512" },
+    { name = "zarr", specifier = ">=2.15,<3" },
+]
+docs = [
+    { name = "mkdocs", specifier = ">=1.6.1" },
+    { name = "mkdocs-gen-files", specifier = ">=0.5.0" },
+    { name = "mkdocs-literate-nav", specifier = ">=0.6.2" },
+    { name = "mkdocs-material", specifier = ">=9.6.12" },
+    { name = "mkdocs-section-index", specifier = ">=0.3.10" },
+    { name = "mkdocs-video", specifier = ">=1.5.0" },
+    { name = "mkdocstrings-python", specifier = ">=1.16.10" },
+]
+test = [
+    { name = "numcodecs", specifier = ">0.12.0,<0.16" },
+    { name = "numcodecs", marker = "python_full_version >= '3.13'", specifier = ">0.14.0,<0.16" },
+    { name = "pytest", specifier = ">=8.3.5" },
+    { name = "pytest-cov", specifier = ">=6.1.1" },
+    { name = "pytest-qt", specifier = ">=4.4.0" },
+    { name = "pyyaml", specifier = ">=6.0.2" },
+    { name = "zarr", specifier = ">=2.15,<3" },
 ]
 
 [[package]]
@@ -2042,6 +2105,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/70/01/392eba83c8e47b946b929d7c46e0f04b35e9671f8bb6fc36b6f7945b4de8/qtpy-2.4.3.tar.gz", hash = "sha256:db744f7832e6d3da90568ba6ccbca3ee2b3b4a890c3d6fbbc63142f6e4cdf5bb", size = 66982, upload-time = "2025-02-11T15:09:25.759Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/69/76/37c0ccd5ab968a6a438f9c623aeecc84c202ab2fabc6a8fd927580c15b5a/QtPy-2.4.3-py3-none-any.whl", hash = "sha256:72095afe13673e017946cc258b8d5da43314197b741ed2890e563cf384b51aa1", size = 95045, upload-time = "2025-02-11T15:09:24.162Z" },
+]
+
+[[package]]
+name = "rendercanvas"
+version = "2.6.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/dc/40/e162bd1eace4392d945fc8ffe90c9cceffeffd0eea227c4e60638a5f30d5/rendercanvas-2.6.3.tar.gz", hash = "sha256:c944ae7b6d89f7d25f2c72216d31cb28f0051f766ec49d049101bb961baaaaac", size = 90228, upload-time = "2026-03-12T13:43:10.272Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c1/b2/b06d7d89eef452ab50ad3e752604c09ec08c8eaf49484641e566a0e5141d/rendercanvas-2.6.3-py3-none-any.whl", hash = "sha256:c2defd04e3e29dcdf94b794e827045882925677bc48b04084f3b9696fd469018", size = 105194, upload-time = "2026-03-12T13:43:08.965Z" },
 ]
 
 [[package]]

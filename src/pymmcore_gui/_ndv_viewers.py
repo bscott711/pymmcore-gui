@@ -65,7 +65,15 @@ class NDVViewersManager(QObject):
         # CONNECTIONS ---------------------------------------------------------
 
         self._is_mda_running = False
-        self._current_image_preview: CDockWidget | None = None
+
+        # Per-camera preview dock widgets, keyed by physical camera label.
+        # e.g. {"Camera-1": <CDockWidget>, "Camera-2": <CDockWidget>}
+        self._camera_previews: dict[str, CDockWidget] = {}
+
+        # Primary "streaming driver" preview — the first camera's NDVPreview owns
+        # the Qt timer that polls the circular buffer.  Other cameras' previews
+        # receive frames via a callback set on this widget.
+        self._streaming_driver: NDVPreview | None = None
 
         ev = self._mmc.events
         ev.imageSnapped.connect(self._on_image_snapped)
@@ -79,6 +87,195 @@ class NDVViewersManager(QObject):
         mda_ev.sequenceFinished.connect(self._on_sequence_finished)
 
         parent.destroyed.connect(self._cleanup)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _get_physical_camera_labels(self) -> list[str]:
+        """Return the list of physical camera labels behind the active camera device.
+
+        For a ``Multi Camera`` device this reads the ``Physical Camera N``
+        properties.  For a plain camera device returns a single-element list.
+        """
+        cam = self._mmc.getCameraDevice()
+        n = self._mmc.getNumberOfCameraChannels()
+        if n <= 1:
+            return [cam]
+        try:
+            return [
+                self._mmc.getProperty(cam, f"Physical Camera {i + 1}")
+                for i in range(n)
+            ]
+        except Exception:
+            # Fallback if the property isn't readable (e.g. non-standard device)
+            return [f"{cam}-ch{i}" for i in range(n)]
+
+    def _create_camera_preview(self, camera_label: str) -> NDVPreview:
+        """Create a new NDVPreview dock widget for *camera_label* and emit the signal."""
+        preview = NDVPreview(mmcore=self._mmc, camera_label=camera_label)
+        parent = self.parent()
+        if not isinstance(parent, QWidget):
+            parent = None  # pragma: no cover
+        dw = CDockWidget(f"Preview: {camera_label}", parent)
+        self._preview_dock_widgets.add(dw)
+        dw.setWidget(preview)
+        dw.setFeature(dw.DockWidgetFeature.DockWidgetFloatable, False)
+        self._camera_previews[camera_label] = dw
+        self.previewViewerCreated.emit(dw)
+        return preview
+
+    def _get_or_create_camera_preview(
+        self, camera_label: str
+    ) -> tuple[NDVPreview, bool]:
+        """Return ``(NDVPreview, created)`` for *camera_label*.
+
+        If the dock widget already exists its view is toggled on and ``created``
+        is *False*.  Otherwise a new preview is created and ``created`` is *True*.
+        """
+        if camera_label in self._camera_previews:
+            dw = self._camera_previews[camera_label]
+            dw.toggleView(True)
+            return cast("NDVPreview", dw.widget()), False
+        return self._create_camera_preview(camera_label), True
+
+    def _dispatch_snap_to_previews(self, images: dict[int, np.ndarray]) -> None:
+        """Send each snapped camera image to its dedicated preview widget."""
+        labels = self._get_physical_camera_labels()
+        for ch_idx, img in images.items():
+            label = labels[ch_idx] if ch_idx < len(labels) else f"Camera-ch{ch_idx}"
+            preview, _ = self._get_or_create_camera_preview(label)
+            preview.append(img)
+
+    def _make_multicam_streaming_callback(
+        self, labels: list[str]
+    ):
+        """Return a callback that dispatches per-camera frames to their previews.
+
+        The callback is installed on the streaming-driver ``NDVPreview``'s
+        ``_multicam_frame_callback`` attribute so that its ``timerEvent`` routes
+        frames here instead of calling ``append``.
+        """
+
+        def _on_frames(frames: list[np.ndarray]) -> None:
+            for ch_idx, frame in enumerate(frames):
+                label = labels[ch_idx] if ch_idx < len(labels) else f"Camera-ch{ch_idx}"
+                dw = self._camera_previews.get(label)
+                if dw is None:
+                    continue
+                preview = cast("NDVPreview", dw.widget())
+                preview.append(frame)
+
+        return _on_frames
+
+    # ------------------------------------------------------------------
+    # Streaming / Snap handlers
+    # ------------------------------------------------------------------
+
+    def _on_streaming_started(self) -> None:
+        if self._is_mda_running:
+            return
+
+        labels = self._get_physical_camera_labels()
+
+        if len(labels) <= 1:
+            # Single camera path — identical to previous behaviour.
+            preview, created = self._get_or_create_camera_preview(labels[0])
+            if created:
+                preview._on_streaming_start()
+            else:
+                # Already running, just make sure it's visible.
+                pass
+            self._streaming_driver = preview
+        else:
+            # Multi-camera path:
+            # Create previews for ALL cameras up front, but only the first one
+            # owns the Qt timer (streaming driver).  A callback dispatches frames
+            # to the others.
+            driver_preview: NDVPreview | None = None
+            for i, label in enumerate(labels):
+                preview, created = self._get_or_create_camera_preview(label)
+                if i == 0:
+                    driver_preview = preview
+
+            if driver_preview is not None:
+                # Install the multicam dispatch callback so that timerEvent
+                # routes per-camera frames correctly.
+                driver_preview._multicam_frame_callback = (
+                    self._make_multicam_streaming_callback(labels)
+                )
+                driver_preview._on_streaming_start()
+                self._streaming_driver = driver_preview
+
+    def _on_image_snapped(self) -> None:
+        if self._is_mda_running:
+            return
+
+        n_channels = self._mmc.getNumberOfCameraChannels()
+
+        if n_channels > 1:
+            # Retrieve each physical camera's image by channel index.
+            images: dict[int, np.ndarray] = {}
+            for ch in range(n_channels):
+                try:
+                    images[ch] = self._mmc.getImage(ch)
+                except Exception as exc:  # pragma: no cover
+                    warnings.warn(
+                        f"Failed to get image for channel {ch}: {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+            if images:
+                self._dispatch_snap_to_previews(images)
+        else:
+            # Single-camera path — identical to previous behaviour.
+            label = self._mmc.getCameraDevice()
+            preview, _ = self._get_or_create_camera_preview(label)
+            try:
+                preview.append(self._mmc.getImage())
+            except Exception as exc:  # pragma: no cover
+                warnings.warn(
+                    f"Failed to get image: {exc}", RuntimeWarning, stacklevel=2
+                )
+
+    # ------------------------------------------------------------------
+    # Property change / invalidation
+    # ------------------------------------------------------------------
+
+    def _on_property_changed(self, dev: str, prop: str, value: str) -> None:
+        if self._mmc is None:
+            return  # pragma: no cover
+
+        cam_device = self._mmc.getCameraDevice()
+        physical_labels = set(self._get_physical_camera_labels())
+
+        # Determine which camera labels are affected.
+        affected: set[str] = set()
+        if dev == "Core" and prop == "Camera":
+            # Core camera device changed — invalidate everything.
+            affected = set(self._camera_previews.keys())
+        elif dev == cam_device:
+            # MultiCamera (or active single camera) property changed.
+            affected = set(self._camera_previews.keys())
+        elif dev in physical_labels:
+            # A specific physical camera changed.
+            affected.add(dev)
+
+        for label in affected:
+            dw = self._camera_previews.get(label)
+            if dw is None:
+                continue
+            preview = cast("NDVPreview", dw.widget())
+            # Only invalidate if shape / dtype actually changed.
+            if preview._get_core_dtype_shape() != preview.dtype_shape:
+                preview.detach()
+                del self._camera_previews[label]
+                if self._streaming_driver is preview:
+                    self._streaming_driver = None
+
+    # ------------------------------------------------------------------
+    # MDA handlers (unchanged, kept for completeness)
+    # ------------------------------------------------------------------
 
     def _cleanup(self, obj: QObject | None = None) -> None:
         self._active_mda_viewer = None
@@ -162,33 +359,6 @@ class NDVViewersManager(QObject):
         self.mdaViewerCreated.emit(ndv_viewer, sequence)
         return ndv_viewer
 
-    def _create_or_show_img_preview(self) -> ImagePreviewBase | None:
-        """Create or show the image preview widget, return True if created."""
-        preview = None
-        if self._current_image_preview is None:
-            preview = NDVPreview(mmcore=self._mmc)
-            if not isinstance((parent := self.parent()), QWidget):
-                parent = None  # pragma: no cover
-            self._current_image_preview = dw = CDockWidget("Preview", parent)
-            self._preview_dock_widgets.add(dw)
-            dw.setWidget(preview)
-            dw.setFeature(dw.DockWidgetFeature.DockWidgetFloatable, False)
-            self.previewViewerCreated.emit(dw)
-        else:
-            self._current_image_preview.toggleView(True)
-
-        return preview
-
-    def _on_streaming_started(self) -> None:
-        if not self._is_mda_running:
-            if preview := self._create_or_show_img_preview():
-                preview._on_streaming_start()
-
-    def _on_image_snapped(self) -> None:
-        if not self._is_mda_running:
-            if preview := self._create_or_show_img_preview():
-                preview.append(self._mmc.getImage())
-
     def __repr__(self) -> str:  # pragma: no cover
         return f"<{self.__class__.__name__} {hex(id(self))} ({len(self)} viewer)>"
 
@@ -197,17 +367,3 @@ class NDVViewersManager(QObject):
 
     def viewers(self) -> Iterator[ndv.ArrayViewer]:
         yield from (self._seq_viewers.values())
-
-    def _on_property_changed(self, dev: str, prop: str, value: str) -> None:
-        if self._mmc is None:
-            return  # pragma: no cover
-
-        # if we change any camera property
-        if dev == self._mmc.getCameraDevice() or (dev == "Core" and prop == "Camera"):
-            if self._current_image_preview:
-                # check if the existing viewer still has a valid shape and dtype
-                # (dtype is actually tuple of (dtype, shape))
-                preview = cast("NDVPreview", self._current_image_preview.widget())
-                if preview._get_core_dtype_shape() != preview.dtype_shape:
-                    preview.detach()
-                    self._current_image_preview = None

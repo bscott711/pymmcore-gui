@@ -119,29 +119,33 @@ def test_main_window_notifications(gui: MicroManagerGUI) -> None:
 def test_snap(gui: MicroManagerGUI, qtbot: QtBot) -> None:
     """Test that snapping creates a new image preview."""
     vm = gui._viewers_manager
-    assert vm._current_image_preview is None
+    assert not vm._camera_previews
     core = gui._mmc
     with qtbot.waitSignal(vm.previewViewerCreated):
         core.snapImage()
-    preview = vm._current_image_preview
-    assert preview is not None
+    # One preview dock for the single camera.
+    assert len(vm._camera_previews) == 1
+    cam_label = core.getCameraDevice()
+    assert cam_label in vm._camera_previews
+    preview_dw = vm._camera_previews[cam_label]
+    assert preview_dw is not None
     assert len(vm._preview_dock_widgets) == 1
 
     # change image dtype/shape.
-    # We should end up with a second preview widget
+    # We should end up with a second preview widget (new camera label slot)
     core.setProperty(core.getCameraDevice(), "PixelType", "32bitRGB")
     with qtbot.waitSignal(vm.previewViewerCreated):
         core.snapImage()
-    assert vm._current_image_preview is not preview
-    preview = vm._current_image_preview
-    assert preview is not None
+    # The old preview was invalidated (shape changed) and a new one created.
+    assert cam_label in vm._camera_previews
+    assert vm._camera_previews[cam_label] is not preview_dw
     assert len(vm._preview_dock_widgets) == 2
 
     # but this should *not* create a new preview
     core.setProperty(core.getCameraDevice(), "Exposure", "42")
     with qtbot.waitSignal(core.events.imageSnapped):
         core.snapImage()
-    assert vm._current_image_preview is preview
+    assert len(vm._camera_previews) == 1
     assert len(vm._preview_dock_widgets) == 2
 
 
@@ -152,14 +156,14 @@ def test_snap(gui: MicroManagerGUI, qtbot: QtBot) -> None:
 def test_stream(gui: MicroManagerGUI, qtbot: QtBot) -> None:
     """Test that streaming creates a new image preview."""
     vm = gui._viewers_manager
-    current = vm._current_image_preview
-    assert current is None
+    assert not vm._camera_previews
     core = gui._mmc
     with qtbot.waitSignal(vm.previewViewerCreated):
         core.startContinuousSequenceAcquisition()
 
-    assert vm._current_image_preview is not None
-    ndv_viewer = vm._current_image_preview.widget()._viewer  # type: ignore
+    assert vm._camera_previews
+    cam_label = core.getCameraDevice()
+    ndv_viewer = vm._camera_previews[cam_label].widget()._viewer  # type: ignore
     assert isinstance(ndv_viewer, ndv.ArrayViewer)
 
     # we should be able to change the exposure

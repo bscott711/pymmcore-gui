@@ -12,6 +12,11 @@ bundle:
 lint:
     uv run pre-commit run --all-files
 
+# Automatically fix all ruff linting and formatting issues
+fix:
+    uv run ruff check --fix .
+    uv run ruff format .
+
 # run tests
 test:
     uv run pytest

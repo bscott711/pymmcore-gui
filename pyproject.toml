@@ -51,6 +51,7 @@ dependencies = [
     "tqdm>=4.67.1",
     "zarr>=2.18.3,<3.0",
     "sentry-sdk>=2.20.0",
+    "rendercanvas>=2.6.3",
 ]
 
 # TO USE pymmcore-nano, you need to add pymmcore-nano to dependencies
@@ -63,7 +64,7 @@ dependencies = [
 
 [tool.uv.sources]
 superqt = { git = "https://github.com/bscott711/superqt.git", branch = "main" }
-pymmcore-widgets = { git = "https://github.com/bscott711/pymmcore-widgets.git", branch = "main" }
+pymmcore-widgets = { path = "../pymmcore-widgets", editable = true }
 
 [dependency-groups]
 test = [
