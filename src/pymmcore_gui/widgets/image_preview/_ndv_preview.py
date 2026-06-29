@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from contextlib import suppress
 from typing import TYPE_CHECKING
 
@@ -11,6 +12,11 @@ from pymmcore_gui.widgets.image_preview._preview_base import ImagePreviewBase
 
 if TYPE_CHECKING:
     from pymmcore_plus import CMMCorePlus
+
+# Opt-in: force ndv to render synchronously (no thread-pool round-trip per
+# frame).  Useful for A/B profiling the live preview — with this on, the
+# profiler's "render" timing reflects the real GPU paint cost.
+_FORCE_SYNC = os.getenv("MM_PREVIEW_SYNC", "") not in ("", "0", "false", "False")
 
 
 class NDVPreview(ImagePreviewBase):
@@ -49,6 +55,9 @@ class NDVPreview(ImagePreviewBase):
 
         self._viewer = ndv.ArrayViewer()
         self._buffer: np.ndarray | None = None
+        if _FORCE_SYNC:
+            # Render inline instead of via ndv's background thread pool.
+            self._viewer._async = False
 
         qwdg = self._viewer.widget()
         qwdg.setParent(self)

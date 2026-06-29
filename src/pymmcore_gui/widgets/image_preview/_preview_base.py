@@ -1,14 +1,25 @@
+import os
+import sys
+import time
 import warnings
 from abc import abstractmethod
 from contextlib import suppress
-from typing import Callable
+from typing import TYPE_CHECKING
 
 import numpy as np
 from pymmcore_plus import CMMCorePlus
 from PyQt6.QtCore import Qt, QTimerEvent
 from PyQt6.QtWidgets import QWidget
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 _DEFAULT_WAIT = 10
+
+# Set the env var MM_PREVIEW_PROFILE=1 to log live-preview throughput while
+# streaming (capture vs display FPS and per-stage timing) once every ~2 s.
+_PROFILE = os.getenv("MM_PREVIEW_PROFILE", "") not in ("", "0", "false", "False")
+_PROFILE_LOG_PERIOD_S = 2.0
 
 
 class ImagePreviewBase(QWidget):
@@ -26,8 +37,19 @@ class ImagePreviewBase(QWidget):
         self._mmc: CMMCorePlus | None = mmcore
         # Optional callback for multicam streaming dispatch.
         # If set, timerEvent will call this instead of self.append.
-        # Signature: (frames: list[np.ndarray]) -> None
-        self._multicam_frame_callback: Callable[[list[np.ndarray]], None] | None = None
+        # Signature: (frames: dict[str, np.ndarray]) -> None  (keyed by camera label)
+        self._multicam_frame_callback: (
+            Callable[[dict[str, np.ndarray]], None] | None
+        ) = None
+
+        # --- profiling counters (only used when _PROFILE) ---
+        self._prof_seen = 0  # frames removed from the circular buffer
+        self._prof_displays = 0  # render/dispatch events
+        self._prof_fetch_s = 0.0
+        self._prof_render_s = 0.0
+        self._prof_last_log = time.perf_counter()
+        self._prof_logged_labels = False
+
         self.attach(mmcore)
 
     def attach(self, core: CMMCorePlus) -> None:
@@ -67,52 +89,86 @@ class ImagePreviewBase(QWidget):
     def append(self, data: np.ndarray) -> None:
         raise NotImplementedError
 
-    def _pop_latest_frame_group(self) -> list[np.ndarray] | None:
-        """Pop the latest complete group of frames from the circular buffer.
+    def _pop_latest_frame_group(self) -> dict[str, np.ndarray] | None:
+        """Return the newest frame for each physical camera, keyed by camera label.
 
-        For multicamera, a "complete group" is one frame per physical camera
-        (n_cams frames total).  Older incomplete groups are discarded so the
-        viewer always shows the most recent data.
+        The ``Utilities/Multi Camera`` device inserts **each** physical camera's
+        frame as its own circular-buffer entry, tagged with a ``"Camera"``
+        metadata tag holding the physical device label.  (The channel-indexed
+        ``getLastImageMD`` API does *not* separate these — only channel 0 exists —
+        which is why an earlier attempt left one pane stuck and bled the other
+        camera into the first.)
 
-        Returns a list of 2-D arrays (one per camera), or a single-element list
-        for the single-camera case.  Returns None when the buffer is empty.
+        We therefore walk the buffer newest-first, read each frame's ``"Camera"``
+        tag, and keep the newest frame per camera.  Routing by the metadata tag
+        (rather than by buffer position) is robust to dropped or interleaved
+        frames: a frame can only ever go to the camera that actually produced it,
+        so the panes can no longer swap.  Only if the tag is entirely absent do we
+        fall back to positional ordering.
+
+        We then drop the whole backlog in one cheap ``clearCircularBuffer`` call
+        instead of draining (and copying) every queued frame.
+
+        Returns ``{camera_label: 2-D array}`` (one entry per camera), or ``None``
+        when a complete latest set is not yet available.
         """
         if not (core := self._mmc):
             return None
 
-        n_cams = core.getNumberOfCameraChannels()
+        n_cams = max(core.getNumberOfCameraChannels(), 1)
         count = core.getRemainingImageCount()
 
-        if count <= 0:
-            return None
+        if count < n_cams:
+            return None  # wait until a full set is available
 
-        if n_cams <= 1:
-            # Single camera: drain buffer and keep only the most recent frame.
+        if n_cams == 1:
             img = None
-            for _ in range(count):
-                with suppress(Exception):
-                    img = core.popNextImage()
-            return [img] if img is not None else None
-
-        # Multi-camera: frames arrive in round-robin order (cam0, cam1, …).
-        # Only process the latest complete group.
-        complete_groups = count // n_cams
-        if complete_groups == 0:
-            return None  # Not enough frames yet for a full set.
-
-        # Discard frames from older complete groups.
-        frames_to_skip = (complete_groups - 1) * n_cams
-        for _ in range(frames_to_skip):
             with suppress(Exception):
-                core.popNextImage()
-
-        # Pop the latest complete group.
-        frames: list[np.ndarray] = []
-        for _ in range(n_cams):
+                img = core.getLastImage()
             with suppress(Exception):
-                frames.append(core.popNextImage())
+                core.clearCircularBuffer()
+            if img is None:
+                return None
+            if _PROFILE:
+                self._prof_seen += count
+            return {core.getCameraDevice(): img}
 
-        return frames if frames else None
+        # Multi-camera: walk newest-first, keeping the newest frame per camera as
+        # identified by its "Camera" metadata tag.
+        labels = [core.getPhysicalCameraDevice(i) or f"Camera-ch{i}" for i in range(
+            n_cams
+        )]
+        frames: dict[str, np.ndarray] = {}
+        max_walk = min(count, n_cams * 8)
+        for offset in range(max_walk):
+            try:
+                img, md = core.getNBeforeLastImageAndMD(offset)
+            except Exception:
+                break
+            label = md.get("Camera", None)
+            if not label:
+                # Tag absent: fall back to positional order within the set.
+                label = labels[offset % n_cams]
+            if label not in frames:
+                frames[label] = img
+                if len(frames) == n_cams:
+                    break
+        with suppress(Exception):
+            core.clearCircularBuffer()
+
+        if not frames:
+            return None
+        if _PROFILE:
+            self._prof_seen += count / n_cams
+            if not self._prof_logged_labels:
+                self._prof_logged_labels = True
+                print(
+                    f"[preview profile] physical labels={labels} | "
+                    f"frame keys={list(frames)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        return frames
 
     def _get_all_images(self) -> np.ndarray | None:
         """Fetch latest image(s) from the buffer; stack into (C, H, W) for multicam.
@@ -123,7 +179,6 @@ class ImagePreviewBase(QWidget):
         if not (core := self._mmc):
             return None
 
-        n_cams = core.getNumberOfCameraChannels()
         count = core.getRemainingImageCount()
 
         if count <= 0:
@@ -131,10 +186,11 @@ class ImagePreviewBase(QWidget):
                 return core.fixImage(core.getLastImage())
             return None
 
-        frames = self._pop_latest_frame_group()
-        if not frames:
+        group = self._pop_latest_frame_group()
+        if not group:
             return None
 
+        frames = list(group.values())
         if len(frames) > 1:
             if all(f.shape == frames[0].shape for f in frames):
                 return np.stack(frames, axis=0)
@@ -155,16 +211,24 @@ class ImagePreviewBase(QWidget):
         if core.getRemainingImageCount() <= 0:
             return
 
+        t0 = time.perf_counter() if _PROFILE else 0.0
         try:
-            frames = self._pop_latest_frame_group()
-            if not frames:
+            group = self._pop_latest_frame_group()
+            if not group:
                 return
 
-            if self._multicam_frame_callback is not None and len(frames) > 1:
-                # Route per-camera frames to the manager for dispatching.
-                self._multicam_frame_callback(frames)
+            t_fetch = time.perf_counter() if _PROFILE else 0.0
+
+            if self._multicam_frame_callback is not None:
+                # Multicam driver: ALWAYS dispatch by camera label, even when this
+                # tick only found one camera's frame.  Falling back to
+                # ``self.append`` here would push that lone frame into the driver's
+                # *own* pane regardless of which camera produced it — which made
+                # the driver pane intermittently show the other camera.
+                self._multicam_frame_callback(group)
             else:
                 # Single camera or composite stacking.
+                frames = list(group.values())
                 if len(frames) > 1:
                     if all(f.shape == frames[0].shape for f in frames):
                         img: np.ndarray = np.stack(frames, axis=0)
@@ -173,13 +237,51 @@ class ImagePreviewBase(QWidget):
                 else:
                     img = frames[0]
                 self.append(img)
+
+            if _PROFILE:
+                now = time.perf_counter()
+                self._prof_displays += 1
+                self._prof_fetch_s += t_fetch - t0
+                self._prof_render_s += now - t_fetch
+                self._prof_maybe_log(now)
         except Exception as e:
             warnings.warn(
                 f"Failed to get image from core: {e}", RuntimeWarning, stacklevel=2
             )
 
+    def _prof_maybe_log(self, now: float) -> None:
+        """Log capture/display throughput once per ``_PROFILE_LOG_PERIOD_S``."""
+        dt = now - self._prof_last_log
+        if dt < _PROFILE_LOG_PERIOD_S:
+            return
+        displays = max(self._prof_displays, 1)
+        capture_fps = self._prof_seen / dt
+        display_fps = self._prof_displays / dt
+        fetch_ms = 1000.0 * self._prof_fetch_s / displays
+        render_ms = 1000.0 * self._prof_render_s / displays
+        dropped = 0.0
+        if self._prof_seen:
+            dropped = 100.0 * (self._prof_seen - self._prof_displays) / self._prof_seen
+        cams = ""
+        if (core := self._mmc) is not None:
+            with suppress(Exception):
+                n = core.getNumberOfCameraChannels()
+                cams = f"{n}cam " if n > 1 else ""
+        print(
+            f"[preview profile] {cams}capture ~{capture_fps:.0f} fps | "
+            f"display ~{display_fps:.0f} fps | fetch {fetch_ms:.1f} ms | "
+            f"render {render_ms:.1f} ms | dropped {max(dropped, 0.0):.0f}%",
+            file=sys.stderr,
+            flush=True,
+        )
+        self._prof_seen = 0
+        self._prof_displays = 0
+        self._prof_fetch_s = 0.0
+        self._prof_render_s = 0.0
+        self._prof_last_log = now
+
     def _on_image_snapped(self) -> None:
-        if (core := self._mmc) is None:
+        if self._mmc is None:
             return  # pragma: no cover
         if not self.use_with_mda and self._is_mda_running:
             return  # pragma: no cover

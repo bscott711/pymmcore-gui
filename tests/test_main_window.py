@@ -117,36 +117,37 @@ def test_main_window_notifications(gui: MicroManagerGUI) -> None:
 
 
 def test_snap(gui: MicroManagerGUI, qtbot: QtBot) -> None:
-    """Test that snapping creates a new image preview."""
+    """Test that snapping creates and updates a single image preview."""
     vm = gui._viewers_manager
     assert not vm._camera_previews
     core = gui._mmc
-    with qtbot.waitSignal(vm.previewViewerCreated):
+    # generous timeout: the first preview build does a one-time GPU init.
+    with qtbot.waitSignal(vm.previewViewerCreated, timeout=15000):
         core.snapImage()
     # One preview dock for the single camera.
     assert len(vm._camera_previews) == 1
     cam_label = core.getCameraDevice()
     assert cam_label in vm._camera_previews
     preview_dw = vm._camera_previews[cam_label]
-    assert preview_dw is not None
+    assert preview_dw.widget().data is not None
     assert len(vm._preview_dock_widgets) == 1
 
-    # change image dtype/shape.
-    # We should end up with a second preview widget (new camera label slot)
+    # A pixel-type / shape change is handled in place by the fast preview (the GPU
+    # texture is recreated on the fly) — the *same* dock is reused, no churn.
     core.setProperty(core.getCameraDevice(), "PixelType", "32bitRGB")
-    with qtbot.waitSignal(vm.previewViewerCreated):
+    with qtbot.waitSignal(core.events.imageSnapped):
         core.snapImage()
-    # The old preview was invalidated (shape changed) and a new one created.
-    assert cam_label in vm._camera_previews
-    assert vm._camera_previews[cam_label] is not preview_dw
-    assert len(vm._preview_dock_widgets) == 2
+    qtbot.wait(20)
+    assert len(vm._camera_previews) == 1
+    assert vm._camera_previews[cam_label] is preview_dw
+    assert len(vm._preview_dock_widgets) == 1
 
-    # but this should *not* create a new preview
+    # an exposure change likewise does not spawn a new preview
     core.setProperty(core.getCameraDevice(), "Exposure", "42")
     with qtbot.waitSignal(core.events.imageSnapped):
         core.snapImage()
     assert len(vm._camera_previews) == 1
-    assert len(vm._preview_dock_widgets) == 2
+    assert len(vm._preview_dock_widgets) == 1
 
 
 @pytest.mark.skipif(
@@ -154,24 +155,27 @@ def test_snap(gui: MicroManagerGUI, qtbot: QtBot) -> None:
     reason="need to debug hanging test on macOS CI",
 )
 def test_stream(gui: MicroManagerGUI, qtbot: QtBot) -> None:
-    """Test that streaming creates a new image preview."""
+    """Test that streaming creates an image preview that receives frames."""
+    from pymmcore_gui.widgets.image_preview._pygfx_preview import PygfxPreview
+
     vm = gui._viewers_manager
     assert not vm._camera_previews
     core = gui._mmc
-    with qtbot.waitSignal(vm.previewViewerCreated):
+    with qtbot.waitSignal(vm.previewViewerCreated, timeout=15000):
         core.startContinuousSequenceAcquisition()
 
     assert vm._camera_previews
     cam_label = core.getCameraDevice()
-    ndv_viewer = vm._camera_previews[cam_label].widget()._viewer  # type: ignore
-    assert isinstance(ndv_viewer, ndv.ArrayViewer)
+    preview = vm._camera_previews[cam_label].widget()
+    assert isinstance(preview, PygfxPreview)
 
-    # we should be able to change the exposure
+    # let a few frames stream and confirm the preview received data
+    qtbot.wait(150)
+    assert preview.data is not None
+
+    # changing the exposure should not break streaming
     core.setExposure(11)
-    # wait until the ndv viewer actually changes the current index (sanity check)
-    change_signal = ndv_viewer.display_model.current_index.value_changed
-    qtbot.waitSignals([change_signal] * 4)
-    qtbot.wait(40)
+    qtbot.wait(50)
     core.stopSequenceAcquisition()
 
 

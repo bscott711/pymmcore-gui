@@ -11,7 +11,7 @@ from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QWidget
 from PyQt6Ads import CDockWidget
 
-from pymmcore_gui.widgets.image_preview._ndv_preview import NDVPreview
+from pymmcore_gui.widgets.image_preview._pygfx_preview import PygfxPreview
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -25,7 +25,6 @@ if TYPE_CHECKING:
     from pymmcore_plus.metadata import FrameMetaV1, SummaryMetaV1
     from useq import MDASequence
 
-    from pymmcore_gui.widgets.image_preview._preview_base import ImagePreviewBase
 
 
 # NOTE: we make this a QObject mostly so that the lifetime of this object is tied to
@@ -70,10 +69,10 @@ class NDVViewersManager(QObject):
         # e.g. {"Camera-1": <CDockWidget>, "Camera-2": <CDockWidget>}
         self._camera_previews: dict[str, CDockWidget] = {}
 
-        # Primary "streaming driver" preview — the first camera's NDVPreview owns
+        # Primary "streaming driver" preview — the first camera's PygfxPreview owns
         # the Qt timer that polls the circular buffer.  Other cameras' previews
         # receive frames via a callback set on this widget.
-        self._streaming_driver: NDVPreview | None = None
+        self._streaming_driver: PygfxPreview | None = None
 
         # Per-camera MDA display handlers/viewers, keyed by physical camera label.
         # Populated only for multi-camera acquisitions; the single-camera path
@@ -108,18 +107,20 @@ class NDVViewersManager(QObject):
         n = self._mmc.getNumberOfCameraChannels()
         if n <= 1:
             return [cam]
-        try:
-            return [
-                self._mmc.getProperty(cam, f"Physical Camera {i + 1}")
-                for i in range(n)
-            ]
-        except Exception:
-            # Fallback if the property isn't readable (e.g. non-standard device)
-            return [f"{cam}-ch{i}" for i in range(n)]
+        # Resolve each channel via the same helper the preview fetch uses
+        # (getPhysicalCameraDevice -> "Physical Camera N" property) so the dock
+        # keys and the frame-dict keys are guaranteed identical.
+        labels: list[str] = []
+        for i in range(n):
+            try:
+                labels.append(self._mmc.getPhysicalCameraDevice(i) or f"Camera-ch{i}")
+            except Exception:
+                labels.append(f"Camera-ch{i}")
+        return labels
 
-    def _create_camera_preview(self, camera_label: str) -> NDVPreview:
-        """Create a new NDVPreview dock widget for *camera_label* and emit the signal."""
-        preview = NDVPreview(mmcore=self._mmc, camera_label=camera_label)
+    def _create_camera_preview(self, camera_label: str) -> PygfxPreview:
+        """Create a new PygfxPreview dock for *camera_label* and emit the signal."""
+        preview = PygfxPreview(mmcore=self._mmc, camera_label=camera_label)
         parent = self.parent()
         if not isinstance(parent, QWidget):
             parent = None  # pragma: no cover
@@ -133,8 +134,8 @@ class NDVViewersManager(QObject):
 
     def _get_or_create_camera_preview(
         self, camera_label: str
-    ) -> tuple[NDVPreview, bool]:
-        """Return ``(NDVPreview, created)`` for *camera_label*.
+    ) -> tuple[PygfxPreview, bool]:
+        """Return ``(PygfxPreview, created)`` for *camera_label*.
 
         If the dock widget already exists its view is toggled on and ``created``
         is *False*.  Otherwise a new preview is created and ``created`` is *True*.
@@ -142,7 +143,7 @@ class NDVViewersManager(QObject):
         if camera_label in self._camera_previews:
             dw = self._camera_previews[camera_label]
             dw.toggleView(True)
-            return cast("NDVPreview", dw.widget()), False
+            return cast("PygfxPreview", dw.widget()), False
         return self._create_camera_preview(camera_label), True
 
     def _dispatch_snap_to_previews(self, images: dict[int, np.ndarray]) -> None:
@@ -153,23 +154,28 @@ class NDVViewersManager(QObject):
             preview, _ = self._get_or_create_camera_preview(label)
             preview.append(img)
 
-    def _make_multicam_streaming_callback(
-        self, labels: list[str]
-    ):
+    def _make_multicam_streaming_callback(self, labels: list[str]):
         """Return a callback that dispatches per-camera frames to their previews.
 
-        The callback is installed on the streaming-driver ``NDVPreview``'s
+        The callback is installed on the streaming-driver ``PygfxPreview``'s
         ``_multicam_frame_callback`` attribute so that its ``timerEvent`` routes
         frames here instead of calling ``append``.
+
+        Frames arrive keyed by physical-camera label (the same key used for the
+        preview docks), so each frame is dispatched to its own pane by an exact
+        lookup — there is no positional/parity assumption that could swap panes.
         """
 
-        def _on_frames(frames: list[np.ndarray]) -> None:
-            for ch_idx, frame in enumerate(frames):
-                label = labels[ch_idx] if ch_idx < len(labels) else f"Camera-ch{ch_idx}"
+        def _on_frames(frames: dict[str, np.ndarray]) -> None:
+            for label, frame in frames.items():
                 dw = self._camera_previews.get(label)
                 if dw is None:
-                    continue
-                preview = cast("NDVPreview", dw.widget())
+                    # Label we didn't pre-create a dock for (e.g. the "Camera"
+                    # metadata tag differs from the Physical Camera property).
+                    # Create it on demand so no camera is silently dropped.
+                    preview, _ = self._get_or_create_camera_preview(label)
+                else:
+                    preview = cast("PygfxPreview", dw.widget())
                 preview.append(frame)
 
         return _on_frames
@@ -198,7 +204,7 @@ class NDVViewersManager(QObject):
             # Create previews for ALL cameras up front, but only the first one
             # owns the Qt timer (streaming driver).  A callback dispatches frames
             # to the others.
-            driver_preview: NDVPreview | None = None
+            driver_preview: PygfxPreview | None = None
             for i, label in enumerate(labels):
                 preview, created = self._get_or_create_camera_preview(label)
                 if i == 0:
@@ -271,7 +277,7 @@ class NDVViewersManager(QObject):
             dw = self._camera_previews.get(label)
             if dw is None:
                 continue
-            preview = cast("NDVPreview", dw.widget())
+            preview = cast("PygfxPreview", dw.widget())
             # Only invalidate if shape / dtype actually changed.
             if preview._get_core_dtype_shape() != preview.dtype_shape:
                 preview.detach()
