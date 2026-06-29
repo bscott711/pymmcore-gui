@@ -41,6 +41,7 @@ class WidgetAction(ActionKey):
     EXCEPTION_LOG = "pymmcore_gui.exception_log"
     STAGE_CONTROL = "pymmcore_gui.stage_control_widget"
     CONFIG_WIZARD = "pymmcore_gui.hardware_config_wizard"
+    CRISP = "pymmcore_gui.crisp_widget"
 
 
 # ######################## Functions that create widgets #########################
@@ -90,11 +91,10 @@ def create_install_widgets(parent: QWidget) -> pmmw.InstallWidget:
 
 
 def create_mda_widget(parent: QWidget) -> pmmw.MDAWidget:
-    """Create the MDA widget."""
-    # from pymmcore_gui.widgets import _MDAWidget
-    from pymmcore_widgets import MDAWidget
+    """Create the MDA widget (multi-camera aware saving)."""
+    from pymmcore_gui.widgets._mda_widget import GuiMDAWidget
 
-    return MDAWidget(parent=parent, mmcore=_get_core(parent))
+    return GuiMDAWidget(parent=parent, mmcore=_get_core(parent))
 
 
 def create_camera_roi(parent: QWidget) -> pmmw.CameraRoiWidget:
@@ -142,6 +142,13 @@ def create_config_wizard(parent: QWidget) -> pmmw.ConfigWizard:
     mmcore = _get_core(parent)
     config_file = mmcore.systemConfigurationFile() or ""
     return ConfigWizard(config_file=config_file, core=mmcore, parent=parent)
+
+
+def create_crisp_widget(parent: QWidget) -> QWidget:
+    """Create the CRISPy ASI CRISP autofocus widget."""
+    from pymmcore_gui.widgets._crisp_widget import CrispWidget
+
+    return CrispWidget(parent=parent, mmcore=_get_core(parent))
 
 
 # ######################## WidgetAction Enum #########################
@@ -256,4 +263,12 @@ show_config_wizard = WidgetActionInfo(
     create_widget=create_config_wizard,
     dock_area=None,
     checkable=False,
+)
+
+show_crisp = WidgetActionInfo(
+    key=WidgetAction.CRISP,
+    text="CRISPy Autofocus",
+    icon="mdi:focus-auto",
+    create_widget=create_crisp_widget,
+    dock_area=DockWidgetArea.RightDockWidgetArea,
 )

@@ -65,8 +65,8 @@ dependencies = [
 
 [tool.uv.sources]
 superqt = { git = "https://github.com/bscott711/superqt.git", branch = "main" }
-pymmcore-widgets = { git = "https://github.com/bscott711/pymmcore-widgets.git", branch = "main" }
-crispy = { git = "https://github.com/bscott711/CRISPy.git" }
+pymmcore-widgets = { path = "../pymmcore-widgets", editable = true }
+crispy = { path = "../CRISPy", editable = true }
 
 [dependency-groups]
 test = [

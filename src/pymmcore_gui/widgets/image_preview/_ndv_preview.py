@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import ndv
 import numpy as np
-from PyQt6.QtWidgets import QApplication, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QVBoxLayout, QWidget
 
 from pymmcore_gui.widgets.image_preview._preview_base import ImagePreviewBase
 
@@ -49,9 +49,6 @@ class NDVPreview(ImagePreviewBase):
 
         self._viewer = ndv.ArrayViewer()
         self._buffer: np.ndarray | None = None
-        # Disable per-append processEvents for managed previews — the manager
-        # calls QApplication.processEvents() once after dispatching to all cameras.
-        self.process_events_on_update = camera_label is None
 
         qwdg = self._viewer.widget()
         qwdg.setParent(self)
@@ -133,14 +130,24 @@ class NDVPreview(ImagePreviewBase):
             or self._buffer.shape != data.shape
             or self._buffer.dtype != data.dtype
         ):
+            # Shape/dtype changed (or first frame): (re)build the viewer.  This
+            # assigns ``self._buffer`` and ``self._viewer.data`` and runs the full
+            # dimension/slider synchronization.
             self._setup_viewer(data)
+            return
 
-        if self._buffer is not None:
-            np.copyto(self._buffer, data)
+        # Fast path: the dimensions are unchanged, so mutate the existing buffer in
+        # place and ask the viewer to redraw only the current slice.  Reassigning
+        # ``self._viewer.data`` here would trigger a full view re-synchronization
+        # every frame (rebuilding sliders, dims, etc.), which is the main cause of
+        # sluggish live updates.  Emitting ``data_changed`` re-renders in place and
+        # lets ndv coalesce paints via the normal Qt event loop — no forced
+        # ``QApplication.processEvents()`` (which caused re-entrancy under load).
+        np.copyto(self._buffer, data)
+        if (wrapper := self._viewer.data_wrapper) is not None:
+            wrapper.data_changed.emit()
+        else:  # pragma: no cover - defensive; wrapper exists after _setup_viewer
             self._viewer.data = self._buffer
-
-        if self.process_events_on_update:
-            QApplication.processEvents()
 
     # ------------------------------------------------------------------
     # Shape / dtype helpers

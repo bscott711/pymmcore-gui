@@ -69,6 +69,7 @@ class Menu(str, Enum):
     PYMM_GUI = "pymmcore-gui"
     WINDOW = "Window"
     DEVICE = "Devices"
+    PLUGINS = "Plugins"
     HELP = "Help"
 
     def __str__(self) -> str:
@@ -148,6 +149,9 @@ class MicroManagerGUI(QMainWindow):
             CoreAction.SAVE_CONFIG,
             None,
             WidgetAction.INSTALL_DEVICES,
+        ],
+        Menu.PLUGINS: [
+            WidgetAction.CRISP,
         ],
         Menu.HELP: [],
     }
@@ -521,16 +525,18 @@ class MicroManagerGUI(QMainWindow):
             widget.raise_()
 
     def _on_mda_viewer_created(
-        self, ndv_viewer: ndv.ArrayViewer, sequence: MDASequence
+        self, ndv_viewer: ndv.ArrayViewer, sequence: MDASequence, camera_label: str = ""
     ) -> None:
         q_viewer = cast("QWidget", ndv_viewer.widget())
 
         sha = str(sequence.uid)[:8]
-        q_viewer.setObjectName(f"ndv-{sha}")
-        q_viewer.setWindowTitle(f"MDA {sha}")
+        suffix = f"-{camera_label}" if camera_label else ""
+        q_viewer.setObjectName(f"ndv-{sha}{suffix}")
+        title = f"MDA {sha}" + (f" — {camera_label}" if camera_label else "")
+        q_viewer.setWindowTitle(title)
         q_viewer.setWindowFlags(Qt.WindowType.Dialog)
 
-        dw = CDockWidget(f"ndv-{sha}")
+        dw = CDockWidget(f"ndv-{sha}{suffix}")
         # small hack ... we need to retain a pointer to the viewer
         # otherwise the viewer will be garbage collected
         dw._viewer = ndv_viewer  # type: ignore

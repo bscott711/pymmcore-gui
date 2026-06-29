@@ -42,7 +42,7 @@ class NDVViewersManager(QObject):
         The CMMCorePlus instance.
     """
 
-    mdaViewerCreated = pyqtSignal(ndv.ArrayViewer, useq.MDASequence)
+    mdaViewerCreated = pyqtSignal(ndv.ArrayViewer, useq.MDASequence, str)
     previewViewerCreated = pyqtSignal(CDockWidget)
     viewerDestroyed = pyqtSignal(str)
 
@@ -74,6 +74,12 @@ class NDVViewersManager(QObject):
         # the Qt timer that polls the circular buffer.  Other cameras' previews
         # receive frames via a callback set on this widget.
         self._streaming_driver: NDVPreview | None = None
+
+        # Per-camera MDA display handlers/viewers, keyed by physical camera label.
+        # Populated only for multi-camera acquisitions; the single-camera path
+        # continues to use ``_own_handler`` / ``_active_mda_viewer`` below.
+        self._mda_camera_handlers: dict[str, TensorStoreHandler] = {}
+        self._mda_camera_viewers: dict[str, ndv.ArrayViewer] = {}
 
         ev = self._mmc.events
         ev.imageSnapped.connect(self._on_image_snapped)
@@ -293,6 +299,25 @@ class NDVViewersManager(QObject):
         self._is_mda_running = True
 
         self._own_handler = self._handler = None
+        self._mda_camera_handlers.clear()
+        self._mda_camera_viewers.clear()
+
+        labels = self._get_physical_camera_labels()
+        if len(labels) > 1:
+            # Multi-camera: every physical camera frame shares the same event
+            # index, so a single store/viewer would overwrite frames.  Give each
+            # camera its own in-memory display handler + viewer (independent of any
+            # save handler), routing frames by ``meta["camera_device"]``.
+            for label in labels:
+                handler = TensorStoreHandler(driver="zarr", kvstore="memory://")
+                handler.reset(sequence)
+                self._mda_camera_handlers[label] = handler
+                self._mda_camera_viewers[label] = self._create_ndv_viewer(
+                    sequence, label
+                )
+            self._active_mda_viewer = None
+            return
+
         if handlers := self._mmc.mda.get_output_handlers():
             # someone else has created a handler for this sequence
             self._handler = handlers[0]
@@ -308,17 +333,36 @@ class NDVViewersManager(QObject):
         self, frame: np.ndarray, event: useq.MDAEvent, meta: FrameMetaV1
     ) -> None:
         """Create a viewer if it does not exist, otherwise update the current index."""
-        # at this point the viewer should exist
+        # Multi-camera: route to the per-camera display handler + viewer.
+        if self._mda_camera_handlers:
+            label = meta.get("camera_device") or self._mmc.getCameraDevice()
+            handler = self._mda_camera_handlers.get(label)
+            viewer = self._mda_camera_viewers.get(label)
+            if handler is None or viewer is None:
+                return  # pragma: no cover
+            handler.frameReady(frame, event, meta)
+            self._update_mda_viewer(viewer, handler, event)
+            return
+
+        # Single-camera path.
         if self._own_handler is not None:
             self._own_handler.frameReady(frame, event, meta)
 
         if (viewer := self._active_mda_viewer) is None:
             return  # pragma: no cover
 
+        self._update_mda_viewer(viewer, self._handler or self._own_handler, event)
+
+    def _update_mda_viewer(
+        self,
+        viewer: ndv.ArrayViewer,
+        handler: SupportsFrameReady | None,
+        event: useq.MDAEvent,
+    ) -> None:
+        """Point the viewer at the handler store, or update its current index."""
         # if the viewer does not yet have data, it's likely the very first frame
         # so update the viewer's data source to the underlying handlers store
         if viewer.data_wrapper is None:
-            handler = self._handler or self._own_handler
             if isinstance(handler, TensorStoreHandler):
                 # TODO: temporary. maybe create the DataWrapper for the handlers
                 viewer.data = handler.store
@@ -349,14 +393,27 @@ class NDVViewersManager(QObject):
         """Called when a sequence has finished."""
         if self._own_handler is not None:
             self._own_handler.sequenceFinished(sequence)
+        for handler in self._mda_camera_handlers.values():
+            handler.sequenceFinished(sequence)
         # cleanup pointers somehow?
         self._is_mda_running = False
 
-    def _create_ndv_viewer(self, sequence: MDASequence) -> ndv.ArrayViewer:
-        """Create a new ndv viewer with no data."""
+    def _create_ndv_viewer(
+        self, sequence: MDASequence, camera_label: str = ""
+    ) -> ndv.ArrayViewer:
+        """Create a new ndv viewer with no data.
+
+        *camera_label* identifies the physical camera for multi-camera
+        acquisitions (empty string for the single-camera case).
+        """
         ndv_viewer = ndv.ArrayViewer()
-        self._seq_viewers[str(sequence.uid)] = ndv_viewer
-        self.mdaViewerCreated.emit(ndv_viewer, sequence)
+        # Key by uid (single camera) or uid::label (one viewer per camera) so the
+        # weak-value map retains a distinct entry per viewer.
+        key = str(sequence.uid)
+        if camera_label:
+            key = f"{key}::{camera_label}"
+        self._seq_viewers[key] = ndv_viewer
+        self.mdaViewerCreated.emit(ndv_viewer, sequence, camera_label)
         return ndv_viewer
 
     def __repr__(self) -> str:  # pragma: no cover
