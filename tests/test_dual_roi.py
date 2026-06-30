@@ -10,6 +10,7 @@ from pymmcore_gui._multi_camera_handler import MultiCameraHandler
 from pymmcore_gui._roi_utils import (
     apply_dual_roi,
     clear_roi,
+    physical_camera_labels,
     rect_to_pixel_roi,
     rois_from_multiroi_tuple,
     safe_split_composite,
@@ -107,20 +108,28 @@ def test_rois_from_multiroi_tuple() -> None:
 class _FakeCore:
     def __init__(self, supported: bool = True) -> None:
         self._supported = supported
+        self.active = "Cam"
         self.multi_calls: list[Any] = []
         self.set_roi_calls: list[Any] = []
+        self.set_camera_calls: list[str] = []
+        self.clear_roi_calls: list[str] = []
         self._roi = (0, 0, 512, 512)
 
     def isMultiROISupported(self) -> bool:
         return self._supported
 
     def getCameraDevice(self) -> str:
-        return "Cam"
+        return self.active
+
+    def setCameraDevice(self, label: str) -> None:
+        self.active = label
+        self.set_camera_calls.append(label)
 
     def setMultiROI(self, xs, ys, ws, hs) -> None:
         self.multi_calls.append((xs, ys, ws, hs))
 
     def clearROI(self) -> None:
+        self.clear_roi_calls.append(self.active)
         self._roi = (0, 0, 512, 512)
 
     def getROI(self, label: str) -> tuple[int, int, int, int]:
@@ -167,6 +176,37 @@ def test_clear_roi_reapplies_full_chip() -> None:
     core = _FakeCore()
     clear_roi(core)  # type: ignore[arg-type]
     assert core.set_roi_calls == [("Cam", 0, 0, 512, 512)]
+
+
+def test_apply_dual_roi_to_multiple_cameras_switches_and_restores() -> None:
+    core = _FakeCore()
+    core.active = "Multi"
+    apply_dual_roi(
+        core,  # type: ignore[arg-type]
+        [(0, 0, 10, 10), (0, 20, 10, 10)],
+        cameras=["Cam1", "Cam2"],
+    )
+    # Both physical cameras received the ROIs; the composite device was restored.
+    assert len(core.multi_calls) == 2
+    assert core.set_camera_calls == ["Cam1", "Cam2", "Multi"]
+    assert core.active == "Multi"
+
+
+def test_clear_roi_multiple_cameras_switches_and_restores() -> None:
+    core = _FakeCore()
+    core.active = "Multi"
+    clear_roi(core, cameras=["Cam1", "Cam2"])  # type: ignore[arg-type]
+    assert core.clear_roi_calls == ["Cam1", "Cam2"]
+    assert core.set_camera_calls == ["Cam1", "Cam2", "Multi"]
+    assert core.active == "Multi"
+    assert [c[0] for c in core.set_roi_calls] == ["Cam1", "Cam2"]
+
+
+def test_physical_camera_labels(mmcore: CMMCorePlus) -> None:
+    mmcore.setProperty("Core", "Camera", "Multi Camera")
+    assert physical_camera_labels(mmcore) == ["Camera", "Camera-2"]
+    mmcore.setProperty("Core", "Camera", "Camera")
+    assert physical_camera_labels(mmcore) == ["Camera"]
 
 
 # --------------------------------------------------------------------------- #

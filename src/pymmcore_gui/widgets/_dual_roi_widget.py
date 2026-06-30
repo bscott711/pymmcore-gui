@@ -37,6 +37,7 @@ from pymmcore_gui._roi_utils import (
     PixelROI,
     apply_dual_roi,
     clear_roi,
+    physical_camera_labels,
     rect_to_pixel_roi,
 )
 
@@ -167,7 +168,12 @@ class DualRoiWidget(QWidget):
             # raises "Camera image buffer not read".
             if mmc.isSequenceRunning():
                 mmc.stopSequenceAcquisition()
-            if mmc.isMultiROIEnabled():
+            # Selection happens against the full sensor. For a composite device the
+            # multi-ROI lives on the physical cameras (not the composite itself), so
+            # clear those; otherwise clear the current camera if it has an ROI.
+            if self._is_multi_camera():
+                clear_roi(mmc, cameras=physical_camera_labels(mmc))
+            elif mmc.isMultiROIEnabled():
                 clear_roi(mmc)
             img = mmc.snap()
         except Exception as exc:  # pragma: no cover - hardware/runtime errors
@@ -280,20 +286,32 @@ class DualRoiWidget(QWidget):
         rois = self._current_pixel_rois()
         if len(rois) != 2:
             return
+        mmc = self._mmc
+        # For a composite device, fan the same ROIs out to every physical camera so
+        # each Kinetix reads out identically (equal sizes keep the composite valid).
+        cams = physical_camera_labels(mmc) if self._is_multi_camera() else None
         try:
-            apply_dual_roi(self._mmc, rois)
+            if mmc.isSequenceRunning():
+                mmc.stopSequenceAcquisition()
+            apply_dual_roi(mmc, rois, cameras=cams)
         except (RuntimeError, ValueError) as exc:
+            # On partial failure, restore a consistent full-chip state so the
+            # composite device doesn't end up with mismatched per-camera sizes.
+            if cams:
+                with suppress(Exception):
+                    clear_roi(mmc, cameras=cams)
             QMessageBox.warning(self, "Could not apply ROIs", str(exc))
             return
         # setMultiROI emits no roiSet; snap so live previews refresh to the composite.
         # Use snap() (not snapImage()) so imageSnapped fires and previews update.
         with suppress(Exception):
-            self._mmc.snap()
+            mmc.snap()
         self._update_readout()
 
     def _reset_full_chip(self) -> None:
+        cams = physical_camera_labels(self._mmc) if self._is_multi_camera() else None
         with suppress(Exception):
-            clear_roi(self._mmc)
+            clear_roi(self._mmc, cameras=cams)
         self._snap()
 
     # ------------------------------------------------------------------
@@ -340,10 +358,10 @@ class DualRoiWidget(QWidget):
             return "No camera loaded."
         cam = self._mmc.getCameraDevice()
         if self._is_multi_camera():
+            cams = ", ".join(physical_camera_labels(self._mmc))
             return (
-                f"Active camera {cam!r} is a composite (Multi Camera) device — "
-                "multi-ROI must be applied to a physical camera. Set the Core camera "
-                "to a Kinetix and reopen, or ask to enable per-camera targeting."
+                f"Active camera {cam!r} is a composite device — Apply will set both "
+                f"ROIs on each physical camera ({cams})."
             )
         if not self._reports_multiroi():
             return (

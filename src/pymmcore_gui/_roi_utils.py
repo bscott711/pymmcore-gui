@@ -88,12 +88,36 @@ def rect_to_pixel_roi(
     return (x, y, max(w, 1), max(h, 1))
 
 
-def apply_dual_roi(mmc: CMMCorePlus, rois: list[PixelROI]) -> None:
-    """Set multiple ROIs on the current camera device.
+def physical_camera_labels(mmc: CMMCorePlus) -> list[str]:
+    """Return the physical camera labels behind the active camera device.
 
-    Operates on the core's *current* camera.  Note that, unlike single-ROI
-    ``setROI``, ``setMultiROI`` does **not** emit a ``roiSet`` event — callers that
-    need a UI/preview refresh should snap a frame afterwards.
+    For a composite (e.g. ``Multi Camera``) device — detected via
+    ``getNumberOfCameraChannels() > 1`` — this returns each ``Physical Camera N``
+    label.  For a plain camera it returns ``[current_camera]`` (or ``[]`` if none).
+    """
+    try:
+        n = mmc.getNumberOfCameraChannels()
+    except Exception:  # pragma: no cover - defensive
+        n = 1
+    if n <= 1:
+        cam = mmc.getCameraDevice()
+        return [cam] if cam else []
+    labels: list[str] = []
+    for i in range(n):
+        try:
+            labels.append(mmc.getPhysicalCameraDevice(i) or f"Camera-ch{i}")
+        except Exception:  # pragma: no cover - defensive
+            labels.append(f"Camera-ch{i}")
+    return labels
+
+
+def apply_dual_roi(
+    mmc: CMMCorePlus, rois: list[PixelROI], *, cameras: list[str] | None = None
+) -> None:
+    """Set the same multiple ROIs on one or more camera devices.
+
+    Note that, unlike single-ROI ``setROI``, ``setMultiROI`` does **not** emit a
+    ``roiSet`` event — callers that need a UI/preview refresh should snap afterwards.
 
     ``isMultiROISupported()`` is intentionally **not** used as a precondition: it is
     an unreliable, false-negative-prone capability flag (the demo camera reports
@@ -107,12 +131,17 @@ def apply_dual_roi(mmc: CMMCorePlus, rois: list[PixelROI]) -> None:
         The core instance.
     rois : list[tuple[int, int, int, int]]
         One or more ``(x, y, w, h)`` ROIs.
+    cameras : list[str] | None
+        If ``None`` (default) the ROIs are applied to the *current* camera.
+        Otherwise the same ROIs are set on each listed camera in turn — the active
+        camera is switched to each label and **restored** afterwards.  This fans a
+        multi-ROI out to every physical camera behind a composite ``Multi Camera``
+        device (``setMultiROI`` only ever acts on the current camera).
 
     Raises
     ------
     RuntimeError
-        If the camera rejects the multi-ROI request (e.g. it truly cannot do it, or
-        the active device is a composite "Multi Camera" utility).
+        If a camera rejects the multi-ROI request.
     ValueError
         If *rois* is empty or any width/height is non-positive.
     """
@@ -125,26 +154,74 @@ def apply_dual_roi(mmc: CMMCorePlus, rois: list[PixelROI]) -> None:
     ys = [y for _, y, _, _ in rois]
     ws = [w for _, _, w, _ in rois]
     hs = [h for _, _, _, h in rois]
+
+    if not cameras:
+        _set_multi_roi(mmc, xs, ys, ws, hs)
+        return
+
+    original = mmc.getCameraDevice()
+    try:
+        for label in cameras:
+            mmc.setCameraDevice(label)
+            _set_multi_roi(mmc, xs, ys, ws, hs)
+    finally:
+        # Always restore the originally-active (e.g. composite) camera.
+        mmc.setCameraDevice(original)
+
+
+def _set_multi_roi(
+    mmc: CMMCorePlus,
+    xs: list[int],
+    ys: list[int],
+    ws: list[int],
+    hs: list[int],
+) -> None:
+    """Call ``setMultiROI`` on the current camera, wrapping device errors."""
     try:
         mmc.setMultiROI(xs, ys, ws, hs)
     except Exception as exc:
         raise RuntimeError(
-            f"Camera {mmc.getCameraDevice()!r} rejected the multi-ROI request "
-            f"({exc}). If this is a composite 'Multi Camera' device, set the active "
-            f"camera to a physical camera that supports multi-ROI first."
+            f"Camera {mmc.getCameraDevice()!r} rejected the multi-ROI request ({exc})."
         ) from exc
 
 
-def clear_roi(mmc: CMMCorePlus, *, label: str | None = None) -> None:
-    """Reset the camera to full-chip readout and emit a ``roiSet`` event.
+def clear_roi(
+    mmc: CMMCorePlus, *, label: str | None = None, cameras: list[str] | None = None
+) -> None:
+    """Reset camera(s) to full-chip readout and emit a ``roiSet`` event.
 
     Restores full-frame readout (clearing any single- or multi-ROI) and re-applies it
     via ``setROI`` so that listeners relying on the ``roiSet`` signal (previews, the
     Camera ROI widget) refresh — ``clearROI`` alone is silent.
+
+    Parameters
+    ----------
+    mmc : CMMCorePlus
+        The core instance.
+    label : str | None
+        Clear this specific camera (defaults to the current camera).
+    cameras : list[str] | None
+        If given, clear each listed camera in turn (switching the active camera to
+        each and restoring it afterwards).  Used to reset every physical camera
+        behind a composite ``Multi Camera`` device.  Takes precedence over *label*.
     """
+    if cameras:
+        original = mmc.getCameraDevice()
+        try:
+            for cam in cameras:
+                mmc.setCameraDevice(cam)
+                _clear_one(mmc, cam)
+        finally:
+            mmc.setCameraDevice(original)
+        return
     cam = label or mmc.getCameraDevice()
     if not cam:
         return
+    _clear_one(mmc, cam)
+
+
+def _clear_one(mmc: CMMCorePlus, cam: str) -> None:
+    """Reset *cam* (assumed current) to full chip, emitting a ``roiSet`` event."""
     # clearROI() resets to full chip (silently); getROI then reports full sensor size.
     mmc.clearROI()
     x, y, w, h = mmc.getROI(cam)
