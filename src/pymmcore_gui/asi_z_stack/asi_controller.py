@@ -267,6 +267,25 @@ def _plogic_available() -> bool:
     return _HW.plogic_label in devices and _HW.tiger_comm_hub_label in devices
 
 
+def ensure_global_shutter_open() -> None:
+    """Raise the fiber-optic global shutter and configure the always-on cell.
+
+    No-op when the ASI PLogic hardware is not loaded. This must run once per
+    session (e.g. on system-configuration load) before software snap/live can
+    gate individual lasers: the laser BNCs are routed to
+    ``plogic_always_on_cell``, which is only set up as a constant-high cell
+    (and BNC3 raised) inside :func:`open_global_shutter`.
+    """
+    if not _plogic_available():
+        return
+    open_global_shutter(
+        _HW.plogic_label,
+        _HW.tiger_comm_hub_label,
+        _HW.plogic_always_on_cell,
+        _HW.plogic_bnc3_addr,
+    )
+
+
 def _selected_laser_bncs() -> list[int]:
     """BNC addresses for the currently selected laser preset (empty if none)."""
     group = _HW.laser_config_group

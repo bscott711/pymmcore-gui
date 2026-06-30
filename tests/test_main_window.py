@@ -215,6 +215,7 @@ def test_laser_gating_noop_without_plogic(gui: MicroManagerGUI) -> None:
     asi_controller.open_selected_lasers()
     asi_controller.close_selected_lasers()
     asi_controller.close_all_lasers()
+    asi_controller.ensure_global_shutter_open()
 
 
 @pytest.mark.skipif(

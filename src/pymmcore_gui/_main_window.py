@@ -397,6 +397,13 @@ class MicroManagerGUI(QMainWindow):
             settings.last_config = None
         settings.flush()
 
+        # On ASI/PLogic configs, raise the fiber-optic global shutter and set up
+        # the always-on cell so software snap/live can gate the laser BNCs.
+        # No-op for demo / non-ASI configs.
+        from pymmcore_gui.asi_z_stack.asi_controller import ensure_global_shutter_open
+
+        ensure_global_shutter_open()
+
     def _add_toolbar(self, name: str, tb_entry: ToolDictValue) -> None:
         if callable(tb_entry):
             tb = tb_entry(self._mmc, self)
