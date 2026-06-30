@@ -37,6 +37,7 @@ class WidgetAction(ActionKey):
     MDA_WIDGET = "pymmcore_gui.mda_widget"
     CONFIG_GROUPS = "pymmcore_gui.config_groups_widget"
     CAMERA_ROI = "pymmcore_gui.camera_roi_widget"
+    DUAL_ROI = "pymmcore_gui.dual_roi_widget"
     CONSOLE = "pymmcore_gui.console"
     EXCEPTION_LOG = "pymmcore_gui.exception_log"
     STAGE_CONTROL = "pymmcore_gui.stage_control_widget"
@@ -102,6 +103,13 @@ def create_camera_roi(parent: QWidget) -> pmmw.CameraRoiWidget:
     from pymmcore_widgets import CameraRoiWidget
 
     return CameraRoiWidget(parent=parent, mmcore=_get_core(parent))
+
+
+def create_dual_roi(parent: QWidget) -> QWidget:
+    """Create the Dual ROI widget (interactive multi-ROI selection)."""
+    from pymmcore_gui.widgets._dual_roi_widget import DualRoiWidget
+
+    return DualRoiWidget(parent=parent, mmcore=_get_core(parent))
 
 
 def create_config_groups(parent: QWidget) -> pmmw.GroupPresetTableWidget:
@@ -217,6 +225,14 @@ show_camera_roi = WidgetActionInfo(
     shortcut="Ctrl+Shift+R",
     icon="material-symbols-light:screenshot-region-rounded",
     create_widget=create_camera_roi,
+    dock_area=DockWidgetArea.LeftDockWidgetArea,
+)
+
+show_dual_roi = WidgetActionInfo(
+    key=WidgetAction.DUAL_ROI,
+    text="Dual ROI",
+    icon="material-symbols-light:select-all-rounded",
+    create_widget=create_dual_roi,
     dock_area=DockWidgetArea.LeftDockWidgetArea,
 )
 

@@ -133,6 +133,7 @@ class MicroManagerGUI(QMainWindow):
             WidgetAction.MDA_WIDGET,
             WidgetAction.STAGE_CONTROL,
             WidgetAction.CAMERA_ROI,
+            WidgetAction.DUAL_ROI,
         ],
     }
     # Menus are a mapping of strings to either a list of ActionKeys or a callable

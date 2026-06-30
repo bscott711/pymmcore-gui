@@ -19,10 +19,11 @@ class GuiMDAWidget(MDAWidget):
     """:class:`pymmcore_widgets.MDAWidget` with multi-camera aware saving.
 
     When the active camera is a *Multi Camera* device (i.e.
-    ``getNumberOfCameraChannels() > 1``) and the chosen output is a save path, the
-    output is wrapped in a :class:`MultiCameraHandler` so that each physical camera
-    is written to its own file.  Single-camera acquisitions behave exactly as the
-    base widget.
+    ``getNumberOfCameraChannels() > 1``) **or** multiple ROIs are active
+    (``isMultiROIEnabled()``) and the chosen output is a save path, the output is
+    wrapped in a :class:`MultiCameraHandler`.  This writes each physical camera — and,
+    for multi-ROI readout, each ROI — to its own file.  Plain single-camera,
+    single-ROI acquisitions behave exactly as the base widget.
     """
 
     def execute_mda(
@@ -35,10 +36,20 @@ class GuiMDAWidget(MDAWidget):
             | None
         ),
     ) -> None:
-        if (
-            isinstance(output, (str, Path))
-            and self._mmc.getNumberOfCameraChannels() > 1
-        ):
+        if isinstance(output, str | Path) and self._needs_multi_camera_handler():
             output = MultiCameraHandler(output, mmcore=self._mmc)
         sequence = self.value()
         self._mmc.run_mda(sequence, output=output)
+
+    def _needs_multi_camera_handler(self) -> bool:
+        """Whether output should be routed through :class:`MultiCameraHandler`.
+
+        True for multi-camera devices, or when the camera is reading out multiple
+        ROIs (so each ROI is saved as its own image).
+        """
+        if self._mmc.getNumberOfCameraChannels() > 1:
+            return True
+        try:
+            return bool(self._mmc.isMultiROIEnabled())
+        except Exception:  # pragma: no cover - camera w/o multi-ROI support
+            return False
