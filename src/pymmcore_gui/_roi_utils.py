@@ -95,6 +95,12 @@ def apply_dual_roi(mmc: CMMCorePlus, rois: list[PixelROI]) -> None:
     ``setROI``, ``setMultiROI`` does **not** emit a ``roiSet`` event — callers that
     need a UI/preview refresh should snap a frame afterwards.
 
+    ``isMultiROISupported()`` is intentionally **not** used as a precondition: it is
+    an unreliable, false-negative-prone capability flag (the demo camera reports
+    ``False`` yet accepts ``setMultiROI``, and some PVCAM/Kinetix configurations do
+    the same).  We therefore attempt the call and let the device be the source of
+    truth, surfacing any rejection as a :class:`RuntimeError`.
+
     Parameters
     ----------
     mmc : CMMCorePlus
@@ -105,16 +111,13 @@ def apply_dual_roi(mmc: CMMCorePlus, rois: list[PixelROI]) -> None:
     Raises
     ------
     RuntimeError
-        If the current camera does not support multiple ROIs.
+        If the camera rejects the multi-ROI request (e.g. it truly cannot do it, or
+        the active device is a composite "Multi Camera" utility).
     ValueError
         If *rois* is empty or any width/height is non-positive.
     """
     if not rois:
         raise ValueError("At least one ROI is required.")
-    if not mmc.isMultiROISupported():
-        raise RuntimeError(
-            f"Camera {mmc.getCameraDevice()!r} does not support multiple ROIs."
-        )
     if any(w <= 0 or h <= 0 for _, _, w, h in rois):
         raise ValueError(f"All ROI widths/heights must be positive, got {rois!r}.")
 
@@ -122,7 +125,14 @@ def apply_dual_roi(mmc: CMMCorePlus, rois: list[PixelROI]) -> None:
     ys = [y for _, y, _, _ in rois]
     ws = [w for _, _, w, _ in rois]
     hs = [h for _, _, _, h in rois]
-    mmc.setMultiROI(xs, ys, ws, hs)
+    try:
+        mmc.setMultiROI(xs, ys, ws, hs)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Camera {mmc.getCameraDevice()!r} rejected the multi-ROI request "
+            f"({exc}). If this is a composite 'Multi Camera' device, set the active "
+            f"camera to a physical camera that supports multi-ROI first."
+        ) from exc
 
 
 def clear_roi(mmc: CMMCorePlus, *, label: str | None = None) -> None:

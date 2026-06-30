@@ -136,9 +136,23 @@ def test_apply_dual_roi_calls_set_multi_roi() -> None:
     assert core.multi_calls == [([10, 10], [20, 200], [100, 100], [80, 80])]
 
 
-def test_apply_dual_roi_unsupported_raises() -> None:
-    with pytest.raises(RuntimeError, match="does not support"):
-        apply_dual_roi(_FakeCore(supported=False), [(0, 0, 10, 10)])  # type: ignore[arg-type]
+def test_apply_dual_roi_attempts_even_when_flag_false() -> None:
+    # isMultiROISupported() is advisory only: a False flag must NOT block the attempt
+    # (the demo cam / some Kinetix configs report False yet accept setMultiROI).
+    core = _FakeCore(supported=False)
+    apply_dual_roi(core, [(0, 0, 10, 10)])  # type: ignore[arg-type]
+    assert core.multi_calls == [([0], [0], [10], [10])]
+
+
+def test_apply_dual_roi_propagates_device_rejection() -> None:
+    core = _FakeCore(supported=False)
+
+    def _raise(*_a: Any, **_k: Any) -> None:
+        raise RuntimeError("multi-ROI not available on this device")
+
+    core.setMultiROI = _raise  # type: ignore[assignment]
+    with pytest.raises(RuntimeError, match="rejected the multi-ROI request"):
+        apply_dual_roi(core, [(0, 0, 10, 10)])  # type: ignore[arg-type]
 
 
 def test_apply_dual_roi_validates_input() -> None:

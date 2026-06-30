@@ -286,7 +286,7 @@ class DualRoiWidget(QWidget):
             QMessageBox.warning(self, "Could not apply ROIs", str(exc))
             return
         # setMultiROI emits no roiSet; snap so live previews refresh to the composite.
-        # Use snap() (not snapImage()) so the imageSnapped event fires and previews update.
+        # Use snap() (not snapImage()) so imageSnapped fires and previews update.
         with suppress(Exception):
             self._mmc.snap()
         self._update_readout()
@@ -300,34 +300,67 @@ class DualRoiWidget(QWidget):
     # UI state
     # ------------------------------------------------------------------
 
-    def _supported(self) -> bool:
-        if not self._mmc.getCameraDevice():
+    def _has_camera(self) -> bool:
+        return bool(self._mmc.getCameraDevice())
+
+    def _is_multi_camera(self) -> bool:
+        """True if the active camera is a composite (e.g. ``Multi Camera``) device.
+
+        ``setMultiROI`` acts on the current camera only; a composite device that
+        fans out to several physical cameras cannot itself take a multi-ROI, so this
+        is surfaced to the user as actionable guidance rather than silently failing.
+        """
+        try:
+            return self._mmc.getNumberOfCameraChannels() > 1
+        except Exception:  # pragma: no cover - defensive
             return False
+
+    def _reports_multiroi(self) -> bool:
+        """Advisory only — the camera's self-reported multi-ROI capability flag."""
         try:
             return bool(self._mmc.isMultiROISupported())
-        except Exception:  # pragma: no cover - camera w/o multi-ROI support
+        except Exception:  # pragma: no cover - defensive
             return False
 
     def _update_controls(self) -> None:
         n = self.roi_manager.roi_model.rowCount()
-        supported = self._supported()
+        has_cam = self._has_camera()
         if self._rect_action is not None:
-            self._rect_action.setEnabled(n == 0)
-        self._add_btn.setEnabled(n == 1)
-        self._apply_btn.setEnabled(supported and n == 2)
-        self._reset_btn.setEnabled(supported)
-        if not supported:
-            self._info.setText("The current camera does not support multiple ROIs.")
+            self._rect_action.setEnabled(has_cam and n == 0)
+        self._add_btn.setEnabled(has_cam and n == 1)
+        # Apply is gated only on having a camera and two ROIs — NOT on the unreliable
+        # isMultiROISupported() flag.  The camera itself reports any real rejection.
+        self._apply_btn.setEnabled(has_cam and n == 2)
+        self._reset_btn.setEnabled(has_cam)
+        self._update_readout()
+
+    def _status_prefix(self) -> str:
+        """Leading status/guidance line shown above the ROI readout."""
+        if not self._has_camera():
+            return "No camera loaded."
+        cam = self._mmc.getCameraDevice()
+        if self._is_multi_camera():
+            return (
+                f"Active camera {cam!r} is a composite (Multi Camera) device — "
+                "multi-ROI must be applied to a physical camera. Set the Core camera "
+                "to a Kinetix and reopen, or ask to enable per-camera targeting."
+            )
+        if not self._reports_multiroi():
+            return (
+                f"Camera {cam!r} does not advertise multi-ROI support; Apply will "
+                "attempt it anyway (this flag is often a false negative)."
+            )
+        return f"Camera {cam!r} — ready."
 
     def _update_readout(self) -> None:
-        if not self._supported():
-            return
-        rois = self._current_pixel_rois()
+        prefix = self._status_prefix()
+        rois = self._current_pixel_rois() if self._has_camera() else []
         if not rois:
-            self._info.setText("Draw the first ROI, then add a matching second ROI.")
+            hint = "Draw the first ROI, then add a matching second ROI."
+            self._info.setText(f"{prefix}\n{hint}")
             return
         parts = [
             f"ROI {i + 1}: x={x} y={y} w={w} h={h}"
             for i, (x, y, w, h) in enumerate(rois)
         ]
-        self._info.setText("   |   ".join(parts))
+        self._info.setText(f"{prefix}\n" + "   |   ".join(parts))
