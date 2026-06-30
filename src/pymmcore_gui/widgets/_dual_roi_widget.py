@@ -37,6 +37,7 @@ from pymmcore_gui._roi_utils import (
     apply_dual_roi,
     clear_roi,
     physical_camera_labels,
+    read_snapped_frame,
     rect_to_pixel_roi,
 )
 
@@ -207,11 +208,13 @@ class DualRoiWidget(QWidget):
         """Return a full-chip frame to draw on, via the app's normal snap path.
 
         Selection happens against the full sensor, so any active ROI is cleared first.
-        For a composite (``Multi Camera``) device this mirrors the live preview's
-        multi-camera path — ``snapImage()`` then ``getImage(0)`` — rather than
-        ``snap()``, whose plain ``getImage()`` returns NULL on the composite.  The
-        demo camera's composite returns NULL even for ``getImage(0)``, so we fall back
-        to snapping the first physical camera directly.
+        For a composite (``Multi Camera``) device we use the **exact path the working
+        Snap/Live preview uses**: ``snapImage()`` then read the frame back from the
+        circular buffer via ``getLastImage()`` (:func:`read_snapped_frame`).  We do
+        **not** use ``getImage(0)`` here — its raw per-channel buffer is empty on the
+        composite, so it raises *"Camera image buffer read failed"*.  As a last
+        resort (e.g. the demo composite, whose buffer can stay empty) we snap the
+        first physical camera directly.
         """
         mmc = self._mmc
         if not self._is_multi_camera():
@@ -223,7 +226,7 @@ class DualRoiWidget(QWidget):
         clear_roi(mmc, cameras=labels)
         mmc.snapImage()
         try:
-            return np.asarray(mmc.getImage(0))
+            return np.asarray(read_snapped_frame(mmc))
         except Exception:
             return self._snap_single(labels[0])
 

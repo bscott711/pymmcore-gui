@@ -111,6 +111,31 @@ def physical_camera_labels(mmc: CMMCorePlus) -> list[str]:
     return labels
 
 
+def read_snapped_frame(mmc: CMMCorePlus) -> np.ndarray:
+    """Read the most-recently snapped frame the way the live preview does.
+
+    After :meth:`~pymmcore_plus.CMMCorePlus.snapImage`, **do not** use
+    ``getImage()`` / ``getImage(0)`` to read the result on a composite
+    ``Multi Camera`` device: the raw per-channel image buffer is not populated, so
+    the SWIG call returns NULL and pymmcore raises *"Camera image buffer read
+    failed"*.  The working Snap/Live preview instead reads the frame back from the
+    circular buffer with ``getLastImage()`` (wrapped in ``fixImage`` for RGB) — see
+    ``ImagePreviewBase._get_all_images``.  This helper mirrors that path so the Dual
+    ROI background is grabbed exactly like the proven preview.
+
+    Parameters
+    ----------
+    mmc : CMMCorePlus
+        The core instance, immediately after a successful ``snapImage()``.
+
+    Returns
+    -------
+    np.ndarray
+        The snapped frame (for a multi-camera composite, the newest buffered frame).
+    """
+    return mmc.fixImage(mmc.getLastImage())
+
+
 def apply_dual_roi(
     mmc: CMMCorePlus, rois: list[PixelROI], *, cameras: list[str] | None = None
 ) -> None:
