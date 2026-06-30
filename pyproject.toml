@@ -49,6 +49,11 @@ dependencies = [
     "sentry-sdk>=2.20.0",
     "superqt[cmap,iconify]>=0.7.1",
     "tqdm>=4.67.1",
+    "zarr>=2.18.3,<3.0",
+    "sentry-sdk>=2.20.0",
+    "rendercanvas>=2.6.3",
+    "crispy",
+    "pygfx>=0.16.0",
 ]
 
 # TO USE pymmcore-nano, you need to add pymmcore-nano to dependencies
@@ -59,11 +64,10 @@ dependencies = [
 # [tool.uv]
 # override-dependencies = ["pymmcore ;  sys_platform == 'never'"]
 
-[tool.uv]
-constraint-dependencies = ["chardet<6"]
-
 [tool.uv.sources]
-pyside6-stubs = { git = "https://github.com/tlambert03/PySide6-stubs", rev = "v6.9.1" }
+superqt = { git = "https://github.com/bscott711/superqt.git", branch = "main" }
+pymmcore-widgets = { path = "../pymmcore-widgets", editable = true }
+crispy = { path = "../CRISPy", editable = true }
 
 [dependency-groups]
 # should only be used after manually uninstalling PyQt6 and PyQt6Ads
@@ -99,6 +103,7 @@ allow-direct-references = true
 # same as console_scripts entry point
 [project.scripts]
 mmgui = "pymmcore_gui.__main__:main"
+microscope-control = "pymmcore_gui.asi_z_stack.__main__:main"
 
 [project.urls]
 homepage = "https://github.com/tlambert03/pymmcore-gui"

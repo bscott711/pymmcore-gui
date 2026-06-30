@@ -11,22 +11,21 @@ from weakref import WeakValueDictionary
 
 from pymmcore_plus import CMMCorePlus
 from pymmcore_widgets import ConfigWizard
-from superqt import QIconifyIcon
-
-from pymmcore_gui._qt.QtAds import CDockManager, CDockWidget, SideBarLocation
-from pymmcore_gui._qt.QtCore import Qt
-from pymmcore_gui._qt.QtGui import QAction, QCloseEvent, QGuiApplication, QIcon
-from pymmcore_gui._qt.QtOpenGLWidgets import QOpenGLWidget
-from pymmcore_gui._qt.QtWidgets import (
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QAction, QCloseEvent, QGuiApplication, QIcon
+from PyQt6.QtWidgets import (
     QApplication,
     QDialog,
     QMainWindow,
     QMenu,
+    QMenuBar,
     QPushButton,
     QStatusBar,
     QToolBar,
     QWidget,
 )
+from PyQt6Ads import CDockManager, CDockWidget, SideBarLocation
+from superqt import QIconifyIcon
 
 from ._ndv_viewers import NDVViewersManager
 from ._notification_manager import NotificationManager
@@ -70,6 +69,7 @@ class Menu(str, Enum):
     PYMM_GUI = "pymmcore-gui"
     WINDOW = "Window"
     DEVICE = "Devices"
+    PLUGINS = "Plugins"
     HELP = "Help"
 
     def __str__(self) -> str:
@@ -150,6 +150,9 @@ class MicroManagerGUI(QMainWindow):
             None,
             WidgetAction.INSTALL_DEVICES,
         ],
+        Menu.PLUGINS: [
+            WidgetAction.CRISP,
+        ],
         Menu.HELP: [],
     }
 
@@ -220,14 +223,8 @@ class MicroManagerGUI(QMainWindow):
             CDockManager.eAutoHideFlag.AutoHideFeatureEnabled, True
         )
         self.dock_manager = CDockManager(self)
-        # Fix: QtAds default stylesheet uses palette(dark) for inactive tab text,
-        # which is invisible on Windows dark themes.
-        self.dock_manager.setStyleSheet(
-            self.dock_manager.styleSheet()
-            + "\nads--CDockWidgetTab QLabel { color: palette(placeholder-text); }"
-        )
 
-        self._central = CDockWidget(self.dock_manager, "Viewers", self)
+        self._central = CDockWidget("Viewers", self)
         self._central.setFeature(CDockWidget.DockWidgetFeature.NoTab, True)
         blank = QWidget()
         blank.setObjectName("blank")
@@ -238,14 +235,7 @@ class MicroManagerGUI(QMainWindow):
         self._central.setWidget(blank)
         self._central_dock_area = self.dock_manager.setCentralWidget(self._central)
 
-        # Adding a QOpenGLWidget (e.g. ndv canvas) to a window that uses raster
-        # rendering forces Qt to destroy and recreate the native window with an
-        # OpenGL-compatible surface, causing a visible flash. Adding a zero-size
-        # QOpenGLWidget before the first show() ensures the window is born with
-        # the right surface type, avoiding the flash.
-        _gl = QOpenGLWidget(self)
-        _gl.setFixedSize(0, 0)
-        _gl.close()
+        # QTimer.singleShot(0, self._restore_state)
 
     # --------------------- Properties ----------------------
 
@@ -342,17 +332,13 @@ class MicroManagerGUI(QMainWindow):
             self._action_widgets[key] = widget
 
             action = self.get_action(key)
-            dock = CDockWidget(self.dock_manager, info.text, self)
+            dock = CDockWidget(info.text, self)
             dock.setWidget(widget, info.scroll_mode)
             dock.setObjectName(f"docked_{info.key}")
             dock.setToggleViewAction(action)
             dock.setMinimumSize(widget.minimumSize())
             dock.setIcon(action.icon())
             dock.resize(widget.sizeHint())
-            if not info.floatable:
-                dock.setFeature(
-                    CDockWidget.DockWidgetFeature.DockWidgetFloatable, False
-                )
             self._dock_widgets[key] = dock
             if area is None:
                 self.dock_manager.addDockWidgetFloating(dock)
@@ -416,7 +402,7 @@ class MicroManagerGUI(QMainWindow):
             tb = tb_entry(self._mmc, self)
             self.addToolBar(tb)
         else:
-            tb = self.addToolBar(name)
+            tb = cast("QToolBar", self.addToolBar(name))
             for action in tb_entry:
                 if action is None:
                     tb.addSeparator()
@@ -425,19 +411,19 @@ class MicroManagerGUI(QMainWindow):
         tb.setObjectName(name)
 
     def _add_menubar(self, name: str, menu_entry: MenuDictValue) -> None:
-        mb = self.menuBar()
+        mb = cast("QMenuBar", self.menuBar())
         if callable(menu_entry):
             menu = menu_entry(self._mmc, self)
             mb.addMenu(menu)
         else:
-            menu = mb.addMenu(name)
+            menu = cast("QMenu", mb.addMenu(name))
             for action in menu_entry:
                 if action is None:
                     menu.addSeparator()
                 else:
                     menu.addAction(self.get_action(action))
 
-    def closeEvent(self, a0: QCloseEvent) -> None:
+    def closeEvent(self, a0: QCloseEvent | None) -> None:
         self._save_state()
         return super().closeEvent(a0)
 
@@ -495,7 +481,7 @@ class MicroManagerGUI(QMainWindow):
         """Save the state of the window to settings."""
         # save position and size of the main window
         settings = Settings.instance()
-        settings.window.geometry = bytes(self.saveGeometry().data())
+        settings.window.geometry = self.saveGeometry().data()
         # remember which widgets are open, and preserve their state.
         settings.window.open_widgets = open_ = self._open_widgets()
         if open_:
@@ -529,7 +515,7 @@ class MicroManagerGUI(QMainWindow):
         # if the widget is a dock widget, we want to toggle the dock widget
         # rather than the inner widget
         if action.key in self._dock_widgets:
-            widget = self.get_dock_widget(action.key)
+            widget: QWidget = self.get_dock_widget(action.key)
         else:
             # this will create the widget if it doesn't exist yet,
             # e.g. for a click event on a Toolbutton that doesn't yet have a widget
@@ -539,19 +525,21 @@ class MicroManagerGUI(QMainWindow):
             widget.raise_()
 
     def _on_mda_viewer_created(
-        self, ndv_viewer: ndv.ArrayViewer, sequence: MDASequence
+        self, ndv_viewer: ndv.ArrayViewer, sequence: MDASequence, camera_label: str = ""
     ) -> None:
         q_viewer = cast("QWidget", ndv_viewer.widget())
 
         sha = str(sequence.uid)[:8]
-        q_viewer.setObjectName(f"ndv-{sha}")
-        q_viewer.setWindowTitle(f"MDA {sha}")
+        suffix = f"-{camera_label}" if camera_label else ""
+        q_viewer.setObjectName(f"ndv-{sha}{suffix}")
+        title = f"MDA {sha}" + (f" — {camera_label}" if camera_label else "")
+        q_viewer.setWindowTitle(title)
         q_viewer.setWindowFlags(Qt.WindowType.Dialog)
 
-        dw = CDockWidget(self.dock_manager, f"ndv-{sha}", self)
+        dw = CDockWidget(f"ndv-{sha}{suffix}")
         # small hack ... we need to retain a pointer to the viewer
         # otherwise the viewer will be garbage collected
-        dw._viewer = ndv_viewer  # pyright: ignore reportAttributeAccessIssue]``
+        dw._viewer = ndv_viewer  # type: ignore
         dw.setWidget(q_viewer)
         dw.setFeature(dw.DockWidgetFeature.DockWidgetFloatable, False)
         self.dock_manager.addDockWidgetTabToArea(dw, self._central_dock_area)

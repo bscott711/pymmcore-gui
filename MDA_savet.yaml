@@ -1,0 +1,26 @@
+axis_order:
+- t
+- p
+- z
+- c
+channels:
+- config: 561nm
+  exposure: 10.0
+  group: Lasers
+metadata:
+  pymmcore_widgets:
+    format: ome-zarr
+    save_dir: S:/TEMP_CAMERA_STREAMING/claude_vibe
+    save_name: next.ome.zarr
+    should_save: true
+    version: 0.1.dev321+g2f1324089
+stage_positions:
+- x: 0.18
+  y: -0.13
+  z: -22.11
+time_plan:
+  interval: 5.0
+  loops: 2
+z_plan:
+  range: 30.0
+  step: 10.0

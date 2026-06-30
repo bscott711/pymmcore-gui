@@ -93,6 +93,10 @@ class PygfxImagePreview(ImagePreviewBase):
         self._canvas = QRenderWidget()
         self._renderer = renderer = pygfx.WgpuRenderer(self._canvas)
         self._camera = camera = pygfx.OrthographicCamera()
+        # Flip the y-axis so row 0 of the image array is at the top (image/array
+        # convention), matching ndv/napari.  Without this pygfx shows images
+        # vertically mirrored.
+        camera.local.scale_y = -1
         self._scene.add(self._image_node)
         self._scene.add(self._camera)
         self.reset_view()

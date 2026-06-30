@@ -5,21 +5,19 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Annotated, TypeVar, cast
 
-import pymmcore_widgets as pmmw
 from pymmcore_plus import CMMCorePlus
-
-from pymmcore_gui._qt.QtAds import CDockWidget, DockWidgetArea, SideBarLocation
-from pymmcore_gui._qt.QtCore import Qt
-from pymmcore_gui._qt.QtGui import QAction
-from pymmcore_gui._qt.QtWidgets import QDialog, QVBoxLayout, QWidget
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QAction
+from PyQt6.QtWidgets import QDialog, QWidget
+from PyQt6Ads import CDockWidget, DockWidgetArea, SideBarLocation
 
 from ._action_info import ActionKey, WidgetActionInfo, _ensure_isinstance
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    import pymmcore_widgets as pmmw
+    from PyQt6.QtCore import QObject
 
     from pymmcore_gui._main_window import MicroManagerGUI
-    from pymmcore_gui._qt.QtCore import QObject
     from pymmcore_gui.widgets._exception_log import ExceptionLog
     from pymmcore_gui.widgets._mm_console import MMConsole
     from pymmcore_gui.widgets._stage_control import StagesControlWidget
@@ -42,8 +40,8 @@ class WidgetAction(ActionKey):
     CONSOLE = "pymmcore_gui.console"
     EXCEPTION_LOG = "pymmcore_gui.exception_log"
     STAGE_CONTROL = "pymmcore_gui.stage_control_widget"
-    STAGE_EXPLORER = "pymmcore_gui.stage_explorer_widget"
     CONFIG_WIZARD = "pymmcore_gui.hardware_config_wizard"
+    CRISP = "pymmcore_gui.crisp_widget"
 
 
 # ######################## Functions that create widgets #########################
@@ -80,18 +78,11 @@ def create_mm_console(parent: QWidget) -> MMConsole:
     return MMConsole(parent=parent)
 
 
-def create_install_widgets(parent: QWidget) -> QDialog:
+def create_install_widgets(parent: QWidget) -> pmmw.InstallWidget:
     """Create the Install Devices widget."""
     from pymmcore_widgets import InstallWidget
 
-    class InstallDialog(QDialog):
-        def __init__(self, parent: QWidget | None = None):
-            super().__init__(parent)
-            self._install_widget = InstallWidget(parent=self)
-
-            layout = QVBoxLayout(self)
-            layout.setContentsMargins(0, 0, 0, 0)
-            layout.addWidget(self._install_widget)
+    class InstallDialog(QDialog, InstallWidget): ...
 
     wdg = InstallDialog(parent=parent)
     wdg.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Window)
@@ -100,32 +91,10 @@ def create_install_widgets(parent: QWidget) -> QDialog:
 
 
 def create_mda_widget(parent: QWidget) -> pmmw.MDAWidget:
-    """Create the MDA widget."""
+    """Create the MDA widget (multi-camera aware saving)."""
+    from pymmcore_gui.widgets._mda_widget import GuiMDAWidget
 
-    class MDAWidget(pmmw.MDAWidget):
-        """MDAWidget subclass: defaults to in-memory output and hides tiff-sequence."""
-
-        def __init__(
-            self, parent: QWidget | None = None, mmcore: CMMCorePlus | None = None
-        ) -> None:
-            super().__init__(parent=parent, mmcore=mmcore)
-            self._hide_tiff_sequence()
-
-        def _hide_tiff_sequence(self) -> None:
-            """Remove the 'tiff-sequence' option from the save widget's writer combo."""
-            combo = self.save_info._writer_combo
-            for i in range(combo.count()):
-                if combo.itemText(i) == "tiff-sequence":
-                    combo.removeItem(i)
-                    break
-
-        def prepare_mda(self) -> bool | str | Path | None:
-            output = super().prepare_mda()
-            if output is None:
-                output = "memory"
-            return output
-
-    return MDAWidget(parent=parent, mmcore=_get_core(parent))
+    return GuiMDAWidget(parent=parent, mmcore=_get_core(parent))
 
 
 def create_camera_roi(parent: QWidget) -> pmmw.CameraRoiWidget:
@@ -144,22 +113,7 @@ def create_config_groups(parent: QWidget) -> pmmw.GroupPresetTableWidget:
 
 def create_pixel_config(parent: QWidget) -> pmmw.PixelConfigurationWidget:
     """Create the Pixel Configuration widget."""
-    from pymmcore_gui._qt.QtAds import CDockWidget
-
-    class PixelConfigurationWidget(pmmw.PixelConfigurationWidget):
-        def close(self) -> bool:
-            # Hide the parent CDockWidget container instead of closing this widget,
-            # so the widget is preserved and can be reopened. Qt-ADS may nest this
-            # widget inside intermediate containers (e.g. a scroll area or wrapper
-            # widget) before the CDockWidget ancestor, so we need to walk up the parent
-            # chain to find it
-            parent = self.parent()
-            while parent is not None:
-                if isinstance(parent, CDockWidget):
-                    parent.toggleView(False)
-                    return True
-                parent = parent.parent()
-            return super().close()
+    from pymmcore_widgets import PixelConfigurationWidget
 
     return PixelConfigurationWidget(parent=parent, mmcore=_get_core(parent))
 
@@ -190,11 +144,11 @@ def create_config_wizard(parent: QWidget) -> pmmw.ConfigWizard:
     return ConfigWizard(config_file=config_file, core=mmcore, parent=parent)
 
 
-def create_stage_explorer_widget(parent: QWidget) -> pmmw.StageExplorer:
-    """Create the Stage Explorer widget."""
-    from pymmcore_widgets import StageExplorer
+def create_crisp_widget(parent: QWidget) -> QWidget:
+    """Create the CRISPy ASI CRISP autofocus widget."""
+    from pymmcore_gui.widgets._crisp_widget import CrispWidget
 
-    return StageExplorer(parent=parent, mmcore=_get_core(parent))
+    return CrispWidget(parent=parent, mmcore=_get_core(parent))
 
 
 # ######################## WidgetAction Enum #########################
@@ -311,11 +265,10 @@ show_config_wizard = WidgetActionInfo(
     checkable=False,
 )
 
-stage_explorer_widget = WidgetActionInfo(
-    key=WidgetAction.STAGE_EXPLORER,
-    text="Stage Explorer",
-    icon="mdi:map-search",
-    create_widget=create_stage_explorer_widget,
-    dock_area=DockWidgetArea.LeftDockWidgetArea,
-    floatable=False,
+show_crisp = WidgetActionInfo(
+    key=WidgetAction.CRISP,
+    text="CRISPy Autofocus",
+    icon="mdi:focus-auto",
+    create_widget=create_crisp_widget,
+    dock_area=DockWidgetArea.RightDockWidgetArea,
 )
