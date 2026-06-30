@@ -106,7 +106,7 @@ class DualRoiWidget(QWidget):
 
         # --- buttons ----------------------------------------------------------------
         self._snap_btn = QPushButton(QIconifyIcon("mdi-light:camera"), "Snap")
-        self._snap_btn.clicked.connect(self._snap)
+        self._snap_btn.clicked.connect(self._on_snap_clicked)
         self._add_btn = QPushButton(QIconifyIcon("mdi:plus-box-outline"), "Add 2nd ROI")
         self._add_btn.clicked.connect(self._add_matching_roi)
         self._clear_boxes_btn = QPushButton("Clear boxes")
@@ -142,19 +142,38 @@ class DualRoiWidget(QWidget):
     # Camera image background
     # ------------------------------------------------------------------
 
-    def _snap(self) -> None:
-        """Snap a full-chip frame and show it as the drawing background."""
-        if not self._mmc.getCameraDevice():
+    def _on_snap_clicked(self, _checked: bool = False) -> None:
+        """Snap triggered by the user via the Snap button (errors shown in a dialog)."""
+        self._snap(interactive=True)
+
+    def _snap(self, *, interactive: bool = False) -> None:
+        """Snap a full-chip frame and show it as the drawing background.
+
+        Parameters
+        ----------
+        interactive : bool
+            When True (the user clicked *Snap*), failures are reported in a dialog.
+            During construction / programmatic refresh they are reported in the info
+            label only, so opening the widget never raises a modal popup.
+        """
+        mmc = self._mmc
+        if not mmc.getCameraDevice():
             self._update_controls()
             return
         try:
-            # Selection happens against the full sensor, so drop any active ROI first.
-            if self._mmc.isMultiROIEnabled():
-                clear_roi(self._mmc)
-            self._mmc.snapImage()
-            img = self._mmc.getImage()
+            # Select against a still, full-chip frame: stop any live/sequence
+            # acquisition first (mirroring the Snap action), then drop any active ROI.
+            # Snapping while a sequence is running leaves the snap buffer unread and
+            # raises "Camera image buffer not read".
+            if mmc.isSequenceRunning():
+                mmc.stopSequenceAcquisition()
+            if mmc.isMultiROIEnabled():
+                clear_roi(mmc)
+            img = mmc.snap()
         except Exception as exc:  # pragma: no cover - hardware/runtime errors
-            QMessageBox.warning(self, "Snap failed", str(exc))
+            if interactive:
+                QMessageBox.warning(self, "Snap failed", str(exc))
+            self._info.setText(f"Snap failed: {exc}.  Press Snap to retry.")
             return
         self._set_background(np.asarray(img))
 
@@ -267,8 +286,9 @@ class DualRoiWidget(QWidget):
             QMessageBox.warning(self, "Could not apply ROIs", str(exc))
             return
         # setMultiROI emits no roiSet; snap so live previews refresh to the composite.
+        # Use snap() (not snapImage()) so the imageSnapped event fires and previews update.
         with suppress(Exception):
-            self._mmc.snapImage()
+            self._mmc.snap()
         self._update_readout()
 
     def _reset_full_chip(self) -> None:
