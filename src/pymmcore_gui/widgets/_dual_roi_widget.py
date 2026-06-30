@@ -21,7 +21,6 @@ from pymmcore_plus import CMMCorePlus
 from pymmcore_widgets.control._rois.roi_manager import SceneROIManager
 from pymmcore_widgets.control._rois.roi_model import RectangleROI
 from PyQt6.QtWidgets import (
-    QHBoxLayout,
     QLabel,
     QMessageBox,
     QPushButton,
@@ -43,6 +42,7 @@ from pymmcore_gui._roi_utils import (
 
 if TYPE_CHECKING:
     from pymmcore_widgets.control._rois.roi_model import ROI
+    from PyQt6.QtGui import QShowEvent
 
 # ROIs whose width/height differ from the reference by less than this (in pixels)
 # are considered equal — avoids fighting sub-pixel float drift during dragging.
@@ -77,8 +77,15 @@ class DualRoiWidget(QWidget):
         # vispy Image visual (untyped); None until the first snap.
         self._image: Any = None
 
+        # Tracks whether the (deferred) first snap has run.
+        self._snapped_once = False
+
         # --- vispy canvas: y-flipped so world coords == sensor pixel coords --------
-        self._canvas = scene.SceneCanvas(show=False)
+        # show=True ensures the GL context is live before any visual is created.  With
+        # show=False an Image visual built during __init__ never initializes its
+        # texture and renders blank, which is why the first snap is also deferred to
+        # showEvent (below) — by then the canvas is on screen and ready to draw.
+        self._canvas = scene.SceneCanvas(show=True)
         self._view = self._canvas.central_widget.add_view()
         self._view.camera = scene.PanZoomCamera(aspect=1, flip=(False, True, False))
 
@@ -95,8 +102,14 @@ class DualRoiWidget(QWidget):
         model.rowsInserted.connect(self._on_model_changed)
         model.rowsRemoved.connect(self._on_model_changed)
         model.dataChanged.connect(self._on_data_changed)
+        # When the rectangle tool finishes a box it flips back to "select" mode; use
+        # that as the cue to auto-add the size-locked second ROI (so the user doesn't
+        # have to find a button).
+        self.roi_manager.modeChanged.connect(self._on_mode_changed)
 
-        # --- toolbar (Select / Rectangle modes) -----------------------------------
+        # --- toolbar: mode actions + all controls, always visible at the top --------
+        # (Putting the buttons here rather than in a bottom row guarantees they can't
+        # be clipped off-screen when the dock is short.)
         toolbar = QToolBar()
         self._rect_action = None
         for act in self.roi_manager.mode_actions.actions():
@@ -104,8 +117,8 @@ class DualRoiWidget(QWidget):
                 toolbar.addAction(act)
                 if act.data() == "create-rect":
                     self._rect_action = act
+        toolbar.addSeparator()
 
-        # --- buttons ----------------------------------------------------------------
         self._snap_btn = QPushButton(QIconifyIcon("mdi-light:camera"), "Snap")
         self._snap_btn.clicked.connect(self._on_snap_clicked)
         self._add_btn = QPushButton(QIconifyIcon("mdi:plus-box-outline"), "Add 2nd ROI")
@@ -116,13 +129,11 @@ class DualRoiWidget(QWidget):
         self._apply_btn.clicked.connect(self._apply)
         self._reset_btn = QPushButton("Reset to full chip")
         self._reset_btn.clicked.connect(self._reset_full_chip)
-
-        btn_row = QHBoxLayout()
         for b in (self._snap_btn, self._add_btn, self._clear_boxes_btn):
-            btn_row.addWidget(b)
-        btn_row.addStretch()
+            toolbar.addWidget(b)
+        toolbar.addSeparator()
         for b in (self._reset_btn, self._apply_btn):
-            btn_row.addWidget(b)
+            toolbar.addWidget(b)
 
         self._info = QLabel()
         self._info.setWordWrap(True)
@@ -132,12 +143,30 @@ class DualRoiWidget(QWidget):
         layout.addWidget(toolbar)
         layout.addWidget(self._canvas.native, 1)
         layout.addWidget(self._info)
-        layout.addLayout(btn_row)
 
         # Start in rectangle mode so the user can immediately draw the first ROI.
         self.roi_manager.mode = "create-rect"
-        self._snap()
         self._update_controls()
+
+    def showEvent(self, a0: QShowEvent | None) -> None:
+        """Snap the first background frame once the canvas is on screen.
+
+        Deferred from ``__init__`` so the GL context exists when the Image visual is
+        created — otherwise the texture never initializes and the canvas stays blank.
+        """
+        super().showEvent(a0)
+        if not self._snapped_once:
+            self._snapped_once = True
+            self._snap()
+
+    def _on_mode_changed(self, mode: str) -> None:
+        """Auto-add the matching second ROI right after the first is drawn."""
+        if (
+            mode == "select"
+            and self.roi_manager.roi_model.rowCount() == 1
+            and self._reference_size is None
+        ):
+            self._add_matching_roi()
 
     # ------------------------------------------------------------------
     # Camera image background
@@ -162,28 +191,56 @@ class DualRoiWidget(QWidget):
             self._update_controls()
             return
         try:
-            # Select against a still, full-chip frame: stop any live/sequence
-            # acquisition first (mirroring the Snap action), then drop any active ROI.
-            # Snapping while a sequence is running leaves the snap buffer unread and
-            # raises "Camera image buffer not read".
+            # Snapping while a sequence is running leaves the snap buffer unread, so
+            # stop any live/sequence acquisition first (mirroring the Snap action).
             if mmc.isSequenceRunning():
                 mmc.stopSequenceAcquisition()
-            # Selection happens against the full sensor. For a composite device the
-            # multi-ROI lives on the physical cameras (not the composite itself), so
-            # clear those; otherwise clear the current camera if it has an ROI.
-            if self._is_multi_camera():
-                clear_roi(mmc, cameras=physical_camera_labels(mmc))
-            elif mmc.isMultiROIEnabled():
-                clear_roi(mmc)
-            img = mmc.snap()
+            img = self._grab_background()
         except Exception as exc:  # pragma: no cover - hardware/runtime errors
             if interactive:
                 QMessageBox.warning(self, "Snap failed", str(exc))
             self._info.setText(f"Snap failed: {exc}.  Press Snap to retry.")
             return
-        self._set_background(np.asarray(img))
+        self._set_background(img)
+
+    def _grab_background(self) -> np.ndarray:
+        """Return a full-chip frame to draw on, via the app's normal snap path.
+
+        Selection happens against the full sensor, so any active ROI is cleared first.
+        For a composite (``Multi Camera``) device this mirrors the live preview's
+        multi-camera path — ``snapImage()`` then ``getImage(0)`` — rather than
+        ``snap()``, whose plain ``getImage()`` returns NULL on the composite.  The
+        demo camera's composite returns NULL even for ``getImage(0)``, so we fall back
+        to snapping the first physical camera directly.
+        """
+        mmc = self._mmc
+        if not self._is_multi_camera():
+            if mmc.isMultiROIEnabled():
+                clear_roi(mmc)
+            return np.asarray(mmc.snap())
+
+        labels = physical_camera_labels(mmc)
+        clear_roi(mmc, cameras=labels)
+        mmc.snapImage()
+        try:
+            return np.asarray(mmc.getImage(0))
+        except Exception:
+            return self._snap_single(labels[0])
+
+    def _snap_single(self, label: str) -> np.ndarray:
+        """Snap one physical camera, restore the active device, return the image."""
+        mmc = self._mmc
+        original = mmc.getCameraDevice()
+        try:
+            mmc.setCameraDevice(label)
+            return np.asarray(mmc.snap())
+        finally:
+            mmc.setCameraDevice(original)
 
     def _set_background(self, img: np.ndarray) -> None:
+        # A composite snap can come back stacked as (C, H, W); show the first plane.
+        if img.ndim == 3 and img.shape[-1] not in (3, 4):
+            img = img[0]
         if self._image is not None:
             self._image.parent = None
         self._image = Image(
@@ -192,11 +249,12 @@ class DualRoiWidget(QWidget):
             clim="auto",
             parent=self._view.scene,
         )
-        # Draw the image behind the ROI visuals.
-        self._image.order = 10
+        # Draw the image *behind* the ROI visuals (lower order draws first).
+        self._image.order = -1
         h, w = img.shape[-2], img.shape[-1]
         self._sensor_wh = (int(w), int(h))
         self._view.camera.set_range(x=(0, w), y=(0, h), margin=0)
+        self._canvas.update()
 
     # ------------------------------------------------------------------
     # ROI model helpers
@@ -302,10 +360,13 @@ class DualRoiWidget(QWidget):
                     clear_roi(mmc, cameras=cams)
             QMessageBox.warning(self, "Could not apply ROIs", str(exc))
             return
-        # setMultiROI emits no roiSet; snap so live previews refresh to the composite.
-        # Use snap() (not snapImage()) so imageSnapped fires and previews update.
-        with suppress(Exception):
-            mmc.snap()
+        # setMultiROI emits no roiSet; refresh the live preview by snapping. For a
+        # single camera snap() emits imageSnapped and shows the new composite; on a
+        # composite device snap()/getImage() return NULL, so leave the refresh to the
+        # user's normal Snap/Live in the main window.
+        if cams is None:
+            with suppress(Exception):
+                mmc.snap()
         self._update_readout()
 
     def _reset_full_chip(self) -> None:
