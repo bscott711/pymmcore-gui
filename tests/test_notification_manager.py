@@ -3,9 +3,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from unittest.mock import Mock, patch
 
-from PyQt6.QtWidgets import QPushButton, QWidget
-
 from pymmcore_gui._notification_manager import Notification, NotificationManager
+from pymmcore_gui._qt.QtWidgets import QPushButton, QWidget
 from pymmcore_gui.widgets._notifications import NotificationToast
 
 if TYPE_CHECKING:
@@ -51,5 +50,7 @@ def test_notification_manager(qtbot: QtBot, monkeypatch: MonkeyPatch) -> None:
     nm.show_info_message("info", "Action", on_action=action_mock)
     toast = nm._notification_widgets[-1]
     assert isinstance(toast, NotificationToast)
-    toast.findChild(QPushButton, "Action").click()
+    child = toast.findChild(QPushButton, "Action")
+    assert child is not None
+    child.click()
     action_mock.assert_called_with("Action")

@@ -8,9 +8,9 @@ run:
 bundle:
     uv run pyinstaller app/mmgui.spec --clean --noconfirm --log-level INFO
 
-# lint all files with pre-commit
+# lint all files with prek
 lint:
-    uv run pre-commit run --all-files
+    uv run prek run -a
 
 # Automatically fix all ruff linting and formatting issues
 fix:
@@ -20,3 +20,7 @@ fix:
 # run tests
 test:
     uv run pytest
+
+# switch to pyside6 backend
+use-pyside:
+    uv sync --group PySide6 --no-install-package PyQt6 --no-install-package PyQt6Ads

@@ -15,14 +15,14 @@ jobs:
   check-manifest:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - run: pipx run check-manifest
 
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
       - run: uv sync
@@ -31,34 +31,59 @@ jobs:
           extra_args: --all-files --verbose
 
   test:
-    name: ${{ matrix.platform }} py${{ matrix.python-version }}
-    runs-on: ${{ matrix.platform }}
+    name: ${{ matrix.os }} py${{ matrix.python-version }}${{ matrix.qt }}
+    runs-on: ${{ matrix.os }}
     env:
       UV_FROZEN: 1
+      UV_NO_SYNC: 1
     strategy:
       fail-fast: false
       matrix:
-        platform: [macos-latest, windows-latest]
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        os: [macos-latest, windows-latest]
+        python-version: ["3.10", "3.12", "3.13"]
+        qt: [""]
+        include:
+          - os: windows-latest
+            python-version: "3.13"
+            qt: "PySide6"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
 
-      - uses: pymmcore-plus/setup-mm-test-adapters@main
       - uses: pyvista/setup-headless-display-action@v4
         with:
           qt: true
 
-      - name: Test
-        run: uv run pytest -v --cov=pymmcore_gui --cov-report=xml --color=yes
+      - name: Install
+        shell: bash
+        run: |
+          if [[ "${{ matrix.qt }}" == "PySide6" ]]; then
+            uv sync --group PySide6 --no-install-package PyQt6 --no-install-package PyQt6Ads
+          else
+            uv sync
+          fi
 
-      - name: Coverage
-        uses: codecov/codecov-action@v5
+      - uses: pymmcore-plus/setup-mm-test-adapters@main
+
+      - name: Test
+        run: uv run coverage run -p -m pytest -v --color=yes
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v6
         with:
-          token: ${{ secrets.CODECOV_TOKEN }}
+          name: covreport-${{ matrix.os }}-py${{ matrix.python-version }}-${{ matrix.qt }}
+          path: ./.coverage*
+          include-hidden-files: true
+
+  upload_coverage:
+    if: always()
+    needs: [test]
+    uses: pyapp-kit/workflows/.github/workflows/upload-coverage.yml@v2
+    secrets:
+      codecov_token: ${{ secrets.CODECOV_TOKEN }}
