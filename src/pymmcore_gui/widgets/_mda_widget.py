@@ -36,7 +36,7 @@ class GuiMDAWidget(MDAWidget):
         ),
     ) -> None:
         if (
-            isinstance(output, (str, Path))
+            isinstance(output, str | Path)
             and self._mmc.getNumberOfCameraChannels() > 1
         ):
             output = MultiCameraHandler(output, mmcore=self._mmc)

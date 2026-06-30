@@ -1,5 +1,5 @@
 # src/pymmcore_gui/asi_z_stack/common.py
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -30,6 +30,22 @@ class HardwareConstants:
     plogic_bnc3_addr: int = 35
     pulses_per_ms: float = 4.0
     plogic_laser_preset_num: int = 30
+
+    # Per-laser PLogic BNC outputs used for software snap/live gating.
+    # Front-panel BNC n maps to PLogic address 32 + n (so BNC3 = 35, as used by
+    # the global shutter). Each wavelength has its own BNC: 638->5, 488->6,
+    # 405->7, 561->8. A laser is turned on by pointing its BNC source at the
+    # always-on cell (``plogic_always_on_cell``) and off by pointing it at 0.
+    laser_config_group: str = "Lasers"
+    all_lasers_preset: str = "AllLasers"
+    laser_bnc_addr: dict[str, int] = field(
+        default_factory=lambda: {
+            "638nm": 37,
+            "488nm": 38,
+            "405nm": 39,
+            "561nm": 40,
+        }
+    )
 
     # Extended parameters for SPIM Z-stack calculations
     slice_calibration_slope_um_per_deg: float = 100.0

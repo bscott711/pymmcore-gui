@@ -26,7 +26,6 @@ if TYPE_CHECKING:
     from useq import MDASequence
 
 
-
 # NOTE: we make this a QObject mostly so that the lifetime of this object is tied to
 # the lifetime of the parent QMainWindow.  If inheriting from QObject is removed in
 # the future, make sure not to store a strong reference to this main_window

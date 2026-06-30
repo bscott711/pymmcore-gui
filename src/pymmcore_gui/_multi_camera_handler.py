@@ -18,13 +18,14 @@ from __future__ import annotations
 
 import re
 from inspect import signature
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from pymmcore_plus import CMMCorePlus
 from pymmcore_plus.mda.handlers import handler_for_path
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     import numpy as np
     import useq
     from pymmcore_plus.metadata import FrameMetaV1, SummaryMetaV1
@@ -54,7 +55,7 @@ def per_camera_path(base: str | Path, label: str) -> str:
     for suffix in _KNOWN_SUFFIXES:
         if lowered.endswith(suffix):
             stem = text[: -len(suffix)]
-            return f"{stem}_{safe}{text[len(stem):]}"
+            return f"{stem}_{safe}{text[len(stem) :]}"
     # No recognized suffix -> treat as a directory (ImageSequenceWriter); create
     # sibling directories per camera.
     return f"{text.rstrip('/').rstrip(chr(92))}_{safe}"

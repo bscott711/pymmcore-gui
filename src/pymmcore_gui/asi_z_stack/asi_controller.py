@@ -4,12 +4,15 @@ from typing import TYPE_CHECKING
 
 from pymmcore_plus import CMMCorePlus
 
+from .common import HardwareConstants
+
 # Direct import - this fixes the Pylance error
 
 if TYPE_CHECKING:
     from .common import AcquisitionSettings
 
 mmc = CMMCorePlus.instance()
+_HW = HardwareConstants()
 
 
 def set_property(device_label: str, property_name: str, value: str) -> None:
@@ -207,3 +210,109 @@ def configure_plogic_for_dual_nrt_pulses(
     finally:
         if original_hub_setting == "Yes":
             set_property(tiger_comm_hub_label, hub_prop, "Yes")
+
+
+def set_laser_outputs(
+    plogic_label: str,
+    tiger_comm_hub_label: str,
+    bnc_addrs: list[int],
+    on: bool,
+    always_on_cell: int,
+) -> None:
+    """Drive PLogic BNC outputs to gate individual lasers on or off.
+
+    Each BNC's source cell is pointed at ``always_on_cell`` (a constant-high cell
+    configured when the global shutter is opened) to turn its laser on, or at cell
+    0 to turn it off. The CCA edits take effect immediately; a single ``SS Z`` at
+    the end persists them (mirroring ``open_global_shutter``).
+
+    Parameters
+    ----------
+    plogic_label : str
+        Device label of the PLogic card (e.g. ``"PLogic:E:36"``).
+    tiger_comm_hub_label : str
+        Device label of the Tiger comm hub used to send serial commands.
+    bnc_addrs : list[int]
+        PLogic addresses of the BNC outputs to drive (front-panel BNC n = 32 + n).
+    on : bool
+        Whether to turn the lasers on (True) or off (False).
+    always_on_cell : int
+        PLogic cell number wired to a constant-high value.
+    """
+    if not bnc_addrs:
+        return
+    plogic_addr_prefix = plogic_label.split(":")[-1]
+    hub_prop = "OnlySendSerialCommandOnChange"
+    original_hub_setting = get_property(tiger_comm_hub_label, hub_prop)
+    source = always_on_cell if on else 0
+
+    try:
+        if original_hub_setting == "Yes":
+            set_property(tiger_comm_hub_label, hub_prop, "No")
+
+        for addr in bnc_addrs:
+            _send_tiger_command(f"M E={addr}", tiger_comm_hub_label)
+            _send_tiger_command(
+                f"{plogic_addr_prefix}CCA Z={source}", tiger_comm_hub_label
+            )
+        _send_tiger_command(f"{plogic_addr_prefix}SS Z", tiger_comm_hub_label)
+    finally:
+        if original_hub_setting == "Yes":
+            set_property(tiger_comm_hub_label, hub_prop, "Yes")
+
+
+def _plogic_available() -> bool:
+    """Return True if the PLogic card and Tiger comm hub are both loaded."""
+    devices = mmc.getLoadedDevices()
+    return _HW.plogic_label in devices and _HW.tiger_comm_hub_label in devices
+
+
+def _selected_laser_bncs() -> list[int]:
+    """BNC addresses for the currently selected laser preset (empty if none)."""
+    group = _HW.laser_config_group
+    if group not in mmc.getAvailableConfigGroups():
+        return []
+    preset = mmc.getCurrentConfig(group)
+    if preset == _HW.all_lasers_preset:
+        return list(_HW.laser_bnc_addr.values())
+    addr = _HW.laser_bnc_addr.get(preset)
+    return [addr] if addr is not None else []
+
+
+def open_selected_lasers() -> None:
+    """Turn on the laser(s) for the current selection (no-op without PLogic)."""
+    if not _plogic_available():
+        return
+    set_laser_outputs(
+        _HW.plogic_label,
+        _HW.tiger_comm_hub_label,
+        _selected_laser_bncs(),
+        True,
+        _HW.plogic_always_on_cell,
+    )
+
+
+def close_selected_lasers() -> None:
+    """Turn off the laser(s) for the current selection (no-op without PLogic)."""
+    if not _plogic_available():
+        return
+    set_laser_outputs(
+        _HW.plogic_label,
+        _HW.tiger_comm_hub_label,
+        _selected_laser_bncs(),
+        False,
+        _HW.plogic_always_on_cell,
+    )
+
+
+def close_all_lasers() -> None:
+    """Turn off every mapped laser BNC (no-op without PLogic)."""
+    if not _plogic_available():
+        return
+    set_laser_outputs(
+        _HW.plogic_label,
+        _HW.tiger_comm_hub_label,
+        list(_HW.laser_bnc_addr.values()),
+        False,
+        _HW.plogic_always_on_cell,
+    )

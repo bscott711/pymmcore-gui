@@ -24,19 +24,35 @@ class CoreAction(ActionKey):
 # TODO: perhaps have alternate signatures for these functions that take a
 # CMMCorePlus instance, rather than needing to extract it from the QCoreAction.
 def snap_image(action: QCoreAction, checked: bool) -> None:
-    """Snap an image, stopping sequence if running."""
+    """Snap an image, firing the selected laser(s) for the exposure."""
+    from pymmcore_gui.asi_z_stack.asi_controller import (
+        close_selected_lasers,
+        open_selected_lasers,
+    )
+
     mmc = action.mmc
     if mmc.isSequenceRunning():
         mmc.stopSequenceAcquisition()
-    mmc.snapImage()
+    open_selected_lasers()
+    try:
+        mmc.snapImage()
+    finally:
+        close_selected_lasers()
 
 
 def toggle_live(action: QCoreAction, checked: bool) -> None:
-    """Start or stop live mode."""
+    """Start or stop live mode, firing the selected laser(s) while live."""
+    from pymmcore_gui.asi_z_stack.asi_controller import (
+        close_all_lasers,
+        open_selected_lasers,
+    )
+
     mmc = action.mmc
     if mmc.isSequenceRunning():
         mmc.stopSequenceAcquisition()
+        close_all_lasers()
     else:
+        open_selected_lasers()
         mmc.startContinuousSequenceAcquisition(0)
 
 

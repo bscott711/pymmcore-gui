@@ -135,9 +135,9 @@ class ImagePreviewBase(QWidget):
 
         # Multi-camera: walk newest-first, keeping the newest frame per camera as
         # identified by its "Camera" metadata tag.
-        labels = [core.getPhysicalCameraDevice(i) or f"Camera-ch{i}" for i in range(
-            n_cams
-        )]
+        labels = [
+            core.getPhysicalCameraDevice(i) or f"Camera-ch{i}" for i in range(n_cams)
+        ]
         frames: dict[str, np.ndarray] = {}
         max_walk = min(count, n_cams * 8)
         for offset in range(max_walk):
