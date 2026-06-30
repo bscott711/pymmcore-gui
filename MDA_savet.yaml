@@ -13,11 +13,11 @@ metadata:
     save_dir: S:/TEMP_CAMERA_STREAMING/claude_vibe
     save_name: next.ome.zarr
     should_save: true
-    version: 0.1.dev321+g2f1324089
+    version: 0.10.1.dev4+ga016e8f07
 stage_positions:
-- x: 0.18
-  y: -0.13
-  z: -22.11
+- x: 742.04
+  y: 361.25
+  z: -14.525
 time_plan:
   interval: 5.0
   loops: 2

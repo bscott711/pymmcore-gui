@@ -3,10 +3,15 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 import tifffile
 import useq
 
-from pymmcore_gui._multi_camera_handler import MultiCameraHandler, per_camera_path
+from pymmcore_gui._multi_camera_handler import (
+    MultiCameraHandler,
+    per_camera_path,
+    without_cam_index,
+)
 from pymmcore_gui.actions._action_info import ActionInfo
 from pymmcore_gui.actions.widget_actions import WidgetAction
 
@@ -74,3 +79,50 @@ def test_multi_camera_handler_writes_one_file_per_camera(tmp_path: Path) -> None
         assert data.shape[0] == 3
         # Every pixel belongs to the routed camera.
         assert int(data.min()) == int(data.max()) == values[cam]
+
+
+def test_without_cam_index_strips_only_cam() -> None:
+    event = useq.MDAEvent(index={"c": 0, "z": 2, "cam": 1})
+    stripped = without_cam_index(event)
+    assert "cam" not in stripped.index
+    assert dict(stripped.index) == {"c": 0, "z": 2}
+
+    # No-op (same object) when there is no cam axis, e.g. single-camera events.
+    plain = useq.MDAEvent(index={"c": 0, "z": 2})
+    assert without_cam_index(plain) is plain
+
+
+def test_tensorstore_rejects_unstripped_cam_axis() -> None:
+    """Regression: the engine's ``cam`` axis is absent from the per-camera store.
+
+    The per-camera ``TensorStoreHandler`` builds its store dimensions from
+    ``seq.sizes`` (here ``{c, z}``), so an event carrying the engine-injected
+    ``cam`` index can't be written until that axis is stripped.
+    """
+    pytest.importorskip("tensorstore")
+    from pymmcore_plus.mda.handlers import TensorStoreHandler
+
+    seq = useq.MDASequence(
+        channels=["DAPI"],  # pyright: ignore[reportArgumentType]
+        z_plan=useq.ZRangeAround(range=2, step=1),  # 3 z slices
+    )
+    event = next(iter(seq))
+    cam_event = event.model_copy(update={"index": {**event.index, "cam": 0}})
+    frame = np.zeros((8, 8), dtype=np.uint16)
+
+    # Unstripped event -> IndexError (the bug this fix targets).
+    failing = TensorStoreHandler(driver="zarr", kvstore="memory://")
+    failing.reset(seq)
+    with pytest.raises(IndexError):
+        failing.frameReady(frame, cam_event, {})
+
+    # Stripped event -> writes cleanly into the cam-less store.
+    handler = TensorStoreHandler(driver="zarr", kvstore="memory://")
+    handler.reset(seq)
+    for ev in seq:
+        cam_ev = ev.model_copy(update={"index": {**ev.index, "cam": 0}})
+        handler.frameReady(frame, without_cam_index(cam_ev), {})
+    handler.sequenceFinished(seq)
+
+    assert handler.store is not None
+    assert "cam" not in set(handler.store.domain.labels)
