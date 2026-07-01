@@ -18,13 +18,14 @@ from __future__ import annotations
 
 import re
 from inspect import signature
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from pymmcore_plus import CMMCorePlus
 from pymmcore_plus.mda.handlers import handler_for_path
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     import numpy as np
     import useq
     from pymmcore_plus.metadata import FrameMetaV1, SummaryMetaV1
@@ -32,6 +33,29 @@ if TYPE_CHECKING:
 # Known (possibly compound) output extensions, longest first so that
 # ``.ome.tiff`` is matched before ``.tiff``.
 _KNOWN_SUFFIXES = (".ome.tiff", ".ome.tif", ".ome.zarr", ".zarr", ".tiff", ".tif")
+
+
+def without_cam_index(event: useq.MDAEvent) -> useq.MDAEvent:
+    """Return *event* with the engine-injected ``cam`` axis removed.
+
+    The :class:`~pymmcore_plus.mda.MDAEngine` adds a ``cam`` entry to
+    ``event.index`` for every multi-camera frame so that a single store *could*
+    separate cameras along a ``cam`` dimension.  Because we route each physical
+    camera to its own writer / viewer (keyed by ``meta["camera_device"]``), that
+    axis is redundant — and the per-camera store's dimensions come from
+    ``seq.sizes``, which has no ``cam``, so leaving it in raises an
+    ``IndexError``.  Strip it so each per-camera event indexes cleanly into its
+    own store.  A no-op when ``cam`` is absent (e.g. single-camera events).
+
+    Parameters
+    ----------
+    event : useq.MDAEvent
+        The event emitted by the MDA engine.
+    """
+    if "cam" not in event.index:
+        return event
+    new_index = {k: v for k, v in event.index.items() if k != "cam"}
+    return event.model_copy(update={"index": new_index})
 
 
 def _sanitize(label: str) -> str:
@@ -54,7 +78,7 @@ def per_camera_path(base: str | Path, label: str) -> str:
     for suffix in _KNOWN_SUFFIXES:
         if lowered.endswith(suffix):
             stem = text[: -len(suffix)]
-            return f"{stem}_{safe}{text[len(stem):]}"
+            return f"{stem}_{safe}{text[len(stem) :]}"
     # No recognized suffix -> treat as a directory (ImageSequenceWriter); create
     # sibling directories per camera.
     return f"{text.rstrip('/').rstrip(chr(92))}_{safe}"
@@ -131,7 +155,9 @@ class MultiCameraHandler:
     ) -> None:
         label = meta.get("camera_device") or self._mmc.getCameraDevice()
         writer = self._get_writer(label)
-        writer.frameReady(frame, event, meta)
+        # Each writer only sees one camera, so the engine's ``cam`` axis is
+        # redundant here and absent from the writer's store dimensions.
+        writer.frameReady(frame, without_cam_index(event), meta)
 
     def sequenceFinished(self, seq: useq.MDASequence) -> None:
         for writer in self._writers.values():

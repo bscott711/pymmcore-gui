@@ -11,10 +11,11 @@ from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QWidget
 from PyQt6Ads import CDockWidget
 
+from pymmcore_gui._multi_camera_handler import without_cam_index
 from pymmcore_gui.widgets.image_preview._pygfx_preview import PygfxPreview
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
     import numpy as np
     from ndv.models._array_display_model import (
@@ -24,7 +25,6 @@ if TYPE_CHECKING:
     from pymmcore_plus.mda import SupportsFrameReady
     from pymmcore_plus.metadata import FrameMetaV1, SummaryMetaV1
     from useq import MDASequence
-
 
 
 # NOTE: we make this a QObject mostly so that the lifetime of this object is tied to
@@ -154,7 +154,9 @@ class NDVViewersManager(QObject):
             preview, _ = self._get_or_create_camera_preview(label)
             preview.append(img)
 
-    def _make_multicam_streaming_callback(self, labels: list[str]):
+    def _make_multicam_streaming_callback(
+        self, labels: list[str]
+    ) -> Callable[[dict[str, np.ndarray]], None]:
         """Return a callback that dispatches per-camera frames to their previews.
 
         The callback is installed on the streaming-driver ``PygfxPreview``'s
@@ -346,6 +348,9 @@ class NDVViewersManager(QObject):
             viewer = self._mda_camera_viewers.get(label)
             if handler is None or viewer is None:
                 return  # pragma: no cover
+            # Each per-camera store is built from ``seq.sizes`` (no ``cam`` axis),
+            # so drop the engine's redundant ``cam`` index before writing/indexing.
+            event = without_cam_index(event)
             handler.frameReady(frame, event, meta)
             self._update_mda_viewer(viewer, handler, event)
             return

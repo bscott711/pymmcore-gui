@@ -190,6 +190,9 @@ filterwarnings = [
     "ignore:Failed to disconnect:RuntimeWarning",
     "ignore:Error fetching icon::superqt",
     "ignore:.*`do_history`.*::ipykernel",
+    # pymmcore-plus 0.18 deprecated `mda.handlers` (moving to ome-writers); we
+    # still rely on TensorStoreHandler. Don't let the FutureWarning fail the suite.
+    "ignore:The 'pymmcore_plus.mda.handlers' module is deprecated:FutureWarning",
 ]
 
 # https://coverage.readthedocs.io/

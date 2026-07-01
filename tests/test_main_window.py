@@ -4,7 +4,6 @@ import sys
 from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
 
-import ndv
 import pytest
 import useq
 
@@ -151,6 +150,72 @@ def test_snap(gui: MicroManagerGUI, qtbot: QtBot) -> None:
         core.snapImage()
     assert len(vm._camera_previews) == 1
     assert len(vm._preview_dock_widgets) == 1
+
+
+def test_snap_fires_selected_lasers(gui: MicroManagerGUI) -> None:
+    """Snap turns the selected laser(s) on before the exposure and off after."""
+    core = gui._mmc
+    calls: list[str] = []
+    with (
+        patch(
+            "pymmcore_gui.asi_z_stack.asi_controller.open_selected_lasers",
+            lambda: calls.append("open"),
+        ),
+        patch(
+            "pymmcore_gui.asi_z_stack.asi_controller.close_selected_lasers",
+            lambda: calls.append("close"),
+        ),
+        patch.object(core, "snapImage", lambda: calls.append("snap")),
+    ):
+        gui.get_action(CoreAction.SNAP).trigger()
+
+    assert calls == ["open", "snap", "close"]
+
+
+def test_toggle_live_fires_and_clears_lasers(gui: MicroManagerGUI) -> None:
+    """Live turns the selected laser(s) on at start and clears all on stop."""
+    core = gui._mmc
+    calls: list[str] = []
+    running = [False]
+
+    def _start(interval: int = 0) -> None:
+        calls.append("start")
+        running[0] = True
+
+    def _stop() -> None:
+        calls.append("stop")
+        running[0] = False
+
+    with (
+        patch(
+            "pymmcore_gui.asi_z_stack.asi_controller.open_selected_lasers",
+            lambda: calls.append("open"),
+        ),
+        patch(
+            "pymmcore_gui.asi_z_stack.asi_controller.close_all_lasers",
+            lambda: calls.append("close_all"),
+        ),
+        patch.object(core, "startContinuousSequenceAcquisition", _start),
+        patch.object(core, "stopSequenceAcquisition", _stop),
+        patch.object(core, "isSequenceRunning", lambda: running[0]),
+    ):
+        live_action = gui.get_action(CoreAction.TOGGLE_LIVE)
+        live_action.trigger()  # start live
+        live_action.trigger()  # stop live
+
+    assert calls == ["open", "start", "stop", "close_all"]
+
+
+def test_laser_gating_noop_without_plogic(gui: MicroManagerGUI) -> None:
+    """Laser gating is a safe no-op when the PLogic hardware is not loaded."""
+    from pymmcore_gui.asi_z_stack import asi_controller
+
+    assert "PLogic:E:36" not in gui._mmc.getLoadedDevices()
+    # Should not raise or send any serial commands on a non-ASI config.
+    asi_controller.open_selected_lasers()
+    asi_controller.close_selected_lasers()
+    asi_controller.close_all_lasers()
+    asi_controller.ensure_global_shutter_open()
 
 
 @pytest.mark.skipif(
