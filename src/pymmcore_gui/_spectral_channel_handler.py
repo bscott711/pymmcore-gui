@@ -49,8 +49,20 @@ def _strip_known_suffix(text: str) -> str:
     return text.rstrip("/").rstrip("\\")
 
 
-def channel_output_path(base: str | Path, channel: SpectralChannelConfig) -> str:
+def channel_output_path(
+    base: str | Path, channel: SpectralChannelConfig, writer_format: str
+) -> str:
     """Return *base* with the sanitized channel name and format suffix appended.
+
+    Parameters
+    ----------
+    base : str | Path
+        The MDA output path; any known writer suffix is stripped first.
+    channel : SpectralChannelConfig
+        The channel whose name is appended to the stem.
+    writer_format : str
+        The writer format chosen in the MDA save widget (one of the keys of
+        :data:`_FORMAT_SUFFIX`); determines the output suffix.
 
     Examples
     --------
@@ -58,7 +70,60 @@ def channel_output_path(base: str | Path, channel: SpectralChannelConfig) -> str
     ``exp`` + ``GFP_488`` (ome-tiff) -> ``exp_GFP_488.ome.tiff``
     """
     stem = _strip_known_suffix(str(base))
-    return f"{stem}_{_sanitize(channel.name)}{_FORMAT_SUFFIX[channel.writer_format]}"
+    suffix = _FORMAT_SUFFIX.get(writer_format, _FORMAT_SUFFIX["ome-zarr"])
+    return f"{stem}_{_sanitize(channel.name)}{suffix}"
+
+
+def channels_for_sequence(
+    sequence: useq.MDASequence,
+    channels: list[SpectralChannelConfig],
+    laser_group: str,
+    all_lasers_preset: str,
+    active_cams: set[str],
+) -> list[SpectralChannelConfig]:
+    """Return the configured channels that *sequence* will actually save.
+
+    A channel is saved when it has a drawn rect, targets a present camera, and
+    its ``laser_preset`` is among the laser presets the sequence uses. The
+    ``all_lasers_preset`` selects every ready channel.
+
+    Parameters
+    ----------
+    sequence : useq.MDASequence
+        The MDA sequence about to run.
+    channels : list[SpectralChannelConfig]
+        All configured spectral channels.
+    laser_group : str
+        The Micro-Manager config group holding laser presets (e.g. ``"Lasers"``).
+    all_lasers_preset : str
+        The preset that fires every laser (e.g. ``"AllLasers"``).
+    active_cams : set[str]
+        Physical camera labels currently present.
+    """
+    used = {c.config for c in sequence.channels if c.group == laser_group}
+    ready = [c for c in channels if c.rect is not None and c.camera in active_cams]
+    if all_lasers_preset in used:
+        return ready
+    return [c for c in ready if c.laser_preset in used]
+
+
+def next_fft_friendly(n: int) -> int:
+    """Return the smallest ``m >= n`` whose only prime factors are 2, 3, 5, 7.
+
+    Such sizes ("7-smooth" / regular numbers) keep FFT-based GPU deconvolution
+    fast. ``n <= 1`` returns 1.
+    """
+    if n <= 1:
+        return 1
+    m = n
+    while True:
+        r = m
+        for p in (2, 3, 5, 7):
+            while r % p == 0:
+                r //= p
+        if r == 1:
+            return m
+        m += 1
 
 
 class SpectralChannelHandler:
@@ -80,6 +145,10 @@ class SpectralChannelHandler:
     all_lasers_preset : str
         The config preset name that fires all lasers simultaneously (e.g.
         ``"AllLasers"``); when active, all configured channels are saved.
+    writer_format : str
+        The writer format chosen in the MDA save widget (a key of
+        :data:`_FORMAT_SUFFIX`); determines each channel file's suffix.
+        Defaults to ``"ome-zarr"``.
     mmcore : CMMCorePlus | None
         The core instance to use. Defaults to the global singleton.
     """
@@ -91,12 +160,14 @@ class SpectralChannelHandler:
         laser_group: str,
         all_lasers_preset: str,
         *,
+        writer_format: str = "ome-zarr",
         mmcore: CMMCorePlus | None = None,
     ) -> None:
         self._output = output
         self._channels = list(channels)
         self._laser_group = laser_group
         self._all_lasers_preset = all_lasers_preset
+        self._writer_format = writer_format
         self._mmc = mmcore or CMMCorePlus.instance()
         # channel name -> writer
         self._writers: dict[str, Any] = {}
@@ -131,7 +202,7 @@ class SpectralChannelHandler:
     def _get_writer(self, channel: SpectralChannelConfig) -> Any:
         """Return (creating + starting if needed) the writer for *channel*."""
         if channel.name not in self._writers:
-            path = channel_output_path(self._output, channel)
+            path = channel_output_path(self._output, channel, self._writer_format)
             self._writers[channel.name] = handler_for_path(path)
         writer = self._writers[channel.name]
         if channel.name not in self._started:

@@ -174,7 +174,18 @@ class WindowSettingsV1(BaseMMSettings):
 
 
 class SpectralChannelConfig(BaseModel):
-    """One splitter sub-region tied to one laser preset on one physical camera."""
+    """One splitter sub-region tied to one laser preset on one physical camera.
+
+    Which regions are actually saved during an MDA is derived from the laser
+    presets used by the running sequence (see
+    :func:`~pymmcore_gui._spectral_channel_handler.channels_for_sequence`), not
+    from a per-channel flag: exciting a laser always saves its region, and
+    unused regions are skipped. The output file format follows the MDA save
+    widget's choice rather than a per-channel setting.
+    """
+
+    # TODO: add an optional per-channel "always save this region even when its
+    # laser isn't in the MDA" override for power users capturing extra regions.
 
     name: str
     """Per-file label, e.g. ``"GFP_488"``."""
@@ -184,13 +195,11 @@ class SpectralChannelConfig(BaseModel):
     """The single-laser config preset this region maps to, e.g. ``"488nm"``."""
     rect: tuple[int, int, int, int] | None = None
     """``(x, y, w, h)`` in full-sensor pixel coordinates. ``None`` until drawn."""
-    enabled: bool = False
-    writer_format: Literal["ome-zarr", "ome-tiff", "tiff-sequence"] = "ome-zarr"
 
     @property
     def is_ready(self) -> bool:
-        """Whether this channel is enabled and has a drawn rect."""
-        return self.enabled and self.rect is not None
+        """Whether this channel has a drawn rect and can be saved."""
+        return self.rect is not None
 
 
 def _default_spectral_channels() -> list[SpectralChannelConfig]:

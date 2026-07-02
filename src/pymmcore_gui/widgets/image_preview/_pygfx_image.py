@@ -316,6 +316,75 @@ class PygfxImagePreview(ImagePreviewBase):
 
         self._renderer.add_event_handler(_on_pointer, *event_types)
 
+    def begin_roi_move(
+        self,
+        initial_rect: tuple[int, int, int, int],
+        on_done: Callable[[tuple[int, int, int, int]], None],
+    ) -> None:
+        """Start an interactive drag that repositions a fixed-size ROI.
+
+        The rectangle keeps *initial_rect*'s width/height; only its top-left
+        corner follows the pointer. Pan/zoom is suspended for the drag, the
+        result is clamped so the rectangle stays fully within the frame, and on
+        release the new ``(x, y, w, h)`` is passed to *on_done*. No-ops if
+        there's no image displayed yet.
+        """
+        if self.data is None:
+            return
+        frame_h, frame_w = self.data.shape[-2:]
+        ox, oy, w, h = initial_rect
+        self._controller.enabled = False
+        drag: dict[str, Any] = {}
+        event_types = ("pointer_down", "pointer_move", "pointer_up")
+
+        def _set_rubber_band(x: int, y: int) -> None:
+            if (line := drag.get("line")) is not None:
+                self._scene.remove(line)
+            x0, y0 = x - 0.5, y - 0.5
+            x1, y1 = x + w - 0.5, y + h - 0.5
+            pts = np.array(
+                [[x0, y0, 0], [x1, y0, 0], [x1, y1, 0], [x0, y1, 0], [x0, y0, 0]],
+                dtype=np.float32,
+            )
+            line = pygfx.Line(
+                pygfx.Geometry(positions=pts),
+                pygfx.LineMaterial(thickness=2.0, color="#ffcc00", depth_test=False),
+            )
+            self._scene.add(line)
+            drag["line"] = line
+            self._canvas.request_draw(self._draw_function)
+
+        def _clamped(dx: float, dy: float) -> tuple[int, int]:
+            # world delta == pixel delta (the -0.5 pixel<->world shift cancels).
+            x = max(0, min(round(ox + dx), frame_w - w))
+            y = max(0, min(round(oy + dy), frame_h - h))
+            return x, y
+
+        def _finish(rect: tuple[int, int, int, int] | None) -> None:
+            self._renderer.remove_event_handler(_on_pointer, *event_types)
+            if (line := drag.pop("line", None)) is not None:
+                self._scene.remove(line)
+            self._controller.enabled = True
+            self._canvas.request_draw(self._draw_function)
+            if rect is not None:
+                on_done(rect)
+
+        def _on_pointer(event: pygfx.PointerEvent) -> None:
+            if event.type == "pointer_down":
+                drag["start"] = self._screen_to_world_xy(event.x, event.y)
+                _set_rubber_band(ox, oy)
+            elif event.type == "pointer_move" and "start" in drag:
+                sx, sy = drag["start"]
+                cx, cy = self._screen_to_world_xy(event.x, event.y)
+                _set_rubber_band(*_clamped(cx - sx, cy - sy))
+            elif event.type == "pointer_up" and "start" in drag:
+                sx, sy = drag["start"]
+                cx, cy = self._screen_to_world_xy(event.x, event.y)
+                x, y = _clamped(cx - sx, cy - sy)
+                _finish((x, y, w, h))
+
+        self._renderer.add_event_handler(_on_pointer, *event_types)
+
     # ----------------------------
 
     def _draw_function(self) -> None:
