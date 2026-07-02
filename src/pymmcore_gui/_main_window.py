@@ -152,6 +152,7 @@ class MicroManagerGUI(QMainWindow):
         ],
         Menu.PLUGINS: [
             WidgetAction.CRISP,
+            WidgetAction.SPECTRAL_CHANNELS,
         ],
         Menu.HELP: [],
     }
@@ -247,6 +248,10 @@ class MicroManagerGUI(QMainWindow):
     @property
     def mmcore(self) -> CMMCorePlus:
         return self._mmc
+
+    @property
+    def viewers_manager(self) -> NDVViewersManager:
+        return self._viewers_manager
 
     # --------------------- Public methods ----------------------
     # -----------------------------------------------------------

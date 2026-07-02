@@ -526,15 +526,15 @@ name = "crispy"
 version = "0.1.0"
 source = { editable = "../CRISPy" }
 dependencies = [
+    { name = "magicgui" },
     { name = "pymmcore-plus" },
-    { name = "pymmcore-widgets" },
     { name = "qtpy" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "magicgui" },
     { name = "pymmcore-plus" },
-    { name = "pymmcore-widgets" },
     { name = "qtpy" },
 ]
 
@@ -592,6 +592,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/70/e5/83f2e002cc24670430374e50db26319c7c4a33a780ed64ceb0fbdb733dcb/diff_cover-9.4.0.tar.gz", hash = "sha256:ee54ff718eb4a970ef29fdfd23539ee1cecec36f0c29b918d6ddf60b9baa4b8a", size = 99127, upload-time = "2025-06-22T19:28:14.051Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/01/ed/e756fe35bb6331e1880128a333f8624b9bcfcb51565f4ddbf0f934004342/diff_cover-9.4.0-py3-none-any.whl", hash = "sha256:61b5c7f14925e9e357c0421dc27a062973b2b9f540a1e1327837a496653afd4a", size = 54623, upload-time = "2025-06-22T19:28:12.602Z" },
+]
+
+[[package]]
+name = "docstring-parser"
+version = "0.18.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/e0/4d/f332313098c1de1b2d2ff91cf2674415cc7cddab2ca1b01ae29774bd5fdf/docstring_parser-0.18.0.tar.gz", hash = "sha256:292510982205c12b1248696f44959db3cdd1740237a968ea1e2e7a900eeb2015", size = 29341, upload-time = "2026-04-14T04:09:19.867Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a7/5f/ed01f9a3cdffbd5a008556fc7b2a08ddb1cc6ace7effa7340604b1d16699/docstring_parser-0.18.0-py3-none-any.whl", hash = "sha256:b3fcbed555c47d8479be0796ef7e19c2670d428d72e96da63f3a40122860374b", size = 22484, upload-time = "2026-04-14T04:09:18.638Z" },
 ]
 
 [[package]]
@@ -1116,6 +1125,23 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/95/ee/af1a3842bdd5902ce133bd246eb7ffd4375c38642aeb5dc0ae3a0329dfa2/macholib-1.16.3.tar.gz", hash = "sha256:07ae9e15e8e4cd9a788013d81f5908b3609aa76f9b1421bae9c4d7606ec86a30", size = 59309, upload-time = "2023-09-25T09:10:16.155Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d1/5d/c059c180c84f7962db0aeae7c3b9303ed1d73d76f2bfbc32bc231c8be314/macholib-1.16.3-py2.py3-none-any.whl", hash = "sha256:0e315d7583d38b8c77e815b1ecbdbf504a8258d8b3e17b61165c6feb60d18f2c", size = 38094, upload-time = "2023-09-25T09:10:14.188Z" },
+]
+
+[[package]]
+name = "magicgui"
+version = "0.10.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "docstring-parser" },
+    { name = "psygnal" },
+    { name = "qtpy" },
+    { name = "superqt", extra = ["iconify"] },
+    { name = "typing-extensions", version = "4.14.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.14'" },
+    { name = "typing-extensions", version = "4.15.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.14'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ba/9c/0d918ee0a9b31f16e9b76c1b86b81b5d4b7bc491354c76030b87790f0cab/magicgui-0.10.2.tar.gz", hash = "sha256:ae7a4cbb7ef2028b827b1877cf0b06743d756074fe6ef849391d62448ab7b65d", size = 20946219, upload-time = "2026-04-10T14:45:28.927Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/56/bb/5ba264d3ccc13294e74c48c3ef0c2e96b8b13765562628515654012cc47e/magicgui-0.10.2-py3-none-any.whl", hash = "sha256:0f304d4da1a4309ad15d38cb809ef73269cea73a3195ac944f38d7c56d8e0fd5", size = 128254, upload-time = "2026-04-10T14:45:27.173Z" },
 ]
 
 [[package]]
@@ -2405,6 +2431,7 @@ dependencies = [
     { name = "ome-writers", extra = ["tensorstore", "tifffile"] },
     { name = "pydantic-settings" },
     { name = "pygfx" },
+    { name = "pylinalg" },
     { name = "pymmcore-plus", extra = ["cli"] },
     { name = "pymmcore-widgets" },
     { name = "pyqt6" },
@@ -2458,6 +2485,7 @@ requires-dist = [
     { name = "ome-writers", extras = ["tensorstore", "tifffile"], specifier = ">=0.3.0" },
     { name = "pydantic-settings", specifier = ">=2.7.1" },
     { name = "pygfx", specifier = ">=0.16.0" },
+    { name = "pylinalg", specifier = ">=0.6.8" },
     { name = "pymmcore-plus", extras = ["cli"], specifier = ">=0.18.0" },
     { name = "pymmcore-widgets", editable = "../pymmcore-widgets" },
     { name = "pyqt6", specifier = "==6.9.1" },

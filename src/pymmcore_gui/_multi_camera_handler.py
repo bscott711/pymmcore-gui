@@ -84,6 +84,19 @@ def per_camera_path(base: str | Path, label: str) -> str:
     return f"{text.rstrip('/').rstrip(chr(92))}_{safe}"
 
 
+def physical_camera_labels(mmcore: CMMCorePlus) -> list[str]:
+    """Return physical camera labels matching the engine's frame metadata.
+
+    For a ``Multi Camera`` device this reads the ``Physical Camera N``
+    properties (one label per channel). For a plain camera device returns a
+    single-element list containing the active camera device.
+    """
+    n = mmcore.getNumberOfCameraChannels()
+    if n <= 1:
+        return [mmcore.getCameraDevice()]
+    return [mmcore.getPhysicalCameraDevice(i) for i in range(n)]
+
+
 class MultiCameraHandler:
     """Route MDA frames to one writer per physical camera, keyed by camera label."""
 
@@ -104,10 +117,7 @@ class MultiCameraHandler:
 
     def _physical_camera_labels(self) -> list[str]:
         """Return physical camera labels matching the engine's metadata."""
-        n = self._mmc.getNumberOfCameraChannels()
-        if n <= 1:
-            return [self._mmc.getCameraDevice()]
-        return [self._mmc.getPhysicalCameraDevice(i) for i in range(n)]
+        return physical_camera_labels(self._mmc)
 
     def _get_writer(self, label: str) -> Any:
         """Return (creating + starting if needed) the writer for *label*."""

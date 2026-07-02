@@ -54,6 +54,7 @@ dependencies = [
     "rendercanvas>=2.6.3",
     "crispy",
     "pygfx>=0.16.0",
+    "pylinalg>=0.6.8",
 ]
 
 # TO USE pymmcore-nano, you need to add pymmcore-nano to dependencies
