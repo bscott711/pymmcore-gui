@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import QWidget
 from PyQt6Ads import CDockWidget
 
 from pymmcore_gui._multi_camera_handler import without_cam_index
+from pymmcore_gui._settings import SettingsV1
 from pymmcore_gui.widgets.image_preview._pygfx_preview import PygfxPreview
 
 if TYPE_CHECKING:
@@ -129,7 +130,32 @@ class NDVViewersManager(QObject):
         dw.setWidget(preview)
         dw.setFeature(dw.DockWidgetFeature.DockWidgetFloatable, False)
         self._camera_previews[camera_label] = dw
+        self._apply_roi_overlays(preview, camera_label)
         self.previewViewerCreated.emit(dw)
+        return preview
+
+    def _apply_roi_overlays(self, preview: PygfxPreview, camera_label: str) -> None:
+        """Draw this camera's configured splitter ROIs on *preview*, if any."""
+        spectral = SettingsV1.instance().spectral
+        rois = [
+            (c.name, c.rect)
+            for c in spectral.channels
+            if c.is_ready and c.camera == camera_label and c.rect is not None
+        ]
+        preview.set_roi_overlays(rois)
+
+    def refresh_roi_overlays(self) -> None:
+        """Re-apply spectral-channel ROI overlays to every open camera preview.
+
+        Called after the spectral-channel config UI saves changes, so already
+        open live/snap panes reflect the new rectangles immediately.
+        """
+        for label, dw in self._camera_previews.items():
+            self._apply_roi_overlays(cast("PygfxPreview", dw.widget()), label)
+
+    def get_or_create_camera_preview(self, camera_label: str) -> PygfxPreview:
+        """Return (creating and showing if needed) the preview for *camera_label*."""
+        preview, _created = self._get_or_create_camera_preview(camera_label)
         return preview
 
     def _get_or_create_camera_preview(

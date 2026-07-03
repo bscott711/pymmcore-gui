@@ -42,6 +42,7 @@ class WidgetAction(ActionKey):
     STAGE_CONTROL = "pymmcore_gui.stage_control_widget"
     CONFIG_WIZARD = "pymmcore_gui.hardware_config_wizard"
     CRISP = "pymmcore_gui.crisp_widget"
+    SPECTRAL_CHANNELS = "pymmcore_gui.spectral_channel_config"
 
 
 # ######################## Functions that create widgets #########################
@@ -149,6 +150,15 @@ def create_crisp_widget(parent: QWidget) -> QWidget:
     from pymmcore_gui.widgets._crisp_widget import CrispWidget
 
     return CrispWidget(parent=parent, mmcore=_get_core(parent))
+
+
+def create_spectral_channel_config(parent: QWidget) -> QWidget:
+    """Create the image-splitter spectral-channel crop configuration widget."""
+    from pymmcore_gui.widgets._spectral_channel_config import (
+        SpectralChannelConfigWidget,
+    )
+
+    return SpectralChannelConfigWidget(parent=parent, mmcore=_get_core(parent))
 
 
 # ######################## WidgetAction Enum #########################
@@ -271,4 +281,12 @@ show_crisp = WidgetActionInfo(
     icon="mdi:focus-auto",
     create_widget=create_crisp_widget,
     dock_area=DockWidgetArea.RightDockWidgetArea,
+)
+
+show_spectral_channels = WidgetActionInfo(
+    key=WidgetAction.SPECTRAL_CHANNELS,
+    text="Spectral Channels",
+    icon="mdi:grid-large",
+    create_widget=create_spectral_channel_config,
+    dock_area=DockWidgetArea.LeftDockWidgetArea,
 )

@@ -173,6 +173,62 @@ class WindowSettingsV1(BaseMMSettings):
         return values
 
 
+class SpectralChannelConfig(BaseModel):
+    """One splitter sub-region tied to one laser preset on one physical camera.
+
+    Which regions are actually saved during an MDA is derived from the laser
+    presets used by the running sequence (see
+    :func:`~pymmcore_gui._spectral_channel_handler.channels_for_sequence`), not
+    from a per-channel flag: exciting a laser always saves its region, and
+    unused regions are skipped. The output file format follows the MDA save
+    widget's choice rather than a per-channel setting.
+    """
+
+    # TODO: add an optional per-channel "always save this region even when its
+    # laser isn't in the MDA" override for power users capturing extra regions.
+
+    name: str
+    """Per-file label, e.g. ``"GFP_488"``."""
+    camera: str
+    """Physical camera device label, e.g. ``"Camera-1"``."""
+    laser_preset: str
+    """The single-laser config preset this region maps to, e.g. ``"488nm"``."""
+    rect: tuple[int, int, int, int] | None = None
+    """``(x, y, w, h)`` in full-sensor pixel coordinates. ``None`` until drawn."""
+
+    @property
+    def is_ready(self) -> bool:
+        """Whether this channel has a drawn rect and can be saved."""
+        return self.rect is not None
+
+
+def _default_spectral_channels() -> list[SpectralChannelConfig]:
+    return [
+        SpectralChannelConfig(name="GFP_488", camera="Camera-1", laser_preset="488nm"),
+        SpectralChannelConfig(
+            name="CalceinViolet_405", camera="Camera-1", laser_preset="405nm"
+        ),
+        SpectralChannelConfig(
+            name="mScarlet_561", camera="Camera-2", laser_preset="561nm"
+        ),
+        SpectralChannelConfig(
+            name="CF647_638", camera="Camera-2", laser_preset="638nm"
+        ),
+    ]
+
+
+class SpectralChannelSettingsV1(BaseMMSettings):
+    """Image-splitter crop-and-save-per-channel feature configuration."""
+
+    enabled: bool = False
+    """Master on/off switch for the whole feature."""
+    laser_config_group: str = "Lasers"
+    all_lasers_preset: str = "AllLasers"
+    channels: list[SpectralChannelConfig] = Field(
+        default_factory=_default_spectral_channels
+    )
+
+
 class SettingsV1(BaseMMSettings):
     """Global settings for the PyMMCore GUI."""
 
@@ -183,6 +239,9 @@ class SettingsV1(BaseMMSettings):
 
     version: Literal["1.0"] = "1.0"
     window: WindowSettingsV1 = Field(default_factory=WindowSettingsV1)
+    spectral: SpectralChannelSettingsV1 = Field(
+        default_factory=SpectralChannelSettingsV1
+    )
 
     send_error_reports: bool | None = None
     """Whether to send error reports to the developers, None means undecided."""
