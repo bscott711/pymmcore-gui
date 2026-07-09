@@ -79,3 +79,20 @@ class HardwareConstants:
     # cameras for external triggering crashed PVCAM's driver (see
     # engine.py's _warn_if_circular_buffer_too_small).
     circular_buffer_target_mb: int = 30_000
+
+    # Camera worker-process tuning (see asi_z_stack/camera_worker.py,
+    # worker_pool.py, camera_handoff.py). Each physical camera runs in its own
+    # OS process for the duration of a hardware-triggered MDA, so a
+    # pvcam64.dll crash during concurrent dual-camera acquisition can, at
+    # worst, take down one disposable worker instead of the whole app.
+    #
+    # Bench-measured on the real rig (2026-07-09): a fresh worker process
+    # loads pymmcore-plus, initializes a Kinetix/PVCAM camera, and reports
+    # ready in ~3-4s -- worker_ready_timeout_s has generous headroom above
+    # that. worker_circular_buffer_mb is per-*worker* (one camera each), so
+    # it doesn't need circular_buffer_target_mb's full session-wide headroom.
+    worker_ready_timeout_s: float = 30.0
+    worker_arm_timeout_s: float = 10.0
+    worker_shutdown_timeout_s: float = 10.0
+    worker_circular_buffer_mb: int = 4096
+    frame_ring_slots_per_camera: int = 8

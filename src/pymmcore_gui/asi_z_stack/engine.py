@@ -13,15 +13,19 @@ from pymmcore_plus.metadata import (
 )
 from useq import MDAEvent, MDASequence
 
-from pymmcore_gui._multi_camera_handler import physical_camera_labels
-
 from .asi_controller import (
     configure_plogic_for_dual_nrt_pulses,
     log_plogic_trigger_chain_state,
-    set_camera_trigger_mode,
     set_plogic_evaluation_clock,
 )
+from .camera_handoff import (
+    CameraHandoffSnapshot,
+    release_cameras_for_workers,
+    reload_cameras_after_handoff,
+)
+from .camera_worker import CameraWorkerConfig
 from .common import AcquisitionSettings, HardwareConstants
+from .worker_pool import CameraWorkerHandle, CameraWorkerPool, WorkerDiedError
 
 logger = logging.getLogger(__name__)
 
@@ -66,47 +70,122 @@ class _ASITriggerEngineBase(MDAEngine):
         self.hw = hw
         self._num_slices = 0
         self._exposure_ms = 10.0
+        self._pixel_size_um = 0.0
         self._original_autoshutter = True
-        self._original_trigger_modes: dict[str, str] = {}
+        self._snapshot: CameraHandoffSnapshot | None = None
+        self._worker_pool: CameraWorkerPool | None = None
 
-    def _arm_cameras(self) -> None:
-        """Switch every physical camera to external triggering.
+    def _handoff_to_workers(self) -> None:
+        """Release every physical camera and spawn one worker process per camera.
 
-        A "Multi Camera" utility device has no TriggerMode property of its
-        own -- each physical camera behind it must be switched individually.
-        Saves each camera's pre-MDA TriggerMode so :meth:`_restore_cameras`
-        can put it back -- without this, a camera left in "Level Trigger"
-        after the MDA ends (whether it succeeded or not) hangs the next
-        Live/Snap waiting for an external trigger that never comes.
+        Replaces the old ``_arm_cameras`` -- instead of switching each
+        physical camera's ``TriggerMode`` while it stays loaded in the main
+        process (behind the ``Multi Camera`` composite), the main process
+        lets go of every physical camera entirely and hands it to its own
+        worker subprocess (see :mod:`~pymmcore_gui.asi_z_stack.worker_pool`).
+        Each worker owns its camera's ``pvcam64.dll`` in its own address
+        space, so a driver-level crash during concurrent dual-camera
+        acquisition can, at worst, take down one disposable worker instead of
+        the whole app. :meth:`_reclaim_from_workers` undoes this.
+
+        Called lazily from :meth:`exec_event` on its first invocation, not
+        from ``setup_sequence`` -- ``MDARunner`` emits ``sequenceStarted``
+        immediately after ``setup_sequence`` returns, and both
+        ``MultiCameraHandler.sequenceStarted`` and
+        ``NDVViewersManager._on_sequence_started`` independently call
+        ``physical_camera_labels(mmc)`` right then to eagerly create one
+        writer/viewer per physical camera, which needs the cameras to still
+        be loaded at that moment. By the time the first ``exec_event`` call
+        happens, ``sequenceStarted`` has already fired, so releasing the
+        cameras here is safe.
+
+        Caches ``pixel_size_um`` here (while the cameras are still loaded)
+        because it's needed for per-frame metadata built later in
+        :meth:`exec_event`, once the cameras -- and the Camera-role-dependent
+        core methods that would otherwise supply it -- are gone.
         """
-        self._original_trigger_modes = {}
-        for cam_label in physical_camera_labels(self.mmcore):
-            if self.mmcore.hasProperty(cam_label, "TriggerMode"):
-                self._original_trigger_modes[cam_label] = self.mmcore.getProperty(
-                    cam_label, "TriggerMode"
+        mmc = self.mmcore
+        self._pixel_size_um = mmc.getPixelSizeUm(True)
+        self._snapshot = release_cameras_for_workers(mmc, self.hw)
+
+        def _worker_for(label: str) -> CameraWorkerHandle:
+            snap = self._snapshot
+            assert snap is not None
+            cam = snap.per_camera.get(label)
+            return CameraWorkerHandle(
+                camera_label=label,
+                config=CameraWorkerConfig(
+                    camera_label=label,
+                    adapter_device_name=label,
+                    property_snapshot=cam.property_values if cam else {},
+                    roi=cam.roi if cam else None,
+                    circular_buffer_mb=self.hw.worker_circular_buffer_mb,
+                ),
+                height=snap.image_height,
+                width=snap.image_width,
+                dtype=snap.dtype_str,
+                n_slots=self.hw.frame_ring_slots_per_camera,
+            )
+
+        self._worker_pool = CameraWorkerPool(
+            [_worker_for(label) for label in self._snapshot.camera_labels]
+        )
+        self._worker_pool.spawn_all(ready_timeout=self.hw.worker_ready_timeout_s)
+        logger.info(
+            f"Camera worker pool ready: {self._snapshot.camera_labels} "
+            f"({self._snapshot.image_width}x{self._snapshot.image_height} "
+            f"{self._snapshot.dtype_str})."
+        )
+
+    def _reclaim_from_workers(self) -> None:
+        """Undo :meth:`_handoff_to_workers`.
+
+        Written defensively (``None`` guards, catch-and-log) since
+        :class:`~pymmcore_plus.mda.MDARunner` calls ``teardown_sequence``
+        unconditionally on completion, cancellation, *or* any exception out
+        of ``setup_sequence``/``exec_event`` -- this may run against a
+        partial handoff (e.g. the pool spawned but ``setup_sequence`` raised
+        before finishing).
+        """
+        if self._worker_pool is not None:
+            try:
+                self._worker_pool.shutdown_all(
+                    timeout=self.hw.worker_shutdown_timeout_s
                 )
-            set_camera_trigger_mode(cam_label)
+            except Exception:
+                logger.error("Error shutting down camera worker pool.", exc_info=True)
+            self._worker_pool = None
+        if self._snapshot is not None:
+            try:
+                reload_cameras_after_handoff(self.mmcore, self.hw, self._snapshot)
+            except Exception:
+                logger.error("Error reloading cameras after handoff.", exc_info=True)
+            self._snapshot = None
 
-    def _warn_if_circular_buffer_too_small(self, total_images: int) -> None:
-        """Log a warning if the circular buffer can't fit a full stack.
+    def _warn_if_circular_buffer_too_small(self, per_camera_images: int) -> None:
+        """Log a warning if a worker's circular buffer can't fit one z-stack.
 
-        MMCore's default circular buffer footprint (100-250 MB) is far
-        smaller than a full hardware-triggered z-stack on this rig's
-        Kinetix/PVCAM cameras (~11 MB/frame at 2400x2400x16-bit) -- e.g. a
-        201-slice, 2-camera acquisition needs ~4.4 GB. An earlier version of
-        this method resized the buffer here, mid-``setup_sequence`` (right
-        after :meth:`_arm_cameras`), and that crashed PVCAM's driver
-        (``pvcam64.dll``, exception ``0xc0000409`` /
-        STATUS_STACK_BUFFER_OVERRUN) even *more* reliably than the
-        wraparound it was meant to prevent -- almost certainly because
-        resizing while a camera is already armed for external triggering
-        leaves the device adapter's buffer pointers stale relative to the
-        newly-reallocated core buffer. The buffer is now sized once, at
-        session startup, before any camera is ever armed -- see
-        :func:`~pymmcore_gui.asi_z_stack.asi_controller.
-        ensure_circular_buffer_capacity`. This just warns if that session-
-        level allocation somehow isn't enough for the current sequence,
-        rather than trying to fix it here.
+        Each camera now lives in its own worker process with its own
+        circular buffer (``HardwareConstants.worker_circular_buffer_mb``) --
+        unlike the old single shared 30 GB main-process buffer this replaces,
+        each worker's buffer only ever needs to hold *one* camera's frames,
+        not ``n_cameras`` worth. Must run against the main process's core
+        *before* :meth:`_handoff_to_workers` releases the cameras -- it needs
+        their live image geometry, which isn't available once they're gone.
+        Mirrors an earlier, hard-won lesson from the old single-buffer
+        design: never resize a circular buffer after a camera is armed for
+        external triggering (that crashed PVCAM's driver,
+        ``pvcam64.dll``, exception ``0xc0000409`` / STATUS_STACK_BUFFER_OVERRUN,
+        even more reliably than the wraparound it was meant to prevent) --
+        so this only warns, it never resizes anything itself. Each worker
+        sizes its own buffer once at startup, before arming -- see
+        :func:`~pymmcore_gui.asi_z_stack.camera_worker.run_camera_worker`.
+
+        Parameters
+        ----------
+        per_camera_images : int
+            The number of frames one camera's z-stack will produce (not
+            multiplied by camera count -- each worker only buffers its own).
         """
         mmc = self.mmcore
         bytes_per_frame = (
@@ -114,20 +193,14 @@ class _ASITriggerEngineBase(MDAEngine):
         )
         if bytes_per_frame <= 0:
             return
-        required_mb = (bytes_per_frame * total_images * 1.5) / (1024 * 1024)
-        current_mb = mmc.getCircularBufferMemoryFootprint()
-        if required_mb > current_mb:
+        required_mb = (bytes_per_frame * per_camera_images * 1.5) / (1024 * 1024)
+        if required_mb > self.hw.worker_circular_buffer_mb:
             logger.warning(
-                f"Circular buffer ({current_mb} MB) may be too small for "
-                f"{total_images} frames (~{required_mb:.0f} MB needed) -- "
-                "consider raising HardwareConstants.circular_buffer_target_mb."
+                f"Worker circular buffer ({self.hw.worker_circular_buffer_mb} MB) "
+                f"may be too small for {per_camera_images} frames "
+                f"(~{required_mb:.0f} MB needed) -- consider raising "
+                "HardwareConstants.worker_circular_buffer_mb."
             )
-
-    def _restore_cameras(self) -> None:
-        """Undo :meth:`_arm_cameras`."""
-        for cam_label, original_mode in self._original_trigger_modes.items():
-            if cam_label in self.mmcore.getLoadedDevices():
-                self.mmcore.setProperty(cam_label, "TriggerMode", original_mode)
 
     def event_iterator(self, events: Iterable[MDAEvent]) -> Iterator[MDAEvent]:
         """Collapse each hardware z-stack down to a single event.
@@ -142,31 +215,99 @@ class _ASITriggerEngineBase(MDAEngine):
             if event.index.get("z", 0) == 0:
                 yield event
 
+    def _build_frame_meta(
+        self,
+        sub_event: MDAEvent,
+        camera_label: str,
+        camera_metadata: dict[str, object],
+        images_remaining: int,
+        runner_time_ms: float,
+    ) -> FrameMetaV1:
+        """Build ``FrameMetaV1`` by hand, avoiding the stock ``get_frame_metadata``.
+
+        ``self.get_frame_metadata`` calls Camera-role-dependent core methods
+        (``getExposure()`` with no camera argument, in particular) that
+        misbehave once every physical camera has been released to a worker
+        process -- so this reconstructs the same fields from values already
+        cached while the cameras were still loaded (see
+        :meth:`_handoff_to_workers`), plus the per-frame ``camera_metadata``
+        each worker reports.
+
+        Parameters
+        ----------
+        sub_event : MDAEvent
+            This frame's per-slice/per-camera event.
+        camera_label : str
+            Which physical camera produced this frame.
+        camera_metadata : dict[str, object]
+            The raw MMCore image-tag dict the worker read off its own
+            circular buffer.
+        images_remaining : int
+            Images still buffered in the worker's circular buffer.
+        runner_time_ms : float
+            Elapsed time since the MDA sequence started.
+        """
+        meta: FrameMetaV1 = {
+            "format": "frame-dict",
+            "version": "1.0",
+            "pixel_size_um": self._pixel_size_um,
+            "camera_device": camera_label,
+            "exposure_ms": self._exposure_ms,
+            "property_values": (),
+            "runner_time_ms": runner_time_ms,
+            "mda_event": sub_event,
+            "hardware_triggered": True,
+            "images_remaining_in_buffer": images_remaining,
+            "camera_metadata": camera_metadata,
+        }
+        if self._include_frame_position_metadata is True:
+            from pymmcore_plus.metadata.functions import position
+
+            meta["position"] = position(self.mmcore)
+        return meta
+
     def exec_event(
         self, event: MDAEvent
     ) -> Iterable[tuple[np.ndarray, MDAEvent, FrameMetaV1]]:
         """Trigger the PLogic/SPIM stack and yield one payload per slice/camera.
 
         A single event (see :meth:`event_iterator`) drives the whole z-stack.
-        Frames land interleaved in the circular buffer; each is tagged with its
-        physical camera (``camera_device`` + ``cam`` index) and its slice (``z``
-        index) so per-camera writers receive a full, distinct z-stack.
-        """
-        mmc = self.mmcore
-        active_cam = mmc.getCameraDevice()
-        n_cameras = mmc.getNumberOfCameraChannels()
-        total_images = self._num_slices * n_cameras
+        Each physical camera's worker process streams its own frames back
+        independently (see :mod:`~pymmcore_gui.asi_z_stack.worker_pool`); each
+        is tagged with its physical camera (``camera_device`` + ``cam`` index,
+        the latter now from the worker pool's own ordering, not a Multi
+        Camera-specific metadata tag) and its slice (``z`` index, the
+        worker's own arrival-order counter) so per-camera writers receive a
+        full, distinct z-stack.
 
-        # Arm the buffer and trigger the hardware z-stack.
-        mmc.startSequenceAcquisition(active_cam, total_images, 0, True)
-        logger.info(
-            f"Camera armed for {total_images} images "
-            f"(sequence running: {mmc.isSequenceRunning()})."
+        A generator ``send()`` of ``"cancel"`` (how
+        :class:`~pymmcore_plus.mda.MDARunner` delivers MDA cancellation into a
+        running ``exec_event``) stops both workers and returns early instead
+        of being silently ignored, as it was before this method streamed
+        frames straight from a shared circular buffer.
+
+        The camera handoff itself happens lazily, here, on the first call --
+        see :meth:`_handoff_to_workers`'s docstring for why it can't happen
+        in ``setup_sequence``. Subsequent calls within the same MDA run (one
+        per timepoint/collapsed z-stack) reuse the same worker pool.
+        """
+        if self._worker_pool is None:
+            self._handoff_to_workers()
+        assert self._worker_pool is not None and self._snapshot is not None
+        n_cameras = self._snapshot.n_cameras
+
+        self._worker_pool.arm_all(
+            self._num_slices, armed_timeout=self.hw.worker_arm_timeout_s
         )
+        logger.info(f"{n_cameras} camera(s) armed for {self._num_slices} images each.")
         # See _trigger_spim_state_value's docstring: currently always
         # "Running" on the galvo (its NO_SCAN/SLICE_SCAN_ONLY trigger path)
         # -- the piezo's SPIMState property has no "Running" value at all,
-        # so no engine here uses it as _master_axis_label.
+        # so no engine here uses it as _master_axis_label. Both workers are
+        # already armed and waiting for the shared PLogic/TTL trigger below --
+        # that hardware signal, not software call order, is what actually
+        # synchronizes the two cameras' exposures.
+        mmc = self.mmcore
         mmc.setProperty(
             self._master_axis_label, "SPIMState", self._trigger_spim_state_value
         )
@@ -174,95 +315,41 @@ class _ASITriggerEngineBase(MDAEngine):
         logger.info(f"{self._master_axis_label} SPIMState readback: '{spim_state}'.")
 
         runner_t0 = event.metadata.get("runner_t0")
-        # Per-physical-camera counter -> the z index of that camera's next slice.
-        slice_counts: dict[int, int] = {}
-        images_collected = 0
-        # A fixed total-duration budget (total_images * exposure_ms + grace) is
-        # too tight: measured on the bench at ~10ms exposure, sustained
-        # throughput is ~36ms/image once galvo settle, PLogic cycle overhead,
-        # and readout are included, not the nominal 10ms -- so a long sequence
-        # can still be steadily progressing when a total-duration budget runs
-        # out. Time out only on a genuine stall (no new image for
-        # stall_timeout_s) instead, so slower-than-nominal but healthy
-        # throughput never trips it.
-        stall_timeout_s = 5.0
-        start_time = time.time()
-        last_progress_log = start_time
-        last_image_time = start_time
-
-        while images_collected < total_images:
-            now = time.time()
-            if now - last_image_time > stall_timeout_s:
-                raise TimeoutError(
-                    f"Acquisition stalled: no new image for "
-                    f"{stall_timeout_s:.1f}s ({images_collected}/{total_images} "
-                    "collected)."
-                )
-            if now - last_progress_log > 1.0:
-                # Camera-buffer-side only -- no Tiger serial traffic here.
-                # Once triggered, this acquisition is fully hardware-timed;
-                # the wait loop must not compete with the SPIM state
-                # machine's own timing for the serial link.
-                logger.debug(
-                    f"...waiting: {images_collected}/{total_images} collected, "
-                    f"{mmc.getRemainingImageCount()} buffered, "
-                    f"sequence running: {mmc.isSequenceRunning()}."
-                )
-                last_progress_log = now
-
-            remaining = mmc.getRemainingImageCount()
-            if remaining > 0:
-                img, mm_meta = mmc.popNextImageAndMD()
-
-                # Physical-camera channel: the Multi Camera adapter tags each
-                # frame with a ``*CameraChannelIndex``; single-camera frames
-                # default to channel 0.
-                ch_index = int(
-                    next(
-                        (
-                            v
-                            for k, v in mm_meta.items()
-                            if k.endswith("CameraChannelIndex")
-                        ),
-                        0,
-                    )
-                )
-                try:
-                    # In circular-buffer metadata this tag is literally "Camera"
-                    # (the physical camera label), not Keyword.CoreCamera.
-                    camera_device = mm_meta.GetSingleTag("Camera").GetValue()
-                except Exception:
-                    camera_device = mmc.getPhysicalCameraDevice(ch_index)
-
-                slice_idx = slice_counts.get(ch_index, 0)
-                slice_counts[ch_index] = slice_idx + 1
-
+        try:
+            for (
+                camera_label,
+                slice_idx,
+                img,
+                camera_metadata,
+                images_remaining,
+            ) in self._worker_pool.iter_frames(stall_timeout_s=5.0):
+                cam_index = self._snapshot.camera_labels.index(camera_label)
                 new_index = {**event.index, "z": slice_idx}
                 if n_cameras > 1:
-                    new_index["cam"] = ch_index
+                    new_index["cam"] = cam_index
                 sub_event = event.model_copy(update={"index": new_index})
 
                 runner_time_ms = (
                     (time.perf_counter() - runner_t0) * 1000.0 if runner_t0 else 0.0
                 )
-                meta = self.get_frame_metadata(
+                meta = self._build_frame_meta(
                     sub_event,
-                    prop_values=(),
-                    runner_time_ms=runner_time_ms,
-                    camera_device=camera_device,
-                    include_position=self._include_frame_position_metadata is True,
+                    camera_label,
+                    camera_metadata,
+                    images_remaining,
+                    runner_time_ms,
                 )
-                meta["hardware_triggered"] = True
-                meta["images_remaining_in_buffer"] = remaining - 1
-                yield img, sub_event, meta
-                images_collected += 1
-                last_image_time = now
-            elif not mmc.isSequenceRunning():
-                raise RuntimeError(
-                    f"Sequence stopped unexpectedly after {images_collected} images."
-                )
-            else:
-                time.sleep(0.005)
+                received = yield img, sub_event, meta
+                if received == "cancel":
+                    logger.info("MDA cancelled -- stopping camera workers.")
+                    self._worker_pool.stop_all()
+                    return
+        except WorkerDiedError:
+            logger.error(
+                "A camera worker process died during acquisition.", exc_info=True
+            )
+            self._worker_pool.stop_all()
+            raise
 
 
 class ASISPIMEngine(_ASITriggerEngineBase):
@@ -316,10 +403,18 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         logger.info("--- SEQUENCE STARTED: Preparing PLogic and Camera ---")
         self._original_autoshutter = self.mmcore.getAutoShutter()
         self.mmcore.setAutoShutter(False)
-        self._arm_cameras()
-        self._warn_if_circular_buffer_too_small(
-            self._num_slices * self.mmcore.getNumberOfCameraChannels()
-        )
+        # Circular-buffer sizing needs live image geometry, so it must run
+        # against the main process's core before the cameras are released.
+        # The handoff itself is deliberately NOT done here: MDARunner emits
+        # sequenceStarted right after setup_sequence returns, and both
+        # MultiCameraHandler.sequenceStarted and
+        # NDVViewersManager._on_sequence_started independently call
+        # physical_camera_labels(mmc) at that point to eagerly create one
+        # writer/viewer per physical camera -- which needs the cameras still
+        # loaded. _handoff_to_workers() runs lazily on the first exec_event
+        # call instead, which always happens after sequenceStarted has
+        # already fired.
+        self._warn_if_circular_buffer_too_small(self._num_slices)
 
         settings = AcquisitionSettings(
             camera_exposure_ms=self._exposure_ms,
@@ -436,7 +531,7 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         # sibling repo's own cleanup never closes it either.
         time.sleep(0.1)
         self.mmcore.setAutoShutter(self._original_autoshutter)
-        self._restore_cameras()
+        self._reclaim_from_workers()
         logger.info("--- Hardware cleanup complete ---")
 
 
@@ -519,10 +614,18 @@ class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
         )
         self._original_autoshutter = self.mmcore.getAutoShutter()
         self.mmcore.setAutoShutter(False)
-        self._arm_cameras()
-        self._warn_if_circular_buffer_too_small(
-            self._num_slices * self.mmcore.getNumberOfCameraChannels()
-        )
+        # Circular-buffer sizing needs live image geometry, so it must run
+        # against the main process's core before the cameras are released.
+        # The handoff itself is deliberately NOT done here: MDARunner emits
+        # sequenceStarted right after setup_sequence returns, and both
+        # MultiCameraHandler.sequenceStarted and
+        # NDVViewersManager._on_sequence_started independently call
+        # physical_camera_labels(mmc) at that point to eagerly create one
+        # writer/viewer per physical camera -- which needs the cameras still
+        # loaded. _handoff_to_workers() runs lazily on the first exec_event
+        # call instead, which always happens after sequenceStarted has
+        # already fired.
+        self._warn_if_circular_buffer_too_small(self._num_slices)
 
         settings = AcquisitionSettings(
             camera_exposure_ms=self._exposure_ms,
@@ -634,5 +737,5 @@ class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
         # ASISPIMEngine.teardown_sequence's comment on the same point.
         time.sleep(0.1)
         self.mmcore.setAutoShutter(self._original_autoshutter)
-        self._restore_cameras()
+        self._reclaim_from_workers()
         logger.info("--- Hardware cleanup complete ---")

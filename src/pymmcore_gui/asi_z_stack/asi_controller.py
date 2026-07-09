@@ -157,6 +157,45 @@ def close_global_shutter(
             set_property(tiger_comm_hub_label, hub_prop, "Yes")
 
 
+# External trigger modes, in order of preference. Shared between
+# set_camera_trigger_mode (session/main-process cameras) and
+# preferred_external_trigger_mode (camera worker subprocesses, each with
+# their own CMMCorePlus instance -- see camera_worker.py).
+EXTERNAL_TRIGGER_MODES = ("Level Trigger", "Edge Trigger")
+
+
+def preferred_external_trigger_mode(
+    core: CMMCorePlus,
+    camera_label: str,
+    desired_modes: tuple[str, ...] = EXTERNAL_TRIGGER_MODES,
+) -> str | None:
+    """Return the first of *desired_modes* that *camera_label* allows.
+
+    Parameters
+    ----------
+    core : CMMCorePlus
+        The core *camera_label* is loaded on (not necessarily the session
+        singleton -- camera worker subprocesses each have their own).
+    camera_label : str
+        The device label of the camera.
+    desired_modes : tuple[str, ...]
+        Trigger mode names to search for, in order of preference.
+
+    Returns
+    -------
+    str | None
+        The first allowed mode from *desired_modes*, or ``None`` if the
+        camera has no ``TriggerMode`` property or none of them are allowed.
+    """
+    if not core.hasProperty(camera_label, "TriggerMode"):
+        return None
+    try:
+        allowed_modes = core.getAllowedPropertyValues(camera_label, "TriggerMode")
+    except Exception:
+        return None
+    return next((mode for mode in desired_modes if mode in allowed_modes), None)
+
+
 def set_camera_trigger_mode(camera_label: str) -> bool:
     """
     Finds and sets the appropriate external trigger mode on the specified camera.
@@ -172,22 +211,20 @@ def set_camera_trigger_mode(camera_label: str) -> bool:
         logger.warning(f"Camera '{camera_label}' not found.")
         return False
 
-    trigger_prop = "TriggerMode"
-    if not mmc.hasProperty(camera_label, trigger_prop):
+    if not mmc.hasProperty(camera_label, "TriggerMode"):
         logger.warning(f"Camera '{camera_label}' has no 'TriggerMode' property.")
         return False
 
-    # List of desired trigger modes, in order of preference
-    desired_modes = ["Level Trigger", "Edge Trigger"]
     try:
-        allowed_modes = mmc.getAllowedPropertyValues(camera_label, trigger_prop)
-        for mode in desired_modes:
-            if mode in allowed_modes:
-                logger.debug(f"Setting '{camera_label}' trigger mode to '{mode}'")
-                mmc.setProperty(camera_label, trigger_prop, mode)
-                return True
-        logger.warning(f"Could not find a suitable trigger mode for '{camera_label}'")
-        return False
+        mode = preferred_external_trigger_mode(mmc, camera_label)
+        if mode is None:
+            logger.warning(
+                f"Could not find a suitable trigger mode for '{camera_label}'"
+            )
+            return False
+        logger.debug(f"Setting '{camera_label}' trigger mode to '{mode}'")
+        mmc.setProperty(camera_label, "TriggerMode", mode)
+        return True
     except Exception:
         logger.error(f"Error setting trigger mode for '{camera_label}'.", exc_info=True)
         return False
