@@ -42,13 +42,105 @@ def get_property(device_label: str, property_name: str) -> str | None:
     return None
 
 
-def _send_tiger_command(cmd: str, tiger_comm_hub_label: str) -> None:
-    """Internal helper to send a serial command to the Tiger controller."""
+def _send_tiger_command(cmd: str, tiger_comm_hub_label: str) -> str | None:
+    """Internal helper to send a serial command to the Tiger controller.
+
+    Returns the ``SerialResponse`` property's value if the hub exposes one,
+    so query-style commands (e.g. ``RA``) can be read back by callers; other
+    commands can simply ignore the return value.
+    """
     if tiger_comm_hub_label in mmc.getLoadedDevices():
+        print(f"  -> {cmd}")
         mmc.setProperty(tiger_comm_hub_label, "SerialCommand", cmd)
         time.sleep(0.01)
+        if mmc.hasProperty(tiger_comm_hub_label, "SerialResponse"):
+            response = mmc.getProperty(tiger_comm_hub_label, "SerialResponse")
+            print(f"  <- {response}")
+            return response
     else:
         print(f"Warning: TigerCommHub not found. Cannot send command: {cmd}")
+    return None
+
+
+def set_plogic_evaluation_clock(
+    plogic_label: str, tiger_comm_hub_label: str, running: bool
+) -> None:
+    """Send the raw ``PM E=<0|1>`` command around a triggered acquisition.
+
+    Matches the ``microscope-control`` sibling repo's oscilloscope-confirmed
+    working ``PLogicMDAEngine`` (``PM E=1`` sent once right before triggering
+    the galvo, ``PM E=0`` during cleanup) exactly, including sending it at
+    all: ASI's PLogic docs describe ``PM``'s ``E`` parameter as selecting the
+    card's cell-evaluation clock source rather than an arm/disarm toggle, and
+    an earlier version of this codebase removed this call on that basis --
+    but the sibling repo sends it unconditionally and its acquisitions do
+    trigger the camera and laser, so that removal was an unconfirmed,
+    documentation-only guess. What ``PM E`` actually does on this hardware is
+    still not settled; this function exists to match known-working behavior,
+    not because its effect is understood.
+    """
+    plogic_addr_prefix = plogic_label.split(":")[-1]
+    mode = 1 if running else 0
+    _send_tiger_command(f"{plogic_addr_prefix}PM E={mode}", tiger_comm_hub_label)
+
+
+def enable_axis_spim_ttl_output(axis_label: str, tiger_comm_hub_label: str) -> None:
+    """Send ``TTL X=0 Y=20`` on an axis card to arm its per-slice trigger.
+
+    ASI's serial command docs define ``TTL`` output mode ``Y=20`` as "TTL
+    OUT0 set during SPIM state machine operation" (requires the ``MM_SPIM``
+    firmware module) -- i.e. the card pulses its own ``TTL OUT0`` line each
+    time the SPIM state machine settles at a new slice. Mode ``0`` (the
+    card's default) is "TTL OUT0 unconditionally set LOW", so without this
+    call the card never emits a trigger pulse of any kind, regardless of how
+    PLogic is wired downstream. Currently only used by the galvo-driven
+    :class:`~pymmcore_gui.asi_z_stack.engine.ASISPIMEngine` (not currently
+    registered by the GUI -- see its docstring). ASI's own reference plugin
+    (see :class:`~pymmcore_gui.asi_z_stack.engine.ASIStationaryTriggerEngine`'s
+    docstring) never sends this command at all, so the currently-registered
+    engine doesn't call it either.
+
+    This is also the documented mechanism behind ASI's diSPIM reference
+    architecture, where the master card's settle pulse feeds PLogic's own
+    cell-evaluation clock (selected via ``PM E=1``, PLC clock-source code 1,
+    "Backplane C7" -- see :func:`set_plogic_evaluation_clock`), so the whole
+    16-cell array, including the dual-NRT camera/laser trigger cells, only
+    re-evaluates at the instant the master axis has settled. Without this
+    call, ``PM E=1`` selects an evaluation clock line nothing is driving --
+    the array never re-evaluates again, which matched the exact symptom
+    observed with the galvo as master: it stepped through its own SPIM
+    state machine as usual (that motion doesn't depend on PLogic), but no
+    PLogic cell, including the camera/laser NRT ones, ever fired.
+    """
+    axis_addr_prefix = axis_label.split(":")[-1]
+    _send_tiger_command(f"{axis_addr_prefix}TTL X=0 Y=20", tiger_comm_hub_label)
+    _send_tiger_command(f"{axis_addr_prefix}SS Z", tiger_comm_hub_label)
+
+
+def reset_axis_ttl_output(axis_label: str, tiger_comm_hub_label: str) -> None:
+    """Send ``TTL X=0 Y=0`` on an axis card, restoring its documented default.
+
+    ``Y=0`` is "TTL OUT0 unconditionally set LOW" -- ASI's documented
+    default, and the state :class:`~pymmcore_gui.asi_z_stack.engine.
+    ASISPIMEngine` (and the confirmed-working microscope-control sibling
+    repo, which never touches ``TTL X=/Y=`` at all) both implicitly assume
+    the galvo card is already in.
+
+    This exists to undo, not merely avoid: earlier debugging this session
+    called :func:`enable_axis_spim_ttl_output` (``TTL X=0 Y=20``) on the
+    galvo several times, each followed by ``SS Z`` -- saving mode 20 to the
+    card's non-volatile memory. Simply no longer calling that function does
+    *not* revert the card's persisted state; a live bench test showed the
+    galvo still failed to trigger the camera after that call was removed
+    from ``ASISPIMEngine``, with the timeout/symptom otherwise identical to
+    every earlier galvo-driven attempt this session -- consistent with the
+    card still silently carrying the mode-20 setting from an earlier,
+    now-removed code path. Call this once during setup to guarantee a known
+    state instead of relying on the card never having been touched.
+    """
+    axis_addr_prefix = axis_label.split(":")[-1]
+    _send_tiger_command(f"{axis_addr_prefix}TTL X=0 Y=0", tiger_comm_hub_label)
+    _send_tiger_command(f"{axis_addr_prefix}SS Z", tiger_comm_hub_label)
 
 
 def open_global_shutter(
@@ -67,8 +159,8 @@ def open_global_shutter(
         if original_hub_setting == "Yes":
             set_property(tiger_comm_hub_label, hub_prop, "No")
 
-        _send_tiger_command(f"{plogic_addr_prefix}CCA X=0", tiger_comm_hub_label)
         _send_tiger_command(f"M E={plogic_always_on_cell}", tiger_comm_hub_label)
+        _send_tiger_command(f"{plogic_addr_prefix}CCA X=0", tiger_comm_hub_label)
         _send_tiger_command(f"{plogic_addr_prefix}CCA Y=0", tiger_comm_hub_label)
         _send_tiger_command(f"{plogic_addr_prefix}CCA Z=5", tiger_comm_hub_label)
         _send_tiger_command(f"{plogic_addr_prefix}CCB X=1", tiger_comm_hub_label)
@@ -212,6 +304,46 @@ def configure_plogic_for_dual_nrt_pulses(
             set_property(tiger_comm_hub_label, hub_prop, "Yes")
 
 
+def read_plogic_trigger_chain_state(
+    plogic_label: str, tiger_comm_hub_label: str
+) -> dict[str, str | None]:
+    """Read back PLogic's front-panel, backplane, and cell-output bitmasks.
+
+    Wraps the ``RA`` query family so the trigger chain (galvo pulse in ->
+    NRT cell output -> BNC out) can be confirmed directly against hardware
+    state during a bench run, rather than only inferred from an oscilloscope
+    trace. Each value is the raw bitmask string the firmware returns (bit
+    N-1 corresponds to address/cell N); interpret it against the specific
+    address of interest (e.g. the trigger address or camera/laser cell
+    number) since bit width/ordering can vary by firmware revision.
+    """
+    plogic_addr_prefix = plogic_label.split(":")[-1]
+    return {
+        "front_panel (RA X?)": _send_tiger_command(
+            f"{plogic_addr_prefix}RA X?", tiger_comm_hub_label
+        ),
+        "backplane (RA Y?)": _send_tiger_command(
+            f"{plogic_addr_prefix}RA Y?", tiger_comm_hub_label
+        ),
+        "cell_outputs (RA Z?)": _send_tiger_command(
+            f"{plogic_addr_prefix}RA Z?", tiger_comm_hub_label
+        ),
+    }
+
+
+def log_plogic_trigger_chain_state(
+    plogic_label: str, tiger_comm_hub_label: str
+) -> None:
+    """Print PLogic's trigger-chain bitmasks.
+
+    See :func:`read_plogic_trigger_chain_state` for what each field means.
+    """
+    for label, value in read_plogic_trigger_chain_state(
+        plogic_label, tiger_comm_hub_label
+    ).items():
+        print(f"  [PLogic] {label} = {value}")
+
+
 def set_laser_outputs(
     plogic_label: str,
     tiger_comm_hub_label: str,
@@ -267,6 +399,23 @@ def _plogic_available() -> bool:
     return _HW.plogic_label in devices and _HW.tiger_comm_hub_label in devices
 
 
+def asi_zstack_hardware_available() -> bool:
+    """Return True if the PLogic, Tiger hub, and SPIM galvo are all loaded.
+
+    Used by the GUI to decide whether to register the PLogic-triggered
+    :class:`~pymmcore_gui.asi_z_stack.engine.ASISPIMEngine` for MDA
+    z-stacks. Requires the galvo (which that engine drives as trigger
+    master) in addition to the PLogic hardware checked by
+    :func:`_plogic_available`.
+    """
+    devices = mmc.getLoadedDevices()
+    return (
+        _HW.plogic_label in devices
+        and _HW.tiger_comm_hub_label in devices
+        and _HW.galvo_a_label in devices
+    )
+
+
 def ensure_global_shutter_open() -> None:
     """Raise the fiber-optic global shutter and configure the always-on cell.
 
@@ -284,6 +433,21 @@ def ensure_global_shutter_open() -> None:
         _HW.plogic_always_on_cell,
         _HW.plogic_bnc3_addr,
     )
+
+
+def ensure_beam_enabled() -> None:
+    """Enable the galvo's beam once per session.
+
+    No-op if the galvo isn't loaded. A captured debug log of the
+    microscope-control sibling repo's actual working ``CustomPLogicMDAEngine``
+    run showed ``BeamEnabled`` set to ``Yes`` once, as a session-level
+    initialization step ("Enabling SPIM beam for the session"), not
+    toggled on/off around every individual MDA run the way an earlier
+    version of :class:`~pymmcore_gui.asi_z_stack.engine.ASISPIMEngine` did.
+    """
+    if _HW.galvo_a_label not in mmc.getLoadedDevices():
+        return
+    set_property(_HW.galvo_a_label, "BeamEnabled", "Yes")
 
 
 def _selected_laser_bncs() -> list[int]:

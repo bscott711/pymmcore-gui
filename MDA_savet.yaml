@@ -1,5 +1,4 @@
 axis_order:
-- t
 - p
 - z
 - c
@@ -10,17 +9,14 @@ channels:
 metadata:
   pymmcore_widgets:
     format: ome-zarr
-    save_dir: S:/TEMP_CAMERA_STREAMING/claude_vibe
-    save_name: next.ome.zarr
+    save_dir: S:/TEMP_CAMERA_STREAMING
+    save_name: cooked_001.ome.zarr
     should_save: true
     version: 0.10.1.dev4+ga016e8f07
 stage_positions:
-- x: 742.04
-  y: 361.25
-  z: -14.525
-time_plan:
-  interval: 5.0
-  loops: 2
+- x: 1269.03
+  y: -1580.02
+  z: 2.804
 z_plan:
-  range: 30.0
-  step: 10.0
+  range: 20.0
+  step: 0.1

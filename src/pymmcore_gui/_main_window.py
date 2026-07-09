@@ -408,11 +408,47 @@ class MicroManagerGUI(QMainWindow):
         settings.flush()
 
         # On ASI/PLogic configs, raise the fiber-optic global shutter and set up
-        # the always-on cell so software snap/live can gate the laser BNCs.
-        # No-op for demo / non-ASI configs.
-        from pymmcore_gui.asi_z_stack.asi_controller import ensure_global_shutter_open
+        # the always-on cell so software snap/live can gate the laser BNCs, and
+        # enable the galvo's beam once for the session (matching the
+        # microscope-control sibling repo's confirmed-working engine, which
+        # does this once at startup rather than per-MDA-run). Both are
+        # no-ops for demo / non-ASI configs.
+        from pymmcore_gui.asi_z_stack.asi_controller import (
+            ensure_beam_enabled,
+            ensure_global_shutter_open,
+        )
 
         ensure_global_shutter_open()
+        ensure_beam_enabled()
+
+        self._register_mda_engine()
+
+    def _register_mda_engine(self) -> None:
+        """Select the MDA engine to match the loaded configuration.
+
+        On ASI/PLogic configs, install the PLogic-triggered
+        :class:`~pymmcore_gui.asi_z_stack.engine.ASISPIMEngine` so MDA
+        z-stacks step the galvo via hardware triggers instead of running a
+        software stage-stepping z-stack. On demo / non-ASI configs, restore
+        the stock :class:`~pymmcore_plus.mda.MDAEngine`. Idempotent: the
+        engine is only swapped when it doesn't already match the current
+        hardware, so demo/test sessions keep the default engine untouched.
+        """
+        from pymmcore_plus.mda import MDAEngine
+
+        from pymmcore_gui.asi_z_stack.asi_controller import (
+            asi_zstack_hardware_available,
+        )
+        from pymmcore_gui.asi_z_stack.common import HardwareConstants
+        from pymmcore_gui.asi_z_stack.engine import ASISPIMEngine
+
+        engine = self._mmc.mda.engine
+        if asi_zstack_hardware_available():
+            if not isinstance(engine, ASISPIMEngine):
+                self._mmc.mda.set_engine(ASISPIMEngine(self._mmc, HardwareConstants()))
+        elif isinstance(engine, ASISPIMEngine):
+            # returning to a demo / non-ASI config: restore the stock engine
+            self._mmc.mda.set_engine(MDAEngine(self._mmc))
 
     def _add_toolbar(self, name: str, tb_entry: ToolDictValue) -> None:
         if callable(tb_entry):

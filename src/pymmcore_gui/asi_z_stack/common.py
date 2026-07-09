@@ -49,7 +49,23 @@ class HardwareConstants:
 
     # Extended parameters for SPIM Z-stack calculations
     slice_calibration_slope_um_per_deg: float = 100.0
-    line_scans_per_slice: int = 1
-    delay_before_scan_ms: float = 0.0
+
+    # Galvo slice-timing defaults. ``delay_before_side_ms``/``delay_before_repeat_ms``
+    # are confirmed against the ``microscope-control`` sibling repo's
+    # validated-working ``CustomPLogicMDAEngine`` (HEAD commit 5f5f573,
+    # ``hardware_profiles/default_config.yml``). These are unrelated to ASI's
+    # native per-slice camera/laser trigger properties (``SPIMDelayBeforeCamera(ms)``
+    # etc.) -- this design triggers the camera and laser entirely through the
+    # PLogic dual-NRT cells (see ``configure_plogic_for_dual_nrt_pulses``), so
+    # those native properties are never set (zeroed in engine.py instead).
+    #
+    # ``line_scan_duration_ms`` was previously kept at 10.5 based on an
+    # early, unverified claim that 1.0 produced zero observable galvo
+    # motion. That claim is now directly contradicted: a full run of the
+    # microscope-control sibling repo's actual CustomPLogicMDAEngine on this
+    # exact hardware, captured in its debug log, set
+    # "Scanner:AB:33.SPIMScanDuration(ms) = 1.0" and went on to collect all
+    # 201 real frames of a z-stack. Reverted to match that confirmed run.
     line_scan_duration_ms: float = 1.0
     delay_before_side_ms: float = 0.0
+    delay_before_repeat_ms: float = 0.0
