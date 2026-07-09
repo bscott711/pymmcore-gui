@@ -12,16 +12,27 @@ chatter competing with the SPIM state machine's own timing.
 
 from __future__ import annotations
 
+import logging
 import time
 
 from pymmcore_gui._multi_camera_handler import physical_camera_labels
 
+from ._logging import configure_asi_logging
 from .asi_controller import _HW, _send_tiger_command, mmc, set_camera_trigger_mode
 
+logger = logging.getLogger(__name__)
+
+# This module is meant to be run interactively (see the module docstring
+# above), so ensure its output is visible by default even if the caller
+# hasn't gone through the `--debug` CLI flag first.
+configure_asi_logging("INFO")
+
 # Backplane TTL0-TTL7, per ASI's PLogic docs ("addresses 41-48 are for the
-# backplane signals, address 41 for TTL0 and so forth"). Address 41 (TTL0)
-# has already been ruled out on the bench: with an oscilloscope on BNC1, no
-# pulse appeared there while the galvo was actively scanning.
+# backplane signals, address 41 for TTL0 and so forth"). An earlier bench
+# session's oscilloscope check on BNC1 seemed to rule out address 41 (TTL0),
+# but that's contradicted by the microscope-control sibling repo's own
+# confirmed-working config (plogic_trigger_ttl_addr: 41) -- treat that
+# earlier finding as unreliable rather than as a reason to avoid 41 here.
 BACKPLANE_TTL_ADDRS = list(range(41, 49))
 
 
@@ -61,7 +72,9 @@ def sweep_backplane_ttl_addrs(candidates: list[int] = BACKPLANE_TTL_ADDRS) -> No
             )
     finally:
         restore_bnc1_to_camera_cell()
-        print(f"BNC1 restored to the camera cell (address {_HW.plogic_camera_cell}).")
+        logger.info(
+            f"BNC1 restored to the camera cell (address {_HW.plogic_camera_cell})."
+        )
 
 
 def poll_plogic_during_live_scan(
@@ -110,7 +123,9 @@ def poll_plogic_during_live_scan(
     plogic_addr = _HW.plogic_label.split(":")[-1]
 
     mmc.setProperty(galvo_label, "SPIMState", "Running")
-    print(f"Galvo triggered -- polling PLogic RA X?/Y?/Z? for {duration_s:.1f}s...")
+    logger.info(
+        f"Galvo triggered -- polling PLogic RA X?/Y?/Z? for {duration_s:.1f}s..."
+    )
 
     last: dict[str, str | None] = {"X": None, "Y": None, "Z": None}
     t0 = time.time()
@@ -122,7 +137,7 @@ def poll_plogic_during_live_scan(
             )
             if resp != last[axis]:
                 elapsed = time.time() - t0
-                print(
+                logger.info(
                     f"  [{elapsed:6.3f}s] RA {axis}? changed: "
                     f"{last[axis]!r} -> {resp!r}"
                 )
@@ -131,7 +146,7 @@ def poll_plogic_during_live_scan(
         time.sleep(poll_interval_s)
 
     if not changed:
-        print(
+        logger.info(
             "No change observed on RA X?/Y?/Z? for the whole scan -- PLogic "
             "never saw the galvo do anything."
         )
@@ -183,13 +198,13 @@ def poll_camera_and_plogic_during_live_scan(
             )
         set_camera_trigger_mode(cam_label)
         mode = mmc.getProperty(cam_label, "TriggerMode")
-        print(f"  [{cam_label}] TriggerMode = {mode!r}")
+        logger.info(f"  [{cam_label}] TriggerMode = {mode!r}")
 
     try:
         mmc.startSequenceAcquisition(active_cam, num_images, 0, True)
-        print(f"Camera armed (sequence running: {mmc.isSequenceRunning()}).")
+        logger.info(f"Camera armed (sequence running: {mmc.isSequenceRunning()}).")
         mmc.setProperty(galvo_label, "SPIMState", "Running")
-        print(f"Galvo triggered -- polling for {duration_s:.1f}s...")
+        logger.info(f"Galvo triggered -- polling for {duration_s:.1f}s...")
 
         last: dict[str, str | None] = {"X": None, "Y": None, "Z": None}
         last_count = -1
@@ -198,7 +213,7 @@ def poll_camera_and_plogic_during_live_scan(
             remaining = mmc.getRemainingImageCount()
             if remaining != last_count:
                 elapsed = time.time() - t0
-                print(
+                logger.info(
                     f"  [{elapsed:6.3f}s] buffered images: {last_count} -> {remaining}"
                 )
                 last_count = remaining
@@ -208,20 +223,20 @@ def poll_camera_and_plogic_during_live_scan(
                 )
                 if resp != last[axis]:
                     elapsed = time.time() - t0
-                    print(
+                    logger.info(
                         f"  [{elapsed:6.3f}s] RA {axis}? changed: "
                         f"{last[axis]!r} -> {resp!r}"
                     )
                     last[axis] = resp
             time.sleep(poll_interval_s)
 
-        print(f"Final buffered image count: {mmc.getRemainingImageCount()}.")
+        logger.info(f"Final buffered image count: {mmc.getRemainingImageCount()}.")
     finally:
         mmc.setProperty(galvo_label, "SPIMState", "Idle")
         mmc.stopSequenceAcquisition(active_cam)
         for cam_label, original_mode in original_trigger_modes.items():
             mmc.setProperty(cam_label, "TriggerMode", original_mode)
-        print("Camera TriggerMode restored to pre-scan value(s).")
+        logger.info("Camera TriggerMode restored to pre-scan value(s).")
 
 
 if __name__ == "__main__":

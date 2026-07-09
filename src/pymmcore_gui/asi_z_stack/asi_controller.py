@@ -1,4 +1,5 @@
 # src/microscope/asi_z_stack/asi_controller.py
+import logging
 import time
 from typing import TYPE_CHECKING
 
@@ -10,6 +11,8 @@ from .common import HardwareConstants
 
 if TYPE_CHECKING:
     from .common import AcquisitionSettings
+
+logger = logging.getLogger(__name__)
 
 mmc = CMMCorePlus.instance()
 _HW = HardwareConstants()
@@ -23,8 +26,8 @@ def set_property(device_label: str, property_name: str, value: str) -> None:
         if mmc.getProperty(device_label, property_name) != str(value):
             mmc.setProperty(device_label, property_name, value)
     else:
-        print(
-            f"Warning: Cannot set '{property_name}' for device '{device_label}'. "
+        logger.warning(
+            f"Cannot set '{property_name}' for device '{device_label}'. "
             "Device or property not found."
         )
 
@@ -35,112 +38,57 @@ def get_property(device_label: str, property_name: str) -> str | None:
         device_label, property_name
     ):
         return mmc.getProperty(device_label, property_name)
-    print(
-        f"Warning: Cannot get '{property_name}' for device '{device_label}'. "
+    logger.warning(
+        f"Cannot get '{property_name}' for device '{device_label}'. "
         "Device or property not found."
     )
     return None
 
 
-def _send_tiger_command(cmd: str, tiger_comm_hub_label: str) -> str | None:
+def _send_tiger_command(
+    cmd: str, tiger_comm_hub_label: str, axis: str = ""
+) -> str | None:
     """Internal helper to send a serial command to the Tiger controller.
 
-    Returns the ``SerialResponse`` property's value if the hub exposes one,
-    so query-style commands (e.g. ``RA``) can be read back by callers; other
-    commands can simply ignore the return value.
+    Prepends ``axis`` (a card address prefix, e.g. ``"33"``) to ``cmd`` per
+    ASI's ``[axis][command][options]`` serial convention, so callers can
+    address a specific card without building the prefix into ``cmd``
+    themselves. Returns the ``SerialResponse`` property's value if the hub
+    exposes one, so query-style commands (e.g. ``RA``) can be read back by
+    callers; other commands can simply ignore the return value.
     """
+    full_cmd = f"{axis}{cmd}"
     if tiger_comm_hub_label in mmc.getLoadedDevices():
-        print(f"  -> {cmd}")
-        mmc.setProperty(tiger_comm_hub_label, "SerialCommand", cmd)
+        logger.debug(f"  -> {full_cmd}")
+        mmc.setProperty(tiger_comm_hub_label, "SerialCommand", full_cmd)
         time.sleep(0.01)
         if mmc.hasProperty(tiger_comm_hub_label, "SerialResponse"):
             response = mmc.getProperty(tiger_comm_hub_label, "SerialResponse")
-            print(f"  <- {response}")
+            logger.debug(f"  <- {response}")
             return response
     else:
-        print(f"Warning: TigerCommHub not found. Cannot send command: {cmd}")
+        logger.warning(f"TigerCommHub not found. Cannot send command: {full_cmd}")
     return None
 
 
-def set_plogic_evaluation_clock(
-    plogic_label: str, tiger_comm_hub_label: str, running: bool
-) -> None:
-    """Send the raw ``PM E=<0|1>`` command around a triggered acquisition.
+def set_plogic_evaluation_clock(tiger_comm_hub_label: str, running: bool) -> None:
+    """Send the raw ``PM E=<0|1>`` command, completely unaddressed.
 
-    Matches the ``microscope-control`` sibling repo's oscilloscope-confirmed
-    working ``PLogicMDAEngine`` (``PM E=1`` sent once right before triggering
-    the galvo, ``PM E=0`` during cleanup) exactly, including sending it at
-    all: ASI's PLogic docs describe ``PM``'s ``E`` parameter as selecting the
-    card's cell-evaluation clock source rather than an arm/disarm toggle, and
-    an earlier version of this codebase removed this call on that basis --
-    but the sibling repo sends it unconditionally and its acquisitions do
-    trigger the camera and laser, so that removal was an unconfirmed,
-    documentation-only guess. What ``PM E`` actually does on this hardware is
-    still not settled; this function exists to match known-working behavior,
-    not because its effect is understood.
+    Matches a captured DEBUG-level log of the microscope-control sibling
+    repo's actual, successful 201-slice acquisition on this exact hardware
+    byte-for-byte: ``Tiger command sent: PM E=1`` (no axis prefix at all)
+    right before triggering the galvo, ``Tiger command sent: PM E=0`` during
+    cleanup. Two earlier versions of this function guessed at an explicit
+    prefix instead -- first the scanner (``33PM E=1``, which the controller
+    rejects outright: ``:N-2``, unrecognized command), then PLogic itself
+    (``36PM E=1``, which the controller accepts, ``:A``, but which did not
+    reproduce the sibling repo's working behavior). Neither guess was
+    needed: the real log sends this command with no prefix at all, so
+    match that exactly rather than re-deriving the addressing model from
+    ASI's general documentation.
     """
-    plogic_addr_prefix = plogic_label.split(":")[-1]
     mode = 1 if running else 0
-    _send_tiger_command(f"{plogic_addr_prefix}PM E={mode}", tiger_comm_hub_label)
-
-
-def enable_axis_spim_ttl_output(axis_label: str, tiger_comm_hub_label: str) -> None:
-    """Send ``TTL X=0 Y=20`` on an axis card to arm its per-slice trigger.
-
-    ASI's serial command docs define ``TTL`` output mode ``Y=20`` as "TTL
-    OUT0 set during SPIM state machine operation" (requires the ``MM_SPIM``
-    firmware module) -- i.e. the card pulses its own ``TTL OUT0`` line each
-    time the SPIM state machine settles at a new slice. Mode ``0`` (the
-    card's default) is "TTL OUT0 unconditionally set LOW", so without this
-    call the card never emits a trigger pulse of any kind, regardless of how
-    PLogic is wired downstream. Currently only used by the galvo-driven
-    :class:`~pymmcore_gui.asi_z_stack.engine.ASISPIMEngine` (not currently
-    registered by the GUI -- see its docstring). ASI's own reference plugin
-    (see :class:`~pymmcore_gui.asi_z_stack.engine.ASIStationaryTriggerEngine`'s
-    docstring) never sends this command at all, so the currently-registered
-    engine doesn't call it either.
-
-    This is also the documented mechanism behind ASI's diSPIM reference
-    architecture, where the master card's settle pulse feeds PLogic's own
-    cell-evaluation clock (selected via ``PM E=1``, PLC clock-source code 1,
-    "Backplane C7" -- see :func:`set_plogic_evaluation_clock`), so the whole
-    16-cell array, including the dual-NRT camera/laser trigger cells, only
-    re-evaluates at the instant the master axis has settled. Without this
-    call, ``PM E=1`` selects an evaluation clock line nothing is driving --
-    the array never re-evaluates again, which matched the exact symptom
-    observed with the galvo as master: it stepped through its own SPIM
-    state machine as usual (that motion doesn't depend on PLogic), but no
-    PLogic cell, including the camera/laser NRT ones, ever fired.
-    """
-    axis_addr_prefix = axis_label.split(":")[-1]
-    _send_tiger_command(f"{axis_addr_prefix}TTL X=0 Y=20", tiger_comm_hub_label)
-    _send_tiger_command(f"{axis_addr_prefix}SS Z", tiger_comm_hub_label)
-
-
-def reset_axis_ttl_output(axis_label: str, tiger_comm_hub_label: str) -> None:
-    """Send ``TTL X=0 Y=0`` on an axis card, restoring its documented default.
-
-    ``Y=0`` is "TTL OUT0 unconditionally set LOW" -- ASI's documented
-    default, and the state :class:`~pymmcore_gui.asi_z_stack.engine.
-    ASISPIMEngine` (and the confirmed-working microscope-control sibling
-    repo, which never touches ``TTL X=/Y=`` at all) both implicitly assume
-    the galvo card is already in.
-
-    This exists to undo, not merely avoid: earlier debugging this session
-    called :func:`enable_axis_spim_ttl_output` (``TTL X=0 Y=20``) on the
-    galvo several times, each followed by ``SS Z`` -- saving mode 20 to the
-    card's non-volatile memory. Simply no longer calling that function does
-    *not* revert the card's persisted state; a live bench test showed the
-    galvo still failed to trigger the camera after that call was removed
-    from ``ASISPIMEngine``, with the timeout/symptom otherwise identical to
-    every earlier galvo-driven attempt this session -- consistent with the
-    card still silently carrying the mode-20 setting from an earlier,
-    now-removed code path. Call this once during setup to guarantee a known
-    state instead of relying on the card never having been touched.
-    """
-    axis_addr_prefix = axis_label.split(":")[-1]
-    _send_tiger_command(f"{axis_addr_prefix}TTL X=0 Y=0", tiger_comm_hub_label)
-    _send_tiger_command(f"{axis_addr_prefix}SS Z", tiger_comm_hub_label)
+    _send_tiger_command(f"PM E={mode}", tiger_comm_hub_label)
 
 
 def open_global_shutter(
@@ -150,7 +98,7 @@ def open_global_shutter(
     plogic_bnc3_addr: int,
 ) -> None:
     """Configures and opens a global shutter on PLogic BNC3."""
-    print("Opening global shutter (BNC3 HIGH)...")
+    logger.debug("Opening global shutter (BNC3 HIGH)...")
     plogic_addr_prefix = plogic_label.split(":")[-1]
     hub_prop = "OnlySendSerialCommandOnChange"
     original_hub_setting = get_property(tiger_comm_hub_label, hub_prop)
@@ -159,19 +107,20 @@ def open_global_shutter(
         if original_hub_setting == "Yes":
             set_property(tiger_comm_hub_label, hub_prop, "No")
 
-        _send_tiger_command(f"M E={plogic_always_on_cell}", tiger_comm_hub_label)
+        # Order and bundling (Y and Z together) both matter here -- they
+        # match the sibling repo's oscilloscope-confirmed working sequence.
         _send_tiger_command(f"{plogic_addr_prefix}CCA X=0", tiger_comm_hub_label)
-        _send_tiger_command(f"{plogic_addr_prefix}CCA Y=0", tiger_comm_hub_label)
-        _send_tiger_command(f"{plogic_addr_prefix}CCA Z=5", tiger_comm_hub_label)
+        _send_tiger_command(f"M E={plogic_always_on_cell}", tiger_comm_hub_label)
+        _send_tiger_command(f"{plogic_addr_prefix}CCA Y=0 Z=5", tiger_comm_hub_label)
         _send_tiger_command(f"{plogic_addr_prefix}CCB X=1", tiger_comm_hub_label)
         _send_tiger_command(f"M E={plogic_bnc3_addr}", tiger_comm_hub_label)
         _send_tiger_command(
             f"{plogic_addr_prefix}CCA Z={plogic_always_on_cell}", tiger_comm_hub_label
         )
         _send_tiger_command(f"{plogic_addr_prefix}SS Z", tiger_comm_hub_label)
-        print("Global shutter is open (BNC3 is HIGH).")
-    except Exception as e:
-        print(f"Error opening global shutter: {e}")
+        logger.info("Global shutter is open (BNC3 is HIGH).")
+    except Exception:
+        logger.error("Error opening global shutter.", exc_info=True)
     finally:
         if original_hub_setting == "Yes":
             set_property(tiger_comm_hub_label, hub_prop, "Yes")
@@ -181,14 +130,14 @@ def close_global_shutter(
     plogic_label: str, tiger_comm_hub_label: str, plogic_bnc3_addr: int
 ) -> None:
     """Closes the global shutter on PLogic BNC3."""
-    print("Closing global shutter (BNC3 LOW)...")
+    logger.debug("Closing global shutter (BNC3 LOW)...")
     plogic_addr_prefix = plogic_label.split(":")[-1]
     hub_prop = "OnlySendSerialCommandOnChange"
     original_hub_setting = get_property(tiger_comm_hub_label, hub_prop)
 
     try:
         if plogic_label not in mmc.getLoadedDevices():
-            print("PLogic device not found, cannot close shutter.")
+            logger.warning("PLogic device not found, cannot close shutter.")
             return
 
         if original_hub_setting == "Yes":
@@ -197,9 +146,9 @@ def close_global_shutter(
         _send_tiger_command(f"M E={plogic_bnc3_addr}", tiger_comm_hub_label)
         _send_tiger_command(f"{plogic_addr_prefix}CCA Z=0", tiger_comm_hub_label)
         _send_tiger_command(f"{plogic_addr_prefix}SS Z", tiger_comm_hub_label)
-        print("Global shutter is closed (BNC3 is LOW).")
-    except Exception as e:
-        print(f"Warning: Could not close global shutter. Error: {e}")
+        logger.info("Global shutter is closed (BNC3 is LOW).")
+    except Exception:
+        logger.warning("Could not close global shutter.", exc_info=True)
     finally:
         if (
             original_hub_setting == "Yes"
@@ -220,12 +169,12 @@ def set_camera_trigger_mode(camera_label: str) -> bool:
         bool: True if a valid trigger mode was set, False otherwise.
     """
     if camera_label not in mmc.getLoadedDevices():
-        print(f"Warning: Camera '{camera_label}' not found.")
+        logger.warning(f"Camera '{camera_label}' not found.")
         return False
 
     trigger_prop = "TriggerMode"
     if not mmc.hasProperty(camera_label, trigger_prop):
-        print(f"Warning: Camera '{camera_label}' has no 'TriggerMode' property.")
+        logger.warning(f"Camera '{camera_label}' has no 'TriggerMode' property.")
         return False
 
     # List of desired trigger modes, in order of preference
@@ -234,13 +183,13 @@ def set_camera_trigger_mode(camera_label: str) -> bool:
         allowed_modes = mmc.getAllowedPropertyValues(camera_label, trigger_prop)
         for mode in desired_modes:
             if mode in allowed_modes:
-                print(f"Setting '{camera_label}' trigger mode to '{mode}'")
+                logger.debug(f"Setting '{camera_label}' trigger mode to '{mode}'")
                 mmc.setProperty(camera_label, trigger_prop, mode)
                 return True
-        print(f"Warning: Could not find a suitable trigger mode for '{camera_label}'")
+        logger.warning(f"Could not find a suitable trigger mode for '{camera_label}'")
         return False
-    except Exception as e:
-        print(f"Error setting trigger mode for '{camera_label}': {e}")
+    except Exception:
+        logger.error(f"Error setting trigger mode for '{camera_label}'.", exc_info=True)
         return False
 
 
@@ -269,13 +218,15 @@ def configure_plogic_for_dual_nrt_pulses(
 
         # 1. Program Laser Preset
         _send(f"{plogic_addr_prefix}CCA X={plogic_laser_preset_num}")
-        print(f"Laser preset number: {plogic_laser_preset_num}")
+        logger.debug(f"Laser preset number: {plogic_laser_preset_num}")
 
         # 2. Program Camera Pulse (NRT One-Shot #1)
         _send(f"M E={plogic_camera_cell}")
-        _send(f"{plogic_addr_prefix}CCA Y=14")  # NRT one-shot mode
         camera_pulse_cycles = int(settings.camera_exposure_ms * pulses_per_ms)
-        _send(f"{plogic_addr_prefix}CCA Z={camera_pulse_cycles}")
+        # Y (NRT one-shot mode) and Z (pulse length) must be bundled into a
+        # single command -- sent as separate calls, the Tiger controller
+        # drops the cell-edit context between them.
+        _send(f"{plogic_addr_prefix}CCA Y=14 Z={camera_pulse_cycles}")
         _send(
             f"{plogic_addr_prefix}CCB X={plogic_trigger_ttl_addr} "
             f"Y={plogic_4khz_clock_addr} Z=0"
@@ -283,9 +234,8 @@ def configure_plogic_for_dual_nrt_pulses(
 
         # 3. Program Laser Pulse (NRT One-Shot #2)
         _send(f"M E={plogic_laser_on_cell}")
-        _send(f"{plogic_addr_prefix}CCA Y=14")  # NRT one-shot mode
         laser_pulse_cycles = int(settings.laser_trig_duration_ms * pulses_per_ms)
-        _send(f"{plogic_addr_prefix}CCA Z={laser_pulse_cycles}")
+        _send(f"{plogic_addr_prefix}CCA Y=14 Z={laser_pulse_cycles}")
         _send(
             f"{plogic_addr_prefix}CCB X={plogic_trigger_ttl_addr} "
             f"Y={plogic_4khz_clock_addr} Z=0"
@@ -297,7 +247,7 @@ def configure_plogic_for_dual_nrt_pulses(
 
         # 5. Save the configuration
         _send(f"{plogic_addr_prefix}SS Z")
-        print("PLogic configured for dual NRT pulses.")
+        logger.info("PLogic configured for dual NRT pulses.")
 
     finally:
         if original_hub_setting == "Yes":
@@ -341,7 +291,7 @@ def log_plogic_trigger_chain_state(
     for label, value in read_plogic_trigger_chain_state(
         plogic_label, tiger_comm_hub_label
     ).items():
-        print(f"  [PLogic] {label} = {value}")
+        logger.info(f"  [PLogic] {label} = {value}")
 
 
 def set_laser_outputs(
@@ -448,6 +398,43 @@ def ensure_beam_enabled() -> None:
     if _HW.galvo_a_label not in mmc.getLoadedDevices():
         return
     set_property(_HW.galvo_a_label, "BeamEnabled", "Yes")
+
+
+def ensure_circular_buffer_capacity() -> None:
+    """Pre-allocate a large circular buffer once, at session startup.
+
+    No-op if the buffer is already at least ``HardwareConstants.
+    circular_buffer_target_mb``. Deliberately session-level, not per-MDA:
+    resizing the circular buffer right after arming cameras for external
+    triggering (an earlier version of
+    :meth:`~pymmcore_gui.asi_z_stack.engine._ASITriggerEngineBase.
+    _ensure_circular_buffer_capacity` did this inside ``setup_sequence``)
+    crashed PVCAM's driver even more reliably than the wraparound it was
+    meant to prevent -- almost certainly because resizing while a camera is
+    already armed leaves the device adapter's buffer pointers stale
+    relative to the newly-reallocated core buffer. Doing this once at
+    launch, before any camera has been armed for anything, avoids that
+    entirely. The one-time allocation cost (a few seconds for tens of GB)
+    happens during app startup instead of in the middle of triggering an
+    acquisition; snap/live afterward read/write the same pre-sized buffer,
+    so they aren't slowed down by it. No-op if PLogic/the Tiger hub aren't
+    loaded (demo or non-ASI configs don't need this large a buffer).
+    """
+    if not _plogic_available():
+        return
+    target_mb = _HW.circular_buffer_target_mb
+    current_mb = mmc.getCircularBufferMemoryFootprint()
+    if current_mb >= target_mb:
+        return
+    logger.info(f"Growing circular buffer footprint {current_mb} -> {target_mb} MB.")
+    try:
+        mmc.setCircularBufferMemoryFootprint(target_mb)
+    except Exception:
+        logger.error(
+            f"Failed to grow circular buffer to {target_mb} MB; keeping "
+            f"{current_mb} MB.",
+            exc_info=True,
+        )
 
 
 def _selected_laser_bncs() -> list[int]:

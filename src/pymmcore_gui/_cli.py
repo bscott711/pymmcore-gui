@@ -101,9 +101,19 @@ def run(
         "--no-telemetry",
         help="Disable telemetry.",
     ),
+    debug: bool = typer.Option(
+        False,
+        "--debug",
+        help="Enable DEBUG-level logging for the ASI hardware layer.",
+    ),
 ) -> None:
     """Run the Micro-Manager GUI (this is the default command)."""
     from pymmcore_gui import create_mmgui
+
+    if debug:
+        from pymmcore_gui.asi_z_stack._logging import configure_asi_logging
+
+        configure_asi_logging("DEBUG")
 
     mm_config = "MMConfig_demo.cfg" if demo_config else config
     create_mmgui(mm_config=mm_config, exec_app=True, install_sentry=not no_telemetry)

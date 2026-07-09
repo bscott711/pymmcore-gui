@@ -69,3 +69,13 @@ class HardwareConstants:
     line_scan_duration_ms: float = 1.0
     delay_before_side_ms: float = 0.0
     delay_before_repeat_ms: float = 0.0
+
+    # MMCore's circular buffer footprint defaults to 100-250 MB, far too
+    # small for a full hardware-triggered z-stack on this rig's Kinetix/PVCAM
+    # cameras (~11 MB/frame at 2400x2400x16-bit) -- e.g. 4 cameras at 201
+    # slices needs over 13 GB with headroom. Provisioned once at session
+    # startup (see ensure_circular_buffer_capacity in asi_controller.py) so
+    # it's never resized mid-acquisition -- resizing right after arming
+    # cameras for external triggering crashed PVCAM's driver (see
+    # engine.py's _warn_if_circular_buffer_too_small).
+    circular_buffer_target_mb: int = 30_000

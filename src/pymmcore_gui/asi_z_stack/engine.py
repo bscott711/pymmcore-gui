@@ -1,4 +1,5 @@
 # src/pymmcore_gui/asi_z_stack/engine.py
+import logging
 import time
 from collections.abc import Iterable, Iterator
 
@@ -15,15 +16,14 @@ from useq import MDAEvent, MDASequence
 from pymmcore_gui._multi_camera_handler import physical_camera_labels
 
 from .asi_controller import (
-    close_global_shutter,
     configure_plogic_for_dual_nrt_pulses,
     log_plogic_trigger_chain_state,
-    open_global_shutter,
-    reset_axis_ttl_output,
     set_camera_trigger_mode,
     set_plogic_evaluation_clock,
 )
 from .common import AcquisitionSettings, HardwareConstants
+
+logger = logging.getLogger(__name__)
 
 
 class _ASITriggerEngineBase(MDAEngine):
@@ -87,6 +87,42 @@ class _ASITriggerEngineBase(MDAEngine):
                 )
             set_camera_trigger_mode(cam_label)
 
+    def _warn_if_circular_buffer_too_small(self, total_images: int) -> None:
+        """Log a warning if the circular buffer can't fit a full stack.
+
+        MMCore's default circular buffer footprint (100-250 MB) is far
+        smaller than a full hardware-triggered z-stack on this rig's
+        Kinetix/PVCAM cameras (~11 MB/frame at 2400x2400x16-bit) -- e.g. a
+        201-slice, 2-camera acquisition needs ~4.4 GB. An earlier version of
+        this method resized the buffer here, mid-``setup_sequence`` (right
+        after :meth:`_arm_cameras`), and that crashed PVCAM's driver
+        (``pvcam64.dll``, exception ``0xc0000409`` /
+        STATUS_STACK_BUFFER_OVERRUN) even *more* reliably than the
+        wraparound it was meant to prevent -- almost certainly because
+        resizing while a camera is already armed for external triggering
+        leaves the device adapter's buffer pointers stale relative to the
+        newly-reallocated core buffer. The buffer is now sized once, at
+        session startup, before any camera is ever armed -- see
+        :func:`~pymmcore_gui.asi_z_stack.asi_controller.
+        ensure_circular_buffer_capacity`. This just warns if that session-
+        level allocation somehow isn't enough for the current sequence,
+        rather than trying to fix it here.
+        """
+        mmc = self.mmcore
+        bytes_per_frame = (
+            mmc.getImageWidth() * mmc.getImageHeight() * mmc.getBytesPerPixel()
+        )
+        if bytes_per_frame <= 0:
+            return
+        required_mb = (bytes_per_frame * total_images * 1.5) / (1024 * 1024)
+        current_mb = mmc.getCircularBufferMemoryFootprint()
+        if required_mb > current_mb:
+            logger.warning(
+                f"Circular buffer ({current_mb} MB) may be too small for "
+                f"{total_images} frames (~{required_mb:.0f} MB needed) -- "
+                "consider raising HardwareConstants.circular_buffer_target_mb."
+            )
+
     def _restore_cameras(self) -> None:
         """Undo :meth:`_arm_cameras`."""
         for cam_label, original_mode in self._original_trigger_modes.items():
@@ -123,7 +159,7 @@ class _ASITriggerEngineBase(MDAEngine):
 
         # Arm the buffer and trigger the hardware z-stack.
         mmc.startSequenceAcquisition(active_cam, total_images, 0, True)
-        print(
+        logger.info(
             f"Camera armed for {total_images} images "
             f"(sequence running: {mmc.isSequenceRunning()})."
         )
@@ -135,26 +171,39 @@ class _ASITriggerEngineBase(MDAEngine):
             self._master_axis_label, "SPIMState", self._trigger_spim_state_value
         )
         spim_state = mmc.getProperty(self._master_axis_label, "SPIMState")
-        print(f"{self._master_axis_label} SPIMState readback: '{spim_state}'.")
+        logger.info(f"{self._master_axis_label} SPIMState readback: '{spim_state}'.")
 
         runner_t0 = event.metadata.get("runner_t0")
         # Per-physical-camera counter -> the z index of that camera's next slice.
         slice_counts: dict[int, int] = {}
         images_collected = 0
-        timeout_s = (total_images * self._exposure_ms / 1000.0) + 5.0
+        # A fixed total-duration budget (total_images * exposure_ms + grace) is
+        # too tight: measured on the bench at ~10ms exposure, sustained
+        # throughput is ~36ms/image once galvo settle, PLogic cycle overhead,
+        # and readout are included, not the nominal 10ms -- so a long sequence
+        # can still be steadily progressing when a total-duration budget runs
+        # out. Time out only on a genuine stall (no new image for
+        # stall_timeout_s) instead, so slower-than-nominal but healthy
+        # throughput never trips it.
+        stall_timeout_s = 5.0
         start_time = time.time()
         last_progress_log = start_time
+        last_image_time = start_time
 
         while images_collected < total_images:
             now = time.time()
-            if now - start_time > timeout_s:
-                raise TimeoutError(f"Acquisition timed out after {timeout_s:.1f}s.")
+            if now - last_image_time > stall_timeout_s:
+                raise TimeoutError(
+                    f"Acquisition stalled: no new image for "
+                    f"{stall_timeout_s:.1f}s ({images_collected}/{total_images} "
+                    "collected)."
+                )
             if now - last_progress_log > 1.0:
                 # Camera-buffer-side only -- no Tiger serial traffic here.
                 # Once triggered, this acquisition is fully hardware-timed;
                 # the wait loop must not compete with the SPIM state
                 # machine's own timing for the serial link.
-                print(
+                logger.debug(
                     f"...waiting: {images_collected}/{total_images} collected, "
                     f"{mmc.getRemainingImageCount()} buffered, "
                     f"sequence running: {mmc.isSequenceRunning()}."
@@ -207,6 +256,7 @@ class _ASITriggerEngineBase(MDAEngine):
                 meta["images_remaining_in_buffer"] = remaining - 1
                 yield img, sub_event, meta
                 images_collected += 1
+                last_image_time = now
             elif not mmc.isSequenceRunning():
                 raise RuntimeError(
                     f"Sequence stopped unexpectedly after {images_collected} images."
@@ -218,18 +268,17 @@ class _ASITriggerEngineBase(MDAEngine):
 class ASISPIMEngine(_ASITriggerEngineBase):
     """Custom MDA Engine for ASI SPIM Z-stacks, galvo-driven TTL triggering.
 
-    Matches a captured debug log of the microscope-control sibling repo's
-    actual ``CustomPLogicMDAEngine`` running a real, successful 201-slice
-    z-stack on this exact hardware (galvo ``Scanner:AB:33`` as trigger
-    master, PLogic dual-NRT pulses, ``PM E=1``/``0``) -- the log revealed
-    two concrete discrepancies from this engine's previous form, now fixed:
-    ``SPIMScanDuration(ms)`` must be ``1.0`` (see
-    ``HardwareConstants.line_scan_duration_ms``), not the ``10.5`` kept
-    around most of this session based on an earlier unverified claim; and
-    ``BeamEnabled`` is set once per session (see ``ensure_beam_enabled`` in
-    ``asi_controller.py``, called from ``_main_window.py`` alongside
-    ``ensure_global_shutter_open``), not toggled on/off every MDA run. The
-    log also confirmed ``TTL X=0 Y=20`` is never sent -- removed here.
+    ``setup_sequence`` deliberately does NOT call
+    :func:`~pymmcore_gui.asi_z_stack.asi_controller.open_global_shutter` --
+    that's session-level (opened once via ``ensure_global_shutter_open``),
+    not per-MDA. Confirmed on the bench: that function's first command
+    (``CCA X=0``) has no ``M E=`` guard, so it lands on whatever PLogic cell
+    was last selected. Called right after
+    :func:`~pymmcore_gui.asi_z_stack.asi_controller.
+    configure_plogic_for_dual_nrt_pulses` (as it used to be here), that's
+    address 33 (BNC1) -- clobbering the camera-cell routing that call just
+    set up, silently, every single MDA run. Likewise ``BeamEnabled`` is set
+    once per session (``ensure_beam_enabled``), not toggled per MDA.
     """
 
     def __init__(self, mmc: CMMCorePlus, hw: HardwareConstants):
@@ -264,10 +313,13 @@ class ASISPIMEngine(_ASITriggerEngineBase):
             self._exposure_ms = self.mmcore.getExposure()
 
         # 3. Prepare Hardware
-        print("--- SEQUENCE STARTED: Preparing PLogic and Camera ---")
+        logger.info("--- SEQUENCE STARTED: Preparing PLogic and Camera ---")
         self._original_autoshutter = self.mmcore.getAutoShutter()
         self.mmcore.setAutoShutter(False)
         self._arm_cameras()
+        self._warn_if_circular_buffer_too_small(
+            self._num_slices * self.mmcore.getNumberOfCameraChannels()
+        )
 
         settings = AcquisitionSettings(
             camera_exposure_ms=self._exposure_ms,
@@ -285,21 +337,19 @@ class ASISPIMEngine(_ASITriggerEngineBase):
             self.hw.plogic_laser_on_cell,
         )
 
-        open_global_shutter(
-            self.hw.plogic_label,
-            self.hw.tiger_comm_hub_label,
-            self.hw.plogic_always_on_cell,
-            self.hw.plogic_bnc3_addr,
-        )
+        # Deliberately not calling open_global_shutter() here -- it's
+        # session-level (opened once via ensure_global_shutter_open), not
+        # per-MDA. Confirmed on the bench: its first command (`CCA X=0`) has
+        # no M E= guard, so it lands on whatever cell was last selected --
+        # which, called right after configure_plogic_for_dual_nrt_pulses, is
+        # address 33 (BNC1), clobbering the camera-cell routing that call
+        # just set up. The sibling repo never has this problem because it
+        # only calls open_global_shutter once at startup, before any PLogic
+        # cell has ever been selected.
 
         # 4. Configure Galvo. BeamEnabled is deliberately not touched here --
         # see ensure_beam_enabled in asi_controller.py.
-        print("Configuring ASI galvo for SPIM scan...")
-        # Reset TTL X=0 Y=0 (documented default) before anything else here:
-        # earlier debugging this session saved TTL X=0 Y=20 to this card's
-        # non-volatile memory, and merely no longer sending that command
-        # doesn't undo it -- see reset_axis_ttl_output's docstring.
-        reset_axis_ttl_output(self.hw.galvo_a_label, self.hw.tiger_comm_hub_label)
+        logger.debug("Configuring ASI galvo for SPIM scan...")
         self.mmcore.setProperty(
             self.hw.galvo_a_label, "SPIMNumSlices", str(self._num_slices)
         )
@@ -354,16 +404,14 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         # through PLogic's dual-NRT cells. Whatever is currently persisted
         # on the card for those SPIM properties is left alone.
         #
-        # "TTL X=0 Y=20" is deliberately NOT sent here (an earlier version
-        # of this engine sent it, on a documentation-based theory about
-        # arming the galvo's own TTL OUT0 line) -- a captured debug log of
-        # the sibling repo's real, successful run on this exact hardware
-        # confirmed it never sends this command either.
-        set_plogic_evaluation_clock(
-            self.hw.plogic_label, self.hw.tiger_comm_hub_label, running=True
-        )
+        # No raw "TTL X=/Y=" command is sent to the scanner anywhere in
+        # this engine -- confirmed against a captured log of the sibling
+        # repo's real, successful run, which never sends one either. The
+        # SPIM scan is driven entirely through the SPIMState/SingleAxis*
+        # device-adapter properties set above.
+        set_plogic_evaluation_clock(self.hw.tiger_comm_hub_label, running=True)
 
-        print(
+        logger.info(
             f"--- PLogic and Camera ready --- "
             f"(slices={self._num_slices}, amplitude={galvo_amplitude_deg:.4f}deg, "
             f"exposure={self._exposure_ms:.1f}ms)"
@@ -376,20 +424,20 @@ class ASISPIMEngine(_ASITriggerEngineBase):
 
     def teardown_sequence(self, sequence: MDASequence) -> None:
         """Clean up hardware state after the sequence finishes."""
-        print("--- SEQUENCE FINISHED: Cleaning up hardware ---")
-        set_plogic_evaluation_clock(
-            self.hw.plogic_label, self.hw.tiger_comm_hub_label, running=False
-        )
+        logger.info("--- SEQUENCE FINISHED: Cleaning up hardware ---")
+        set_plogic_evaluation_clock(self.hw.tiger_comm_hub_label, running=False)
         if self.hw.galvo_a_label in self.mmcore.getLoadedDevices():
             self.mmcore.setProperty(self.hw.galvo_a_label, "SPIMState", "Idle")
 
-        close_global_shutter(
-            self.hw.plogic_label, self.hw.tiger_comm_hub_label, self.hw.plogic_bnc3_addr
-        )
+        # Deliberately not closing the global shutter here -- it's
+        # session-level infrastructure (opened once via
+        # ensure_global_shutter_open so software snap/live can gate
+        # individual lasers), not something to toggle per MDA run. The
+        # sibling repo's own cleanup never closes it either.
         time.sleep(0.1)
         self.mmcore.setAutoShutter(self._original_autoshutter)
         self._restore_cameras()
-        print("--- Hardware cleanup complete ---")
+        logger.info("--- Hardware cleanup complete ---")
 
 
 class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
@@ -466,10 +514,15 @@ class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
             self._exposure_ms = self.mmcore.getExposure()
 
         # 3. Prepare hardware
-        print("--- SEQUENCE STARTED: Preparing PLogic and Camera (stationary) ---")
+        logger.info(
+            "--- SEQUENCE STARTED: Preparing PLogic and Camera (stationary) ---"
+        )
         self._original_autoshutter = self.mmcore.getAutoShutter()
         self.mmcore.setAutoShutter(False)
         self._arm_cameras()
+        self._warn_if_circular_buffer_too_small(
+            self._num_slices * self.mmcore.getNumberOfCameraChannels()
+        )
 
         settings = AcquisitionSettings(
             camera_exposure_ms=self._exposure_ms,
@@ -487,12 +540,8 @@ class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
             self.hw.plogic_laser_on_cell,
         )
 
-        open_global_shutter(
-            self.hw.plogic_label,
-            self.hw.tiger_comm_hub_label,
-            self.hw.plogic_always_on_cell,
-            self.hw.plogic_bnc3_addr,
-        )
+        # Deliberately not calling open_global_shutter() here -- see
+        # ASISPIMEngine.setup_sequence's comment on the same point.
 
         # 4. Configure the galvo as trigger master, held stationary.
         # SingleAxisYAmplitude(deg) is set just below the piezo's own step
@@ -500,7 +549,7 @@ class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
         # exactly 0) -- the piezo's identical-shaped property hard-rejected
         # SPIMState=Running at amplitude 0.0 on the bench, so the same
         # nonzero-amplitude validation is assumed possible here too.
-        print("Configuring ASI galvo as a stationary SPIM trigger master...")
+        logger.debug("Configuring ASI galvo as a stationary SPIM trigger master...")
         self.mmcore.setProperty(
             self.hw.galvo_a_label, "SPIMNumSlices", str(self._num_slices)
         )
@@ -542,7 +591,7 @@ class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
         # 5. Arm the piezo in parallel, also held stationary. Matches ASI's
         # reference (prepareControllerForAquisition_Side): the piezo is
         # always armed even when it isn't the axis actually stepping.
-        print("Arming ASI piezo (stationary, SPIMState=Armed)...")
+        logger.debug("Arming ASI piezo (stationary, SPIMState=Armed)...")
         self.mmcore.setProperty(
             self.hw.piezo_a_label, "SPIMNumSlices", str(self._num_slices)
         )
@@ -560,13 +609,13 @@ class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
             for prop in self.mmcore.getDevicePropertyNames(label):
                 if "SPIM" in prop or "SingleAxis" in prop:
                     value = self.mmcore.getProperty(label, prop)
-                    print(f"  [{tag}] {prop} = {value}")
+                    logger.info(f"  [{tag}] {prop} = {value}")
 
         log_plogic_trigger_chain_state(
             self.hw.plogic_label, self.hw.tiger_comm_hub_label
         )
 
-        print(
+        logger.info(
             f"--- PLogic and Camera ready (stationary) --- "
             f"(slices={self._num_slices}, exposure={self._exposure_ms:.1f}ms)"
         )
@@ -575,16 +624,15 @@ class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
 
     def teardown_sequence(self, sequence: MDASequence) -> None:
         """Clean up hardware state after the sequence finishes."""
-        print("--- SEQUENCE FINISHED: Cleaning up hardware (stationary) ---")
+        logger.info("--- SEQUENCE FINISHED: Cleaning up hardware (stationary) ---")
         if self.hw.galvo_a_label in self.mmcore.getLoadedDevices():
             self.mmcore.setProperty(self.hw.galvo_a_label, "SPIMState", "Idle")
         if self.hw.piezo_a_label in self.mmcore.getLoadedDevices():
             self.mmcore.setProperty(self.hw.piezo_a_label, "SPIMState", "Idle")
 
-        close_global_shutter(
-            self.hw.plogic_label, self.hw.tiger_comm_hub_label, self.hw.plogic_bnc3_addr
-        )
+        # Deliberately not closing the global shutter here -- see
+        # ASISPIMEngine.teardown_sequence's comment on the same point.
         time.sleep(0.1)
         self.mmcore.setAutoShutter(self._original_autoshutter)
         self._restore_cameras()
-        print("--- Hardware cleanup complete ---")
+        logger.info("--- Hardware cleanup complete ---")

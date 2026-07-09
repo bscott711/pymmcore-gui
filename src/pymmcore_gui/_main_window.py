@@ -411,15 +411,20 @@ class MicroManagerGUI(QMainWindow):
         # the always-on cell so software snap/live can gate the laser BNCs, and
         # enable the galvo's beam once for the session (matching the
         # microscope-control sibling repo's confirmed-working engine, which
-        # does this once at startup rather than per-MDA-run). Both are
-        # no-ops for demo / non-ASI configs.
+        # does this once at startup rather than per-MDA-run). Also
+        # pre-allocate a large circular buffer once here -- see
+        # ensure_circular_buffer_capacity's docstring for why this must
+        # never happen mid-acquisition. All three are no-ops for demo /
+        # non-ASI configs.
         from pymmcore_gui.asi_z_stack.asi_controller import (
             ensure_beam_enabled,
+            ensure_circular_buffer_capacity,
             ensure_global_shutter_open,
         )
 
         ensure_global_shutter_open()
         ensure_beam_enabled()
+        ensure_circular_buffer_capacity()
 
         self._register_mda_engine()
 
