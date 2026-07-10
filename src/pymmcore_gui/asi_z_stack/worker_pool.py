@@ -18,6 +18,8 @@ creates and owns (workers only attach to it); control messages travel over a
 
 from __future__ import annotations
 
+import os
+import re
 import time
 from dataclasses import replace
 from multiprocessing import get_context
@@ -26,6 +28,8 @@ from multiprocessing.shared_memory import SharedMemory
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+from pymmcore_plus._logger import current_logfile
+from pymmcore_plus._logger import logger as _pymmcore_plus_logger
 
 from .camera_worker import CameraWorkerConfig, run_camera_worker
 from .worker_messages import (
@@ -50,6 +54,36 @@ if TYPE_CHECKING:
     # (Connection on POSIX, PipeConnection on Windows) with no common public
     # base type in typeshed -- Any is the pragmatic cross-platform choice.
     Connection = Any
+
+
+def _worker_log_file(camera_label: str) -> str:
+    """Compute a per-worker sibling of the main process's pymmcore-plus logfile.
+
+    Every worker process re-imports ``pymmcore_plus`` on spawn, which
+    re-runs its import-time ``configure_logging()`` and would otherwise
+    attach a second, independent ``RotatingFileHandler`` to the exact same
+    shared logfile as the main process. On Windows that second open handle
+    blocks the main process's log rotation (``os.rename`` -> ``WinError
+    32``). Pointing each worker at its own file via ``PYMM_LOG_FILE``
+    sidesteps this without touching pymmcore-plus internals.
+
+    Parameters
+    ----------
+    camera_label : str
+        The camera this worker owns, used to make its logfile name unique.
+
+    Returns
+    -------
+    str
+        A sibling logfile path, or ``"0"`` (pymmcore-plus's own syntax for
+        "disable file logging") if the main process has no logfile
+        configured.
+    """
+    current = current_logfile(_pymmcore_plus_logger)
+    if current is None:
+        return "0"
+    safe_label = re.sub(r"[^\w-]", "_", camera_label)
+    return str(current.with_name(f"{current.stem}-worker-{safe_label}{current.suffix}"))
 
 
 class WorkerDiedError(RuntimeError):
@@ -117,7 +151,20 @@ class CameraWorkerHandle:
             args=(self.config, child_conn),
             daemon=False,
         )
-        process.start()
+        # See _worker_log_file: give this worker its own pymmcore-plus
+        # logfile so it doesn't fight the main process over rotation of
+        # the shared one. spawn_all() spawns workers one at a time, so
+        # this set/restore around start() (which snapshots the env for
+        # the new process) can't race with another worker's spawn().
+        prev_log_file = os.environ.get("PYMM_LOG_FILE")
+        os.environ["PYMM_LOG_FILE"] = _worker_log_file(self.camera_label)
+        try:
+            process.start()
+        finally:
+            if prev_log_file is None:
+                os.environ.pop("PYMM_LOG_FILE", None)
+            else:
+                os.environ["PYMM_LOG_FILE"] = prev_log_file
         self.process = process
         child_conn.close()
 
