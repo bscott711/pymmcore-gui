@@ -99,6 +99,11 @@ class NotificationManager(QObject):
         self.reposition_notifications(animate=True)
 
     def remove_widget(self, widget: NotificationToast) -> None:
+        # remove_notification can fire twice for the same widget (e.g. a
+        # manual dismiss racing the auto-hide timer's fade_out), so this must
+        # be idempotent rather than assuming the widget is still present.
+        if widget not in self._notification_widgets:
+            return
         self._notification_widgets.remove(widget)
         widget.close()
         widget.deleteLater()

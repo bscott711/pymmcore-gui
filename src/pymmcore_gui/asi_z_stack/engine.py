@@ -202,6 +202,27 @@ class _ASITriggerEngineBase(MDAEngine):
                 "HardwareConstants.worker_circular_buffer_mb."
             )
 
+    def _reset_channel_config_cache(self) -> None:
+        """Force the next per-channel config switch to actually happen.
+
+        Mirrors the stock ``MDAEngine.setup_sequence``'s own
+        ``core._last_config = ("", "")`` reset (added for
+        https://github.com/pymmcore-plus/pymmcore-plus/issues/503) -- which
+        neither ``ASISPIMEngine`` nor ``ASIStationaryTriggerEngine`` ever ran,
+        since both override ``setup_sequence`` completely rather than calling
+        ``super()``. Without it, ``_set_event_channel`` compares the
+        sequence's first channel against whatever ``"Lasers"`` config was
+        last actually applied (e.g. a Live/Snap selection, or the previous
+        MDA's final channel); if they match, it treats the channel as already
+        correct and skips calling ``mmc.setConfig(...)`` for it entirely --
+        silently leaving that channel's whole z-stack running under whatever
+        raw PLogic BNC wiring ``setup_sequence`` happened to leave behind,
+        rather than its own selected laser. Calling this at the top of every
+        ``setup_sequence`` guarantees the first channel always gets a real,
+        unconditional ``setConfig`` call, same as every later channel change.
+        """
+        self.mmcore._last_config = ("", "")
+
     def event_iterator(self, events: Iterable[MDAEvent]) -> Iterator[MDAEvent]:
         """Collapse each hardware z-stack down to a single event.
 
@@ -210,6 +231,17 @@ class _ASITriggerEngineBase(MDAEngine):
         event per z-slice, so forward only the first slice of each stack
         (``z`` index 0, or events with no ``z`` axis) and drop the rest --
         otherwise the stack would be re-triggered once per slice.
+
+        Only **per-volume** channel switching is possible today: a whole
+        z-stack is triggered by a single, uninterrupted hardware burst (see
+        :meth:`exec_event`), with no software checkpoint between slices where
+        a different laser could be selected. This holds regardless of which
+        ``axis_order`` ("...cz" vs "...zc") the MDA sequence uses -- that
+        setting has no effect on this engine's actual trigger timing, only on
+        event bookkeeping order. True per-slice (interleaved) laser switching
+        would need a different PLogic wiring scheme entirely (a hardware
+        mod-N BNC counter clocked per-slice, as ASI's own diSPIM plugin
+        implements) and is not currently implemented.
         """
         for event in events:
             if event.index.get("z", 0) == 0:
@@ -374,6 +406,10 @@ class ASISPIMEngine(_ASITriggerEngineBase):
 
     def setup_sequence(self, sequence: MDASequence) -> SummaryMetaV1 | None:
         """Prepare hardware and calculate Z-stack parameters."""
+        # 0. Force the sequence's first channel to get a real hardware
+        # config switch -- see _reset_channel_config_cache's docstring.
+        self._reset_channel_config_cache()
+
         # 1. Calculate Z-stack parameters
         if sequence.z_plan:
             z_positions = list(sequence.z_plan)
@@ -424,7 +460,6 @@ class ASISPIMEngine(_ASITriggerEngineBase):
             settings,
             self.hw.plogic_label,
             self.hw.tiger_comm_hub_label,
-            self.hw.plogic_laser_preset_num,
             self.hw.plogic_camera_cell,
             self.hw.pulses_per_ms,
             self.hw.plogic_4khz_clock_addr,
@@ -590,6 +625,10 @@ class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
 
     def setup_sequence(self, sequence: MDASequence) -> SummaryMetaV1 | None:
         """Prepare hardware; both galvo and piezo stay stationary."""
+        # 0. Force the sequence's first channel to get a real hardware
+        # config switch -- see _reset_channel_config_cache's docstring.
+        self._reset_channel_config_cache()
+
         # 1. Number of trigger pulses/frames wanted. Neither axis moves, so
         # there's no amplitude/step-size to compute from the z_plan
         # positions -- only their count matters.
@@ -635,7 +674,6 @@ class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
             settings,
             self.hw.plogic_label,
             self.hw.tiger_comm_hub_label,
-            self.hw.plogic_laser_preset_num,
             self.hw.plogic_camera_cell,
             self.hw.pulses_per_ms,
             self.hw.plogic_4khz_clock_addr,

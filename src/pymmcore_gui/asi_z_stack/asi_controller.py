@@ -234,14 +234,28 @@ def configure_plogic_for_dual_nrt_pulses(
     settings: "AcquisitionSettings",
     plogic_label: str,
     tiger_comm_hub_label: str,
-    plogic_laser_preset_num: int,
     plogic_camera_cell: int,
     pulses_per_ms: float,
     plogic_4khz_clock_addr: int,
     plogic_trigger_ttl_addr: int,
     plogic_laser_on_cell: int,
 ) -> None:
-    """Configures PLogic for two independent, synchronized NRT one-shot pulses."""
+    """Configures PLogic for two independent, synchronized NRT one-shot pulses.
+
+    Deliberately does not touch laser BNC routing (no preset load): which
+    physical laser cell 10 drives is exclusively the ``"Lasers"`` ConfigGroup's
+    ``OutputChannel`` property's job (set per-MDA-channel by the stock
+    ``MDAEngine``/``_set_event_channel``). This function previously loaded
+    PLogic preset 30 here first -- confirmed against ASI's own Tiger PLogic
+    documentation to be "diSPIM: simultaneous 4-color" (wires BNC5-8 *all* to
+    cell 10 at once), a different preset family entirely from the single-laser
+    presets (5-8) ``OutputChannel`` uses. Loading it unconditionally on every
+    sequence setup forced "all lasers on" as a transient baseline that a
+    channel's own config switch could, in some cases, never correct (see
+    ``_ASITriggerEngineBase._reset_channel_config_cache``) -- removed rather
+    than fixed in place, since this function has no business selecting a
+    laser preset at all.
+    """
     plogic_addr_prefix = plogic_label.split(":")[-1]
     hub_prop = "OnlySendSerialCommandOnChange"
     original_hub_setting = get_property(tiger_comm_hub_label, hub_prop)
@@ -253,11 +267,7 @@ def configure_plogic_for_dual_nrt_pulses(
         if original_hub_setting == "Yes":
             set_property(tiger_comm_hub_label, hub_prop, "No")
 
-        # 1. Program Laser Preset
-        _send(f"{plogic_addr_prefix}CCA X={plogic_laser_preset_num}")
-        logger.debug(f"Laser preset number: {plogic_laser_preset_num}")
-
-        # 2. Program Camera Pulse (NRT One-Shot #1)
+        # 1. Program Camera Pulse (NRT One-Shot #1)
         _send(f"M E={plogic_camera_cell}")
         camera_pulse_cycles = int(settings.camera_exposure_ms * pulses_per_ms)
         # Y (NRT one-shot mode) and Z (pulse length) must be bundled into a
@@ -269,7 +279,7 @@ def configure_plogic_for_dual_nrt_pulses(
             f"Y={plogic_4khz_clock_addr} Z=0"
         )
 
-        # 3. Program Laser Pulse (NRT One-Shot #2)
+        # 2. Program Laser Pulse (NRT One-Shot #2)
         _send(f"M E={plogic_laser_on_cell}")
         laser_pulse_cycles = int(settings.laser_trig_duration_ms * pulses_per_ms)
         _send(f"{plogic_addr_prefix}CCA Y=14 Z={laser_pulse_cycles}")
@@ -278,11 +288,11 @@ def configure_plogic_for_dual_nrt_pulses(
             f"Y={plogic_4khz_clock_addr} Z=0"
         )
 
-        # 4. Route Camera Trigger Cell Output to BNC1 (Address 33)
+        # 3. Route Camera Trigger Cell Output to BNC1 (Address 33)
         _send("M E=33")
         _send(f"{plogic_addr_prefix}CCA Z={plogic_camera_cell}")
 
-        # 5. Save the configuration
+        # 4. Save the configuration
         _send(f"{plogic_addr_prefix}SS Z")
         logger.info("PLogic configured for dual NRT pulses.")
 

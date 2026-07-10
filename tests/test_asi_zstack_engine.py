@@ -21,6 +21,7 @@ import numpy as np
 import pytest
 import useq
 
+from pymmcore_gui.asi_z_stack import engine as engine_module
 from pymmcore_gui.asi_z_stack.camera_handoff import CameraHandoffSnapshot
 from pymmcore_gui.asi_z_stack.common import HardwareConstants
 from pymmcore_gui.asi_z_stack.engine import (
@@ -243,3 +244,68 @@ def test_stationary_engine_triggers_galvo_not_piezo() -> None:
     assert ("PiezoStage:P:34", "SPIMState", "Running") not in [
         call.args for call in core.setProperty.call_args_list
     ]
+
+
+def test_reset_channel_config_cache_clears_last_config() -> None:
+    """``_reset_channel_config_cache`` unconditionally clears the cache.
+
+    Direct unit test of the helper both ``setup_sequence`` overrides call --
+    see :func:`test_setup_sequence_resets_channel_config_cache` for the
+    end-to-end regression test that it's actually wired in.
+    """
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=1)
+    core._last_config = ("Lasers", "488nm")
+
+    engine._reset_channel_config_cache()
+
+    assert core._last_config == ("", "")
+
+
+@pytest.mark.parametrize("engine_cls", [ASISPIMEngine, ASIStationaryTriggerEngine])
+def test_setup_sequence_resets_channel_config_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    engine_cls: type[_ASITriggerEngineBase],
+) -> None:
+    """``setup_sequence`` must invalidate a stale ``core._last_config``.
+
+    Regression test for the wrong-laser bug: both ``ASISPIMEngine`` and
+    ``ASIStationaryTriggerEngine.setup_sequence`` completely override the
+    stock ``MDAEngine.setup_sequence`` (rather than calling ``super()``), so
+    they must replicate its ``core._last_config = ("", "")`` reset
+    themselves. Without it, ``_set_event_channel`` can wrongly treat the
+    sequence's first channel as "already configured" (because it happens to
+    match whatever config was last actually applied, e.g. from Live/Snap or
+    the previous MDA run) and skip calling ``mmc.setConfig(...)`` for it --
+    silently leaving that channel's whole z-stack running under whatever raw
+    PLogic wiring was left over from setup instead of its own selected laser.
+
+    Heavy hardware/network side effects (``configure_plogic_for_dual_nrt_pulses``,
+    ``set_plogic_evaluation_clock``, ``log_plogic_trigger_chain_state``,
+    ``summary_metadata``) are stubbed out -- they talk to PLogic's own
+    process-global ``CMMCorePlus`` singleton (a separate concern, unrelated to
+    the cache-reset behavior under test here) rather than the mocked ``core``.
+    """
+    monkeypatch.setattr(
+        engine_module, "configure_plogic_for_dual_nrt_pulses", MagicMock()
+    )
+    monkeypatch.setattr(engine_module, "set_plogic_evaluation_clock", MagicMock())
+    monkeypatch.setattr(engine_module, "log_plogic_trigger_chain_state", MagicMock())
+    monkeypatch.setattr(engine_module, "summary_metadata", MagicMock(return_value=None))
+
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=3, engine_cls=engine_cls)
+    # Simulate a stale cache left over from a prior Live/Snap selection or MDA
+    # run that happens to match this sequence's first (and only) channel.
+    core._last_config = ("Lasers", "488nm")
+    core.getExposure.return_value = 10.0
+    # Real ints, not MagicMocks -- _warn_if_circular_buffer_too_small does
+    # arithmetic/comparisons on these.
+    core.getImageWidth.return_value = 2
+    core.getImageHeight.return_value = 2
+    core.getBytesPerPixel.return_value = 2
+
+    sequence = useq.MDASequence(
+        channels=(useq.Channel(config="488nm", group="Lasers", exposure=10.0),)
+    )
+    engine.setup_sequence(sequence)
+
+    assert core._last_config == ("", "")

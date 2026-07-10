@@ -29,7 +29,6 @@ class HardwareConstants:
     plogic_always_on_cell: int = 12
     plogic_bnc3_addr: int = 35
     pulses_per_ms: float = 4.0
-    plogic_laser_preset_num: int = 30
 
     # Per-laser PLogic BNC outputs used for software snap/live gating.
     # Front-panel BNC n maps to PLogic address 32 + n (so BNC3 = 35, as used by
