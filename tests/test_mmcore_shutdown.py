@@ -7,13 +7,13 @@ from unittest.mock import patch
 from pymmcore_gui._mmcore_shutdown import shutdown_mmcore, track_mda_thread
 
 
-def test_shutdown_unloads_all_devices(mmcore) -> None:  # noqa: ANN001
+def test_shutdown_unloads_all_devices(mmcore) -> None:
     assert len(mmcore.getLoadedDevices()) > 1
     shutdown_mmcore(mmcore)
     assert mmcore.getLoadedDevices() == ("Core",)
 
 
-def test_shutdown_stops_live_sequence(mmcore) -> None:  # noqa: ANN001
+def test_shutdown_stops_live_sequence(mmcore) -> None:
     mmcore.startContinuousSequenceAcquisition(0)
     assert mmcore.isSequenceRunning()
     shutdown_mmcore(mmcore)
@@ -21,7 +21,7 @@ def test_shutdown_stops_live_sequence(mmcore) -> None:  # noqa: ANN001
     assert mmcore.getLoadedDevices() == ("Core",)
 
 
-def test_shutdown_cancels_running_mda(mmcore) -> None:  # noqa: ANN001
+def test_shutdown_cancels_running_mda(mmcore) -> None:
     import useq
 
     thread = mmcore.run_mda(
@@ -36,7 +36,7 @@ def test_shutdown_cancels_running_mda(mmcore) -> None:  # noqa: ANN001
     assert mmcore.getLoadedDevices() == ("Core",)
 
 
-def test_shutdown_auto_tracks_mda_thread_without_explicit_arg(mmcore) -> None:  # noqa: ANN001, E501
+def test_shutdown_auto_tracks_mda_thread_without_explicit_arg(mmcore) -> None:
     """Regression test: polling `is_running()` alone is racy.
 
     `MDARunner.cancel()` can flip the runner to a non-running state while the
@@ -62,21 +62,19 @@ def test_shutdown_auto_tracks_mda_thread_without_explicit_arg(mmcore) -> None:  
     assert mmcore.getLoadedDevices() == ("Core",)
 
 
-def test_shutdown_is_idempotent(mmcore) -> None:  # noqa: ANN001
+def test_shutdown_is_idempotent(mmcore) -> None:
     shutdown_mmcore(mmcore)
     # calling again on an already-unloaded core must not raise
     shutdown_mmcore(mmcore)
     assert mmcore.getLoadedDevices() == ("Core",)
 
 
-def test_shutdown_tolerates_unload_exception(mmcore) -> None:  # noqa: ANN001
-    with patch.object(
-        mmcore, "unloadAllDevices", side_effect=RuntimeError("boom")
-    ):
+def test_shutdown_tolerates_unload_exception(mmcore) -> None:
+    with patch.object(mmcore, "unloadAllDevices", side_effect=RuntimeError("boom")):
         shutdown_mmcore(mmcore)  # must not raise
 
 
-def test_shutdown_does_not_hang_on_slow_unload(mmcore) -> None:  # noqa: ANN001
+def test_shutdown_does_not_hang_on_slow_unload(mmcore) -> None:
     def _slow_unload() -> None:
         time.sleep(5)
 
@@ -87,7 +85,7 @@ def test_shutdown_does_not_hang_on_slow_unload(mmcore) -> None:  # noqa: ANN001
     assert elapsed < 2.0
 
 
-def test_shutdown_tolerates_undead_mda_thread(mmcore) -> None:  # noqa: ANN001
+def test_shutdown_tolerates_undead_mda_thread(mmcore) -> None:
     stuck = threading.Event()
 
     def _never_finishes() -> None:

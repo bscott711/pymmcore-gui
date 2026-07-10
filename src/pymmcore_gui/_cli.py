@@ -1,3 +1,4 @@
+import multiprocessing
 import os
 import subprocess
 import sys
@@ -101,9 +102,19 @@ def run(
         "--no-telemetry",
         help="Disable telemetry.",
     ),
+    debug: bool = typer.Option(
+        False,
+        "--debug",
+        help="Enable DEBUG-level logging for the ASI hardware layer.",
+    ),
 ) -> None:
     """Run the Micro-Manager GUI (this is the default command)."""
     from pymmcore_gui import create_mmgui
+
+    if debug:
+        from pymmcore_gui.asi_z_stack._logging import configure_asi_logging
+
+        configure_asi_logging("DEBUG")
 
     mm_config = "MMConfig_demo.cfg" if demo_config else config
     create_mmgui(mm_config=mm_config, exec_app=True, install_sentry=not no_telemetry)
@@ -189,5 +200,15 @@ def _ensure_settings(path: Path) -> None:
 
 
 def main() -> None:
-    """Main entry point for the Micro-Manager GUI."""
+    """Main entry point for the Micro-Manager GUI.
+
+    ``freeze_support()`` must run before anything else: this is the one
+    function every launch path (the ``mmgui`` console script, ``python -m
+    pymmcore_gui``, and a PyInstaller-frozen ``mmgui.exe``) funnels through,
+    and it's a no-op on non-Windows/non-frozen runs. Without it, a frozen
+    build would re-launch the whole GUI in every
+    :mod:`~pymmcore_gui.asi_z_stack.camera_worker` subprocess it spawns
+    instead of running the worker's entry point.
+    """
+    multiprocessing.freeze_support()
     app()

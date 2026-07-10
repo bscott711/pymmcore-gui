@@ -55,6 +55,7 @@ dependencies = [
     "crispy",
     "pygfx>=0.16.0",
     "pylinalg>=0.6.8",
+    "pyvcam>=2.3.2",
 ]
 
 # TO USE pymmcore-nano, you need to add pymmcore-nano to dependencies

@@ -2410,6 +2410,7 @@ dependencies = [
     { name = "pymmcore-widgets" },
     { name = "pyqt6" },
     { name = "pyqt6ads" },
+    { name = "pyvcam" },
     { name = "pyyaml" },
     { name = "qtconsole" },
     { name = "rendercanvas" },
@@ -2464,6 +2465,7 @@ requires-dist = [
     { name = "pymmcore-widgets", editable = "../pymmcore-widgets" },
     { name = "pyqt6", specifier = "==6.9.1" },
     { name = "pyqt6ads", specifier = "==4.4.0.post2" },
+    { name = "pyvcam", specifier = ">=2.3.2" },
     { name = "pyyaml", specifier = ">=6.0.2" },
     { name = "qtconsole", specifier = ">=5.6.1" },
     { name = "rendercanvas", specifier = ">=2.6.3" },
@@ -2878,6 +2880,28 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/88/2c/7bb1416c5620485aa793f2de31d3df393d3686aa8a8506d11e10e13c5baf/python_dotenv-1.1.0.tar.gz", hash = "sha256:41f90bc6f5f177fb41f53e87666db362025010eb28f60a01c9143bfa33a2b2d5", size = 39920, upload-time = "2025-03-25T10:14:56.835Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/1e/18/98a99ad95133c6a6e2005fe89faedf294a748bd5dc803008059409ac9b1e/python_dotenv-1.1.0-py3-none-any.whl", hash = "sha256:d7c01d9e2293916c18baf562d95698754b0dbbb5e74d457c45d4f6561fb9d55d", size = 20256, upload-time = "2025-03-25T10:14:55.034Z" },
+]
+
+[[package]]
+name = "pyvcam"
+version = "2.3.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.14'" },
+    { name = "numpy", version = "2.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.14'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/7b/c9/777f702636241177ef89af5f8c60990533f8cd62304519b3642e442b779e/pyvcam-2.3.2.tar.gz", hash = "sha256:9be199526db5984430e4aff48e98c642df8b2d61818f921f04aac518c933f9f0", size = 39146, upload-time = "2026-03-03T09:39:53.199Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0e/3f/7a79b5823cf8f4ea3bae9fa7e2a0244618404e7147c634bd71240373c7df/pyvcam-2.3.2-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c090de94a95b64cb8d98e65a25a3da80f006f282dadb41f36a278b7b2705b19a", size = 346061, upload-time = "2026-03-03T09:39:39.148Z" },
+    { url = "https://files.pythonhosted.org/packages/2f/03/369c38832d70c82d6cc656cb32e6d2c1574bee9c18f12a524b9fe2e9a209/pyvcam-2.3.2-cp310-cp310-win_amd64.whl", hash = "sha256:55602f499d5abd37637cdf9445e46f3b1152cafe427cb45cb06cfd7d441bd9c0", size = 63286, upload-time = "2026-03-03T09:39:40.396Z" },
+    { url = "https://files.pythonhosted.org/packages/72/38/135263bcddbb7f6142fe42b8bcc1cc5723447051cf560ceac78308a64d8a/pyvcam-2.3.2-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:97ccdee93ca077d43413157a2cb356bcb236dd92b2f78f9681696c085d2b835a", size = 347617, upload-time = "2026-03-03T09:39:41.511Z" },
+    { url = "https://files.pythonhosted.org/packages/2f/a3/c16f2c8aa3d6df79b843c5a46a86f4b1123f130eaa3cfdcf65ecfc0a5996/pyvcam-2.3.2-cp311-cp311-win_amd64.whl", hash = "sha256:7c45594971792a9bd001701b564e3da1e163fa6f5668cdacc7bc34c389f5f521", size = 63293, upload-time = "2026-03-03T09:39:42.648Z" },
+    { url = "https://files.pythonhosted.org/packages/eb/c1/5c85b0a7ba239363bfd71ea5bdfdedc0d60048e72104d3e33a1ebb23e198/pyvcam-2.3.2-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:fd6b53be37ce8d00fdcabff6f504d6868159f884efbffd6375e6188e77710ed7", size = 347937, upload-time = "2026-03-03T09:39:43.733Z" },
+    { url = "https://files.pythonhosted.org/packages/6d/a5/8b808d2f97e0d3e2e9f27db67704a4570d9101ed40a7f75d39f021f4a8ec/pyvcam-2.3.2-cp312-cp312-win_amd64.whl", hash = "sha256:6edc6684ad9989eed36385808a9e4cebbc702ada58fd2dc0ac0293fa7a5388df", size = 63410, upload-time = "2026-03-03T09:39:44.868Z" },
+    { url = "https://files.pythonhosted.org/packages/4e/a8/370d21ba8e9f0377a1c7bb2a560d520077d57f90c3c00724230744ff1222/pyvcam-2.3.2-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e99e06ed9a529978fec8fed076098c753dc9f60f49b7f8cd150e92a934df87c7", size = 347891, upload-time = "2026-03-03T09:39:46.212Z" },
+    { url = "https://files.pythonhosted.org/packages/fb/96/052151696bc952f323a87eed27d186e4c8681727ad938d68337348b34b2e/pyvcam-2.3.2-cp313-cp313-win_amd64.whl", hash = "sha256:8bebf491af899eee713d497823927b1954a4217293e6f3f955cb983639d2b59b", size = 63419, upload-time = "2026-03-03T09:39:47.347Z" },
+    { url = "https://files.pythonhosted.org/packages/91/d5/5fe9610598e9c379a61f5824bd8c6a2719700dfc83533717aba9a59669f4/pyvcam-2.3.2-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:1c568419615406914ad5dac51b2def6644c0dcb36d5bff0d7dc8bb945b95b28e", size = 348142, upload-time = "2026-03-03T09:39:48.672Z" },
+    { url = "https://files.pythonhosted.org/packages/b6/df/759e887dd8d1a9ce232a764d630fb07ef9ebcea13d9c48e5bc90e88d6dca/pyvcam-2.3.2-cp314-cp314-win_amd64.whl", hash = "sha256:016de692d45619a52ad87d2e66e0a6dae897f9ee96929acde1b94c4aa472431d", size = 64103, upload-time = "2026-03-03T09:39:49.869Z" },
 ]
 
 [[package]]

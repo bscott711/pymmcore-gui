@@ -211,11 +211,49 @@ def test_laser_gating_noop_without_plogic(gui: MicroManagerGUI) -> None:
     from pymmcore_gui.asi_z_stack import asi_controller
 
     assert "PLogic:E:36" not in gui._mmc.getLoadedDevices()
+    assert "Scanner:AB:33" not in gui._mmc.getLoadedDevices()
     # Should not raise or send any serial commands on a non-ASI config.
     asi_controller.open_selected_lasers()
     asi_controller.close_selected_lasers()
     asi_controller.close_all_lasers()
     asi_controller.ensure_global_shutter_open()
+    asi_controller.ensure_beam_enabled()
+
+
+def test_mda_engine_defaults_without_asi_hardware(gui: MicroManagerGUI) -> None:
+    """Without ASI hardware the MDA keeps the stock engine (no PLogic z-stack)."""
+    from pymmcore_gui.asi_z_stack.asi_controller import asi_zstack_hardware_available
+    from pymmcore_gui.asi_z_stack.engine import ASISPIMEngine
+
+    assert "PLogic:E:36" not in gui._mmc.getLoadedDevices()
+    assert asi_zstack_hardware_available() is False
+    gui._register_mda_engine()
+    assert not isinstance(gui._mmc.mda.engine, ASISPIMEngine)
+
+
+def test_mda_engine_registered_when_asi_hardware_present(
+    gui: MicroManagerGUI,
+) -> None:
+    """The PLogic-triggered engine is installed only while ASI hardware is loaded."""
+    from pymmcore_plus.mda import MDAEngine
+
+    from pymmcore_gui.asi_z_stack.engine import ASISPIMEngine
+
+    try:
+        with patch(
+            "pymmcore_gui.asi_z_stack.asi_controller.asi_zstack_hardware_available",
+            lambda: True,
+        ):
+            gui._register_mda_engine()
+        assert isinstance(gui._mmc.mda.engine, ASISPIMEngine)
+
+        # switching back to a non-ASI config restores the stock engine
+        gui._register_mda_engine()
+        assert isinstance(gui._mmc.mda.engine, MDAEngine)
+        assert not isinstance(gui._mmc.mda.engine, ASISPIMEngine)
+    finally:
+        # don't leak an ASI engine onto the shared global core
+        gui._mmc.mda.set_engine(MDAEngine(gui._mmc))
 
 
 @pytest.mark.skipif(
