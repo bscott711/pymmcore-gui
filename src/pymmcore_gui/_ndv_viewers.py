@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import warnings
+from contextlib import suppress
 from typing import TYPE_CHECKING, cast
 from weakref import WeakSet, WeakValueDictionary
 
@@ -71,6 +72,9 @@ class NDVViewersManager(QObject):
         # (see set_viewer_z_locked / _update_mda_viewer). Absent from this dict
         # means "live" mode -- the default, always-jump-to-latest behavior.
         self._locked_z_axis: dict[ndv.ArrayViewer, int] = {}
+        # {viewer: current_index.item_changed listener} for locked viewers, so
+        # set_viewer_z_locked(locked=False) / _cleanup can disconnect them.
+        self._z_lock_listeners: dict[ndv.ArrayViewer, Callable[..., None]] = {}
 
         # Per-camera preview dock widgets, keyed by physical camera label.
         # e.g. {"Camera-1": <CDockWidget>, "Camera-2": <CDockWidget>}
@@ -136,9 +140,28 @@ class NDVViewersManager(QObject):
         dw.setWidget(preview)
         dw.setFeature(dw.DockWidgetFeature.DockWidgetFloatable, False)
         self._camera_previews[camera_label] = dw
-        self._apply_roi_overlays(preview, camera_label)
+        rois = self._apply_roi_overlays(preview, camera_label)
+        # Default the view -- including future resets from append() recreating
+        # the texture (e.g. the first real frame after the placeholder) -- to
+        # the union of this camera's defined spectral ROIs (its new "100%")
+        # instead of the full sensor. The user can still pan/zoom further in.
+        preview.set_default_zoom_rect(self._roi_union_rect(rois))
         self.previewViewerCreated.emit(dw, camera_label)
         return preview
+
+    @staticmethod
+    def _roi_union_rect(
+        rois: list[tuple[str, tuple[int, int, int, int]]],
+    ) -> tuple[int, int, int, int] | None:
+        """Return the ``(x, y, w, h)`` union bbox of *rois*, or None if empty."""
+        if not rois:
+            return None
+        xs0 = [r[0] for _, r in rois]
+        ys0 = [r[1] for _, r in rois]
+        xs1 = [r[0] + r[2] for _, r in rois]
+        ys1 = [r[1] + r[3] for _, r in rois]
+        x0, y0 = min(xs0), min(ys0)
+        return x0, y0, max(xs1) - x0, max(ys1) - y0
 
     def create_default_camera_previews(self) -> None:
         """Proactively create a preview dock for every configured physical camera.
@@ -158,8 +181,15 @@ class NDVViewersManager(QObject):
         for label in self._get_physical_camera_labels():
             self._get_or_create_camera_preview(label)
 
-    def _apply_roi_overlays(self, preview: PygfxPreview, camera_label: str) -> None:
-        """Draw this camera's configured splitter ROIs on *preview*, if any."""
+    def _apply_roi_overlays(
+        self, preview: PygfxPreview, camera_label: str
+    ) -> list[tuple[str, tuple[int, int, int, int]]]:
+        """Draw this camera's configured splitter ROIs on *preview*, if any.
+
+        Returns the ``(name, rect)`` pairs drawn, so callers that need the
+        raw rectangles (e.g. to compute a zoom target) don't have to
+        re-derive them from settings.
+        """
         spectral = SettingsV1.instance().spectral
         rois = [
             (c.name, c.rect)
@@ -167,15 +197,22 @@ class NDVViewersManager(QObject):
             if c.is_ready and c.camera == camera_label and c.rect is not None
         ]
         preview.set_roi_overlays(rois)
+        return rois
 
     def refresh_roi_overlays(self) -> None:
         """Re-apply spectral-channel ROI overlays to every open camera preview.
 
         Called after the spectral-channel config UI saves changes, so already
-        open live/snap panes reflect the new rectangles immediately.
+        open live/snap panes reflect the new rectangles immediately. Also
+        updates each preview's stored zoom-to-ROI default so it stays correct
+        across future texture resets, but doesn't force an immediate re-frame
+        -- an already-open preview may have been manually panned/zoomed since
+        it was created, and this shouldn't yank that away.
         """
         for label, dw in self._camera_previews.items():
-            self._apply_roi_overlays(cast("PygfxPreview", dw.widget()), label)
+            preview = cast("PygfxPreview", dw.widget())
+            rois = self._apply_roi_overlays(preview, label)
+            preview.set_default_zoom_rect(self._roi_union_rect(rois), apply=False)
 
     def get_or_create_camera_preview(self, camera_label: str) -> PygfxPreview:
         """Return (creating and showing if needed) the preview for *camera_label*."""
@@ -345,7 +382,29 @@ class NDVViewersManager(QObject):
         self._active_mda_viewer = None
         self._own_handler = None
         self._pending_viewer_updates.clear()
+        for viewer, listener in self._z_lock_listeners.items():
+            with suppress(Exception):  # viewer may already be gone/destroyed
+                viewer.display_model.current_index.item_changed.disconnect(listener)
+        self._z_lock_listeners.clear()
         self._locked_z_axis.clear()
+
+    def _make_z_lock_listener(self, viewer: ndv.ArrayViewer) -> Callable[..., None]:
+        """Return a listener that keeps ``_locked_z_axis[viewer]`` in sync.
+
+        Connected to ``current_index.item_changed`` while *viewer* is locked,
+        so that manually dragging to a new slice re-locks to it (rather than
+        the slice originally captured at lock time). Safe against the
+        manager's own programmatic writes in ``_update_mda_viewer``: those
+        only ever set "z" to the value already recorded in
+        ``_locked_z_axis`` (frames at any other z are dropped before that
+        call), so this listener re-recording the same value is a no-op.
+        """
+
+        def _on_item_changed(key: str, new_value: object, old_value: object) -> None:
+            if key == "z" and viewer in self._locked_z_axis:
+                self._locked_z_axis[viewer] = cast("int", new_value)
+
+        return _on_item_changed
 
     def set_viewer_z_locked(self, viewer: ndv.ArrayViewer, locked: bool) -> None:
         """Toggle "locked slice" playback mode for a live-MDA *viewer*.
@@ -355,15 +414,23 @@ class NDVViewersManager(QObject):
         viewer is showing right now and stops jumping around -- it only
         updates when a new frame arrives at that same z index (see
         ``_update_mda_viewer``), so watching one plane over time isn't
-        interrupted by frames from other z planes. A no-op if the sequence
-        has no z axis. Unlocking (or re-locking) returns to normal behavior.
+        interrupted by frames from other z planes. Manually dragging to a
+        different slice while locked re-locks to that new slice for
+        subsequent frames. A no-op if the sequence has no z axis. Unlocking
+        (or re-locking) returns to normal behavior.
         """
         if locked:
             current_z = dict(viewer.display_model.current_index).get("z")
             if current_z is not None:
                 self._locked_z_axis[viewer] = cast("int", current_z)
+                listener = self._make_z_lock_listener(viewer)
+                self._z_lock_listeners[viewer] = listener
+                viewer.display_model.current_index.item_changed.connect(listener)
         else:
             self._locked_z_axis.pop(viewer, None)
+            if viewer in self._z_lock_listeners:
+                listener = self._z_lock_listeners.pop(viewer)
+                viewer.display_model.current_index.item_changed.disconnect(listener)
 
     def _on_sequence_started(
         self, sequence: useq.MDASequence, meta: SummaryMetaV1

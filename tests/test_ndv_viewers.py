@@ -112,3 +112,75 @@ def test_z_lock_skips_non_matching_frames(mmcore: CMMCorePlus, qtbot: QtBot) -> 
     assert dict(viewer.display_model.current_index).get("z") == other_z_event.index.get(
         "z"
     )
+
+
+def test_z_lock_tracks_manual_slice_drag(mmcore: CMMCorePlus, qtbot: QtBot) -> None:
+    """Manually dragging to a new slice while locked re-locks to that slice."""
+    dummy = QWidget()
+    manager = NDVViewersManager(dummy, mmcore)
+
+    seq = MDASequence(
+        z_plan=useq.ZRangeAround(range=2, step=1),
+        time_plan=useq.TIntervalLoops(interval=0, loops=3),  # pyright: ignore
+    )
+    events = list(seq)
+    handler = TensorStoreHandler(driver="zarr", kvstore="memory://")
+    handler.reset(seq)
+    frame = np.zeros((4, 4), dtype="uint8")
+
+    viewer = ndv.ArrayViewer()
+
+    # first call just binds the viewer to the handler's store (no index
+    # update happens yet); the second establishes a real current_index via
+    # the normal coalesced-update path (see test_z_lock_skips_non_matching_frames).
+    first = events[0]
+    handler.frameReady(frame, first, {})  # pyright: ignore
+    manager._update_mda_viewer(viewer, handler, first)
+    manager._update_mda_viewer(viewer, handler, first)
+    qtbot.waitUntil(
+        lambda: dict(viewer.display_model.current_index).get("z") is not None,
+        timeout=2000,
+    )
+    original_z = dict(viewer.display_model.current_index).get("z")
+    assert original_z is not None
+    assert dict(viewer.display_model.current_index).get("t") == first.index.get("t")
+
+    manager.set_viewer_z_locked(viewer, True)
+    assert manager._locked_z_axis[viewer] == original_z
+
+    # simulate the user manually dragging the z slider to a different slice
+    new_z = next(z for z in (e.index.get("z") for e in events) if z != original_z)
+    viewer.display_model.current_index["z"] = new_z
+    assert manager._locked_z_axis[viewer] == new_z
+
+    # a subsequent frame at the *original* z is now skipped -- it no longer
+    # matches the (updated) lock
+    stale_z_event = next(
+        e
+        for e in events
+        if e.index.get("z") == original_z and e.index.get("t") != first.index.get("t")
+    )
+    handler.frameReady(frame, stale_z_event, {})  # pyright: ignore
+    manager._update_mda_viewer(viewer, handler, stale_z_event)
+    qtbot.wait(200)  # give the (dropped) coalesced update a chance to fire
+    assert dict(viewer.display_model.current_index).get("z") == new_z
+
+    # a frame at the newly-locked z *does* update the view
+    new_z_event = next(
+        e
+        for e in events
+        if e.index.get("z") == new_z and e.index.get("t") != first.index.get("t")
+    )
+    handler.frameReady(frame, new_z_event, {})  # pyright: ignore
+    manager._update_mda_viewer(viewer, handler, new_z_event)
+    qtbot.waitUntil(
+        lambda: dict(viewer.display_model.current_index).get("t")
+        == new_z_event.index.get("t"),
+        timeout=2000,
+    )
+
+    # unlocking disconnects the listener -- further manual drags no longer
+    # touch _locked_z_axis
+    manager.set_viewer_z_locked(viewer, False)
+    viewer.display_model.current_index["z"] = original_z
+    assert viewer not in manager._locked_z_axis
