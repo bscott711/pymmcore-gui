@@ -11,10 +11,13 @@ from weakref import WeakValueDictionary
 
 from pymmcore_plus import CMMCorePlus
 from pymmcore_widgets import ConfigWizard
+from PyQt6.QtCore import QTimer
 from PyQt6.QtGui import QAction, QCloseEvent, QGuiApplication, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDialog,
+    QHBoxLayout,
     QMainWindow,
     QMenu,
     QMenuBar,
@@ -22,9 +25,16 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QStatusBar,
     QToolBar,
+    QVBoxLayout,
     QWidget,
 )
-from PyQt6Ads import CDockManager, CDockWidget, SideBarLocation
+from PyQt6Ads import (
+    CDockAreaWidget,
+    CDockManager,
+    CDockWidget,
+    DockWidgetArea,
+    SideBarLocation,
+)
 from superqt import QIconifyIcon
 
 from ._mmcore_shutdown import shutdown_mmcore, track_mda_thread
@@ -239,6 +249,13 @@ class MicroManagerGUI(QMainWindow):
         )
         self._central.setWidget(blank)
         self._central_dock_area = self.dock_manager.setCentralWidget(self._central)
+
+        # Per-camera preview dock AREAS (not just widgets), keyed by physical
+        # camera label -- populated in _on_previewer_created, consulted in
+        # _on_mda_viewer_created so each camera's MDA tab joins that camera's
+        # own preview area instead of a single shared central area. Reset
+        # fresh every session (not persisted) -- see _ensure_camera_previews.
+        self._camera_preview_areas: dict[str, CDockAreaWidget] = {}
 
         # QTimer.singleShot(0, self._restore_state)
 
@@ -554,6 +571,24 @@ class MicroManagerGUI(QMainWindow):
         if show:
             self.show()
             self.nm.reposition_notifications()
+            # Defer past this event-loop iteration so the window actually
+            # paints before we potentially block on the one-time GPU/wgpu
+            # init that creating a camera preview triggers (see
+            # _ensure_camera_previews) -- otherwise that pause would land
+            # before the user ever sees the window at all.
+            QTimer.singleShot(0, self._ensure_camera_previews)
+
+    def _ensure_camera_previews(self) -> None:
+        """Proactively create + auto-arrange camera preview docks at startup.
+
+        Without this, Camera-1/Camera-2 preview docks only appear after the
+        user manually clicks Snap or Live, and have to be manually
+        rearranged into a split view every session. This also moves the
+        one-time GPU/wgpu initialization (shared with the first MDA's ndv
+        viewer) to this deliberate startup pause instead of blocking the
+        event loop mid-Acquire on the first MDA of a session.
+        """
+        self._viewers_manager.create_default_camera_previews()
 
     def _save_state(self) -> None:
         """Save the state of the window to settings."""
@@ -613,6 +648,29 @@ class MicroManagerGUI(QMainWindow):
         title = f"MDA {sha}" + (f" — {camera_label}" if camera_label else "")
         q_viewer.setWindowTitle(title)
 
+        # Small header row with a "Lock current slice" toggle -- lets the
+        # user pin whichever z-index is currently displayed, so the view
+        # stops jumping to every new frame and only updates when a new
+        # frame arrives at that same z (see NDVViewersManager.set_viewer_z_locked
+        # / _update_mda_viewer). A no-op for sequences with no z axis.
+        container = QWidget(self)
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(0)
+        lock_row = QWidget(container)
+        lock_layout = QHBoxLayout(lock_row)
+        lock_layout.setContentsMargins(4, 2, 4, 2)
+        lock_checkbox = QCheckBox("Lock current slice", lock_row)
+        lock_checkbox.toggled.connect(
+            lambda checked, v=ndv_viewer: self._viewers_manager.set_viewer_z_locked(
+                v, checked
+            )
+        )
+        lock_layout.addWidget(lock_checkbox)
+        lock_layout.addStretch()
+        container_layout.addWidget(lock_row)
+        container_layout.addWidget(q_viewer)
+
         # NOTE: don't call q_viewer.setWindowFlags(Qt.WindowType.Dialog) here --
         # changing window flags on an already-parented widget forces Qt to hide
         # and rebuild its native window handle, which (combined with the
@@ -624,12 +682,39 @@ class MicroManagerGUI(QMainWindow):
         # small hack ... we need to retain a pointer to the viewer
         # otherwise the viewer will be garbage collected
         dw._viewer = ndv_viewer  # type: ignore
-        dw.setWidget(q_viewer)
+        dw.setWidget(container)
         dw.setFeature(dw.DockWidgetFeature.DockWidgetFloatable, False)
+
+        # Route each camera's MDA tab to that camera's own preview area, so
+        # multi-camera MDAs don't all pile up as tabs in one shared area.
+        # Falls back to the shared central area for the single-camera case
+        # or if the tracked area reference has gone stale (e.g. the preview
+        # dock was closed/reparented in the meantime).
+        area = self._camera_preview_areas.get(camera_label) if camera_label else None
+        if area is not None:
+            try:
+                self.dock_manager.addDockWidgetTabToArea(dw, area)
+                return
+            except RuntimeError:
+                pass
         self.dock_manager.addDockWidgetTabToArea(dw, self._central_dock_area)
 
-    def _on_previewer_created(self, dock_widget: CDockWidget) -> None:
-        self.dock_manager.addDockWidgetTabToArea(dock_widget, self._central_dock_area)
+    def _on_previewer_created(
+        self, dock_widget: CDockWidget, camera_label: str = ""
+    ) -> None:
+        if self._camera_preview_areas:
+            # split beside the most recently placed camera preview, extending
+            # the row left-to-right as more cameras are discovered
+            target = next(reversed(self._camera_preview_areas.values()))
+            area = self.dock_manager.addDockWidget(
+                DockWidgetArea.RightDockWidgetArea, dock_widget, target
+            )
+        else:
+            area = self.dock_manager.addDockWidgetTabToArea(
+                dock_widget, self._central_dock_area
+            )
+        if area is not None and camera_label:
+            self._camera_preview_areas[camera_label] = area
 
     def _on_exception(self, exc: BaseException) -> None:
         """Show a notification when an exception is raised."""

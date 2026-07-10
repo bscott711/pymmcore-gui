@@ -105,6 +105,77 @@ def test_ndv_viewers_in_main_window(gui: MicroManagerGUI) -> None:
     assert central_area.dockWidgetsCount() == 2
 
 
+def test_startup_camera_previews_split_layout(
+    gui: MicroManagerGUI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Startup should auto-create + split-layout a preview for every camera."""
+    vm = gui._viewers_manager
+    central_area = cast("CDockAreaWidget", gui._central_dock_area)
+    before = central_area.dockWidgetsCount()  # the blank placeholder widget
+    monkeypatch.setattr(gui.mmcore, "getCameraDevice", lambda: "MultiCam")
+    monkeypatch.setattr(
+        vm, "_get_physical_camera_labels", lambda: ["Camera-1", "Camera-2"]
+    )
+
+    gui._ensure_camera_previews()
+
+    assert set(vm._camera_previews) == {"Camera-1", "Camera-2"}
+    assert set(gui._camera_preview_areas) == {"Camera-1", "Camera-2"}
+    area1 = gui._camera_preview_areas["Camera-1"]
+    area2 = gui._camera_preview_areas["Camera-2"]
+    # the first camera preview tabs into the existing central area; the
+    # second gets its own new area, split beside the first (not tabbed)
+    assert area1 is central_area
+    assert area2 is not area1
+    assert area1.dockWidgetsCount() == before + 1
+    assert area2.dockWidgetsCount() == 1
+
+    # calling it again (e.g. a second startup) doesn't duplicate anything
+    gui._ensure_camera_previews()
+    assert area1.dockWidgetsCount() == before + 1
+    assert area2.dockWidgetsCount() == 1
+
+
+def test_ensure_camera_previews_noop_without_camera(
+    gui: MicroManagerGUI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No camera configured yet (e.g. no config loaded) -> no-op, no crash."""
+    monkeypatch.setattr(gui.mmcore, "getCameraDevice", lambda: "")
+    gui._ensure_camera_previews()
+    assert not gui._viewers_manager._camera_previews
+    assert not gui._camera_preview_areas
+
+
+def test_mda_viewer_routed_to_own_camera_preview_area(
+    gui: MicroManagerGUI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each camera's MDA viewer tab should join that camera's own preview area."""
+    import ndv
+
+    vm = gui._viewers_manager
+    monkeypatch.setattr(gui.mmcore, "getCameraDevice", lambda: "MultiCam")
+    monkeypatch.setattr(
+        vm, "_get_physical_camera_labels", lambda: ["Camera-1", "Camera-2"]
+    )
+    gui._ensure_camera_previews()
+    area1 = gui._camera_preview_areas["Camera-1"]
+    area2 = gui._camera_preview_areas["Camera-2"]
+    before1, before2 = area1.dockWidgetsCount(), area2.dockWidgetsCount()
+
+    seq = useq.MDASequence(channels=["DAPI"])  # pyright: ignore
+    vm.mdaViewerCreated.emit(ndv.ArrayViewer(), seq, "Camera-1")
+    vm.mdaViewerCreated.emit(ndv.ArrayViewer(), seq, "Camera-2")
+
+    assert area1.dockWidgetsCount() == before1 + 1
+    assert area2.dockWidgetsCount() == before2 + 1
+
+    # single-camera case (empty camera_label) still falls back to central,
+    # which is the same area object as area1 here (Camera-1 was first)
+    before = area1.dockWidgetsCount()
+    vm.mdaViewerCreated.emit(ndv.ArrayViewer(), seq, "")
+    assert area1.dockWidgetsCount() == before + 1
+
+
 def test_main_window_notifications(gui: MicroManagerGUI) -> None:
     """Test that notifications are created and removed correctly."""
     assert isinstance(gui.nm, NotificationManager)

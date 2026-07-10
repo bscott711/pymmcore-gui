@@ -70,6 +70,7 @@ dependencies = [
 superqt = { git = "https://github.com/bscott711/superqt.git", branch = "main" }
 pymmcore-widgets = { path = "../pymmcore-widgets", editable = true }
 crispy = { path = "../CRISPy", editable = true }
+ndv = { path = "../ndv", editable = true }
 
 [dependency-groups]
 # should only be used after manually uninstalling PyQt6 and PyQt6Ads

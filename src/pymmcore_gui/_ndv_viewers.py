@@ -39,7 +39,7 @@ class NDVViewersManager(QObject):
     """
 
     mdaViewerCreated = pyqtSignal(ndv.ArrayViewer, useq.MDASequence, str)
-    previewViewerCreated = pyqtSignal(CDockWidget)
+    previewViewerCreated = pyqtSignal(CDockWidget, str)
     viewerDestroyed = pyqtSignal(str)
 
     def __init__(self, parent: QWidget, mmcore: CMMCorePlus):
@@ -66,6 +66,11 @@ class NDVViewersManager(QObject):
         # {viewer: latest event} for a coalesced, at-most-one-in-flight
         # QTimer.singleShot per viewer -- see _update_mda_viewer.
         self._pending_viewer_updates: dict[ndv.ArrayViewer, useq.MDAEvent] = {}
+
+        # {viewer: locked z index} for viewers in "locked slice" playback mode
+        # (see set_viewer_z_locked / _update_mda_viewer). Absent from this dict
+        # means "live" mode -- the default, always-jump-to-latest behavior.
+        self._locked_z_axis: dict[ndv.ArrayViewer, int] = {}
 
         # Per-camera preview dock widgets, keyed by physical camera label.
         # e.g. {"Camera-1": <CDockWidget>, "Camera-2": <CDockWidget>}
@@ -132,8 +137,26 @@ class NDVViewersManager(QObject):
         dw.setFeature(dw.DockWidgetFeature.DockWidgetFloatable, False)
         self._camera_previews[camera_label] = dw
         self._apply_roi_overlays(preview, camera_label)
-        self.previewViewerCreated.emit(dw)
+        self.previewViewerCreated.emit(dw, camera_label)
         return preview
+
+    def create_default_camera_previews(self) -> None:
+        """Proactively create a preview dock for every configured physical camera.
+
+        Called once at startup (see ``MicroManagerGUI._ensure_camera_previews``)
+        so the user doesn't have to Snap before the camera panes exist. This
+        also has the side effect of paying the one-time GPU/wgpu
+        initialization that the first ``PygfxPreview`` (or ``ndv.ArrayViewer``)
+        triggers during this deliberate startup pause, instead of blocking the
+        event loop mid-Acquire on the first MDA of a session -- both use the
+        same underlying ``pygfx`` renderer singleton.
+
+        No-op if no camera device is configured yet (e.g. no config loaded).
+        """
+        if not self._mmc.getCameraDevice():
+            return
+        for label in self._get_physical_camera_labels():
+            self._get_or_create_camera_preview(label)
 
     def _apply_roi_overlays(self, preview: PygfxPreview, camera_label: str) -> None:
         """Draw this camera's configured splitter ROIs on *preview*, if any."""
@@ -322,6 +345,25 @@ class NDVViewersManager(QObject):
         self._active_mda_viewer = None
         self._own_handler = None
         self._pending_viewer_updates.clear()
+        self._locked_z_axis.clear()
+
+    def set_viewer_z_locked(self, viewer: ndv.ArrayViewer, locked: bool) -> None:
+        """Toggle "locked slice" playback mode for a live-MDA *viewer*.
+
+        In the default "live" mode, the viewer jumps to show every newly
+        acquired frame. In "locked" mode, it captures whichever z index the
+        viewer is showing right now and stops jumping around -- it only
+        updates when a new frame arrives at that same z index (see
+        ``_update_mda_viewer``), so watching one plane over time isn't
+        interrupted by frames from other z planes. A no-op if the sequence
+        has no z axis. Unlocking (or re-locking) returns to normal behavior.
+        """
+        if locked:
+            current_z = dict(viewer.display_model.current_index).get("z")
+            if current_z is not None:
+                self._locked_z_axis[viewer] = cast("int", current_z)
+        else:
+            self._locked_z_axis.pop(viewer, None)
 
     def _on_sequence_started(
         self, sequence: useq.MDASequence, meta: SummaryMetaV1
@@ -427,6 +469,9 @@ class NDVViewersManager(QObject):
             latest = self._pending_viewer_updates.pop(v, None)
             if latest is None:
                 return  # pragma: no cover
+            locked_z = self._locked_z_axis.get(v)
+            if locked_z is not None and latest.index.get("z") != locked_z:
+                return  # locked to a different z-slice -- skip this frame
             try:
                 v.display_model.current_index.update(latest.index.items())
             except Exception:  # pragma: no cover
