@@ -15,13 +15,13 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from pymmcore_plus import CMMCorePlus
-from pymmcore_plus.mda.handlers import handler_for_path
 
 from pymmcore_gui._multi_camera_handler import (
     _KNOWN_SUFFIXES,
     _sanitize,
     without_cam_index,
 )
+from pymmcore_gui._vendored.mda_handlers import handler_for_path
 
 if TYPE_CHECKING:
     from pathlib import Path

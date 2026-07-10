@@ -172,9 +172,17 @@ ignore_missing_imports = true
 module = ["PyQt6.*"]
 follow_imports = "skip"
 
+[[tool.mypy.overrides]]
+# Vendored, unmodified copy of pymmcore_plus.mda.handlers (see its __init__.py
+# docstring) -- don't hand-patch typing issues into someone else's code we're
+# keeping byte-identical for future updates.
+module = ["pymmcore_gui._vendored.*"]
+ignore_errors = true
+
 
 [tool.pyright]
 include = ["src", "tests"]
+exclude = ["src/pymmcore_gui/_vendored"]
 pythonVersion = "3.10"
 enableExperimentalFeatures = true
 reportMissingImports = false
@@ -192,14 +200,6 @@ filterwarnings = [
     "ignore:Failed to disconnect:RuntimeWarning",
     "ignore:Error fetching icon::superqt",
     "ignore:.*`do_history`.*::ipykernel",
-    # pymmcore-plus 0.18 deprecated `mda.handlers` (moving to ome-writers); we
-    # still rely on TensorStoreHandler. Don't let the FutureWarning fail the suite.
-    "ignore:The 'pymmcore_plus.mda.handlers' module is deprecated:FutureWarning",
-    # pymmcore-plus 0.18 deprecated `get_output_handlers` in favor of `get_sink()`,
-    # but `get_sink()` isn't implemented yet in this version. _ndv_viewers.py still
-    # needs to detect an externally-supplied handler, so keep using the old (still
-    # functional) API until a real replacement lands upstream.
-    "ignore:`get_output_handlers` is deprecated:DeprecationWarning",
 ]
 
 # https://coverage.readthedocs.io/

@@ -6,24 +6,20 @@ from weakref import WeakSet, WeakValueDictionary
 
 import ndv
 import useq
-from pymmcore_plus.mda.handlers import TensorStoreHandler
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QWidget
 from PyQt6Ads import CDockWidget
 
 from pymmcore_gui._multi_camera_handler import without_cam_index
 from pymmcore_gui._settings import SettingsV1
+from pymmcore_gui._vendored.mda_handlers import TensorStoreHandler
 from pymmcore_gui.widgets.image_preview._pygfx_preview import PygfxPreview
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
     import numpy as np
-    from ndv.models._array_display_model import (
-        IndexMap,  # pyright: ignore[reportPrivateImportUsage]
-    )
     from pymmcore_plus import CMMCorePlus
-    from pymmcore_plus.mda import SupportsFrameReady
     from pymmcore_plus.metadata import FrameMetaV1, SummaryMetaV1
     from useq import MDASequence
 
@@ -56,15 +52,20 @@ class NDVViewersManager(QObject):
         # currently active viewer
         self._active_mda_viewer: ndv.ArrayViewer | None = None
 
-        # We differentiate between handlers that were created by someone else, and
-        # gathered using mda.get_output_handlers(), vs handlers that were created by us.
-        # because we need to call frameReady/sequenceFinished manually on the latter.
-        self._handler: SupportsFrameReady | None = None
+        # Private, in-memory (``memory://``) display-only handler for the
+        # single-camera case -- always created fresh per sequence (see
+        # _on_sequence_started), independent of whatever the MDA's real
+        # output/save handler is doing. We call frameReady/sequenceFinished on
+        # it manually.
         self._own_handler: TensorStoreHandler | None = None
 
         # CONNECTIONS ---------------------------------------------------------
 
         self._is_mda_running = False
+
+        # {viewer: latest event} for a coalesced, at-most-one-in-flight
+        # QTimer.singleShot per viewer -- see _update_mda_viewer.
+        self._pending_viewer_updates: dict[ndv.ArrayViewer, useq.MDAEvent] = {}
 
         # Per-camera preview dock widgets, keyed by physical camera label.
         # e.g. {"Camera-1": <CDockWidget>, "Camera-2": <CDockWidget>}
@@ -319,20 +320,25 @@ class NDVViewersManager(QObject):
 
     def _cleanup(self, obj: QObject | None = None) -> None:
         self._active_mda_viewer = None
-        self._handler = None
         self._own_handler = None
+        self._pending_viewer_updates.clear()
 
     def _on_sequence_started(
         self, sequence: useq.MDASequence, meta: SummaryMetaV1
     ) -> None:
         """Called when a new MDA sequence has been started.
 
-        We grab the first handler in the list of output handlers, or create a new
-        TensorStoreHandler if none exist. Then we create a new ndv viewer and show it.
+        Every camera gets its own private, in-memory ``TensorStoreHandler``
+        purely for display, regardless of whatever the MDA's real output/save
+        handler is doing (pymmcore-plus 0.18 routes a str/Path output through
+        a sink that isn't discoverable via the now-deprecated
+        ``mda.get_output_handlers()``, so there's no reliable way to reuse the
+        real save handler as a display source here). Then we create a new ndv
+        viewer and show it.
         """
         self._is_mda_running = True
 
-        self._own_handler = self._handler = None
+        self._own_handler = None
         self._mda_camera_handlers.clear()
         self._mda_camera_viewers.clear()
 
@@ -352,13 +358,8 @@ class NDVViewersManager(QObject):
             self._active_mda_viewer = None
             return
 
-        if handlers := self._mmc.mda.get_output_handlers():
-            # someone else has created a handler for this sequence
-            self._handler = handlers[0]
-        else:
-            # if it does not exist, create a new TensorStoreHandler
-            self._own_handler = TensorStoreHandler(driver="zarr", kvstore="memory://")
-            self._own_handler.reset(sequence)
+        self._own_handler = TensorStoreHandler(driver="zarr", kvstore="memory://")
+        self._own_handler.reset(sequence)
 
         # since the handler is empty at this point, create a ndv viewer with no data
         self._active_mda_viewer = self._create_ndv_viewer(sequence)
@@ -388,43 +389,52 @@ class NDVViewersManager(QObject):
         if (viewer := self._active_mda_viewer) is None:
             return  # pragma: no cover
 
-        self._update_mda_viewer(viewer, self._handler or self._own_handler, event)
+        self._update_mda_viewer(viewer, self._own_handler, event)
 
     def _update_mda_viewer(
         self,
         viewer: ndv.ArrayViewer,
-        handler: SupportsFrameReady | None,
+        handler: TensorStoreHandler | None,
         event: useq.MDAEvent,
     ) -> None:
         """Point the viewer at the handler store, or update its current index."""
+        if handler is None:
+            return  # pragma: no cover
+
         # if the viewer does not yet have data, it's likely the very first frame
-        # so update the viewer's data source to the underlying handlers store
+        # so update the viewer's data source to the underlying handler's store
         if viewer.data_wrapper is None:
-            if isinstance(handler, TensorStoreHandler):
-                # TODO: temporary. maybe create the DataWrapper for the handlers
-                viewer.data = handler.store
-            else:
-                warnings.warn(
-                    f"don't know how to show data of type {type(handler)}",
-                    stacklevel=2,
-                )
-        # otherwise update the sliders to the most recently acquired frame
-        else:
-            # Add a small delay to make sure the data are available in the handler
-            # This is a bit of a hack to get around the data handlers can write data
-            # asynchronously, so the data may not be available immediately to the viewer
-            # after the handler's frameReady method is called.
-            current_index = viewer.display_model.current_index
+            # TODO: temporary. maybe create the DataWrapper for the handlers
+            viewer.data = handler.store
+            return
 
-            def _update(_idx: IndexMap = current_index) -> None:
-                try:
-                    _idx.update(event.index.items())
-                except Exception:  # pragma: no cover
-                    # this happens if the viewer has been closed in the meantime
-                    # usually it's a RuntimeError, but could be an EmitLoopError
-                    pass
+        # Otherwise, move the viewer's slider to the most recently acquired
+        # frame. At real acquisition frame rates, scheduling a brand-new
+        # QTimer.singleShot per frame (as before) piles up callbacks on the Qt
+        # event loop faster than they can run -- only the *latest* event
+        # actually matters (each update just moves the slider to "wherever we
+        # are now"), so coalesce: at most one deferred update in flight per
+        # viewer, always reflecting the latest event. The 10ms delay (kept
+        # from the original implementation) works around data handlers
+        # writing asynchronously, so the frame may not be available to the
+        # viewer immediately after the handler's frameReady method is called.
+        already_pending = viewer in self._pending_viewer_updates
+        self._pending_viewer_updates[viewer] = event
+        if already_pending:
+            return  # already scheduled -- it will pick up this latest event
 
-            QTimer.singleShot(10, _update)
+        def _update(v: ndv.ArrayViewer = viewer) -> None:
+            latest = self._pending_viewer_updates.pop(v, None)
+            if latest is None:
+                return  # pragma: no cover
+            try:
+                v.display_model.current_index.update(latest.index.items())
+            except Exception:  # pragma: no cover
+                # this happens if the viewer has been closed in the meantime
+                # usually it's a RuntimeError, but could be an EmitLoopError
+                pass
+
+        QTimer.singleShot(10, _update)
 
     def _on_sequence_finished(self, sequence: useq.MDASequence) -> None:
         """Called when a sequence has finished."""

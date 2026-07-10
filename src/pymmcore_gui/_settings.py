@@ -193,6 +193,13 @@ class SpectralChannelConfig(BaseModel):
     """Physical camera device label, e.g. ``"Camera-1"``."""
     laser_preset: str
     """The single-laser config preset this region maps to, e.g. ``"488nm"``."""
+    position: Literal["top", "bottom"] = "top"
+    """Which half of the image splitter's sensor this region occupies.
+
+    Used only to auto-populate sibling regions when the first region on any
+    camera is drawn (see :class:`~pymmcore_gui.widgets._spectral_channel_config.
+    SpectralChannelConfigWidget`) -- it is not otherwise consulted for saving.
+    """
     rect: tuple[int, int, int, int] | None = None
     """``(x, y, w, h)`` in full-sensor pixel coordinates. ``None`` until drawn."""
 
@@ -204,15 +211,23 @@ class SpectralChannelConfig(BaseModel):
 
 def _default_spectral_channels() -> list[SpectralChannelConfig]:
     return [
-        SpectralChannelConfig(name="GFP_488", camera="Camera-1", laser_preset="488nm"),
         SpectralChannelConfig(
-            name="CalceinViolet_405", camera="Camera-1", laser_preset="405nm"
+            name="GFP_488", camera="Camera-1", laser_preset="488nm", position="top"
         ),
         SpectralChannelConfig(
-            name="mScarlet_561", camera="Camera-2", laser_preset="561nm"
+            name="CalceinViolet_405",
+            camera="Camera-1",
+            laser_preset="405nm",
+            position="bottom",
         ),
         SpectralChannelConfig(
-            name="CF647_638", camera="Camera-2", laser_preset="638nm"
+            name="mScarlet_561", camera="Camera-2", laser_preset="561nm", position="top"
+        ),
+        SpectralChannelConfig(
+            name="CF647_638",
+            camera="Camera-2",
+            laser_preset="638nm",
+            position="bottom",
         ),
     ]
 

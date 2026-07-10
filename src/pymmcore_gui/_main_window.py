@@ -11,7 +11,6 @@ from weakref import WeakValueDictionary
 
 from pymmcore_plus import CMMCorePlus
 from pymmcore_widgets import ConfigWizard
-from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction, QCloseEvent, QGuiApplication, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
@@ -613,9 +612,15 @@ class MicroManagerGUI(QMainWindow):
         q_viewer.setObjectName(f"ndv-{sha}{suffix}")
         title = f"MDA {sha}" + (f" — {camera_label}" if camera_label else "")
         q_viewer.setWindowTitle(title)
-        q_viewer.setWindowFlags(Qt.WindowType.Dialog)
 
-        dw = CDockWidget(f"ndv-{sha}{suffix}")
+        # NOTE: don't call q_viewer.setWindowFlags(Qt.WindowType.Dialog) here --
+        # changing window flags on an already-parented widget forces Qt to hide
+        # and rebuild its native window handle, which (combined with the
+        # parentless CDockWidget below) was the cause of the whole main window
+        # visibly flickering/disappearing every time an MDA started. The
+        # viewer is going straight into a dock, not shown as a standalone
+        # dialog, so it doesn't need Dialog window flags.
+        dw = CDockWidget(f"ndv-{sha}{suffix}", self)
         # small hack ... we need to retain a pointer to the viewer
         # otherwise the viewer will be garbage collected
         dw._viewer = ndv_viewer  # type: ignore

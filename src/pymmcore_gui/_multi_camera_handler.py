@@ -21,7 +21,8 @@ from inspect import signature
 from typing import TYPE_CHECKING, Any
 
 from pymmcore_plus import CMMCorePlus
-from pymmcore_plus.mda.handlers import handler_for_path
+
+from pymmcore_gui._vendored.mda_handlers import handler_for_path
 
 if TYPE_CHECKING:
     from pathlib import Path

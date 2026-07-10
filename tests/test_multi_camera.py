@@ -100,7 +100,7 @@ def test_tensorstore_rejects_unstripped_cam_axis() -> None:
     ``cam`` index can't be written until that axis is stripped.
     """
     pytest.importorskip("tensorstore")
-    from pymmcore_plus.mda.handlers import TensorStoreHandler
+    from pymmcore_gui._vendored.mda_handlers import TensorStoreHandler
 
     seq = useq.MDASequence(
         channels=["DAPI"],  # pyright: ignore[reportArgumentType]
