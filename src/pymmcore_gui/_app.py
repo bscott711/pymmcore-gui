@@ -12,10 +12,16 @@ from typing import TYPE_CHECKING, Literal, cast
 from superqt.utils import WorkerBase
 
 from pymmcore_gui import __version__
-from pymmcore_gui._main_window import ICON, MicroManagerGUI
-from pymmcore_gui._qt.QtCore import QTimer, Signal
-from pymmcore_gui._qt.QtGui import QIcon
-from pymmcore_gui._qt.QtWidgets import QApplication, QCheckBox, QMessageBox, QWidget
+from pymmcore_gui._main_window import ICON, RESOURCES, MicroManagerGUI
+from pymmcore_gui._qt.QtCore import QCoreApplication, Qt, QTimer, Signal
+from pymmcore_gui._qt.QtGui import QIcon, QPixmap
+from pymmcore_gui._qt.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QMessageBox,
+    QSplashScreen,
+    QWidget,
+)
 from pymmcore_gui._settings import Settings
 
 from . import _sentry
@@ -169,8 +175,32 @@ def create_mmgui(
             stacklevel=2,
         )
 
+    # Everything below this point -- building the main window, loading a
+    # hardware config -- runs synchronously on this thread *before* app.exec()
+    # starts, so there's no event loop yet to paint anything. Without a
+    # splash, that shows up as a blank/unresponsive process for however long
+    # config loading takes. Skipped under pytest: popping a real window
+    # during the test suite is noise, not signal. See TESTING/_show_splash.
+    splash = None if TESTING else _show_splash(app)
+
+    def _set_status(msg: str) -> None:
+        if splash is not None:
+            splash.showMessage(
+                msg,
+                Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignHCenter,
+                Qt.GlobalColor.white,
+            )
+            app.processEvents()
+
+    _set_status("Building interface...")
     win = MicroManagerGUI(mmcore=mmcore)
-    QTimer.singleShot(0, lambda: win.restore_state(show=True))
+
+    def _show_main_window() -> None:
+        win.restore_state(show=True)
+        if splash is not None:
+            splash.finish(win)
+
+    QTimer.singleShot(0, _show_main_window)
 
     def _on_about_to_quit() -> None:
         # Safety net for exit paths that bypass MicroManagerGUI.closeEvent
@@ -192,10 +222,12 @@ def create_mmgui(
         # if a string was passed, load that config
         if mm_config:
             # if mm_config is a string, load that config
+            _set_status("Loading configuration...")
             win.mmcore.loadSystemConfiguration(mm_config)
         # otherwise, fall back to auto-loading / cli-based
         elif config := _decide_configuration(mm_config, win):
             try:
+                _set_status("Loading configuration...")
                 win.mmcore.loadSystemConfiguration(config)
             except Exception as e:  # pragma: no cover
                 warnings.warn(
@@ -215,6 +247,32 @@ def create_mmgui(
     if exec_app:
         app.exec()
     return win
+
+
+def _show_splash(app: QCoreApplication) -> QSplashScreen:
+    """Show a splash screen immediately, before the main window is built.
+
+    Loading a real hardware config -- especially one that grows the ASI/
+    PLogic circular buffer, see :func:`~pymmcore_gui.asi_z_stack.
+    asi_controller.ensure_circular_buffer_capacity_async` -- can take several
+    seconds, and that work currently happens before the Qt event loop even
+    starts. A splash gives the user something responsive to look at during
+    that gap instead of a blank, seemingly-frozen window. Closed via
+    ``QSplashScreen.finish(win)`` once the main window is shown.
+    """
+    pixmap = QPixmap(str(RESOURCES / "logo.png")).scaledToWidth(
+        220, Qt.TransformationMode.SmoothTransformation
+    )
+    splash = QSplashScreen(pixmap)
+    splash.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+    splash.showMessage(
+        "Starting pymmcore-gui...",
+        Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignHCenter,
+        Qt.GlobalColor.white,
+    )
+    splash.show()
+    app.processEvents()
+    return splash
 
 
 def _close_splash_screen() -> None:  # pragma: no cover

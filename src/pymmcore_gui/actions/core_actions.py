@@ -43,6 +43,7 @@ def snap_image(action: QCoreAction, checked: bool) -> None:
 
 def toggle_live(action: QCoreAction, checked: bool) -> None:
     """Start or stop live mode, firing the selected laser(s) while live."""
+    from pymmcore_gui.asi_z_stack import asi_controller
     from pymmcore_gui.asi_z_stack.asi_controller import (
         close_all_lasers,
         open_selected_lasers,
@@ -52,6 +53,11 @@ def toggle_live(action: QCoreAction, checked: bool) -> None:
     if mmc.isSequenceRunning():
         mmc.stopSequenceAcquisition()
         close_all_lasers()
+    elif asi_controller.circular_buffer_growing:
+        # Belt-and-suspenders: the action is normally disabled for this
+        # window (see MicroManagerGUI._on_system_config_loaded), but guard
+        # here too in case of a click that lands right as it's re-enabling.
+        action.setChecked(False)
     else:
         open_selected_lasers()
         mmc.startContinuousSequenceAcquisition(0)

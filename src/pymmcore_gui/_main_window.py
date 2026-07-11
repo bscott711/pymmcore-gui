@@ -432,18 +432,32 @@ class MicroManagerGUI(QMainWindow):
         # microscope-control sibling repo's confirmed-working engine, which
         # does this once at startup rather than per-MDA-run). Also
         # pre-allocate a large circular buffer once here -- see
-        # ensure_circular_buffer_capacity's docstring for why this must
+        # ensure_circular_buffer_capacity_async's docstring for why this must
         # never happen mid-acquisition. All three are no-ops for demo /
         # non-ASI configs.
         from pymmcore_gui.asi_z_stack.asi_controller import (
             ensure_beam_enabled,
-            ensure_circular_buffer_capacity,
+            ensure_circular_buffer_capacity_async,
             ensure_global_shutter_open,
         )
 
         ensure_global_shutter_open()
         ensure_beam_enabled()
-        ensure_circular_buffer_capacity()
+
+        # The buffer grow (if any) runs on a background thread and can take a
+        # few seconds for tens of GB -- disable Live for that window so it
+        # can't start a sequence acquisition against the main-process core
+        # while its circular buffer is mid-resize (see
+        # asi_controller.circular_buffer_growing). Resolves synchronously,
+        # with no visible flicker, when no growth is actually needed.
+        live_action = self.get_action(CoreAction.TOGGLE_LIVE)
+        live_action.setEnabled(False)
+
+        def _on_buffer_ready() -> None:
+            with suppress(RuntimeError):
+                live_action.setEnabled(bool(self._mmc.getCameraDevice()))
+
+        ensure_circular_buffer_capacity_async(on_done=_on_buffer_ready)
 
         self._register_mda_engine()
 
@@ -684,7 +698,7 @@ class MicroManagerGUI(QMainWindow):
         dw = CDockWidget(f"ndv-{sha}{suffix}", self)
         # small hack ... we need to retain a pointer to the viewer
         # otherwise the viewer will be garbage collected
-        dw._viewer = ndv_viewer  # type: ignore
+        dw._viewer = ndv_viewer
         dw.setWidget(container)
         dw.setFeature(dw.DockWidgetFeature.DockWidgetFloatable, False)
 
