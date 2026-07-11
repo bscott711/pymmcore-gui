@@ -236,9 +236,7 @@ class MicroManagerGUI(QMainWindow):
         CDockManager.setConfigFlag(CDockManager.eConfigFlag.OpaqueSplitterResize, True)
         # Split new docks evenly with their neighbor on insertion (e.g. two
         # camera preview docks end up 50/50 instead of sized off widget hints).
-        CDockManager.setConfigFlag(
-            CDockManager.eConfigFlag.EqualSplitOnInsertion, True
-        )
+        CDockManager.setConfigFlag(CDockManager.eConfigFlag.EqualSplitOnInsertion, True)
         CDockManager.setAutoHideConfigFlag(
             CDockManager.eAutoHideFlag.AutoHideFeatureEnabled, True
         )
