@@ -74,6 +74,68 @@ class _ASITriggerEngineBase(MDAEngine):
         self._original_autoshutter = True
         self._snapshot: CameraHandoffSnapshot | None = None
         self._worker_pool: CameraWorkerPool | None = None
+        self._piezo_pos_at_setup: float | None = None
+
+    def _set_event_z(self, event: MDAEvent) -> None:
+        """No-op: Z-stepping here is done entirely by the galvo hardware trigger.
+
+        ``event_iterator`` below forwards only the z-index-0 sub-event of
+        each collapsed stack, so the inherited ``MDAEngine._set_event_z``
+        would call ``mmcore.setZPosition()`` with that sub-event's resolved
+        position -- the *bottom* of the intended range for the default
+        ``go_up=True`` direction -- physically moving the piezo (this rig's
+        Core-Focus device) by ``-range/2`` before the galvo stack even
+        triggers. Since the galvo's own sweep is always centered on wherever
+        the focus device physically sits at trigger time
+        (``SingleAxisYOffset(deg)`` is hardcoded to ``"0.0"`` in
+        ``setup_sequence``), that stray pre-move shifts the whole optical
+        stack by another ``range/2`` in the same direction -- landing the
+        pre-acquisition focus at the very last slice instead of the middle,
+        and leaving the piezo parked away from where the user left it
+        (nothing restores it afterward). Confirmed bench symptom: a
+        symmetric ``ZRangeAround`` stack put the focused plane at the last
+        slice instead of the middle, and the piezo's position read
+        differently after a run than before it.
+        """
+
+    def _snapshot_piezo_position(self) -> None:
+        """Record the piezo's position so :meth:`_warn_if_piezo_moved` can compare.
+
+        Called at the top of each subclass's ``setup_sequence``, before any
+        hardware is touched.
+        """
+        mmc = self.mmcore
+        if self.hw.piezo_a_label in mmc.getLoadedDevices():
+            self._piezo_pos_at_setup = mmc.getPosition(self.hw.piezo_a_label)
+        else:
+            self._piezo_pos_at_setup = None
+
+    def _warn_if_piezo_moved(self) -> None:
+        """Log a warning if the piezo's position changed since ``setup_sequence``.
+
+        Defensive check for this class of bug: with :meth:`_set_event_z`
+        now a no-op, nothing in this engine should ever move the piezo. If
+        it moves anyway (e.g. an ASI-firmware auto-home side effect of
+        setting the galvo's ``SPIMState`` to ``"Running"``, which is
+        plausible but unconfirmed), this turns a silent focus drift into a
+        visible warning in the run log instead of requiring another round
+        of bench detective work.
+        """
+        mmc = self.mmcore
+        if (
+            self._piezo_pos_at_setup is None
+            or self.hw.piezo_a_label not in mmc.getLoadedDevices()
+        ):
+            return
+        current = mmc.getPosition(self.hw.piezo_a_label)
+        delta = current - self._piezo_pos_at_setup
+        if abs(delta) > 0.05:  # um -- above readback noise, well below a real move
+            logger.warning(
+                f"Piezo ({self.hw.piezo_a_label}) moved {delta:+.3f} um during "
+                f"acquisition: {self._piezo_pos_at_setup:.3f} -> {current:.3f}. "
+                "This engine never commands the piezo -- investigate whether "
+                "the ASI SPIM state machine is auto-homing it."
+            )
 
     def _handoff_to_workers(self) -> None:
         """Release every physical camera and spawn one worker process per camera.
@@ -409,6 +471,7 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         # 0. Force the sequence's first channel to get a real hardware
         # config switch -- see _reset_channel_config_cache's docstring.
         self._reset_channel_config_cache()
+        self._snapshot_piezo_position()
 
         # 1. Calculate Z-stack parameters
         if sequence.z_plan:
@@ -555,6 +618,7 @@ class ASISPIMEngine(_ASITriggerEngineBase):
     def teardown_sequence(self, sequence: MDASequence) -> None:
         """Clean up hardware state after the sequence finishes."""
         logger.info("--- SEQUENCE FINISHED: Cleaning up hardware ---")
+        self._warn_if_piezo_moved()
         set_plogic_evaluation_clock(self.hw.tiger_comm_hub_label, running=False)
         if self.hw.galvo_a_label in self.mmcore.getLoadedDevices():
             self.mmcore.setProperty(self.hw.galvo_a_label, "SPIMState", "Idle")
@@ -628,6 +692,7 @@ class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
         # 0. Force the sequence's first channel to get a real hardware
         # config switch -- see _reset_channel_config_cache's docstring.
         self._reset_channel_config_cache()
+        self._snapshot_piezo_position()
 
         # 1. Number of trigger pulses/frames wanted. Neither axis moves, so
         # there's no amplitude/step-size to compute from the z_plan
@@ -766,6 +831,7 @@ class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
     def teardown_sequence(self, sequence: MDASequence) -> None:
         """Clean up hardware state after the sequence finishes."""
         logger.info("--- SEQUENCE FINISHED: Cleaning up hardware (stationary) ---")
+        self._warn_if_piezo_moved()
         if self.hw.galvo_a_label in self.mmcore.getLoadedDevices():
             self.mmcore.setProperty(self.hw.galvo_a_label, "SPIMState", "Idle")
         if self.hw.piezo_a_label in self.mmcore.getLoadedDevices():

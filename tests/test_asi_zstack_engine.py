@@ -14,6 +14,7 @@ rather than the old direct ``core.startSequenceAcquisition``/
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, cast
 from unittest.mock import MagicMock
 
@@ -244,6 +245,67 @@ def test_stationary_engine_triggers_galvo_not_piezo() -> None:
     assert ("PiezoStage:P:34", "SPIMState", "Running") not in [
         call.args for call in core.setProperty.call_args_list
     ]
+
+
+@pytest.mark.parametrize("engine_cls", [ASISPIMEngine, ASIStationaryTriggerEngine])
+def test_setup_event_never_moves_focus_device(
+    engine_cls: type[_ASITriggerEngineBase],
+) -> None:
+    """``setup_event`` must never call ``core.setZPosition`` for these engines.
+
+    Regression test for the actual mis-centered-stack bug: ``event_iterator``
+    collapses a whole z-stack down to its z-index-0 sub-event, and the stock
+    ``MDAEngine.setup_single_event`` calls ``_set_event_z`` (->
+    ``mmcore.setZPosition``) whenever that sub-event's ``z_pos`` is not
+    ``None``. Since z-index 0 resolves to the *bottom* of the range for the
+    default ``go_up=True`` direction, this physically pre-moved the piezo --
+    this rig's Core-Focus device -- by ``-range/2`` before the galvo's own
+    independent ``+/-range/2`` sweep (always centered on wherever the focus
+    device is at trigger time) ran on top of it -- landing the user's actual
+    pre-acquisition focus at the very last slice instead of the middle, and
+    leaving the piezo parked away from where the user left it.
+    ``_ASITriggerEngineBase._set_event_z`` is now a no-op specifically to
+    prevent this; this test exercises the real ``setup_event`` dispatch path
+    (not ``_set_event_z`` directly) so it fails if that dispatch ever changes.
+    """
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=3, engine_cls=engine_cls)
+
+    event = useq.MDAEvent(index={"t": 0, "z": 0}, z_pos=-50.0)
+    engine.setup_event(event)
+
+    core.setZPosition.assert_not_called()
+
+
+@pytest.mark.parametrize("engine_cls", [ASISPIMEngine, ASIStationaryTriggerEngine])
+def test_warn_if_piezo_moved(
+    caplog: pytest.LogCaptureFixture,
+    engine_cls: type[_ASITriggerEngineBase],
+) -> None:
+    """``_warn_if_piezo_moved`` only logs when the piezo's position changed.
+
+    Defensive check for this class of bug: with ``_set_event_z`` now a
+    no-op, nothing in these engines should ever move the piezo. If it moves
+    anyway (e.g. an ASI-firmware auto-home side effect of the galvo's
+    ``SPIMState`` going to ``"Running"``), this should surface as a warning
+    instead of silently trusting the hardware.
+    """
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=3, engine_cls=engine_cls)
+    core.getLoadedDevices.return_value = ["PiezoStage:P:34", "Scanner:AB:33"]
+
+    core.getPosition.return_value = 10.0
+    engine._snapshot_piezo_position()
+    with caplog.at_level(logging.WARNING):
+        engine._warn_if_piezo_moved()
+    assert not caplog.records
+
+    core.getPosition.return_value = 10.0
+    engine._snapshot_piezo_position()
+    core.getPosition.return_value = 15.0
+    with caplog.at_level(logging.WARNING):
+        engine._warn_if_piezo_moved()
+    assert len(caplog.records) == 1
+    assert "10.000" in caplog.records[0].message
+    assert "15.000" in caplog.records[0].message
 
 
 def test_reset_channel_config_cache_clears_last_config() -> None:
