@@ -200,7 +200,28 @@ def create_mmgui(
         if splash is not None:
             splash.finish(win)
 
-    QTimer.singleShot(0, _show_main_window)
+    # Don't show the window until the session's ASI/PLogic circular-buffer
+    # grow (if any) has actually finished. It runs on a background thread
+    # (see ensure_circular_buffer_capacity_async), but that background call
+    # is a long-running pymmcore-plus/C call that doesn't release the GIL --
+    # so showing the window while it's still in flight just trades a
+    # frozen splash for a frozen, now-*visible* main window (spinning
+    # beach ball). Keeping it behind the splash until bufferReady fires
+    # means the window only ever appears once it's actually interactive.
+    # bufferReady can fire again later (e.g. a config reload from the
+    # menu); only react to the first one, at startup.
+    _startup_shown = False
+
+    def _on_startup_ready() -> None:
+        nonlocal _startup_shown
+        if _startup_shown:
+            return
+        _startup_shown = True
+        with suppress(RuntimeError):
+            win.bufferReady.disconnect(_on_startup_ready)
+        QTimer.singleShot(0, _show_main_window)
+
+    win.bufferReady.connect(_on_startup_ready)
 
     def _on_about_to_quit() -> None:
         # Safety net for exit paths that bypass MicroManagerGUI.closeEvent
@@ -218,23 +239,41 @@ def create_mmgui(
         QTimer.singleShot(int(float(quit_s) * 1000), win.close)
 
     # if False was passed, don't load any config at all
+    config_loaded = False
     if mm_config is not False:
         # if a string was passed, load that config
         if mm_config:
             # if mm_config is a string, load that config
             _set_status("Loading configuration...")
             win.mmcore.loadSystemConfiguration(mm_config)
+            config_loaded = True
         # otherwise, fall back to auto-loading / cli-based
         elif config := _decide_configuration(mm_config, win):
             try:
                 _set_status("Loading configuration...")
                 win.mmcore.loadSystemConfiguration(config)
+                config_loaded = True
             except Exception as e:  # pragma: no cover
                 warnings.warn(
                     f"Failed to load system configuration: {e}",
                     RuntimeWarning,
                     stacklevel=2,
                 )
+
+    if config_loaded:
+        # loadSystemConfiguration() above already fired MicroManagerGUI.
+        # _on_system_config_loaded synchronously, which kicks off the
+        # background buffer grow (if one is needed) before returning here.
+        # If none was needed, bufferReady already fired synchronously and
+        # _startup_shown is already True -- don't show a misleading message.
+        if not _startup_shown:
+            _set_status("Allocating memory...")
+    else:
+        # No config was loaded at all (mm_config=False, none chosen, or the
+        # load failed) -- systemConfigurationLoaded never fired, so nothing
+        # will ever call _on_startup_ready. Show the window now instead of
+        # waiting forever.
+        _on_startup_ready()
 
     if install_sys_excepthook:
         _install_excepthook()

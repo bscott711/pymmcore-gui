@@ -11,7 +11,7 @@ from weakref import WeakValueDictionary
 
 from pymmcore_plus import CMMCorePlus
 from pymmcore_widgets import ConfigWizard
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QCloseEvent, QGuiApplication, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
@@ -128,6 +128,13 @@ def _create_window_menu(mmc: CMMCorePlus, parent: MicroManagerGUI) -> QMenu:
 
 class MicroManagerGUI(QMainWindow):
     """Micro-Manager minimal GUI."""
+
+    # Emitted (possibly more than once, on every config load/reload) each
+    # time the session's ASI/PLogic circular-buffer grow is confirmed
+    # finished -- immediately, if no growth was needed. create_mmgui uses
+    # this to delay showing the main window at startup until it's actually
+    # safe to interact with; see _on_system_config_loaded.
+    bufferReady = pyqtSignal()
 
     # Toolbars are a mapping of strings to either a list of ActionKeys or a callable
     # that takes a CMMCorePlus instance and QMainWindow and returns a QToolBar.
@@ -456,6 +463,7 @@ class MicroManagerGUI(QMainWindow):
         def _on_buffer_ready() -> None:
             with suppress(RuntimeError):
                 live_action.setEnabled(bool(self._mmc.getCameraDevice()))
+            self.bufferReady.emit()
 
         ensure_circular_buffer_capacity_async(on_done=_on_buffer_ready)
 
