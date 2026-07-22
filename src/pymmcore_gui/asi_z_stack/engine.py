@@ -98,6 +98,65 @@ class _ASITriggerEngineBase(MDAEngine):
         differently after a run than before it.
         """
 
+    def setup_single_event(self, event: MDAEvent) -> None:
+        """Set up hardware for one event, replicating the base method minus exposure.
+
+        Copied from ``MDAEngine.setup_single_event`` verbatim, with one
+        deliberate omission: the trailing ``mmcore.setExposure(event.exposure)``
+        block. This engine bakes exposure into the PLogic pulse width at
+        ``setup_sequence`` time instead (see
+        :func:`~pymmcore_gui.asi_z_stack.asi_controller.
+        configure_plogic_for_dual_nrt_pulses`), and each camera worker
+        subprocess owns its own independent ``CMMCorePlus`` (see
+        :meth:`_handoff_to_workers`) -- so ``core.setExposure()`` against the
+        main process's core is never meaningful here, not even for the very
+        first event, before the handoff has run. Left in place, the
+        inherited version's own try/except silently logs "Failed to set
+        exposure. %s" on every event from the 2nd one onward, once every
+        physical camera has been released to a worker and the main-process
+        core has no camera device left for ``setExposure`` to target -- this
+        is the exact spurious warning seen in production logs. Everything
+        else here (XY position, channel switching, properties/ROI/SLM
+        no-ops, the trailing keep-shutter-open block) is kept verbatim for
+        fidelity with the base dispatch, even where it's a no-op for this
+        engine (``_set_event_z`` is already overridden separately -- see its
+        docstring).
+
+        Parameters
+        ----------
+        event : MDAEvent
+            The event to use for the hardware config.
+        """
+        if event.keep_shutter_open:
+            ...
+
+        self._set_event_xy_position(event)
+
+        if event.z_pos is not None:
+            self._set_event_z(event)
+        if event.slm_image is not None:
+            self._set_event_slm_image(event)
+
+        self._set_event_channel(event)
+
+        mmcore = self.mmcore
+        if event.properties is not None:
+            self._set_event_properties(event.properties)
+        if event.roi is not None:
+            self._set_event_roi(event)
+        if (
+            # (if autoshutter wasn't set at the beginning of the sequence
+            # then it never matters...)
+            self._autoshutter_was_set
+            # if we want to leave the shutter open after this event, and
+            # autoshutter is currently enabled...
+            and event.keep_shutter_open
+            and mmcore.getAutoShutter()
+        ):
+            # we have to disable autoshutter and open the shutter
+            mmcore.setAutoShutter(False)
+            mmcore.setShutterOpen(True)
+
     def _snapshot_piezo_position(self) -> None:
         """Record the piezo's position so :meth:`_warn_if_piezo_moved` can compare.
 
@@ -436,14 +495,28 @@ class _ASITriggerEngineBase(MDAEngine):
                 received = yield img, sub_event, meta
                 if received == "cancel":
                     logger.info("MDA cancelled -- stopping camera workers.")
-                    self._worker_pool.stop_all()
                     return
         except WorkerDiedError:
             logger.error(
                 "A camera worker process died during acquisition.", exc_info=True
             )
-            self._worker_pool.stop_all()
             raise
+        finally:
+            # Guarantees every worker gets a StopCmd on every exit path from
+            # this generator -- normal completion, "cancel", WorkerDiedError,
+            # a TimeoutError from iter_frames's stall guard, a plain
+            # RuntimeError wrapping a worker's ErrorMsg, or this generator
+            # being abandoned mid-iteration by its caller and closed by the
+            # interpreter (GeneratorExit thrown at the yield above) -- the
+            # mechanism behind a production deadlock where an abandoned
+            # generator left a worker blocked forever in
+            # camera_worker._wait_for_free_slot, waiting for a SlotFreeCmd/
+            # StopCmd that would never come. stop_all() is best-effort/
+            # idempotent (worker_pool.py's own conn-closed/OSError guards),
+            # so the extra call this now makes on ordinary per-event
+            # completion (never called there before) is harmless: a StopCmd
+            # against an already-idle worker.
+            self._worker_pool.stop_all()
 
 
 class ASISPIMEngine(_ASITriggerEngineBase):

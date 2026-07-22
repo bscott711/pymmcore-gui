@@ -126,8 +126,10 @@ def _apply_snapshot(mmc: CMMCorePlus, config: CameraWorkerConfig) -> None:
         _log(label, f"could not set TriggerMode={trigger_mode!r}: {exc}")
 
 
-def _drain_incoming(conn: Connection, free_slots: list[int]) -> bool:
-    """Drain any pending ``SlotFreeCmd``/``StopCmd`` messages without blocking.
+def _drain_incoming(
+    conn: Connection, free_slots: list[int]
+) -> type[StopCmd] | type[ShutdownCmd] | None:
+    """Drain any pending ``SlotFreeCmd``/``StopCmd``/``ShutdownCmd`` without blocking.
 
     Parameters
     ----------
@@ -138,22 +140,29 @@ def _drain_incoming(conn: Connection, free_slots: list[int]) -> bool:
 
     Returns
     -------
-    bool
-        Whether a :class:`~pymmcore_gui.asi_z_stack.worker_messages.StopCmd`
-        was seen.
+    type[StopCmd] | type[ShutdownCmd] | None
+        ``ShutdownCmd`` if one was seen anywhere in this drain pass -- it
+        always wins over a ``StopCmd`` seen in the same pass (see
+        ``ShutdownCmd``'s docstring: "exit the worker process" is a
+        stronger signal than "stop the current sequence"). Otherwise
+        ``StopCmd`` if one was seen, otherwise ``None``.
     """
-    stop_requested = False
+    stop_signal: type[StopCmd] | type[ShutdownCmd] | None = None
     while conn.poll(0):
         msg = conn.recv()
         if isinstance(msg, SlotFreeCmd):
             free_slots.append(msg.slot_index)
-        elif isinstance(msg, StopCmd):
-            stop_requested = True
-    return stop_requested
+        elif isinstance(msg, ShutdownCmd):
+            stop_signal = ShutdownCmd
+        elif isinstance(msg, StopCmd) and stop_signal is None:
+            stop_signal = StopCmd
+    return stop_signal
 
 
-def _wait_for_free_slot(conn: Connection, free_slots: list[int], label: str) -> bool:
-    """Block until a slot frees up or a stop is requested.
+def _wait_for_free_slot(
+    conn: Connection, free_slots: list[int], label: str
+) -> type[StopCmd] | type[ShutdownCmd] | None:
+    """Block until a slot frees up or a stop/shutdown is requested.
 
     Parameters
     ----------
@@ -166,9 +175,9 @@ def _wait_for_free_slot(conn: Connection, free_slots: list[int], label: str) -> 
 
     Returns
     -------
-    bool
-        Whether a
-        :class:`~pymmcore_gui.asi_z_stack.worker_messages.StopCmd` was seen.
+    type[StopCmd] | type[ShutdownCmd] | None
+        ``StopCmd`` or ``ShutdownCmd`` -- whichever arrives first -- if one
+        is seen while waiting, else ``None`` once a slot has freed up.
     """
     waited_s = 0.0
     while not free_slots:
@@ -176,13 +185,15 @@ def _wait_for_free_slot(conn: Connection, free_slots: list[int], label: str) -> 
             msg = conn.recv()
             if isinstance(msg, SlotFreeCmd):
                 free_slots.append(msg.slot_index)
+            elif isinstance(msg, ShutdownCmd):
+                return ShutdownCmd
             elif isinstance(msg, StopCmd):
-                return True
+                return StopCmd
         else:
             waited_s += 1.0
             if waited_s >= _SLOT_WAIT_WARNING_S:
                 _log(label, f"no free frame slot for {waited_s:.0f}s -- main stalled?")
-    return False
+    return None
 
 
 def _drain_sequence(
@@ -191,7 +202,7 @@ def _drain_sequence(
     shm: SharedMemory,
     config: CameraWorkerConfig,
     n_images: int,
-) -> None:
+) -> bool:
     """Pop frames off the camera's circular buffer until *n_images* or a stop.
 
     Parameters
@@ -207,6 +218,15 @@ def _drain_sequence(
         Supplies ``camera_label`` and ``slot_nbytes``.
     n_images : int
         The number of frames this arm cycle expects.
+
+    Returns
+    -------
+    bool
+        ``True`` if a ``ShutdownCmd`` ended this drain -- the caller
+        (``run_camera_worker``) must break its outer command loop and exit
+        the process. ``False`` for an ordinary ``StopCmd``, an unexpected
+        sequence stop, or normal completion -- the caller returns to
+        waiting for the next ``ArmCmd``.
     """
     label = config.camera_label
     free_slots = list(range(config.n_slots))
@@ -215,17 +235,20 @@ def _drain_sequence(
     last_image_time = time.monotonic()
 
     while images_collected < n_images:
-        if _drain_incoming(conn, free_slots):
+        stop_signal = _drain_incoming(conn, free_slots)
+        if stop_signal is not None:
             mmc.stopSequenceAcquisition(label)
             conn.send(StoppedMsg(label, images_collected))
-            return
+            return stop_signal is ShutdownCmd
 
         remaining = mmc.getRemainingImageCount()
         if remaining > 0:
-            if not free_slots and _wait_for_free_slot(conn, free_slots, label):
-                mmc.stopSequenceAcquisition(label)
-                conn.send(StoppedMsg(label, images_collected))
-                return
+            if not free_slots:
+                stop_signal = _wait_for_free_slot(conn, free_slots, label)
+                if stop_signal is not None:
+                    mmc.stopSequenceAcquisition(label)
+                    conn.send(StoppedMsg(label, images_collected))
+                    return stop_signal is ShutdownCmd
 
             slot = free_slots.pop(0)
             img, mm_meta = mmc.popNextImageAndMD()
@@ -263,7 +286,7 @@ def _drain_sequence(
                     traceback_text="",
                 )
             )
-            return
+            return False
         else:
             now = time.monotonic()
             if now - last_image_time > _STALL_TIMEOUT_S:
@@ -282,6 +305,7 @@ def _drain_sequence(
     if mmc.isSequenceRunning(label):
         mmc.stopSequenceAcquisition(label)
     conn.send(StoppedMsg(label, images_collected))
+    return False
 
 
 def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
@@ -327,11 +351,14 @@ def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
                 break
 
             if isinstance(cmd, ArmCmd):
+                shutdown_requested = False
                 try:
                     armed_count = cmd.n_images + _ARM_COUNT_PADDING
                     mmc.startSequenceAcquisition(label, armed_count, 0, True)
                     conn.send(ArmedMsg(label))
-                    _drain_sequence(mmc, conn, shm, config, cmd.n_images)
+                    shutdown_requested = _drain_sequence(
+                        mmc, conn, shm, config, cmd.n_images
+                    )
                 except Exception:
                     _log(label, f"arm/drain failed:\n{traceback.format_exc()}")
                     conn.send(
@@ -342,6 +369,8 @@ def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
                             traceback_text=traceback.format_exc(),
                         )
                     )
+                if shutdown_requested:
+                    break
             elif isinstance(cmd, StopCmd):
                 if mmc.isSequenceRunning(label):
                     mmc.stopSequenceAcquisition(label)

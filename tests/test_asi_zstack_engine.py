@@ -21,6 +21,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 import useq
+from useq._mda_event import Channel as EventChannel
 
 from pymmcore_gui.asi_z_stack import engine as engine_module
 from pymmcore_gui.asi_z_stack.camera_handoff import CameraHandoffSnapshot
@@ -306,6 +307,102 @@ def test_warn_if_piezo_moved(
     assert len(caplog.records) == 1
     assert "10.000" in caplog.records[0].message
     assert "15.000" in caplog.records[0].message
+
+
+@pytest.mark.parametrize("engine_cls", [ASISPIMEngine, ASIStationaryTriggerEngine])
+def test_setup_event_never_calls_set_exposure(
+    engine_cls: type[_ASITriggerEngineBase],
+) -> None:
+    """``setup_event`` must never call ``core.setExposure``, but still switches channel.
+
+    Regression test for the spurious "Failed to set exposure" warning seen
+    in production logs: the inherited ``MDAEngine.setup_single_event`` calls
+    ``mmcore.setExposure(event.exposure)`` unconditionally whenever
+    ``event.exposure`` is set, which fails on every event once
+    ``_handoff_to_workers`` has released every physical camera -- this
+    engine bakes exposure into the PLogic pulse width instead, so the call
+    is never useful here. ``_ASITriggerEngineBase.setup_single_event`` drops
+    that call but must still perform the real channel-switch
+    (``_set_event_channel`` -> ``core.setConfig``).
+    """
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=3, engine_cls=engine_cls)
+    event = useq.MDAEvent(
+        index={"t": 0, "z": 0},
+        channel=EventChannel(config="488nm", group="Lasers"),
+        exposure=25.0,
+    )
+
+    engine.setup_event(event)
+
+    core.setExposure.assert_not_called()
+    core.setConfig.assert_called_once_with("Lasers", "488nm")
+
+
+def test_exec_event_timeout_stops_workers_and_reraises() -> None:
+    """A ``TimeoutError`` from ``iter_frames`` (stall guard) still stops workers.
+
+    Regression test for a gap in the old explicit stop_all()-on-error
+    handling: only ``WorkerDiedError`` triggered a stop, so a plain
+    ``TimeoutError`` (worker_pool.py's stall guard) or a worker's own
+    ``ErrorMsg``-derived ``RuntimeError`` left the survivor running with no
+    stop signal. ``exec_event`` now calls ``stop_all()`` in a ``finally``
+    block that covers every exit path.
+    """
+    _core, engine, pool = _make_engine(n_cameras=2, n_slices=3)
+    pool.iter_frames.side_effect = TimeoutError(
+        "no message from any camera worker for 5.0s"
+    )
+
+    with pytest.raises(TimeoutError):
+        list(engine.exec_event(useq.MDAEvent(index={"t": 0})))
+
+    pool.stop_all.assert_called_once()
+
+
+def test_exec_event_generator_close_stops_workers() -> None:
+    """Abandoning ``exec_event`` mid-iteration (``GeneratorExit``) still stops workers.
+
+    This is the actual mechanism behind the production deadlock: if
+    ``exec_event``'s generator is closed/garbage-collected before being
+    fully drained (e.g. the runner's own iteration is abandoned by an
+    exception elsewhere), the interpreter throws ``GeneratorExit`` at the
+    generator's current ``yield``. The old code only called ``stop_all()``
+    from the ``"cancel"`` branch and the ``WorkerDiedError`` handler, so an
+    abandoned generator left workers blocked forever in
+    ``camera_worker._wait_for_free_slot``, waiting for a ``SlotFreeCmd``/
+    ``StopCmd`` that would never come. The ``finally`` block now covers
+    this path too.
+    """
+    _core, engine, pool = _make_engine(n_cameras=1, n_slices=3)
+    _queue_frames(pool, [("cam0", 0), ("cam0", 1), ("cam0", 2)])
+
+    gen = cast(
+        "Generator[tuple[np.ndarray, useq.MDAEvent, FrameMetaV1], str | None, None]",
+        engine.exec_event(useq.MDAEvent(index={"t": 0})),
+    )
+    next(gen)
+    gen.close()
+
+    pool.stop_all.assert_called_once()
+
+
+def test_exec_event_normal_completion_also_stops_workers() -> None:
+    """Ordinary, uncancelled completion also calls ``stop_all()`` exactly once.
+
+    New (safe, intentional) side effect of moving ``stop_all()`` into a
+    ``finally`` block: it now fires on every exit path, including normal
+    completion, where it previously never fired at all. Harmless -- workers
+    are already idle by the time ``iter_frames`` naturally exhausts, so the
+    extra ``StopCmd`` lands on an idle worker as a guarded no-op -- but
+    locked in here as a named test so it isn't mistaken for a regression by
+    a future reader.
+    """
+    _core, engine, pool = _make_engine(n_cameras=1, n_slices=2)
+    _queue_frames(pool, [("cam0", 0), ("cam0", 1)])
+
+    list(engine.exec_event(useq.MDAEvent(index={"t": 0})))
+
+    pool.stop_all.assert_called_once()
 
 
 def test_reset_channel_config_cache_clears_last_config() -> None:
