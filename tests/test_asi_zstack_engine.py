@@ -15,6 +15,7 @@ rather than the old direct ``core.startSequenceAcquisition``/
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING, cast
 from unittest.mock import MagicMock
 
@@ -468,3 +469,217 @@ def test_setup_sequence_resets_channel_config_cache(
     engine.setup_sequence(sequence)
 
     assert core._last_config == ("", "")
+
+
+# --- Shutter-gated laser (561): whole-stack-open instead of per-slice blanking ---
+#
+# The 561 line is a CW laser behind a physical mechanical shutter (Oxxius
+# L4C), which can't reliably follow PLogic's per-frame TTL blanking (laser
+# NRT cell 10, fired every slice like the camera). These tests cover holding
+# it open for a whole per-volume burst instead: see
+# ``_ASITriggerEngineBase._shutter_gated_bncs`` and its use in ``exec_event``.
+
+
+def test_shutter_gated_bncs_single_wavelength_preset() -> None:
+    """A single shutter-gated wavelength preset returns its own BNC."""
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=1)
+    core.getAvailableConfigGroups.return_value = ["Lasers"]
+    core.getCurrentConfig.return_value = "561nm"
+
+    assert engine._shutter_gated_bncs() == [40]
+
+
+def test_shutter_gated_bncs_diode_preset_returns_empty() -> None:
+    """A diode-only preset (not shutter-gated) returns no BNCs."""
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=1)
+    core.getAvailableConfigGroups.return_value = ["Lasers"]
+    core.getCurrentConfig.return_value = "488nm"
+
+    assert engine._shutter_gated_bncs() == []
+
+
+def test_shutter_gated_bncs_all_lasers_preset_returns_only_gated() -> None:
+    """The "AllLasers" preset pulls out only the shutter-gated wavelength's BNC.
+
+    Regression coverage for the "all lasers at once" case: cell 10 fires
+    per-slice for every wavelength under this preset, so the diode BNCs
+    (37/38/39) must stay off this list -- only 561's BNC (40) should be
+    re-pointed to the always-on cell, pulling it out of the simultaneous
+    per-slice triggering while the diodes keep blanking normally.
+    """
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=1)
+    core.getAvailableConfigGroups.return_value = ["Lasers"]
+    core.getCurrentConfig.return_value = "AllLasers"
+
+    assert engine._shutter_gated_bncs() == [40]
+
+
+def test_shutter_gated_bncs_flag_off_returns_empty() -> None:
+    """``laser_open_full_stack=False`` disables the feature entirely."""
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=1)
+    engine.hw.laser_open_full_stack = False
+    core.getAvailableConfigGroups.return_value = ["Lasers"]
+    core.getCurrentConfig.return_value = "561nm"
+
+    assert engine._shutter_gated_bncs() == []
+
+
+def test_shutter_gated_bncs_missing_config_group_returns_empty() -> None:
+    """No "Lasers" config group loaded (e.g. a demo config) returns no BNCs."""
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=1)
+    core.getAvailableConfigGroups.return_value = []
+
+    assert engine._shutter_gated_bncs() == []
+
+
+def test_exec_event_opens_then_closes_shutter_gated_laser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shutter-gated channel opens its laser before the burst, closes after.
+
+    The mechanical 561 shutter can't follow per-frame TTL blanking reliably,
+    so ``exec_event`` must hold it open for the whole per-volume burst
+    instead -- via the same ``set_laser_outputs`` primitive snap/live
+    already use to gate lasers -- and close it again only after the last
+    frame has been delivered.
+    """
+    calls: list[tuple[str, tuple[object, ...]]] = []
+    mock_set_laser_outputs = MagicMock(
+        side_effect=lambda *a, **kw: calls.append(("set_laser_outputs", a))
+    )
+    monkeypatch.setattr(engine_module, "set_laser_outputs", mock_set_laser_outputs)
+    monkeypatch.setattr(time, "sleep", MagicMock())
+
+    core, engine, pool = _make_engine(n_cameras=1, n_slices=2)
+    core.getAvailableConfigGroups.return_value = ["Lasers"]
+    core.getCurrentConfig.return_value = "561nm"
+    core.setProperty.side_effect = lambda *a, **kw: calls.append(("setProperty", a))
+    _queue_frames(pool, [("cam0", 0), ("cam0", 1)])
+
+    list(engine.exec_event(useq.MDAEvent(index={"t": 0})))
+
+    laser_calls = [c for c in calls if c[0] == "set_laser_outputs"]
+    assert len(laser_calls) == 2
+    assert laser_calls[0][1][2] == [40]  # bnc_addrs
+    assert laser_calls[0][1][3] is True  # on=True -- opened
+    assert laser_calls[1][1][3] is False  # on=False -- closed
+
+    open_idx = calls.index(laser_calls[0])
+    close_idx = calls.index(laser_calls[1])
+    trigger_idx = calls.index(
+        ("setProperty", (engine._master_axis_label, "SPIMState", "Running"))
+    )
+    assert open_idx < trigger_idx < close_idx
+
+
+def test_exec_event_settle_delay_honored(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The configured shutter settle delay is slept before the burst fires."""
+    monkeypatch.setattr(engine_module, "set_laser_outputs", MagicMock())
+    mock_sleep = MagicMock()
+    monkeypatch.setattr(time, "sleep", mock_sleep)
+
+    core, engine, pool = _make_engine(n_cameras=1, n_slices=1)
+    engine.hw.shutter_open_settle_ms = 25.0
+    core.getAvailableConfigGroups.return_value = ["Lasers"]
+    core.getCurrentConfig.return_value = "561nm"
+    _queue_frames(pool, [("cam0", 0)])
+
+    list(engine.exec_event(useq.MDAEvent(index={"t": 0})))
+
+    mock_sleep.assert_called_once_with(0.025)
+
+
+def test_exec_event_does_not_gate_diode_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A diode-only channel (e.g. 488) never touches ``set_laser_outputs``."""
+    mock_set_laser_outputs = MagicMock()
+    monkeypatch.setattr(engine_module, "set_laser_outputs", mock_set_laser_outputs)
+
+    core, engine, pool = _make_engine(n_cameras=1, n_slices=2)
+    core.getAvailableConfigGroups.return_value = ["Lasers"]
+    core.getCurrentConfig.return_value = "488nm"
+    _queue_frames(pool, [("cam0", 0), ("cam0", 1)])
+
+    list(engine.exec_event(useq.MDAEvent(index={"t": 0})))
+
+    mock_set_laser_outputs.assert_not_called()
+
+
+def test_exec_event_respects_flag_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``laser_open_full_stack=False`` disables the shutter bracket, even for 561."""
+    mock_set_laser_outputs = MagicMock()
+    monkeypatch.setattr(engine_module, "set_laser_outputs", mock_set_laser_outputs)
+
+    core, engine, pool = _make_engine(n_cameras=1, n_slices=2)
+    engine.hw.laser_open_full_stack = False
+    core.getAvailableConfigGroups.return_value = ["Lasers"]
+    core.getCurrentConfig.return_value = "561nm"
+    _queue_frames(pool, [("cam0", 0), ("cam0", 1)])
+
+    list(engine.exec_event(useq.MDAEvent(index={"t": 0})))
+
+    mock_set_laser_outputs.assert_not_called()
+
+
+def test_exec_event_closes_shutter_gated_laser_on_worker_death(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``WorkerDiedError`` still closes the shutter-gated laser via ``finally``.
+
+    Mirrors :func:`test_exec_event_worker_died_stops_survivor_and_reraises`:
+    the shutter must never be left open on an aborted run.
+    """
+    mock_set_laser_outputs = MagicMock()
+    monkeypatch.setattr(engine_module, "set_laser_outputs", mock_set_laser_outputs)
+    monkeypatch.setattr(time, "sleep", MagicMock())
+
+    core, engine, pool = _make_engine(n_cameras=1, n_slices=2)
+    core.getAvailableConfigGroups.return_value = ["Lasers"]
+    core.getCurrentConfig.return_value = "561nm"
+    pool.iter_frames.side_effect = WorkerDiedError("cam0", -1073740791)
+
+    with pytest.raises(WorkerDiedError):
+        list(engine.exec_event(useq.MDAEvent(index={"t": 0})))
+
+    on_values = [call.args[3] for call in mock_set_laser_outputs.call_args_list]
+    assert on_values == [True, False]
+
+
+def test_teardown_sequence_closes_all_lasers_when_flag_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``teardown_sequence``'s safety net closes any shutter-gated laser left open.
+
+    Strictly redundant with ``exec_event``'s own per-burst ``finally`` close,
+    but guards against a run aborting between volumes rather than mid-burst.
+    """
+    monkeypatch.setattr(engine_module, "set_plogic_evaluation_clock", MagicMock())
+    monkeypatch.setattr(engine_module, "reload_cameras_after_handoff", MagicMock())
+    monkeypatch.setattr(time, "sleep", MagicMock())
+    mock_close_all_lasers = MagicMock()
+    monkeypatch.setattr(engine_module, "close_all_lasers", mock_close_all_lasers)
+
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=1)
+
+    engine.teardown_sequence(useq.MDASequence())
+
+    mock_close_all_lasers.assert_called_once()
+
+
+def test_teardown_sequence_skips_close_all_lasers_when_flag_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The teardown safety net is itself gated by ``laser_open_full_stack``."""
+    monkeypatch.setattr(engine_module, "set_plogic_evaluation_clock", MagicMock())
+    monkeypatch.setattr(engine_module, "reload_cameras_after_handoff", MagicMock())
+    monkeypatch.setattr(time, "sleep", MagicMock())
+    mock_close_all_lasers = MagicMock()
+    monkeypatch.setattr(engine_module, "close_all_lasers", mock_close_all_lasers)
+
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=1)
+    engine.hw.laser_open_full_stack = False
+
+    engine.teardown_sequence(useq.MDASequence())
+
+    mock_close_all_lasers.assert_not_called()

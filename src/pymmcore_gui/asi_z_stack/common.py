@@ -46,6 +46,19 @@ class HardwareConstants:
         }
     )
 
+    # Hold shutter-gated lasers open for the whole per-volume burst instead of
+    # blanking them per slice. A mechanical shutter (e.g. the 561 line, an
+    # Oxxius L4C CW laser behind a physical shutter) cannot follow per-frame
+    # TTL toggling reliably -- opening once per stack actuates it twice total
+    # instead of once per slice. Diode lasers not listed here keep per-frame
+    # blanking (less photobleaching).
+    laser_open_full_stack: bool = True
+    shutter_gated_wavelengths: tuple[str, ...] = ("561nm",)
+    # Delay after opening a shutter-gated laser before the burst starts, so
+    # the mechanical shutter is fully open before the first exposure. Tune on
+    # the bench/oscilloscope for the actual shutter in use.
+    shutter_open_settle_ms: float = 10.0
+
     # Extended parameters for SPIM Z-stack calculations
     slice_calibration_slope_um_per_deg: float = 100.0
 

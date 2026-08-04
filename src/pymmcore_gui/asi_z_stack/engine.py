@@ -14,8 +14,10 @@ from pymmcore_plus.metadata import (
 from useq import MDAEvent, MDASequence
 
 from .asi_controller import (
+    close_all_lasers,
     configure_plogic_for_dual_nrt_pulses,
     log_plogic_trigger_chain_state,
+    set_laser_outputs,
     set_plogic_evaluation_clock,
 )
 from .camera_handoff import (
@@ -344,6 +346,33 @@ class _ASITriggerEngineBase(MDAEngine):
         """
         self.mmcore._last_config = ("", "")
 
+    def _shutter_gated_bncs(self) -> list[int]:
+        """BNC addresses of currently-active, shutter-gated lasers.
+
+        A laser qualifies only if it is both (a) driven by the current
+        ``"Lasers"`` preset and (b) listed in
+        :attr:`~pymmcore_gui.asi_z_stack.common.HardwareConstants.shutter_gated_wavelengths`.
+        Diode lasers firing alongside it -- e.g. the other three wavelengths
+        under the ``all_lasers_preset`` -- are deliberately excluded, so they
+        keep per-frame blanking off PLogic's laser NRT cell while only the
+        shutter-gated wavelength is held open for the whole burst.
+        """
+        if not self.hw.laser_open_full_stack:
+            return []
+        group = self.hw.laser_config_group
+        mmc = self.mmcore
+        if group not in mmc.getAvailableConfigGroups():
+            return []
+        preset = mmc.getCurrentConfig(group)
+        if preset == self.hw.all_lasers_preset:
+            active = set(self.hw.laser_bnc_addr)
+        elif preset in self.hw.laser_bnc_addr:
+            active = {preset}
+        else:
+            return []
+        gated = active.intersection(self.hw.shutter_gated_wavelengths)
+        return [self.hw.laser_bnc_addr[w] for w in gated]
+
     def event_iterator(self, events: Iterable[MDAEvent]) -> Iterator[MDAEvent]:
         """Collapse each hardware z-stack down to a single event.
 
@@ -453,6 +482,25 @@ class _ASITriggerEngineBase(MDAEngine):
             self._num_slices, armed_timeout=self.hw.worker_arm_timeout_s
         )
         logger.info(f"{n_cameras} camera(s) armed for {self._num_slices} images each.")
+
+        # Shutter-gated lasers (e.g. 561, a CW laser behind a physical
+        # shutter) can't follow per-frame TTL blanking reliably, so hold them
+        # open for the whole burst instead of pulsing them per slice. The
+        # channel's "Lasers" preset is already applied by this point (via
+        # setup_single_event -> _set_event_channel, before exec_event runs),
+        # so _shutter_gated_bncs() reflects the laser this burst will use.
+        gated_bncs = self._shutter_gated_bncs()
+        if gated_bncs:
+            set_laser_outputs(
+                self.hw.plogic_label,
+                self.hw.tiger_comm_hub_label,
+                gated_bncs,
+                True,
+                self.hw.plogic_always_on_cell,
+            )
+            if self.hw.shutter_open_settle_ms > 0:
+                time.sleep(self.hw.shutter_open_settle_ms / 1000.0)
+
         # See _trigger_spim_state_value's docstring: currently always
         # "Running" on the galvo (its NO_SCAN/SLICE_SCAN_ONLY trigger path)
         # -- the piezo's SPIMState property has no "Running" value at all,
@@ -516,6 +564,14 @@ class _ASITriggerEngineBase(MDAEngine):
             # so the extra call this now makes on ordinary per-event
             # completion (never called there before) is harmless: a StopCmd
             # against an already-idle worker.
+            if gated_bncs:
+                set_laser_outputs(
+                    self.hw.plogic_label,
+                    self.hw.tiger_comm_hub_label,
+                    gated_bncs,
+                    False,
+                    self.hw.plogic_always_on_cell,
+                )
             self._worker_pool.stop_all()
 
 
@@ -695,6 +751,12 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         set_plogic_evaluation_clock(self.hw.tiger_comm_hub_label, running=False)
         if self.hw.galvo_a_label in self.mmcore.getLoadedDevices():
             self.mmcore.setProperty(self.hw.galvo_a_label, "SPIMState", "Idle")
+
+        # Belt-and-suspenders: exec_event's own finally block already closes
+        # any shutter-gated laser it opened after every burst, so this is
+        # only a safety net against a run aborting between volumes.
+        if self.hw.laser_open_full_stack:
+            close_all_lasers()
 
         # Deliberately not closing the global shutter here -- it's
         # session-level infrastructure (opened once via
