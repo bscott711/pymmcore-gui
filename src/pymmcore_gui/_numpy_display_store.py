@@ -1,27 +1,41 @@
-"""Minimal, in-RAM, single-array MDA display store for live ndv previews.
+"""Chunked, lazily-allocated, in-RAM single-array MDA display store.
 
 Purely for backing a live ``ndv.ArrayViewer`` during an MDA -- NOT a save
 handler (no disk I/O, no metadata), and independent of the MDA's real output
 handler. Intentionally does NOT use tensorstore: a prior in-memory
 ``TensorStoreHandler`` here caused a native STATUS_STACK_BUFFER_OVERRUN during
 sustained dual-camera runs (ndv's background thread does blocking native reads
-while frames are asynchronously, natively written -- concurrently, x2 cameras).
-The preview only ever needed a pre-allocated in-RAM array; ndv's
-``ArrayLikeWrapper`` auto-wraps a plain ``np.ndarray``, so no custom
-``DataWrapper`` is required.
+while frames are asynchronously, natively written -- concurrently, x2
+cameras).
+
+Backed by a plain, in-memory ``zarr.Array`` (chunk size = exactly one frame)
+rather than a dense ``np.ndarray``: declaring the full ``(t, p, z, c, y, x)``
+domain up front must NOT eagerly allocate memory for the whole acquisition --
+a real 100-timepoint x 201-slice x 2400x2400 uint16 dual-camera run is ~216
+GiB dense, which is exactly what a naive ``np.zeros(full_shape)`` here did (it
+raised ``MemoryError`` on the very first frame, which silently broke the live
+preview since psygnal swallows exceptions raised in ``frameReady`` signal
+handlers). zarr's chunks are only materialized when written, so memory grows
+with frames actually acquired so far -- the same lazy-allocation profile
+``TensorStoreHandler`` had, just without tensorstore's native code. ndv's
+``ArrayLikeWrapper`` auto-wraps any object with ``.shape``/``__getitem__``/
+``__array__`` (which ``zarr.Array`` satisfies), and slices *before*
+materializing to numpy (``self._data[idx]`` then ``np.asarray()`` on the
+small result), so reads never force the whole array into memory either.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import numpy as np
+import zarr
 
 from pymmcore_gui._vendored.mda_handlers._util import position_sizes
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    import numpy as np
     import useq
     from pymmcore_plus.metadata import FrameMetaV1
 
@@ -30,11 +44,11 @@ _SIZE_INCREMENT = 300
 
 
 class NumpyDisplayStore:
-    """Pre-allocated, in-RAM, single-array display store for a live MDA preview."""
+    """Chunked, lazily-allocated, in-RAM display store for a live MDA preview."""
 
     def __init__(self) -> None:
         self._current_sequence: useq.MDASequence | None = None
-        self._array: np.ndarray | None = None
+        self._array: zarr.Array | None = None
         self._labels: tuple[str, ...] = ()
         # "_nd_storage" mirrors TensorStoreHandler: True means we could build a
         # labeled ND array from `seq.sizes`; False is the growable frame-dim
@@ -43,8 +57,8 @@ class NumpyDisplayStore:
         self._frame_index: int = 0
 
     @property
-    def array(self) -> np.ndarray | None:
-        """The current backing numpy array (``None`` until the first frame)."""
+    def array(self) -> zarr.Array | None:
+        """The current backing zarr array (``None`` until the first frame)."""
         return self._array
 
     @property
@@ -61,7 +75,7 @@ class NumpyDisplayStore:
     def frameReady(
         self, frame: np.ndarray, event: useq.MDAEvent, meta: FrameMetaV1, /
     ) -> None:
-        """Write *frame* into the pre-allocated display array."""
+        """Write *frame* into the (lazily-allocated) display array."""
         if self._array is None:
             self._array = self._new_array(frame, event.sequence)
 
@@ -73,10 +87,13 @@ class NumpyDisplayStore:
                 self._array = self._grow(self._array)
             index = (self._frame_index,)
 
-        # single vectorized assignment -- see plan's thread-safety note: this
-        # races with ndv's background-thread reads, but numpy __setitem__ is
-        # GIL-governed and bounds-checked, so at worst a frame is displayed
-        # briefly torn/stale, never a native fault.
+        # Each frame lands in its own, never-before-written chunk (chunk size
+        # is exactly one frame -- see _new_array), and reads only ever target
+        # chunks that a prior, already-completed frameReady call finished
+        # writing (_on_frame_ready always calls frameReady synchronously
+        # before scheduling any viewer update). So there's no read/write
+        # overlap on the same chunk to race on, unlike the old tensorstore
+        # store's concurrent native async-write + threaded blocking-read.
         self._array[index] = frame
         self._frame_index += 1
 
@@ -94,16 +111,19 @@ class NumpyDisplayStore:
     # module docstring for why these can't be imported/subclassed instead.
     # ------------------------------------------------------------------
 
-    def _new_array(self, frame: np.ndarray, seq: useq.MDASequence | None) -> np.ndarray:
-        shape, labels = self._shape_and_labels(frame.shape, seq)
+    def _new_array(self, frame: np.ndarray, seq: useq.MDASequence | None) -> zarr.Array:
+        shape, chunks, labels = self._shape_chunks_labels(frame.shape, seq)
         self._nd_storage = FRAME_DIM not in labels
         self._labels = labels
-        return np.zeros(shape, dtype=frame.dtype)
+        # No `store=` -> zarr's default in-memory (plain dict) store. Chunks
+        # are created lazily on write; reading an unwritten chunk returns
+        # zeros without allocating anything.
+        return zarr.zeros(shape, chunks=chunks, dtype=frame.dtype)
 
-    def _shape_and_labels(
+    def _shape_chunks_labels(
         self, frame_shape: tuple[int, ...], seq: useq.MDASequence | None
-    ) -> tuple[tuple[int, ...], tuple[str, ...]]:
-        """Mirrors TensorStoreHandler.get_shape_chunks_labels, minus chunking."""
+    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[str, ...]]:
+        """Mirrors TensorStoreHandler.get_shape_chunks_labels."""
         labels: tuple[str, ...]
         if seq is not None and seq.sizes:
             # expand the sizes to include the largest size we encounter for each
@@ -119,7 +139,10 @@ class NumpyDisplayStore:
         else:
             labels = (FRAME_DIM,)
             full_shape = (_SIZE_INCREMENT, *frame_shape)
-        return full_shape, (*labels, "y", "x")
+
+        # one frame per chunk: every non-frame axis gets a chunk size of 1.
+        chunks = (1,) * (len(full_shape) - len(frame_shape)) + frame_shape
+        return full_shape, chunks, (*labels, "y", "x")
 
     def _event_index_to_array_index(
         self, index: Mapping[str, int]
@@ -127,7 +150,7 @@ class NumpyDisplayStore:
         """Convert an event.index mapping into a tuple valid for __setitem__."""
         return tuple(index.get(label, slice(None)) for label in self._labels)
 
-    def _grow(self, ary: np.ndarray) -> np.ndarray:
+    def _grow(self, ary: zarr.Array) -> zarr.Array:
         """Grow the frame-dim fallback array by ``_SIZE_INCREMENT`` frames."""
-        pad = np.zeros((_SIZE_INCREMENT, *ary.shape[1:]), dtype=ary.dtype)
-        return np.concatenate([ary, pad], axis=0)
+        ary.resize((self._frame_index + _SIZE_INCREMENT, *ary.shape[1:]))
+        return ary

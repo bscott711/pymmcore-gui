@@ -186,6 +186,43 @@ def test_z_lock_tracks_manual_slice_drag(mmcore: CMMCorePlus, qtbot: QtBot) -> N
     assert viewer not in manager._locked_z_axis
 
 
+def test_display_store_does_not_eagerly_allocate_full_domain() -> None:
+    """Regression: declaring a huge domain must not eagerly allocate it.
+
+    A real ASI SPIM run (100 timepoints x 201 z-slices x 2400x2400 uint16)
+    declares a ~216 GiB logical domain. An earlier ``NumpyDisplayStore``
+    implementation backed this with a dense ``np.zeros(full_shape)``, which
+    raised ``MemoryError`` on the very first frame -- silently, since
+    psygnal swallows exceptions raised inside ``frameReady`` signal
+    handlers, so the live preview just stopped updating with no visible
+    error. The store is now backed by a chunked, lazily-allocated
+    ``zarr.Array`` (one frame per chunk, matching the old tensorstore
+    store's memory-growth profile), so only frames actually written consume
+    memory -- this asserts that writing a handful of frames out of a
+    20,100-frame declared sequence stays well under 1% of the fully-dense
+    size, without raising.
+    """
+    store = NumpyDisplayStore()
+    seq = MDASequence(
+        time_plan=useq.TIntervalLoops(interval=1, loops=100),  # pyright: ignore
+        z_plan=useq.ZRangeAround(range=20, step=0.1),
+        channels=["488nm"],  # pyright: ignore
+    )
+    frame = np.zeros((2400, 2400), dtype="uint16")
+    events = list(seq)
+    assert len(events) == 20100
+
+    for event in events[:5]:
+        store.frameReady(frame, event, {})  # pyright: ignore
+
+    arr = store.array
+    assert arr is not None
+    dense_nbytes = arr.nbytes  # the full logical (t, p, z, y, x) domain
+    assert dense_nbytes > 200 * 1024**3  # ~216 GiB fully dense
+    # only the 5 written frames' chunks actually consumed memory.
+    assert arr.nbytes_stored < 0.01 * dense_nbytes
+
+
 def test_live_preview_creates_no_tensorstore(
     mmcore: CMMCorePlus, qtbot: QtBot, monkeypatch: pytest.MonkeyPatch
 ) -> None:
