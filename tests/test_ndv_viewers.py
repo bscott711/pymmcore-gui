@@ -11,8 +11,8 @@ import useq
 from useq import MDASequence
 
 from pymmcore_gui._ndv_viewers import NDVViewersManager
+from pymmcore_gui._numpy_display_store import NumpyDisplayStore
 from pymmcore_gui._qt.QtWidgets import QApplication, QWidget
-from pymmcore_gui._vendored.mda_handlers import TensorStoreHandler
 
 if TYPE_CHECKING:
     from pymmcore_plus import CMMCorePlus
@@ -60,7 +60,7 @@ def test_z_lock_skips_non_matching_frames(mmcore: CMMCorePlus, qtbot: QtBot) -> 
         time_plan=useq.TIntervalLoops(interval=0, loops=2),  # pyright: ignore
     )
     events = list(seq)
-    handler = TensorStoreHandler(driver="zarr", kvstore="memory://")
+    handler = NumpyDisplayStore()
     handler.reset(seq)
     frame = np.zeros((4, 4), dtype="uint8")
 
@@ -124,7 +124,7 @@ def test_z_lock_tracks_manual_slice_drag(mmcore: CMMCorePlus, qtbot: QtBot) -> N
         time_plan=useq.TIntervalLoops(interval=0, loops=3),  # pyright: ignore
     )
     events = list(seq)
-    handler = TensorStoreHandler(driver="zarr", kvstore="memory://")
+    handler = NumpyDisplayStore()
     handler.reset(seq)
     frame = np.zeros((4, 4), dtype="uint8")
 
@@ -184,3 +184,58 @@ def test_z_lock_tracks_manual_slice_drag(mmcore: CMMCorePlus, qtbot: QtBot) -> N
     manager.set_viewer_z_locked(viewer, False)
     viewer.display_model.current_index["z"] = original_z
     assert viewer not in manager._locked_z_axis
+
+
+def test_live_preview_creates_no_tensorstore(
+    mmcore: CMMCorePlus, qtbot: QtBot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: the live-preview path must never touch tensorstore.
+
+    A native tensorstore crash (STATUS_STACK_BUFFER_OVERRUN) was previously
+    triggered by concurrent async writes + threaded blocking reads against a
+    private per-camera ``TensorStoreHandler`` used only to back the ndv live
+    preview during dual-camera MDAs. The live preview now uses a plain
+    ``NumpyDisplayStore``, so this asserts that ``tensorstore.open`` (the call
+    ``TensorStoreHandler.new_store`` used to make) is never invoked while
+    driving the manager's multi-camera path with synthetic frames, and that
+    ``_ndv_viewers`` no longer even references ``TensorStoreHandler``.
+
+    Frames are fed directly via ``_on_sequence_started``/``_on_frame_ready``
+    (as the z-lock tests above do) rather than through a real
+    ``mmcore.mda.run()``: the demo "Multi Camera" device in this environment
+    cannot actually snap images (a pre-existing device-adapter limitation,
+    unrelated to this fix), but ``getNumberOfCameraChannels()`` /
+    ``getPhysicalCameraDevice()`` -- all ``NDVViewersManager`` needs to drive
+    its multi-camera branch -- work fine without a real snap.
+    """
+    ts = pytest.importorskip("tensorstore")
+    import pymmcore_gui._ndv_viewers as ndv_viewers_mod
+
+    assert not hasattr(ndv_viewers_mod, "TensorStoreHandler")
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise AssertionError("live-preview path must not create a tensorstore store")
+
+    monkeypatch.setattr(ts, "open", _boom)
+
+    dummy = QWidget()
+    manager = NDVViewersManager(dummy, mmcore)
+    mmcore.setCameraDevice("Multi Camera")
+
+    seq = MDASequence(
+        channels=["DAPI", "FITC"],  # pyright: ignore
+        z_plan=useq.ZRangeAround(range=2, step=1),
+    )
+    manager._on_sequence_started(seq, {})  # pyright: ignore
+    labels = manager._get_physical_camera_labels()
+    assert len(labels) == 2
+
+    frame = np.zeros((4, 4), dtype="uint16")
+    for event in seq:
+        for label in labels:
+            manager._on_frame_ready(frame, event, {"camera_device": label})  # pyright: ignore
+    manager._on_sequence_finished(seq)
+
+    assert len(manager._mda_camera_handlers) == 2
+    for handler in manager._mda_camera_handlers.values():
+        assert handler.array is not None

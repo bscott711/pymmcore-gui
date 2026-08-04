@@ -12,8 +12,8 @@ from PyQt6.QtWidgets import QWidget
 from PyQt6Ads import CDockWidget
 
 from pymmcore_gui._multi_camera_handler import without_cam_index
+from pymmcore_gui._numpy_display_store import NumpyDisplayStore
 from pymmcore_gui._settings import SettingsV1
-from pymmcore_gui._vendored.mda_handlers import TensorStoreHandler
 from pymmcore_gui.widgets.image_preview._pygfx_preview import PygfxPreview
 
 if TYPE_CHECKING:
@@ -53,12 +53,11 @@ class NDVViewersManager(QObject):
         # currently active viewer
         self._active_mda_viewer: ndv.ArrayViewer | None = None
 
-        # Private, in-memory (``memory://``) display-only handler for the
-        # single-camera case -- always created fresh per sequence (see
-        # _on_sequence_started), independent of whatever the MDA's real
-        # output/save handler is doing. We call frameReady/sequenceFinished on
-        # it manually.
-        self._own_handler: TensorStoreHandler | None = None
+        # Private, in-RAM display-only store for the single-camera case --
+        # always created fresh per sequence (see _on_sequence_started),
+        # independent of whatever the MDA's real output/save handler is
+        # doing. We call frameReady/sequenceFinished on it manually.
+        self._own_handler: NumpyDisplayStore | None = None
 
         # CONNECTIONS ---------------------------------------------------------
 
@@ -88,7 +87,7 @@ class NDVViewersManager(QObject):
         # Per-camera MDA display handlers/viewers, keyed by physical camera label.
         # Populated only for multi-camera acquisitions; the single-camera path
         # continues to use ``_own_handler`` / ``_active_mda_viewer`` below.
-        self._mda_camera_handlers: dict[str, TensorStoreHandler] = {}
+        self._mda_camera_handlers: dict[str, NumpyDisplayStore] = {}
         self._mda_camera_viewers: dict[str, ndv.ArrayViewer] = {}
 
         ev = self._mmc.events
@@ -437,13 +436,14 @@ class NDVViewersManager(QObject):
     ) -> None:
         """Called when a new MDA sequence has been started.
 
-        Every camera gets its own private, in-memory ``TensorStoreHandler``
+        Every camera gets its own private, in-RAM ``NumpyDisplayStore``
         purely for display, regardless of whatever the MDA's real output/save
         handler is doing (pymmcore-plus 0.18 routes a str/Path output through
         a sink that isn't discoverable via the now-deprecated
         ``mda.get_output_handlers()``, so there's no reliable way to reuse the
-        real save handler as a display source here). Then we create a new ndv
-        viewer and show it.
+        real save handler as a display source here). This intentionally does
+        NOT use tensorstore -- see ``NumpyDisplayStore`` docstring for why.
+        Then we create a new ndv viewer and show it.
         """
         self._is_mda_running = True
 
@@ -458,7 +458,7 @@ class NDVViewersManager(QObject):
             # camera its own in-memory display handler + viewer (independent of any
             # save handler), routing frames by ``meta["camera_device"]``.
             for label in labels:
-                handler = TensorStoreHandler(driver="zarr", kvstore="memory://")
+                handler = NumpyDisplayStore()
                 handler.reset(sequence)
                 self._mda_camera_handlers[label] = handler
                 self._mda_camera_viewers[label] = self._create_ndv_viewer(
@@ -467,7 +467,7 @@ class NDVViewersManager(QObject):
             self._active_mda_viewer = None
             return
 
-        self._own_handler = TensorStoreHandler(driver="zarr", kvstore="memory://")
+        self._own_handler = NumpyDisplayStore()
         self._own_handler.reset(sequence)
 
         # since the handler is empty at this point, create a ndv viewer with no data
@@ -503,18 +503,19 @@ class NDVViewersManager(QObject):
     def _update_mda_viewer(
         self,
         viewer: ndv.ArrayViewer,
-        handler: TensorStoreHandler | None,
+        handler: NumpyDisplayStore | None,
         event: useq.MDAEvent,
     ) -> None:
-        """Point the viewer at the handler store, or update its current index."""
+        """Point the viewer at the handler array, or update its current index."""
         if handler is None:
             return  # pragma: no cover
 
         # if the viewer does not yet have data, it's likely the very first frame
-        # so update the viewer's data source to the underlying handler's store
+        # so update the viewer's data source to the underlying handler's array.
+        # ndv's ArrayLikeWrapper (PRIORITY=100 fallback) auto-wraps any plain
+        # np.ndarray, so no custom DataWrapper is needed here.
         if viewer.data_wrapper is None:
-            # TODO: temporary. maybe create the DataWrapper for the handlers
-            viewer.data = handler.store
+            viewer.data = handler.array
             return
 
         # Otherwise, move the viewer's slider to the most recently acquired

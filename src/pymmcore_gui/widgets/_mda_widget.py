@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from pymmcore_widgets import MDAWidget
 from pymmcore_widgets.useq_widgets import PYMMCW_METADATA_KEY
@@ -22,6 +22,7 @@ from pymmcore_gui._spectral_channel_handler import (
     channel_output_path,
     channels_for_sequence,
 )
+from pymmcore_gui._vendored.mda_handlers import handler_for_path
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -59,8 +60,10 @@ class GuiMDAWidget(MDAWidget):
     When the active camera is a *Multi Camera* device (i.e.
     ``getNumberOfCameraChannels() > 1``) and the chosen output is a save path,
     the output is wrapped in a handler so that each physical camera is written
-    to its own file. Single-camera acquisitions behave exactly as the base
-    widget.
+    to its own file. Single-camera, non-spectral saves are routed through the
+    same vendored :func:`~pymmcore_gui._vendored.mda_handlers.handler_for_path`
+    writer (rather than the base widget's default ``ome_writers`` sink) so
+    that no GUI save path pulls in ``ome_writers``'s tensorstore backend.
 
     If the image-splitter spectral-channel feature is enabled (see
     :class:`~pymmcore_gui._settings.SpectralChannelSettingsV1`), the regions
@@ -103,6 +106,13 @@ class GuiMDAWidget(MDAWidget):
                     self._warn_no_spectral_match(spectral, active_cams)
                 if self._mmc.getNumberOfCameraChannels() > 1:
                     output = MultiCameraHandler(output, mmcore=self._mmc)
+                else:
+                    # Route through the vendored, tensorstore-free writer
+                    # (OMEZarrWriter / OMETiffWriter / ImageSequenceWriter)
+                    # instead of letting a bare str/Path fall through to
+                    # pymmcore-plus's OmeWritersSink -> ome_writers -> its
+                    # (native) tensorstore backend.
+                    output = cast("SupportsFrameReady", handler_for_path(output))
         self._mmc.run_mda(sequence, output=output)
 
     def get_next_available_path(self, requested_path: Path) -> Path:

@@ -2524,7 +2524,7 @@ source = { editable = "." }
 dependencies = [
     { name = "crispy" },
     { name = "ndv", extra = ["vispy"] },
-    { name = "ome-writers", extra = ["tensorstore", "tifffile"] },
+    { name = "ome-writers", extra = ["tifffile"] },
     { name = "pydantic-settings" },
     { name = "pygfx" },
     { name = "pylinalg" },
@@ -2579,7 +2579,7 @@ test = [
 requires-dist = [
     { name = "crispy", editable = "../CRISPy" },
     { name = "ndv", extras = ["vispy"], editable = "../ndv" },
-    { name = "ome-writers", extras = ["tensorstore", "tifffile"], specifier = ">=0.3.0" },
+    { name = "ome-writers", extras = ["tifffile"], specifier = ">=0.3.0" },
     { name = "pydantic-settings", specifier = ">=2.7.1" },
     { name = "pygfx", specifier = ">=0.16.0" },
     { name = "pylinalg", specifier = ">=0.6.8" },
