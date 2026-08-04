@@ -186,6 +186,59 @@ def test_z_lock_tracks_manual_slice_drag(mmcore: CMMCorePlus, qtbot: QtBot) -> N
     assert viewer not in manager._locked_z_axis
 
 
+def test_live_frames_actually_resolve_not_just_the_raw_model(
+    mmcore: CMMCorePlus, qtbot: QtBot
+) -> None:
+    """Regression: incoming frames must actually re-resolve, not just set the model.
+
+    ndv's built-in fallback wrapper for a plain array exposes bare integer
+    dim positions (0, 1, 2, ...) instead of string axis labels. Since
+    ``_update_mda_viewer`` calls ``current_index.update(event.index.items())``
+    with *string*-keyed indices ("t"/"z"/etc), every key silently failed to
+    normalize against those integer dims (``ndv.models._resolve
+    ._norm_current_index`` swallows the ``IndexError``/``KeyError`` and just
+    drops the key) -- so ``display_model.current_index`` still *looked*
+    correct (our own code writes those raw string keys into it
+    unconditionally), but the *resolved*, wrapper-position-keyed state ndv
+    actually uses to decide whether to re-fetch/re-render never changed. The
+    live preview appeared to only update when a user manually dragged a
+    slider (which drives the view's own, correctly-integer-keyed index).
+
+    This checks the actual resolved state (not just the raw model dict the
+    other z-lock tests above check) to catch that class of regression.
+    """
+    from ndv.models._resolve import resolve
+
+    dummy = QWidget()
+    manager = NDVViewersManager(dummy, mmcore)
+
+    seq = MDASequence(
+        z_plan=useq.ZRangeAround(range=2, step=1),
+        time_plan=useq.TIntervalLoops(interval=0, loops=2),  # pyright: ignore
+    )
+    events = list(seq)
+    handler = NumpyDisplayStore()
+    handler.reset(seq)
+    frame = np.zeros((4, 4), dtype="uint8")
+
+    viewer = ndv.ArrayViewer()
+
+    first = events[0]
+    handler.frameReady(frame, first, {})  # pyright: ignore
+    manager._update_mda_viewer(viewer, handler, first)
+    qtbot.wait(50)
+
+    second = next(e for e in events if e.index.get("z") != first.index.get("z"))
+    handler.frameReady(frame, second, {})  # pyright: ignore
+    manager._update_mda_viewer(viewer, handler, second)
+    qtbot.wait(50)
+
+    assert viewer.data_wrapper is not None
+    z_pos = viewer.data_wrapper.normalize_axis_key("z")
+    resolved = resolve(viewer.display_model, viewer.data_wrapper)
+    assert resolved.current_index.get(z_pos) == second.index.get("z")
+
+
 def test_display_store_does_not_eagerly_allocate_full_domain() -> None:
     """Regression: declaring a huge domain must not eagerly allocate it.
 

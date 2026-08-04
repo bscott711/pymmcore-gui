@@ -62,6 +62,14 @@ class NumpyDisplayStore:
         return self._array
 
     @property
+    def dims(self) -> tuple[str, ...]:
+        """Axis labels for ``.array``, in shape order (e.g. ``('t','z','y','x')``).
+
+        Empty until the first frame allocates ``.array``.
+        """
+        return self._labels
+
+    @property
     def current_sequence(self) -> useq.MDASequence | None:
         """Return current sequence, or None. Use ``.reset()`` for a new one."""
         return self._current_sequence

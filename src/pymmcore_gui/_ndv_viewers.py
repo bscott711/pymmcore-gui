@@ -18,11 +18,50 @@ from pymmcore_gui.widgets.image_preview._pygfx_preview import PygfxPreview
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
+    from typing import Any, TypeGuard
 
     import numpy as np
     from pymmcore_plus import CMMCorePlus
     from pymmcore_plus.metadata import FrameMetaV1, SummaryMetaV1
     from useq import MDASequence
+
+
+class _LabeledArrayWrapper(ndv.DataWrapper):
+    """Expose a ``NumpyDisplayStore``'s array with its real t/p/z/c/y/x axis labels.
+
+    ndv's built-in fallback wrapper for a plain array (or zarr array) exposes
+    bare integer dim positions (0, 1, 2, ...), which silently breaks
+    ``_update_mda_viewer``'s ``current_index.update(event.index.items())``
+    calls below: ``event.index`` is keyed by string axis names ("t"/"z"/etc),
+    and ndv drops any ``current_index`` key that doesn't resolve against the
+    wrapper's ``dims`` (see ``ndv.models._resolve._norm_current_index``'s
+    ``except (IndexError, KeyError): continue``) -- so those "jump to latest"
+    updates were silent no-ops, and the display only ever advanced when a
+    user manually dragged a slider (which uses the view's own,
+    correctly-integer-keyed index, giving the impression that frames only
+    "arrive" once you scrub). This mirrors what ndv's own
+    ``TensorstoreWrapper`` did for a tensorstore store (reading real string
+    dim labels from the store's domain), just for our zarr-backed
+    ``NumpyDisplayStore``.
+    """
+
+    def __init__(self, handler: NumpyDisplayStore) -> None:
+        array = handler.array
+        if array is None:  # pragma: no cover -- only constructed after frameReady
+            raise ValueError("NumpyDisplayStore has no data yet")
+        self._dims_ = handler.dims
+        super().__init__(array)
+
+    @classmethod
+    def supports(cls, obj: Any) -> TypeGuard[Any]:
+        # Only ever constructed explicitly (see _update_mda_viewer) -- never
+        # auto-detected by DataWrapper.create(), so this must never claim
+        # ownership of some other, unrelated bare array elsewhere in the app.
+        return False
+
+    @property
+    def dims(self) -> tuple[str, ...]:
+        return self._dims_
 
 
 # NOTE: we make this a QObject mostly so that the lifetime of this object is tied to
@@ -511,11 +550,12 @@ class NDVViewersManager(QObject):
             return  # pragma: no cover
 
         # if the viewer does not yet have data, it's likely the very first frame
-        # so update the viewer's data source to the underlying handler's array.
-        # ndv's ArrayLikeWrapper (PRIORITY=100 fallback) auto-wraps any plain
-        # np.ndarray, so no custom DataWrapper is needed here.
+        # so update the viewer's data source to the underlying handler's array,
+        # wrapped so its axes carry the real t/p/z/c labels event.index uses
+        # (see _LabeledArrayWrapper docstring for why this can't just be a
+        # bare `viewer.data = handler.array`).
         if viewer.data_wrapper is None:
-            viewer.data = handler.array
+            viewer.data = _LabeledArrayWrapper(handler)
             return
 
         # Otherwise, move the viewer's slider to the most recently acquired
