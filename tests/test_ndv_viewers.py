@@ -254,8 +254,15 @@ def test_display_store_does_not_eagerly_allocate_full_domain() -> None:
     memory -- this asserts that writing a handful of frames out of a
     20,100-frame declared sequence stays well under 1% of the fully-dense
     size, without raising.
+
+    Uses a huge window budget to disable the (separately tested, see
+    ``test_rolling_window_evicts_old_timepoints``) rolling-window t-capping,
+    so this test keeps exercising the full declared domain as originally
+    intended -- with the *default* budget the array's own declared "t" size
+    would already be capped well below 100, making the ~216 GiB comparison
+    below moot.
     """
-    store = NumpyDisplayStore()
+    store = NumpyDisplayStore(window_budget_bytes=10**15)
     seq = MDASequence(
         time_plan=useq.TIntervalLoops(interval=1, loops=100),  # pyright: ignore
         z_plan=useq.ZRangeAround(range=20, step=0.1),
@@ -274,6 +281,153 @@ def test_display_store_does_not_eagerly_allocate_full_domain() -> None:
     assert dense_nbytes > 200 * 1024**3  # ~216 GiB fully dense
     # only the 5 written frames' chunks actually consumed memory.
     assert arr.nbytes_stored < 0.01 * dense_nbytes
+
+
+def test_rolling_window_evicts_old_timepoints() -> None:
+    """Regression: even lazy chunked allocation must not retain every timepoint.
+
+    Confirmed in production: a real 100-timepoint dual-camera run hit a
+    genuine ``MemoryError`` (this time inside ``numcodecs.blosc.compress``,
+    writing a *new* chunk) at timepoint 11 of 100 -- tens of GB of real,
+    poorly-compressible camera data had already accumulated per camera, with
+    no ceiling. The store now caps its "t" axis to a rolling window sized
+    from a memory-byte budget: writing more timepoints than the window holds
+    must evict (overwrite, not accumulate) the oldest ones, keeping both the
+    array's own declared shape and its actual stored bytes bounded no matter
+    how long the acquisition runs.
+    """
+    frame = np.zeros((4, 4), dtype="uint16")
+    # budget for exactly 3 timepoints of this (1, 4, 4) uint16 frame.
+    store = NumpyDisplayStore(window_budget_bytes=3 * 1 * 4 * 4 * 2)
+    seq = MDASequence(
+        time_plan=useq.TIntervalLoops(interval=0, loops=10),  # pyright: ignore
+    )
+    store.reset(seq)
+    events = list(seq)
+    assert len(events) == 10
+
+    for event in events:
+        store.frameReady(frame, event, {})  # pyright: ignore
+
+    assert store.window_size == 3
+    assert store.max_t_seen == 9
+    arr = store.array
+    assert arr is not None
+    assert arr.shape[0] == 3  # declared "t" size capped, not the full 10
+    assert store.is_evicted(0)
+    assert store.is_evicted(6)
+    assert not store.is_evicted(9)  # the current/newest timepoint
+    # Only ever `window_size` chunks resident, however many timepoints ran --
+    # generous per-chunk overhead allowance since Blosc's fixed framing cost
+    # dominates for these tiny (32-byte) synthetic test frames.
+    assert arr.nbytes_stored <= store.window_size * (frame.nbytes + 300)
+
+
+def test_to_storage_index_modulo_wraparound() -> None:
+    """``to_storage_index`` must correctly wrap "t" at the window boundary."""
+    frame = np.zeros((4, 4), dtype="uint16")
+    store = NumpyDisplayStore(window_budget_bytes=3 * 1 * 4 * 4 * 2)
+    # loops must exceed the budget-computed window (3) for it to actually
+    # bind -- window is also capped at the *declared* t count.
+    seq = MDASequence(time_plan=useq.TIntervalLoops(interval=0, loops=10))  # pyright: ignore
+    store.reset(seq)
+    # allocate the array (and window_size) via a real frame first.
+    store.frameReady(frame, next(iter(seq)), {})  # pyright: ignore
+    assert store.window_size == 3
+
+    assert store.to_storage_index({"t": 0}) == {"t": 0}
+    assert store.to_storage_index({"t": 3}) == {"t": 0}
+    assert store.to_storage_index({"t": 5}) == {"t": 2}
+    # slice width is preserved across the remap.
+    assert store.to_storage_index({"t": slice(5, 6)}) == {"t": slice(2, 3)}
+    # non-"t" axes pass through unchanged.
+    assert store.to_storage_index({"y": slice(None)}) == {"y": slice(None)}
+
+
+def test_z_progress_for_newest_volume_only() -> None:
+    """``z_progress_for`` tracks only the currently-filling volume.
+
+    Older, already-complete volumes must report ``None`` (meaning "use the
+    full declared z range"), never a stale partial count.
+    """
+    frame = np.zeros((4, 4), dtype="uint16")
+    store = NumpyDisplayStore()
+    seq = MDASequence(
+        time_plan=useq.TIntervalLoops(interval=0, loops=2),  # pyright: ignore
+        z_plan=useq.ZRangeAround(range=2, step=1),  # 3 z slices
+    )
+    store.reset(seq)
+    events = list(seq)
+    t0_events = [e for e in events if e.index.get("t") == 0]
+    assert len(t0_events) == 3
+
+    store.frameReady(frame, t0_events[0], {})  # pyright: ignore
+    assert store.z_progress_for(0, 0) == 1
+    store.frameReady(frame, t0_events[1], {})  # pyright: ignore
+    assert store.z_progress_for(0, 0) == 2
+
+    # a frame for a new t implies the previous (t, p) is now complete.
+    t1_events = [e for e in events if e.index.get("t") == 1]
+    store.frameReady(frame, t1_events[0], {})  # pyright: ignore
+    assert store.z_progress_for(0, 0) is None  # old volume -- use full range
+    assert store.z_progress_for(1, 0) == 1  # new volume -- in progress
+
+
+def test_labeled_wrapper_bounds_and_evicted_reads() -> None:
+    """``_LabeledArrayWrapper.coords``/``isel`` reflect collected data, not the domain.
+
+    Covers: "t" always reports ``range(0, max_t_seen+1)`` (never the larger
+    declared total); "z" is bounded only while viewing the still-filling
+    newest volume, and reports the full range for any older (complete)
+    volume; reading an evicted "t" returns zeros of the correct shape/dtype
+    without raising, rather than stale or wrong data.
+    """
+    from pymmcore_gui._ndv_viewers import _LabeledArrayWrapper
+
+    frame = np.ones((4, 4), dtype="uint16")
+    store = NumpyDisplayStore(window_budget_bytes=3 * 3 * 4 * 4 * 2)  # window=3
+    seq = MDASequence(
+        time_plan=useq.TIntervalLoops(interval=0, loops=6),  # pyright: ignore
+        z_plan=useq.ZRangeAround(range=2, step=1),  # 3 z slices
+    )
+    store.reset(seq)
+    events = list(seq)
+
+    # write only the first z-slice of t=0, then build the wrapper.
+    t0_events = [e for e in events if e.index.get("t") == 0]
+    store.frameReady(frame, t0_events[0], {})  # pyright: ignore
+    wrapper = _LabeledArrayWrapper(store)
+    wrapper.set_selection(t=0, p=0)
+
+    coords = dict(wrapper.coords)
+    assert coords["t"] == range(1)  # only t=0 collected so far
+    assert coords["z"] == range(1)  # only 1 of 3 z slices written for t=0
+
+    # finish t=0's volume -- z bound should now show the full declared range.
+    for e in t0_events[1:]:
+        store.frameReady(frame, e, {})  # pyright: ignore
+    assert dict(wrapper.coords)["z"] == range(3)
+
+    # advance well past the window (window=3, so t=0 gets evicted).
+    for e in events:
+        store.frameReady(frame, e, {})  # pyright: ignore
+    assert store.is_evicted(0)
+    assert dict(wrapper.coords)["t"] == range(6)  # always 0-based, full collected range
+
+    # isel on the evicted t=0 returns zeros, not stale/wrong data, no raise.
+    # (mirrors real usage: every non-visible axis is pinned, only y/x are left
+    # unpinned -- see ndv's _resolve.py:build_slice_requests -- so both "t"
+    # and "z" must be pinned here for a proper 2D (y, x) result.)
+    t_pos = wrapper.dims.index(next(d for d in wrapper.dims if str(d) == "t"))
+    z_pos = wrapper.dims.index(next(d for d in wrapper.dims if str(d) == "z"))
+    result = wrapper.isel({t_pos: 0, z_pos: 0})
+    assert result.shape == (4, 4)
+    assert result.dtype == frame.dtype
+    assert np.all(result == 0)
+
+    # isel on a still-resident, non-evicted t returns the real (non-zero) data.
+    result = wrapper.isel({t_pos: 5, z_pos: 0})
+    assert np.all(result == 1)
 
 
 def test_live_preview_creates_no_tensorstore(

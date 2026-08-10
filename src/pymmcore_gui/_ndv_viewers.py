@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, cast
 from weakref import WeakSet, WeakValueDictionary
 
 import ndv
+import numpy as np
 import useq
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QWidget
@@ -17,10 +18,9 @@ from pymmcore_gui._settings import SettingsV1
 from pymmcore_gui.widgets.image_preview._pygfx_preview import PygfxPreview
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
     from typing import Any, TypeGuard
 
-    import numpy as np
     from pymmcore_plus import CMMCorePlus
     from pymmcore_plus.metadata import FrameMetaV1, SummaryMetaV1
     from useq import MDASequence
@@ -43,6 +43,16 @@ class _LabeledArrayWrapper(ndv.DataWrapper):
     ``TensorstoreWrapper`` did for a tensorstore store (reading real string
     dim labels from the store's domain), just for our zarr-backed
     ``NumpyDisplayStore``.
+
+    Also bounds ``"t"``/``"z"`` sliders to data that's actually been
+    collected (``coords``), and translates the handler's rolling-window
+    storage positions transparently on read (``isel``) -- see
+    ``NumpyDisplayStore``'s module docstring for why the store only retains a
+    bounded window of recent timepoints. Neither of these needs an offset/
+    non-zero-based ``coords`` range (which ``_norm_current_index`` mishandles,
+    see above): ``useq.MDAEvent.index["t"]`` is a permanent, monotonic,
+    0-based counter that's never renumbered as older timepoints are evicted,
+    so ``coords["t"]`` can just report ``range(0, max_t_seen + 1)`` forever.
     """
 
     def __init__(self, handler: NumpyDisplayStore) -> None:
@@ -50,6 +60,17 @@ class _LabeledArrayWrapper(ndv.DataWrapper):
         if array is None:  # pragma: no cover -- only constructed after frameReady
             raise ValueError("NumpyDisplayStore has no data yet")
         self._dims_ = handler.dims
+        self._handler = handler
+        # currently-viewed t/p, kept in sync via _ndv_viewers's selection
+        # listener -- used only to decide whether the "z" bound below should
+        # reflect the (possibly still-filling) newest volume or the full
+        # declared range of an older, guaranteed-complete one.
+        self._selected_t: int | None = None
+        self._selected_p: int = 0
+        # last-reported bounds, so dims_changed is only emitted when the
+        # valid range has actually changed (avoids redundant slider rebuilds).
+        self._last_t_bound = 0
+        self._last_z_bound: int | None = None
         super().__init__(array)
 
     @classmethod
@@ -62,6 +83,76 @@ class _LabeledArrayWrapper(ndv.DataWrapper):
     @property
     def dims(self) -> tuple[str, ...]:
         return self._dims_
+
+    @property
+    def coords(self) -> Mapping[Hashable, Sequence]:
+        array = self._handler.array
+        assert array is not None  # guaranteed by __init__ / handler lifecycle
+        coords: dict[Hashable, Sequence] = {
+            label: range(size)
+            for label, size in zip(self._dims_, array.shape, strict=False)
+        }
+        if "t" in coords:
+            # collected-data bound, not the (possibly much larger) declared
+            # domain -- always 0-based since t is never renumbered.
+            coords["t"] = range(self._handler.max_t_seen + 1)
+        if "z" in coords and self._selected_t == self._handler.max_t_seen:
+            z_filled = self._handler.z_progress_for(
+                self._handler.max_t_seen, self._selected_p
+            )
+            if z_filled is not None:
+                coords["z"] = range(z_filled)
+        return coords
+
+    def isel(self, index: Mapping[int, int | slice]) -> np.ndarray:
+        by_label = {
+            self._dims_[k]: index.get(k, slice(None)) for k in range(len(self._dims_))
+        }
+        t_val = by_label.get("t")
+        if isinstance(t_val, slice):
+            t_val = t_val.start
+        evicted = t_val is not None and self._handler.is_evicted(t_val)
+
+        storage = self._handler.to_storage_index(by_label)
+        idx = tuple(storage[label] for label in self._dims_)
+        array = self._handler.array
+        assert array is not None
+        result = self._asarray(array[idx])
+        # An evicted t still maps to a *resident* storage slot (whatever
+        # timepoint currently occupies it after wraparound) -- reading it is
+        # safe but the data is stale/wrong, so zero it out. Reusing the real
+        # read's shape here (rather than hand-computing it) keeps this
+        # correct-by-construction for every visible-axes combination ndv can
+        # request.
+        return np.zeros_like(result) if evicted else result
+
+    def set_selection(self, *, t: int | None = None, p: int | None = None) -> None:
+        """Record the currently-selected t/p (see the manager's selection listener)."""
+        changed = (t is not None and t != self._selected_t) or (
+            p is not None and p != self._selected_p
+        )
+        if t is not None:
+            self._selected_t = t
+        if p is not None:
+            self._selected_p = p
+        if changed:
+            self._maybe_emit_dims_changed()
+
+    def notify_frame_written(self) -> None:
+        """Re-check whether the collected-data bounds changed; called after writes."""
+        self._maybe_emit_dims_changed()
+
+    def _maybe_emit_dims_changed(self) -> None:
+        new_t_bound = self._handler.max_t_seen + 1
+        new_z_bound = (
+            self._handler.z_progress_for(self._handler.max_t_seen, self._selected_p)
+            if self._selected_t == self._handler.max_t_seen
+            else None
+        )
+        if new_t_bound != self._last_t_bound or new_z_bound != self._last_z_bound:
+            self._last_t_bound = new_t_bound
+            self._last_z_bound = new_z_bound
+            self.dims_changed.emit()
 
 
 # NOTE: we make this a QObject mostly so that the lifetime of this object is tied to
@@ -113,6 +204,12 @@ class NDVViewersManager(QObject):
         # {viewer: current_index.item_changed listener} for locked viewers, so
         # set_viewer_z_locked(locked=False) / _cleanup can disconnect them.
         self._z_lock_listeners: dict[ndv.ArrayViewer, Callable[..., None]] = {}
+
+        # {viewer: current_index.item_changed listener} that keeps each
+        # viewer's _LabeledArrayWrapper informed of the currently-selected
+        # t/p (see _LabeledArrayWrapper.set_selection), for the whole
+        # lifetime of the viewer -- disconnected in _cleanup.
+        self._selection_listeners: dict[ndv.ArrayViewer, Callable[..., None]] = {}
 
         # Per-camera preview dock widgets, keyed by physical camera label.
         # e.g. {"Camera-1": <CDockWidget>, "Camera-2": <CDockWidget>}
@@ -425,6 +522,10 @@ class NDVViewersManager(QObject):
                 viewer.display_model.current_index.item_changed.disconnect(listener)
         self._z_lock_listeners.clear()
         self._locked_z_axis.clear()
+        for viewer, listener in self._selection_listeners.items():
+            with suppress(Exception):  # viewer may already be gone/destroyed
+                viewer.display_model.current_index.item_changed.disconnect(listener)
+        self._selection_listeners.clear()
 
     def _make_z_lock_listener(self, viewer: ndv.ArrayViewer) -> Callable[..., None]:
         """Return a listener that keeps ``_locked_z_axis[viewer]`` in sync.
@@ -441,6 +542,25 @@ class NDVViewersManager(QObject):
         def _on_item_changed(key: str, new_value: object, old_value: object) -> None:
             if key == "z" and viewer in self._locked_z_axis:
                 self._locked_z_axis[viewer] = cast("int", new_value)
+
+        return _on_item_changed
+
+    def _make_selection_listener(
+        self, wrapper: _LabeledArrayWrapper
+    ) -> Callable[..., None]:
+        """Return a listener that keeps *wrapper*'s selected t/p in sync.
+
+        Connected to ``current_index.item_changed`` for the viewer's whole
+        lifetime (both programmatic "jump to latest" updates and manual
+        slider drags go through this), so ``_LabeledArrayWrapper.coords``'s
+        z-bound stays correct for whichever t/p is currently being viewed.
+        """
+
+        def _on_item_changed(key: str, new_value: object, old_value: object) -> None:
+            if key == "t":
+                wrapper.set_selection(t=cast("int", new_value))
+            elif key == "p":
+                wrapper.set_selection(p=cast("int", new_value))
 
         return _on_item_changed
 
@@ -555,7 +675,18 @@ class NDVViewersManager(QObject):
         # (see _LabeledArrayWrapper docstring for why this can't just be a
         # bare `viewer.data = handler.array`).
         if viewer.data_wrapper is None:
-            viewer.data = _LabeledArrayWrapper(handler)
+            wrapper = _LabeledArrayWrapper(handler)
+            # seed the initial selection from this (first) event, rather than
+            # waiting for the item_changed listener below to fire, so the
+            # very first coords computation already reflects the right t/p.
+            wrapper.set_selection(
+                t=cast("int", event.index.get("t", 0)),
+                p=cast("int", event.index.get("p", 0)),
+            )
+            viewer.data = wrapper
+            listener = self._make_selection_listener(wrapper)
+            self._selection_listeners[viewer] = listener
+            viewer.display_model.current_index.item_changed.connect(listener)
             return
 
         # Otherwise, move the viewer's slider to the most recently acquired
@@ -577,6 +708,11 @@ class NDVViewersManager(QObject):
             latest = self._pending_viewer_updates.pop(v, None)
             if latest is None:
                 return  # pragma: no cover
+            # Re-check the collected-data bounds regardless of whether this
+            # particular viewer's z-lock (below) ends up skipping the visible
+            # update -- new data has been written either way.
+            if isinstance(wrapper := v.data_wrapper, _LabeledArrayWrapper):
+                wrapper.notify_frame_written()
             locked_z = self._locked_z_axis.get(v)
             if locked_z is not None and latest.index.get("z") != locked_z:
                 return  # locked to a different z-slice -- skip this frame
