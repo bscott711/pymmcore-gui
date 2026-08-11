@@ -14,7 +14,7 @@ from superqt.utils import WorkerBase
 from pymmcore_gui import __version__
 from pymmcore_gui._main_window import ICON, RESOURCES, MicroManagerGUI
 from pymmcore_gui._qt.QtCore import QCoreApplication, Qt, QTimer, Signal
-from pymmcore_gui._qt.QtGui import QIcon, QPixmap
+from pymmcore_gui._qt.QtGui import QColor, QIcon, QPainter, QPixmap
 from pymmcore_gui._qt.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -299,11 +299,29 @@ def _show_splash(app: QCoreApplication) -> QSplashScreen:
     that gap instead of a blank, seemingly-frozen window. Closed via
     ``QSplashScreen.finish(win)`` once the main window is shown.
     """
-    pixmap = QPixmap(str(RESOURCES / "logo.png")).scaledToWidth(
+    logo = QPixmap(str(RESOURCES / "logo.png")).scaledToWidth(
         220, Qt.TransformationMode.SmoothTransformation
     )
+
+    # QSplashScreen.showMessage() paints its text directly onto the pixmap,
+    # and logo.png has a (near-)white background there -- white text used to
+    # land right on top of it and disappear. Give the message a dedicated
+    # dark banner strip below the logo so it always has guaranteed contrast,
+    # instead of depending on whatever happens to be under it.
+    banner_height = 32
+    pixmap = QPixmap(logo.width(), logo.height() + banner_height)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.drawPixmap(0, 0, logo)
+    painter.fillRect(0, logo.height(), logo.width(), banner_height, QColor("#202124"))
+    painter.end()
+
     splash = QSplashScreen(pixmap)
-    splash.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+    # Deliberately no WindowStaysOnTopHint: this used to force the splash
+    # above every other window on the machine for the whole loading time,
+    # with no way to bring anything else forward. Without it, the splash
+    # still shows on top initially, but clicking another window covers it
+    # like a normal window.
     splash.showMessage(
         "Starting pymmcore-gui...",
         Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignHCenter,
