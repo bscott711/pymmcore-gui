@@ -171,6 +171,7 @@ class MicroManagerGUI(QMainWindow):
         Menu.PLUGINS: [
             WidgetAction.CRISP,
             WidgetAction.SPECTRAL_CHANNELS,
+            WidgetAction.CAMERA_ALIGNMENT,
         ],
         Menu.HELP: [],
     }

@@ -43,6 +43,7 @@ class WidgetAction(ActionKey):
     CONFIG_WIZARD = "pymmcore_gui.hardware_config_wizard"
     CRISP = "pymmcore_gui.crisp_widget"
     SPECTRAL_CHANNELS = "pymmcore_gui.spectral_channel_config"
+    CAMERA_ALIGNMENT = "pymmcore_gui.camera_alignment_widget"
 
 
 # ######################## Functions that create widgets #########################
@@ -159,6 +160,13 @@ def create_spectral_channel_config(parent: QWidget) -> QWidget:
     )
 
     return SpectralChannelConfigWidget(parent=parent, mmcore=_get_core(parent))
+
+
+def create_camera_alignment_widget(parent: QWidget) -> QWidget:
+    """Create the dual-camera overlay/alignment widget."""
+    from pymmcore_gui.widgets.camera_alignment import CameraAlignmentWidget
+
+    return CameraAlignmentWidget(parent=parent, mmcore=_get_core(parent))
 
 
 # ######################## WidgetAction Enum #########################
@@ -289,4 +297,12 @@ show_spectral_channels = WidgetActionInfo(
     icon="mdi:grid-large",
     create_widget=create_spectral_channel_config,
     dock_area=DockWidgetArea.LeftDockWidgetArea,
+)
+
+show_camera_alignment = WidgetActionInfo(
+    key=WidgetAction.CAMERA_ALIGNMENT,
+    text="Camera Alignment",
+    icon="mdi:crosshairs",
+    create_widget=create_camera_alignment_widget,
+    dock_area=DockWidgetArea.RightDockWidgetArea,
 )
