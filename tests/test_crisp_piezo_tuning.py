@@ -10,18 +10,23 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
+
 from pymmcore_gui.asi_z_stack.crisp_piezo_tuning import (
     GAIN_PROP,
     UPDATE_RATE_PROP,
+    _focus_score,
     apply_and_sample,
     capture_focus_curve,
     diff_crisp_state,
     dump_crisp_state,
+    log_crisp_drift,
     sample_fluctuation,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from pathlib import Path
 
 
 class _StubCore:
@@ -37,10 +42,21 @@ class _StubCore:
             label: dict(props) for label, props in devices.items()
         }
         self._sequences: dict[tuple[str, str], Iterator[str]] = {}
+        self._positions: dict[str, float] = {}
+        self._position_sequences: dict[str, Iterator[float]] = {}
+        self._images: Iterator[np.ndarray] | None = None
+        self._last_image: np.ndarray | None = None
         self.set_calls: list[tuple[str, str, str]] = []
+        self.camera_device: str | None = None
 
     def queue_sequence(self, label: str, prop: str, values: list[Any]) -> None:
         self._sequences[(label, prop)] = iter(str(v) for v in values)
+
+    def queue_positions(self, label: str, values: list[float]) -> None:
+        self._position_sequences[label] = iter(values)
+
+    def queue_images(self, images: list[np.ndarray]) -> None:
+        self._images = iter(images)
 
     def getLoadedDevices(self) -> list[str]:
         return list(self._devices)
@@ -66,6 +82,23 @@ class _StubCore:
         # and reports "unknown", which is fine: nothing under test depends
         # on the actuator-type classification itself.
         return []
+
+    def getPosition(self, label: str) -> float:
+        if label in self._position_sequences:
+            return next(self._position_sequences[label])
+        return self._positions.get(label, 0.0)
+
+    def setCameraDevice(self, label: str) -> None:
+        self.camera_device = label
+
+    def snapImage(self) -> None:
+        if self._images is not None:
+            self._last_image = next(self._images)
+
+    def getImage(self) -> np.ndarray:
+        if self._last_image is not None:
+            return self._last_image
+        return np.zeros((8, 8), dtype=np.uint16)
 
 
 def _piezo_props(**overrides: str) -> dict[str, str]:
@@ -186,3 +219,70 @@ def test_capture_focus_curve_collects_changed_lines_only() -> None:
     )
     assert lines == ["T=1 Z=0.1", "T=2 Z=0.2"]
     assert ("CRISPAFocus:P:34", "CRISP State", "Curve") in core.set_calls
+
+
+def test_focus_score_ranks_sharp_above_blurred() -> None:
+    flat = np.full((16, 16), 100, dtype=np.uint16)
+    checkerboard = np.indices((16, 16)).sum(axis=0) % 2 * 65535
+    checkerboard = checkerboard.astype(np.uint16)
+    assert _focus_score(flat) == 0.0
+    assert _focus_score(checkerboard) > _focus_score(flat)
+
+
+def test_log_crisp_drift_writes_telemetry_and_position(tmp_path: Path) -> None:
+    core = _StubCore(
+        {
+            "CRISPAFocus:P:34": _piezo_props(),
+            "PiezoStage:P:34": {},
+        }
+    )
+    core.queue_sequence("CRISPAFocus:P:34", "Dither Error", ["0"] * 10)
+    core.queue_positions("PiezoStage:P:34", [-40.180, -40.181, -40.183, -40.190])
+
+    csv_path = log_crisp_drift(
+        {"CRISPAFocus:P:34": "PiezoStage:P:34"},
+        duration_s=0.25,
+        interval_s=0.1,
+        out_dir=tmp_path,
+        mmcore=core,
+    )
+
+    assert csv_path.exists()
+    rows = csv_path.read_text().strip().splitlines()
+    header, *data_rows = rows
+    assert "actuator_position_um" in header
+    assert len(data_rows) >= 2
+    assert all("CRISPAFocus:P:34" in row for row in data_rows)
+    assert all("PiezoStage:P:34" in row for row in data_rows)
+    # position values from queue_positions should show up (Python's str()
+    # drops the trailing zero: -40.180 -> "-40.18")
+    assert "-40.18" in data_rows[0]
+
+
+def test_log_crisp_drift_captures_camera_snapshots(tmp_path: Path) -> None:
+    core = _StubCore(
+        {
+            "CRISPAFocus:P:34": _piezo_props(),
+            "PiezoStage:P:34": {},
+        }
+    )
+    core.queue_sequence("CRISPAFocus:P:34", "Dither Error", ["0"] * 10)
+    checkerboard = (np.indices((16, 16)).sum(axis=0) % 2 * 65535).astype(np.uint16)
+    core.queue_images([checkerboard, checkerboard])
+
+    csv_path = log_crisp_drift(
+        {"CRISPAFocus:P:34": "PiezoStage:P:34"},
+        duration_s=0.25,
+        interval_s=0.1,
+        camera_label="Camera-1",
+        snapshot_interval_s=0.1,
+        out_dir=tmp_path,
+        mmcore=core,
+    )
+
+    rows = csv_path.read_text().strip().splitlines()
+    camera_rows = [r for r in rows if "__camera__" in r]
+    assert camera_rows, "expected at least one camera snapshot row"
+    assert core.camera_device == "Camera-1"
+    saved = list((tmp_path / "snapshots").glob("*.tiff"))
+    assert saved
