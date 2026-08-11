@@ -11,7 +11,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import pytest
 
+import pymmcore_gui.asi_z_stack.crisp_piezo_tuning as cpt
+from pymmcore_gui.asi_z_stack.asi_controller import _HW
 from pymmcore_gui.asi_z_stack.crisp_piezo_tuning import (
     GAIN_PROP,
     UPDATE_RATE_PROP,
@@ -48,6 +51,7 @@ class _StubCore:
         self._last_image: np.ndarray | None = None
         self.set_calls: list[tuple[str, str, str]] = []
         self.camera_device: str | None = None
+        self.fail_snap: Exception | None = None
 
     def queue_sequence(self, label: str, prop: str, values: list[Any]) -> None:
         self._sequences[(label, prop)] = iter(str(v) for v in values)
@@ -92,6 +96,8 @@ class _StubCore:
         self.camera_device = label
 
     def snapImage(self) -> None:
+        if self.fail_snap is not None:
+            raise self.fail_snap
         if self._images is not None:
             self._last_image = next(self._images)
 
@@ -286,3 +292,88 @@ def test_log_crisp_drift_captures_camera_snapshots(tmp_path: Path) -> None:
     assert core.camera_device == "Camera-1"
     saved = list((tmp_path / "snapshots").glob("*.tiff"))
     assert saved
+
+
+def test_log_crisp_drift_records_snapshot_error_in_csv(tmp_path: Path) -> None:
+    core = _StubCore({"CRISPAFocus:P:34": _piezo_props(), "PiezoStage:P:34": {}})
+    core.queue_sequence("CRISPAFocus:P:34", "Dither Error", ["0"] * 10)
+    core.fail_snap = RuntimeError("camera busy")
+
+    csv_path = log_crisp_drift(
+        {"CRISPAFocus:P:34": "PiezoStage:P:34"},
+        duration_s=0.25,
+        interval_s=0.1,
+        camera_label="Camera-1",
+        snapshot_interval_s=0.1,
+        out_dir=tmp_path,
+        mmcore=core,
+    )
+
+    rows = csv_path.read_text().strip().splitlines()
+    camera_rows = [r for r in rows if "__camera__" in r]
+    assert camera_rows
+    # failed attempt: error captured, no snapshot file/path/score written
+    assert "camera busy" in camera_rows[0]
+    assert not list((tmp_path / "snapshots").glob("*.tiff"))
+
+
+def test_log_crisp_drift_rejects_unknown_laser(tmp_path: Path) -> None:
+    core = _StubCore({"CRISPAFocus:P:34": _piezo_props(), "PiezoStage:P:34": {}})
+    with pytest.raises(ValueError, match="Unknown laser"):
+        log_crisp_drift(
+            {"CRISPAFocus:P:34": "PiezoStage:P:34"},
+            duration_s=1.0,
+            camera_label="Camera-1",
+            laser="not-a-real-laser",
+            out_dir=tmp_path,
+            mmcore=core,
+        )
+
+
+def test_log_crisp_drift_gates_laser_around_each_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str, tuple[int, ...], bool] | tuple[str]] = []
+    monkeypatch.setattr(
+        cpt, "ensure_global_shutter_open", lambda: calls.append(("shutter",))
+    )
+
+    def fake_set_laser_outputs(
+        plogic_label: str,
+        hub_label: str,
+        bnc_addrs: list[int],
+        on: bool,
+        always_on_cell: int,
+    ) -> None:
+        calls.append(("laser", tuple(bnc_addrs), on))
+
+    monkeypatch.setattr(cpt, "set_laser_outputs", fake_set_laser_outputs)
+
+    core = _StubCore({"CRISPAFocus:P:34": _piezo_props(), "PiezoStage:P:34": {}})
+    core.queue_sequence("CRISPAFocus:P:34", "Dither Error", ["0"] * 10)
+    checkerboard = (np.indices((16, 16)).sum(axis=0) % 2 * 65535).astype(np.uint16)
+    core.queue_images([checkerboard])
+
+    # duration_s < interval_s so the loop breaks after exactly one outer
+    # iteration -- one snapshot attempt, consuming the single queued image.
+    csv_path = cpt.log_crisp_drift(
+        {"CRISPAFocus:P:34": "PiezoStage:P:34"},
+        duration_s=0.05,
+        interval_s=0.1,
+        camera_label="Camera-1",
+        snapshot_interval_s=0.1,
+        laser="488nm",
+        out_dir=tmp_path,
+        mmcore=core,
+    )
+
+    assert ("shutter",) in calls
+    laser_calls = [c for c in calls if c[0] == "laser"]
+    assert len(laser_calls) == 2
+    on_call, off_call = laser_calls
+    expected_addr = (_HW.laser_bnc_addr["488nm"],)
+    assert on_call == ("laser", expected_addr, True)
+    assert off_call == ("laser", expected_addr, False)
+
+    rows = csv_path.read_text().strip().splitlines()
+    assert any("__camera__" in r and "snapshots" in r for r in rows)

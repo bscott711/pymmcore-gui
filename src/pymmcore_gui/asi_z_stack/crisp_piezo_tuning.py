@@ -20,18 +20,20 @@ closed-loop auto-tuner: per this project's established lesson (see the
 against real hardware one confirmed step at a time, not driven by an
 unattended loop.
 
-Also includes :func:`log_crisp_drift`, a *passive* (never writes a CRISP
-property) long-duration logger for a distinct failure mode: CRISP reporting
-a clean, healthy lock (good SNR/Sum, near-zero Dither Error, "In Focus")
-while the true image focus silently drifts away underneath it -- ASI's own
-docs confirm CRISP's health metrics are entirely self-referential (they
-describe how well the servo tracks its own setpoint, not whether that
-setpoint still matches true focus), so this can't be caught by watching the
-CRISPy panel alone. Because this never mutates hardware state, it's safe to
-run unattended for many minutes, unlike the tuning helpers above -- but it
-still blocks whatever thread calls it, so for anything longer than a few
-seconds use :func:`log_crisp_drift_async` instead of calling it directly
-from pymmcore-gui's embedded console (see that function's docstring for why).
+Also includes :func:`log_crisp_drift`, a long-duration logger for a distinct
+failure mode: CRISP reporting a clean, healthy lock (good SNR/Sum,
+near-zero Dither Error, "In Focus") while the true image focus silently
+drifts away underneath it -- ASI's own docs confirm CRISP's health metrics
+are entirely self-referential (they describe how well the servo tracks its
+own setpoint, not whether that setpoint still matches true focus), so this
+can't be caught by watching the CRISPy panel alone. It never writes a CRISP
+property, so it's safe to run unattended for many minutes, unlike the
+tuning helpers above -- but it still blocks whatever thread calls it, so for
+anything longer than a few seconds use :func:`log_crisp_drift_async` instead
+of calling it directly from pymmcore-gui's embedded console (see that
+function's docstring for why). If given a *laser*, it does briefly gate that
+laser on/off around each camera snapshot (see :func:`log_crisp_drift`'s
+docstring) -- everything else it does is read-only.
 """
 
 from __future__ import annotations
@@ -51,7 +53,7 @@ from CRISPy.controller import ASICrispController
 from superqt.utils import create_worker
 
 from ._logging import configure_asi_logging
-from .asi_controller import _HW, mmc
+from .asi_controller import _HW, ensure_global_shutter_open, mmc, set_laser_outputs
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -344,6 +346,7 @@ _DRIFT_LOG_FIELDS = [
     "actuator_position_um",
     "snapshot_path",
     "focus_score",
+    "error",
 ]
 
 
@@ -372,6 +375,7 @@ def log_crisp_drift(
     interval_s: float = 5.0,
     camera_label: str | None = None,
     snapshot_interval_s: float = 60.0,
+    laser: str | None = None,
     out_dir: str | Path = ".",
     mmcore: CMMCorePlus | None = None,
 ) -> Path:
@@ -396,6 +400,11 @@ def log_crisp_drift(
       true image plane -- a different, likely mechanical/thermal-alignment
       problem, not something more CRISP tuning can fix.
 
+    Note this only tells you anything about the *drift-while-locked* failure
+    mode if the CRISP axis is actually locked (``crisp_state`` should read
+    ``Lock``/``In Focus``) for the run -- if it reads ``Idle`` throughout,
+    the axis was never engaged and this log doesn't test that question.
+
     Parameters
     ----------
     crisp_to_actuator : dict[str, str]
@@ -413,10 +422,25 @@ def log_crisp_drift(
         from this camera and saves it as a TIFF alongside a focus score.
         Temporarily sets this as the Core's active camera device for each
         snapshot (matching the snap convention in
-        :mod:`~pymmcore_gui.asi_z_stack.verify_handle_release`).
+        :mod:`~pymmcore_gui.asi_z_stack.verify_handle_release`). Without a
+        *laser*, this captures whatever illumination state already happens
+        to exist in the Core -- if nothing is lit, every snapshot will be a
+        blank dark frame.
     snapshot_interval_s : float
         Seconds between camera snapshots, decoupled from *interval_s* since
         snapping is slower and produces files on disk (default 60s).
+    laser : str | None
+        If given (must be a key of ``HardwareConstants.laser_bnc_addr``,
+        e.g. ``"488nm"``), briefly gates that laser on immediately before
+        each snapshot and off immediately after via this codebase's own
+        PLogic BNC gating (:func:`~pymmcore_gui.asi_z_stack.asi_controller.
+        set_laser_outputs`), rather than leaving it on for the whole
+        *duration_s* -- minimizes total light dose on the sample over a long
+        unattended run. Ignored if *camera_label* is not given. Calls
+        :func:`~pymmcore_gui.asi_z_stack.asi_controller.
+        ensure_global_shutter_open` once up front (idempotent, no-op
+        without PLogic hardware) since per-laser gating depends on the
+        always-on cell it configures.
     out_dir : str | Path
         Directory to write the timestamped CSV (and a ``snapshots/``
         subdirectory of TIFFs, if *camera_label* is given) into.
@@ -427,8 +451,15 @@ def log_crisp_drift(
     -------
     Path
         Path to the written CSV. Written incrementally (flushed after every
-        row), so an interrupted run still leaves usable partial data.
+        row), so an interrupted run still leaves usable partial data. Any
+        per-row read/snapshot failure is caught, logged, and recorded in
+        that row's ``error`` column rather than silently leaving blank
+        fields with no indication why.
     """
+    if laser is not None and laser not in _HW.laser_bnc_addr:
+        raise ValueError(
+            f"Unknown laser {laser!r}; expected one of {list(_HW.laser_bnc_addr)}"
+        )
     core = mmcore or mmc
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -436,12 +467,15 @@ def log_crisp_drift(
     snapshot_dir = out_dir / "snapshots"
     if camera_label:
         snapshot_dir.mkdir(parents=True, exist_ok=True)
+        if laser is not None:
+            ensure_global_shutter_open()
 
     logger.info(
         f"Logging CRISP drift for {duration_s:.0f}s to {csv_path} "
         f"(axes: {list(crisp_to_actuator)})"
         + (
             f", camera snapshots every {snapshot_interval_s:.0f}s"
+            + (f" (laser: {laser})" if laser else "")
             if camera_label
             else ""
         )
@@ -496,7 +530,19 @@ def log_crisp_drift(
                 snap_row["timestamp"] = now
                 snap_row["crisp_label"] = "__camera__"
                 snap_row["actuator_label"] = camera_label
+                laser_addr: int | None = None
                 try:
+                    if laser is not None:
+                        laser_addr = _HW.laser_bnc_addr[laser]
+                        set_laser_outputs(
+                            _HW.plogic_label,
+                            _HW.tiger_comm_hub_label,
+                            [laser_addr],
+                            True,
+                            _HW.plogic_always_on_cell,
+                        )
+                        if laser in _HW.shutter_gated_wavelengths:
+                            time.sleep(_HW.shutter_open_settle_ms / 1000)
                     core.setCameraDevice(camera_label)
                     core.snapImage()
                     image = core.getImage()
@@ -507,6 +553,19 @@ def log_crisp_drift(
                     snapshot_idx += 1
                 except Exception as e:  # pragma: no cover - defensive
                     logger.warning(f"Snapshot failed at t={elapsed:.0f}s: {e}")
+                    snap_row["error"] = str(e)
+                finally:
+                    if laser_addr is not None:
+                        try:
+                            set_laser_outputs(
+                                _HW.plogic_label,
+                                _HW.tiger_comm_hub_label,
+                                [laser_addr],
+                                False,
+                                _HW.plogic_always_on_cell,
+                            )
+                        except Exception as e:  # pragma: no cover - defensive
+                            logger.warning(f"Failed to turn laser back off: {e}")
                 writer.writerow(snap_row)
                 fh.flush()
                 next_snapshot_at += snapshot_interval_s
@@ -523,6 +582,7 @@ def log_crisp_drift_async(
     interval_s: float = 5.0,
     camera_label: str | None = None,
     snapshot_interval_s: float = 60.0,
+    laser: str | None = None,
     out_dir: str | Path = ".",
     mmcore: CMMCorePlus | None = None,
     on_done: Callable[[Path], None] | None = None,
@@ -567,6 +627,8 @@ def log_crisp_drift_async(
         See :func:`log_crisp_drift`.
     snapshot_interval_s : float
         See :func:`log_crisp_drift`.
+    laser : str | None
+        See :func:`log_crisp_drift`.
     out_dir : str | Path
         See :func:`log_crisp_drift`.
     mmcore : CMMCorePlus | None
@@ -592,6 +654,7 @@ def log_crisp_drift_async(
         interval_s=interval_s,
         camera_label=camera_label,
         snapshot_interval_s=snapshot_interval_s,
+        laser=laser,
         out_dir=out_dir,
         mmcore=mmcore,
         _start_thread=True,
