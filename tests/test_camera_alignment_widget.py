@@ -142,6 +142,43 @@ def test_pick_and_track_updates_readout_and_chart(
     assert len(widget._chart._samples) == 0
 
 
+def test_no_new_sample_without_new_frame(gui: MicroManagerGUI, qtbot: QtBot) -> None:
+    """Polling again on the same (unchanged) frames must not advance the chart.
+
+    Acquisition being paused/stopped means the preview keeps returning the
+    same frame object tick after tick; the strip chart should hold its last
+    point rather than keep stamping fresh wall-clock times onto stale data.
+    """
+    mmc = gui.mmcore
+    mmc.setProperty("Core", "Camera", "Multi Camera")
+
+    widget = CameraAlignmentWidget(parent=gui, mmcore=mmc)
+    qtbot.addWidget(widget)
+    widget._on_config_loaded()
+    assert widget._cam1 is not None and widget._cam2 is not None
+
+    preview1 = gui.viewers_manager.get_or_create_camera_preview(widget._cam1)
+    preview2 = gui.viewers_manager.get_or_create_camera_preview(widget._cam2)
+    preview1.append(_blob_frame((128, 128), (60.0, 60.0)))
+    preview2.append(_blob_frame((128, 128), (64.0, 65.0)))
+    widget._on_pick1_done((60.0 - 0.5, 60.0 - 0.5))
+    widget._on_pick2_done((64.0 - 0.5, 65.0 - 0.5))
+
+    widget._on_poll()
+    assert len(widget._chart._samples) == 1
+
+    # No new frames pushed -- simulates acquisition being paused. Repeated
+    # polling must not add more samples.
+    widget._on_poll()
+    widget._on_poll()
+    assert len(widget._chart._samples) == 1
+
+    # A genuinely new frame arrives -- the chart should advance again.
+    preview1.append(_blob_frame((128, 128), (61.0, 60.0)))
+    widget._on_poll()
+    assert len(widget._chart._samples) == 2
+
+
 def test_paused_during_mda(
     gui: MicroManagerGUI, qtbot: QtBot, monkeypatch: pytest.MonkeyPatch
 ) -> None:

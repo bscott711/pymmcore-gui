@@ -40,6 +40,8 @@ from ._overlay_canvas import OverlayCanvas
 from ._strip_chart import DisplacementStripChart
 
 if TYPE_CHECKING:
+    import numpy as np
+
     from pymmcore_gui._main_window import MicroManagerGUI
     from pymmcore_gui.widgets.image_preview._pygfx_preview import PygfxPreview
 
@@ -73,6 +75,11 @@ class CameraAlignmentWidget(QWidget):
         self._preview2: PygfxPreview | None = None
         self._spot1: TrackedSpot | None = None
         self._spot2: TrackedSpot | None = None
+        # Identity (not content) of the last frame seen from each camera, so
+        # `_on_poll` can tell a genuinely new frame apart from the same stale
+        # array returned tick after tick while acquisition is paused/stopped.
+        self._last_frame1: np.ndarray | None = None
+        self._last_frame2: np.ndarray | None = None
         # The one swap point for a future FFT-cross-correlation tracker.
         self._track_fn: TrackFunc = centroid_track
 
@@ -224,16 +231,28 @@ class CameraAlignmentWidget(QWidget):
         if f2 is not None:
             self._overlay.set_frame2(f2)
 
-        if self._spot1 is not None and f1 is not None:
+        # PygfxPreview.data returns the exact object last given to it via
+        # `.append()`, unchanged in between -- so identity (not content)
+        # comparison cheaply detects whether acquisition actually produced a
+        # new frame since the last tick, vs. is just paused/stopped.
+        new_frame1 = f1 is not None and f1 is not self._last_frame1
+        new_frame2 = f2 is not None and f2 is not self._last_frame2
+        self._last_frame1, self._last_frame2 = f1, f2
+
+        if new_frame1 and self._spot1 is not None and f1 is not None:
             if (new1 := self._track_fn(f1, self._spot1)) is not None:
                 self._spot1 = new1
                 self._overlay.set_marker("cam1", (new1.x, new1.y), _CAM1_COLOR)
-        if self._spot2 is not None and f2 is not None:
+        if new_frame2 and self._spot2 is not None and f2 is not None:
             if (new2 := self._track_fn(f2, self._spot2)) is not None:
                 self._spot2 = new2
                 self._overlay.set_marker("cam2", (new2.x, new2.y), _CAM2_COLOR)
 
-        if self._spot1 is not None and self._spot2 is not None:
+        if (
+            (new_frame1 or new_frame2)
+            and self._spot1 is not None
+            and self._spot2 is not None
+        ):
             dx, dy, mag = displacement(self._spot1, self._spot2)
             self._readout.setText(
                 f"dx = {dx:+.2f} px   dy = {dy:+.2f} px   |d| = {mag:.2f} px"
@@ -242,6 +261,7 @@ class CameraAlignmentWidget(QWidget):
 
     def _reset_tracking(self) -> None:
         self._spot1 = self._spot2 = None
+        self._last_frame1 = self._last_frame2 = None
         self._overlay.set_marker("cam1", None, _CAM1_COLOR)
         self._overlay.set_marker("cam2", None, _CAM2_COLOR)
         self._chart.clear()
