@@ -300,20 +300,24 @@ def _show_splash(app: QCoreApplication) -> QSplashScreen:
     ``QSplashScreen.finish(win)`` once the main window is shown.
     """
     logo = QPixmap(str(RESOURCES / "logo.png")).scaledToWidth(
-        220, Qt.TransformationMode.SmoothTransformation
+        160, Qt.TransformationMode.SmoothTransformation
     )
 
     # QSplashScreen.showMessage() paints its text directly onto the pixmap,
-    # and logo.png has a (near-)white background there -- white text used to
-    # land right on top of it and disappear. Give the message a dedicated
-    # dark banner strip below the logo so it always has guaranteed contrast,
-    # instead of depending on whatever happens to be under it.
-    banner_height = 32
-    pixmap = QPixmap(logo.width(), logo.height() + banner_height)
-    pixmap.fill(Qt.GlobalColor.transparent)
+    # and logo.png has a white background there -- white text used to land
+    # right on top of it and disappear. Rather than bolt a separate colored
+    # strip under the logo for the text to sit on (which just looks like a
+    # strip bolted under the logo), give the whole splash one background --
+    # the same blue as the logo's own icon -- so the icon card floats on it
+    # and the text below shares that surface instead of sitting in a box.
+    side_margin, top_margin, gap, text_area = 32, 36, 20, 40
+    width = logo.width() + 2 * side_margin
+    height = top_margin + logo.height() + gap + text_area
+
+    pixmap = QPixmap(width, height)
+    pixmap.fill(QColor("#2b79b3"))
     painter = QPainter(pixmap)
-    painter.drawPixmap(0, 0, logo)
-    painter.fillRect(0, logo.height(), logo.width(), banner_height, QColor("#202124"))
+    painter.drawPixmap(side_margin, top_margin, logo)
     painter.end()
 
     splash = QSplashScreen(pixmap)
