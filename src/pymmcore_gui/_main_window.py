@@ -11,13 +11,14 @@ from weakref import WeakValueDictionary
 
 from pymmcore_plus import CMMCorePlus
 from pymmcore_widgets import ConfigWizard
-from PyQt6.QtCore import QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QCloseEvent, QGuiApplication, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QDialog,
     QHBoxLayout,
+    QLabel,
     QMainWindow,
     QMenu,
     QMenuBar,
@@ -37,6 +38,7 @@ from PyQt6Ads import (
 )
 from superqt import QIconifyIcon
 
+from ._argus_stream import ArgusStreamSession, ArgusTunnelManager, StreamState
 from ._mmcore_shutdown import shutdown_mmcore, track_mda_thread
 from ._ndv_viewers import NDVViewersManager
 from ._notification_manager import NotificationManager
@@ -126,6 +128,33 @@ def _create_window_menu(mmc: CMMCorePlus, parent: MicroManagerGUI) -> QMenu:
     return menu
 
 
+class _ArgusStatusRelay(QObject):
+    """Marshals :class:`ArgusStreamSession` status callbacks onto the GUI thread.
+
+    ``ArgusStreamSession``'s ``on_state_changed`` callback is invoked directly
+    from its per-run sender thread (see ``_argus_stream._session``), so it
+    can't touch Qt widgets itself. Routing it through a signal on a QObject
+    that lives on the GUI thread lets Qt's normal auto-queued cross-thread
+    connection handle the marshaling, the same mechanism
+    :class:`~pymmcore_gui._ndv_viewers.NDVViewersManager` relies on for
+    ``core.mda.events`` callbacks.
+    """
+
+    stateChanged = pyqtSignal(str, str)
+
+
+_ARGUS_STATE_TEXT = {
+    StreamState.DISABLED: "Argus: off",
+    StreamState.IDLE: "Argus: idle",
+    StreamState.SKIPPED: "Argus: skipped",
+    StreamState.CONNECTING: "Argus: connecting…",
+    StreamState.STREAMING: "Argus: streaming",
+    StreamState.RECONNECTING: "Argus: reconnecting…",
+    StreamState.BACKLOG_ALARM: "Argus: backlog!",
+    StreamState.FINISHING: "Argus: finishing…",
+}
+
+
 class MicroManagerGUI(QMainWindow):
     """Micro-Manager minimal GUI."""
 
@@ -209,11 +238,46 @@ class MicroManagerGUI(QMainWindow):
             if hasattr(app, "exceptionRaised"):
                 cast("MMQApplication", app).exceptionRaised.connect(self._on_exception)
 
+        # Real-time Argus streaming (deskew/decon) -------------
+        #
+        # A plain (non-QObject) object connected directly to core.mda.events,
+        # like NDVViewersManager, so it shares no thread with the local disk
+        # writers -- see _argus_stream._session's module docstring. The
+        # tunnel is app-lifetime and started lazily by ArgusStreamSession the
+        # first time a run is both enabled and eligible, so simply flipping
+        # ArgusStreamSettingsV1.enabled (no restart needed) takes effect on
+        # the next MDA run.
+
+        argus_settings = Settings.instance().argus_stream
+        self._argus_tunnel = ArgusTunnelManager(
+            argus_settings.ssh_host,
+            argus_settings.local_port,
+            argus_settings.remote_port,
+        )
+        self._argus_status_relay = _ArgusStatusRelay(self)
+        self._argus_stream = ArgusStreamSession(
+            self._mmc,
+            self._argus_tunnel,
+            get_settings=lambda: Settings.instance(),
+            on_state_changed=lambda state, detail: (
+                self._argus_status_relay.stateChanged.emit(state.value, detail)
+            ),
+        )
+        argus_mda_ev = self._mmc.mda.events
+        argus_mda_ev.sequenceStarted.connect(self._argus_stream.sequenceStarted)
+        argus_mda_ev.frameReady.connect(self._argus_stream.frameReady)
+        argus_mda_ev.sequenceFinished.connect(self._argus_stream.sequenceFinished)
+        argus_mda_ev.sequenceCanceled.connect(self._argus_stream.sequenceCanceled)
+
         # Status bar -----------------------------------------
 
         self._status_bar = QStatusBar(self)
         self._status_bar.setMaximumHeight(26)
         self.setStatusBar(self._status_bar)
+
+        self._argus_status_label = QLabel(_ARGUS_STATE_TEXT[StreamState.DISABLED])
+        self._argus_status_relay.stateChanged.connect(self._on_argus_state_changed)
+        self._status_bar.addPermanentWidget(self._argus_status_label)
 
         self.bell_button = QPushButton(QIconifyIcon("codicon:bell"), None)
         self.bell_button.setFixedWidth(20)
@@ -530,10 +594,19 @@ class MicroManagerGUI(QMainWindow):
             return
         self._save_state()
         try:
+            self._argus_stream.shutdown()
+        except Exception:
+            logger.exception("Error shutting down Argus stream on close")
+        self._argus_tunnel.stop()
+        try:
             shutdown_mmcore(self._mmc)
         except Exception:
             logger.exception("Error during mmcore shutdown on close")
         return super().closeEvent(a0)
+
+    def _on_argus_state_changed(self, state: str, detail: str) -> None:
+        text = _ARGUS_STATE_TEXT.get(StreamState(state), f"Argus: {state}")
+        self._argus_status_label.setText(f"{text} ({detail})" if detail else text)
 
     def _confirm_close_with_running_mda(self) -> bool:
         box = QMessageBox(

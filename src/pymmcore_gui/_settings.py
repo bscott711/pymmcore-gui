@@ -244,6 +244,77 @@ class SpectralChannelSettingsV1(BaseMMSettings):
     )
 
 
+class ArgusStreamSettingsV1(BaseMMSettings):
+    """Real-time frame-streaming-to-Argus feature configuration.
+
+    See ``pymmcore_gui._argus_stream`` for the streaming client this
+    configures, and ``opym_local/src/opym/stream/`` (Argus side, canonical)
+    for the wire protocol and receiver these fields feed. v1 only supports
+    single-position MDA sequences (Argus's ``(T, C)`` grid has no position
+    axis). Multi-camera sequences are supported *only* when spectral-channel
+    cropping (see :class:`SpectralChannelSettingsV1`) resolves each camera's
+    regions into distinct channel identities -- an uncropped multi-camera
+    acquisition is skipped, same as multi-position (see
+    ``_argus_stream._session.ArgusStreamSession``).
+    """
+
+    enabled: bool = False
+    """Master on/off switch for the whole feature."""
+    ssh_host: str = "Argus"
+    """``Host`` alias from the user's ``~/.ssh/config`` to tunnel through."""
+    local_port: int = 5555
+    """Local end of the SSH port-forward that the ZMQ DEALER connects to."""
+    remote_port: int = 5555
+    """Port ``opym-receive`` binds to on ``127.0.0.1`` on the Argus side.
+
+    Matches ``opym.stream.receiver.DEFAULT_BIND_ADDR`` (``tcp://127.0.0.1:5555``).
+    """
+    buffer_budget_mb: int = 4096
+    """RAM budget for buffered-but-unacked volumes before raising an alarm.
+
+    Sized generously (several volumes deep) since the policy on exceeding it
+    is to warn, not to drop data -- see ``_argus_stream._session``.
+    """
+    gpfs_scratch_root: str = ""
+    """GPFS root PetaKit5D writes final Decon/DSR output under.
+
+    Each session's ``output_dir`` header field is
+    ``<gpfs_scratch_root>/<base_name>/Decon``. Streaming refuses to start
+    if this is unset.
+    """
+    sheet_angle_deg: float = 60.0
+    """OPM light-sheet angle, in degrees.
+
+    Default is the validated production value confirmed by the Argus side
+    (used consistently across ``opym.petakit``, ``run_petakit_server.m``,
+    ``run_napari_opym.py``, and the ``psf_tools/*`` scripts) -- override only
+    if this system's hardware geometry actually differs.
+    """
+    interp_method: str = "cubic"
+    """PetaKit5D interpolation method (receiver default is also "cubic")."""
+    rl_method: str = "simple"
+    """PetaKit5D Richardson-Lucy method (receiver default is also "simple")."""
+    iterations: int | None = None
+    """Richardson-Lucy iteration count. ``None`` along with an empty
+    ``psf_paths`` gives deskew-only processing (no deconvolution)."""
+    psf_paths: dict[str, str] = Field(default_factory=dict)
+    """Per-channel PSF file paths (GPFS paths), keyed by channel name.
+
+    "Channel name" matches whatever ``channel_names`` ends up being for a
+    given run: spectral-region names (e.g. ``"GFP_488"``) when spectral
+    cropping is active for that sequence, otherwise the raw MDA sequence's
+    laser/config preset names. If any channel used in a streamed sequence is
+    missing an entry here, the whole session falls back to deskew-only
+    (``psf_paths`` omitted on the wire) rather than sending a
+    partial/misaligned list -- see
+    ``_argus_stream._session._build_session_header``.
+    """
+    dz_psf: float | None = None
+    """The PSF's own z-step, in microns. Optional even when ``psf_paths`` is
+    set -- the receiver falls back to reading it from the PSF file's own
+    ImageJ metadata -- but sending it avoids a per-frame file read."""
+
+
 class SettingsV1(BaseMMSettings):
     """Global settings for the PyMMCore GUI."""
 
@@ -257,6 +328,7 @@ class SettingsV1(BaseMMSettings):
     spectral: SpectralChannelSettingsV1 = Field(
         default_factory=SpectralChannelSettingsV1
     )
+    argus_stream: ArgusStreamSettingsV1 = Field(default_factory=ArgusStreamSettingsV1)
 
     send_error_reports: bool | None = None
     """Whether to send error reports to the developers, None means undecided."""

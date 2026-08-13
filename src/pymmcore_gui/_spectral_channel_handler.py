@@ -74,6 +74,32 @@ def channel_output_path(
     return f"{stem}_{_sanitize(channel.name)}{suffix}"
 
 
+def active_channels_for_event(
+    event: useq.MDAEvent,
+    channels: list[SpectralChannelConfig],
+    laser_group: str,
+    all_lasers_preset: str,
+) -> list[SpectralChannelConfig]:
+    """Return the configured *channels* that are "lit" for *event*.
+
+    Determined from the laser preset active for this event
+    (``event.channel.config``), matched against each channel's configured
+    ``laser_preset``. ``all_lasers_preset`` (or a missing/foreign channel
+    group) activates every configured channel.
+
+    Standalone so other frame consumers (e.g. the Argus real-time streamer)
+    can determine exactly which regions :class:`SpectralChannelHandler` would
+    save for a given event, without duplicating -- and risking drifting from
+    -- this logic.
+    """
+    ch = event.channel
+    in_group = ch is not None and ch.group == laser_group
+    preset = ch.config if (ch is not None and in_group) else None
+    if preset is None or preset == all_lasers_preset:
+        return list(channels)
+    return [c for c in channels if c.laser_preset == preset]
+
+
 def channels_for_sequence(
     sequence: useq.MDASequence,
     channels: list[SpectralChannelConfig],
@@ -187,17 +213,11 @@ class SpectralChannelHandler:
     ) -> list[SpectralChannelConfig]:
         """Return the configured channels that are "lit" for *event*.
 
-        Determined from the laser preset active for this event
-        (``event.channel.config``), matched against each channel's configured
-        ``laser_preset``. ``AllLasers`` (or a missing/foreign channel group)
-        activates every configured channel.
+        See :func:`active_channels_for_event`.
         """
-        ch = event.channel
-        in_group = ch is not None and ch.group == self._laser_group
-        preset = ch.config if (ch is not None and in_group) else None
-        if preset is None or preset == self._all_lasers_preset:
-            return list(self._channels)
-        return [c for c in self._channels if c.laser_preset == preset]
+        return active_channels_for_event(
+            event, self._channels, self._laser_group, self._all_lasers_preset
+        )
 
     def _get_writer(self, channel: SpectralChannelConfig) -> Any:
         """Return (creating + starting if needed) the writer for *channel*."""

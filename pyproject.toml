@@ -36,6 +36,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
+    "msgpack>=1.0.8",
     "ndv[vispy]>=0.5.0rc4",
     "ome-writers[tifffile]>=0.3.0",
     "pydantic-settings>=2.7.1",
@@ -44,6 +45,7 @@ dependencies = [
     "PyQt6==6.9.1",
     "PyQt6Ads==4.4.0.post2",
     "pyyaml>=6.0.2",
+    "pyzmq>=26.0",
     "qtconsole>=5.6.1",
     "rich",
     "sentry-sdk>=2.20.0",
@@ -173,6 +175,7 @@ module = [
     "rendercanvas.*",
     "pytestqt.*",
     "zarr.*",
+    "msgpack.*",
 ]
 ignore_missing_imports = true
 
