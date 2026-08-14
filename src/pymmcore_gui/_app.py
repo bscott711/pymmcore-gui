@@ -13,8 +13,22 @@ from superqt.utils import WorkerBase
 
 from pymmcore_gui import __version__
 from pymmcore_gui._main_window import ICON, RESOURCES, MicroManagerGUI
-from pymmcore_gui._qt.QtCore import QCoreApplication, Qt, QTimer, Signal
-from pymmcore_gui._qt.QtGui import QColor, QIcon, QPainter, QPixmap
+from pymmcore_gui._qt.QtCore import (
+    QCoreApplication,
+    QPointF,
+    QRect,
+    Qt,
+    QTimer,
+    Signal,
+)
+from pymmcore_gui._qt.QtGui import (
+    QColor,
+    QFont,
+    QFontMetricsF,
+    QIcon,
+    QPainter,
+    QPixmap,
+)
 from pymmcore_gui._qt.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -185,11 +199,7 @@ def create_mmgui(
 
     def _set_status(msg: str) -> None:
         if splash is not None:
-            splash.showMessage(
-                msg,
-                Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignHCenter,
-                Qt.GlobalColor.white,
-            )
+            splash.set_status(msg)
             app.processEvents()
 
     _set_status("Building interface...")
@@ -288,7 +298,74 @@ def create_mmgui(
     return win
 
 
-def _show_splash(app: QCoreApplication) -> QSplashScreen:
+# Geometry measured from logo.png (1024x1024). The opaque white card sits at
+# x/y 101-922 with a soft drop shadow trailing to y=937, and everything outside
+# that is transparent padding -- hence the crop, which is the art's real alpha
+# bounding box. The yellow base graphic ends at y=827, leaving a band of plain
+# white card from y=828 to y=922 with nothing in it.
+_CARD_CROP = QRect(95, 101, 834, 837)
+_BAND_TOP_SRC, _BAND_BOT_SRC = 828, 922
+# 256px of card yields a ~29px band -- enough for 11pt with clearance above the
+# yellow base and below for descenders. Smaller sizes crowd both.
+_CARD_ART_WIDTH = 256
+_CARD_MARGIN = 8
+_STATUS_INK = "#1f3b52"
+
+
+class _SplashScreen(QSplashScreen):
+    """Splash screen that paints its status text inside the logo card itself.
+
+    ``QSplashScreen.showMessage()`` can only draw flat, single-color text, and
+    the color it used to be given was white -- which landed on the logo's white
+    card and vanished. Adding a colored strip or a full background behind the
+    text fixes legibility but reads as a box bolted onto the artwork. Instead
+    the text goes in the empty white margin the card art already has beneath
+    the microscope, in a dark ink: nothing is added to the splash at all, so it
+    stays just the app icon floating, and the text can never collide with
+    whatever happens to be on the desktop behind it.
+
+    Painting it requires overriding :meth:`drawContents`, which Qt calls on
+    every repaint after blitting the pixmap.
+    """
+
+    def __init__(self, pixmap: QPixmap, font: QFont, baseline: float) -> None:
+        super().__init__(pixmap)
+        self._font = font
+        self._baseline = baseline
+
+    def set_status(self, message: str) -> None:
+        """Show ``message`` in the card's text band and repaint.
+
+        Parameters
+        ----------
+        message : str
+            The status text to display.
+        """
+        # showMessage()'s alignment and color arguments are inert here --
+        # drawContents() ignores them -- but it is still what stores the
+        # message and triggers the repaint.
+        self.showMessage(message)
+
+    def drawContents(self, painter: QPainter) -> None:
+        """Paint the current status message centered in the card's white band.
+
+        Parameters
+        ----------
+        painter : QPainter
+            Painter supplied by Qt, already clipped to the splash.
+        """
+        if not (message := self.message()):
+            return
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setFont(self._font)
+        painter.setPen(QColor(_STATUS_INK))
+        advance = QFontMetricsF(self._font).horizontalAdvance(message)
+        painter.drawText(
+            QPointF((self.width() - advance) / 2.0, self._baseline), message
+        )
+
+
+def _show_splash(app: QCoreApplication) -> _SplashScreen:
     """Show a splash screen immediately, before the main window is built.
 
     Loading a real hardware config -- especially one that grows the ASI/
@@ -298,39 +375,55 @@ def _show_splash(app: QCoreApplication) -> QSplashScreen:
     starts. A splash gives the user something responsive to look at during
     that gap instead of a blank, seemingly-frozen window. Closed via
     ``QSplashScreen.finish(win)`` once the main window is shown.
+
+    Parameters
+    ----------
+    app : QCoreApplication
+        The running application, used to pump events so the splash paints
+        before the (synchronous) startup work begins.
     """
-    logo = QPixmap(str(RESOURCES / "logo.png")).scaledToWidth(
-        160, Qt.TransformationMode.SmoothTransformation
+    art = (
+        QPixmap(str(RESOURCES / "logo.png"))
+        .copy(_CARD_CROP)
+        .scaledToWidth(_CARD_ART_WIDTH, Qt.TransformationMode.SmoothTransformation)
     )
 
-    # QSplashScreen.showMessage() paints its text directly onto the pixmap,
-    # and logo.png has a white background there -- white text used to land
-    # right on top of it and disappear. Rather than bolt a separate colored
-    # strip under the logo for the text to sit on (which just looks like a
-    # strip bolted under the logo), give the whole splash one background --
-    # the same blue as the logo's own icon -- so the icon card floats on it
-    # and the text below shares that surface instead of sitting in a box.
-    side_margin, top_margin, gap, text_area = 32, 36, 20, 40
-    width = logo.width() + 2 * side_margin
-    height = top_margin + logo.height() + gap + text_area
-
-    pixmap = QPixmap(width, height)
-    pixmap.fill(QColor("#2b79b3"))
+    pixmap = QPixmap(art.width() + 2 * _CARD_MARGIN, art.height() + 2 * _CARD_MARGIN)
+    # QSplashScreen sets WA_TranslucentBackground when its pixmap has an alpha
+    # channel, so filling with transparent is what makes the card actually
+    # float rather than sit on a window-colored rectangle. QPixmap(w, h) is
+    # uninitialized memory -- the fill is required, not cosmetic.
+    pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
-    painter.drawPixmap(side_margin, top_margin, logo)
+    painter.drawPixmap(_CARD_MARGIN, _CARD_MARGIN, art)
     painter.end()
 
-    splash = QSplashScreen(pixmap)
+    # Build the font only now: QFont created before a QApplication exists
+    # silently falls back to another family, which shifts every metric below.
+    font = QFont(QApplication.font())
+    font.setPointSizeF(11.0)
+    font.setWeight(QFont.Weight.Medium)
+    font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 101.0)
+
+    scale = _CARD_ART_WIDTH / _CARD_CROP.width()
+    band_top = (_BAND_TOP_SRC - _CARD_CROP.y()) * scale
+    band_bottom = (_BAND_BOT_SRC - _CARD_CROP.y()) * scale
+    metrics = QFontMetricsF(font)
+    # Center the visual block (cap top..descender bottom) in the band. Centering
+    # on cap height alone pushes descenders onto the card's rounded edge.
+    baseline = (
+        _CARD_MARGIN
+        + (band_top + band_bottom) / 2.0
+        + (metrics.capHeight() - metrics.descent()) / 2.0
+    )
+
+    splash = _SplashScreen(pixmap, font, baseline)
     # Deliberately no WindowStaysOnTopHint: this used to force the splash
     # above every other window on the machine for the whole loading time,
     # with no way to bring anything else forward. Without it, the splash
     # still shows on top initially, but clicking another window covers it
     # like a normal window.
-    splash.showMessage(
-        "Starting pymmcore-gui...",
-        Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignHCenter,
-        Qt.GlobalColor.white,
-    )
+    splash.set_status("Starting pymmcore-gui...")
     splash.show()
     app.processEvents()
     return splash
