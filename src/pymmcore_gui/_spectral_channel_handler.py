@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from pymmcore_plus import CMMCorePlus
 
+from pymmcore_gui._async_writer import DEFAULT_BACKLOG_BUDGET_BYTES, AsyncWriter
 from pymmcore_gui._multi_camera_handler import (
     _KNOWN_SUFFIXES,
     _sanitize,
@@ -188,6 +189,8 @@ class SpectralChannelHandler:
         *,
         writer_format: str = "ome-zarr",
         mmcore: CMMCorePlus | None = None,
+        zarr_compression: bool = False,
+        backlog_budget_bytes: int = DEFAULT_BACKLOG_BUDGET_BYTES,
     ) -> None:
         self._output = output
         self._channels = list(channels)
@@ -195,6 +198,8 @@ class SpectralChannelHandler:
         self._all_lasers_preset = all_lasers_preset
         self._writer_format = writer_format
         self._mmc = mmcore or CMMCorePlus.instance()
+        self._zarr_compression = zarr_compression
+        self._backlog_budget_bytes = backlog_budget_bytes
         # channel name -> writer
         self._writers: dict[str, Any] = {}
         self._started: set[str] = set()
@@ -223,7 +228,11 @@ class SpectralChannelHandler:
         """Return (creating + starting if needed) the writer for *channel*."""
         if channel.name not in self._writers:
             path = channel_output_path(self._output, channel, self._writer_format)
-            self._writers[channel.name] = handler_for_path(path)
+            self._writers[channel.name] = AsyncWriter(
+                handler_for_path(path, zarr_compression=self._zarr_compression),
+                name=_sanitize(channel.name),
+                backlog_budget_bytes=self._backlog_budget_bytes,
+            )
         writer = self._writers[channel.name]
         if channel.name not in self._started:
             self._call_sequence_started(writer)

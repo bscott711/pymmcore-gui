@@ -315,6 +315,31 @@ class ArgusStreamSettingsV1(BaseMMSettings):
     ImageJ metadata -- but sending it avoids a per-frame file read."""
 
 
+class MdaWriterSettingsV1(BaseMMSettings):
+    """Local MDA save-writer tuning.
+
+    See ``pymmcore_gui._async_writer`` and
+    ``pymmcore_gui._vendored.mda_handlers._ome_zarr_writer``.
+    """
+
+    zarr_compression: bool = False
+    """Compress OME-Zarr chunks (blosc/lz4).
+
+    Off by default: for fast multi-camera / SPIM acquisitions the compress
+    step is the write-throughput bottleneck and raw camera frames compress
+    poorly. Turn on only if disk space matters more than acquisition-keep-up.
+    """
+    backlog_budget_mb: int = 32768
+    """Per-writer cap on frame bytes buffered in RAM waiting to be written.
+
+    Each per-camera / per-channel writer drains its own queue on its own
+    thread; if the disk can't keep up and a writer's backlog would exceed
+    this, further frames for that writer are dropped (with a visible alarm)
+    rather than growing until the process runs out of memory. A healthy run
+    never approaches this -- the backlog stays near zero.
+    """
+
+
 class SettingsV1(BaseMMSettings):
     """Global settings for the PyMMCore GUI."""
 
@@ -329,6 +354,7 @@ class SettingsV1(BaseMMSettings):
         default_factory=SpectralChannelSettingsV1
     )
     argus_stream: ArgusStreamSettingsV1 = Field(default_factory=ArgusStreamSettingsV1)
+    mda_writer: MdaWriterSettingsV1 = Field(default_factory=MdaWriterSettingsV1)
 
     send_error_reports: bool | None = None
     """Whether to send error reports to the developers, None means undecided."""

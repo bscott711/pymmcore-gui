@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, cast
 from pymmcore_widgets import MDAWidget
 from pymmcore_widgets.useq_widgets import PYMMCW_METADATA_KEY
 
+from pymmcore_gui._async_writer import AsyncWriter
 from pymmcore_gui._multi_camera_handler import (
     MultiCameraHandler,
     per_camera_path,
@@ -88,6 +89,9 @@ class GuiMDAWidget(MDAWidget):
     ) -> None:
         sequence = self.value()
         if isinstance(output, str | Path):
+            writer_cfg = SettingsV1.instance().mda_writer
+            zarr_compression = writer_cfg.zarr_compression
+            backlog_budget_bytes = writer_cfg.backlog_budget_mb * 1024**2
             save = self._spectral_channels_to_save(sequence)
             if save:
                 meta = sequence.metadata.get(PYMMCW_METADATA_KEY, {})
@@ -98,6 +102,8 @@ class GuiMDAWidget(MDAWidget):
                     SettingsV1.instance().spectral.all_lasers_preset,
                     writer_format=meta.get("format", "ome-zarr"),
                     mmcore=self._mmc,
+                    zarr_compression=zarr_compression,
+                    backlog_budget_bytes=backlog_budget_bytes,
                 )
             else:
                 spectral = SettingsV1.instance().spectral
@@ -105,14 +111,28 @@ class GuiMDAWidget(MDAWidget):
                     active_cams = set(physical_camera_labels(self._mmc))
                     self._warn_no_spectral_match(spectral, active_cams)
                 if self._mmc.getNumberOfCameraChannels() > 1:
-                    output = MultiCameraHandler(output, mmcore=self._mmc)
+                    output = MultiCameraHandler(
+                        output,
+                        mmcore=self._mmc,
+                        zarr_compression=zarr_compression,
+                        backlog_budget_bytes=backlog_budget_bytes,
+                    )
                 else:
                     # Route through the vendored, tensorstore-free writer
                     # (OMEZarrWriter / OMETiffWriter / ImageSequenceWriter)
                     # instead of letting a bare str/Path fall through to
                     # pymmcore-plus's OmeWritersSink -> ome_writers -> its
-                    # (native) tensorstore backend.
-                    output = cast("SupportsFrameReady", handler_for_path(output))
+                    # (native) tensorstore backend. Wrap it in an AsyncWriter so
+                    # the disk I/O is off the shared MDA relay thread, bounded,
+                    # and can't die silently -- see _async_writer.py.
+                    output = cast(
+                        "SupportsFrameReady",
+                        AsyncWriter(
+                            handler_for_path(output, zarr_compression=zarr_compression),
+                            name="mda-save",
+                            backlog_budget_bytes=backlog_budget_bytes,
+                        ),
+                    )
         self._mmc.run_mda(sequence, output=output)
 
     def get_next_available_path(self, requested_path: Path) -> Path:

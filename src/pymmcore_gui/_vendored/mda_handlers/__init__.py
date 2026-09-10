@@ -25,16 +25,35 @@ __all__ = [
 ]
 
 
-def handler_for_path(path: str | Path) -> object:
+def handler_for_path(path: str | Path, *, zarr_compression: bool = False) -> object:
     """Convert a string or Path into a handler object.
 
     This method picks from the built-in handlers based on the extension of the path.
+
+    Parameters
+    ----------
+    path : str | Path
+        Output path; the extension selects the writer.
+    zarr_compression : bool
+        GUI-local addition: when the path is an OME-Zarr, compress chunks with
+        a fast blosc/lz4 codec. Default ``False`` -- see
+        :class:`~pymmcore_gui._vendored.mda_handlers._ome_zarr_writer.OMEZarrWriter`
+        for why compression is off by default.
     """
     if str(path).rstrip("/").rstrip(":").lower() == "memory":
         return TensorStoreHandler(kvstore="memory://")
 
     path = str(Path(path).expanduser().resolve())
     if path.endswith(".zarr"):
+        if zarr_compression:
+            from numcodecs import Blosc
+
+            return OMEZarrWriter(
+                path,
+                array_kwargs={
+                    "compressor": Blosc(cname="lz4", clevel=1, shuffle=Blosc.SHUFFLE)
+                },
+            )
         return OMEZarrWriter(path)
 
     if path.endswith((".tiff", ".tif")):

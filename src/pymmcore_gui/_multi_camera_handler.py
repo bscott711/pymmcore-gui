@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 from pymmcore_plus import CMMCorePlus
 
+from pymmcore_gui._async_writer import DEFAULT_BACKLOG_BUDGET_BYTES, AsyncWriter
 from pymmcore_gui._vendored.mda_handlers import handler_for_path
 
 if TYPE_CHECKING:
@@ -102,10 +103,17 @@ class MultiCameraHandler:
     """Route MDA frames to one writer per physical camera, keyed by camera label."""
 
     def __init__(
-        self, output: str | Path, *, mmcore: CMMCorePlus | None = None
+        self,
+        output: str | Path,
+        *,
+        mmcore: CMMCorePlus | None = None,
+        zarr_compression: bool = False,
+        backlog_budget_bytes: int = DEFAULT_BACKLOG_BUDGET_BYTES,
     ) -> None:
         self._output = output
         self._mmc = mmcore or CMMCorePlus.instance()
+        self._zarr_compression = zarr_compression
+        self._backlog_budget_bytes = backlog_budget_bytes
         # camera label -> writer
         self._writers: dict[str, Any] = {}
         self._started: set[str] = set()
@@ -124,7 +132,11 @@ class MultiCameraHandler:
         """Return (creating + starting if needed) the writer for *label*."""
         if label not in self._writers:
             path = per_camera_path(self._output, label)
-            self._writers[label] = handler_for_path(path)
+            self._writers[label] = AsyncWriter(
+                handler_for_path(path, zarr_compression=self._zarr_compression),
+                name=_sanitize(label),
+                backlog_budget_bytes=self._backlog_budget_bytes,
+            )
         writer = self._writers[label]
         if label not in self._started:
             self._call_sequence_started(writer)

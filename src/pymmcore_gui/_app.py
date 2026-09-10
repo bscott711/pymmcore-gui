@@ -495,6 +495,12 @@ def _install_excepthook() -> None:
     sys._original_excepthook_ = sys.excepthook  # type: ignore
     sys.excepthook = ndv_excepthook
 
+    # Also cover worker threads -- otherwise a thread that dies on an unhandled
+    # exception (e.g. the MDA save relay) only prints to an unseen stderr.
+    from pymmcore_gui._exceptions import install_threading_excepthook
+
+    install_threading_excepthook()
+
 
 def rich_print_exception(
     exc_type: type[BaseException],

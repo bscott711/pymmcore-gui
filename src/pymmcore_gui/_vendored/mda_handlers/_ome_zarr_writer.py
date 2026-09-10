@@ -28,7 +28,7 @@ if TYPE_CHECKING:
         def __getitem__(self, key: str) -> AbstractAsyncContextManager: ...
 
     class ArrayCreationKwargs(TypedDict, total=False):
-        compressor: str | Codec
+        compressor: str | Codec | None
         fill_value: int | None
         order: Literal["C", "F"]
         synchronizer: ZarrSynchronizer | None
@@ -143,6 +143,13 @@ class OMEZarrWriter(_5DWriterBase["zarr.Array"]):
         # passed to zarr.group.create
         self._array_kwargs: ArrayCreationKwargs = array_kwargs or {}
         self._array_kwargs.setdefault("dimension_separator", "/")
+        # GUI-local change from the upstream vendored copy: default to *no*
+        # compression. For fast multi-camera / SPIM acquisitions the blosc
+        # compress step is the write-throughput bottleneck (measured ~90
+        # planes/s compressed vs ~260 raw on this rig's data), and raw camera
+        # frames compress poorly anyway. Pass ``array_kwargs={"compressor":
+        # <codec>}`` (or the MDA-writer setting) to re-enable compression.
+        self._array_kwargs.setdefault("compressor", None)
         self._minify_metadata = minify_attrs_metadata
 
     @classmethod
