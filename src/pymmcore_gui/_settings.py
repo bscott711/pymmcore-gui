@@ -340,6 +340,47 @@ class MdaWriterSettingsV1(BaseMMSettings):
     """
 
 
+class FocusOffsetSettingsV1(BaseMMSettings):
+    """Per-excitation-wavelength focus (Z) offset configuration.
+
+    Corrects axial chromatic aberration on the ASI SPIM rig: CRISP holds one
+    physical plane, but each excitation wavelength focuses slightly
+    differently. When enabled, a small per-wavelength Z offset is applied at
+    the per-volume channel switch by shifting the CRISP lock setpoint (see
+    ``pymmcore_gui.asi_z_stack.engine.ASISPIMEngine``); the offset travels
+    into the sequence as ``useq.Channel.z_offset`` (see
+    ``pymmcore_gui.widgets._mda_widget``).
+
+    Offsets are stored **absolute** -- each measured against one calibration
+    datum -- and ``locked_preset`` picks the runtime zero, so re-locking CRISP
+    on a different channel never needs the offsets re-measured.
+    """
+
+    enabled: bool = False
+    """Master on/off switch for the whole feature."""
+    laser_config_group: str = "Lasers"
+    """MM config group whose presets name the excitation wavelengths."""
+    all_lasers_preset: str = "AllLasers"
+    """Simultaneous-multi-wavelength preset -- never given an offset."""
+    crisp_label: str = "CRISPAFocus:P:34"
+    """CRISP AutoFocus device servoing the focus piezo. Empty => auto-discover."""
+    counts_per_um: float | None = None
+    """Signed CRISP lock-offset counts per micron of focus shift, from the
+    bench probe (``crisp_focus_offset_tuning.probe_lock_offset_response``).
+    ``None`` falls back to the device's own
+    ``|Calibration Gain| / Calibration Range(um)`` sensitivity."""
+    locked_preset: str = ""
+    """Which wavelength CRISP is currently focused/locked on -- the runtime
+    zero that gets no net move. Empty => use the running sequence's first
+    channel."""
+    apply_live: bool = False
+    """Auto-apply the active channel's offset during ordinary live preview
+    (opt-in; off by default -- otherwise it silently fights the CRISPy panel)."""
+    offsets: dict[str, float] = Field(default_factory=dict)
+    """Per-preset focus offset in microns, absolute vs the calibration datum,
+    keyed by laser-preset name (e.g. ``{"561nm": 0.35}``)."""
+
+
 class SettingsV1(BaseMMSettings):
     """Global settings for the PyMMCore GUI."""
 
@@ -355,6 +396,7 @@ class SettingsV1(BaseMMSettings):
     )
     argus_stream: ArgusStreamSettingsV1 = Field(default_factory=ArgusStreamSettingsV1)
     mda_writer: MdaWriterSettingsV1 = Field(default_factory=MdaWriterSettingsV1)
+    focus: FocusOffsetSettingsV1 = Field(default_factory=FocusOffsetSettingsV1)
 
     send_error_reports: bool | None = None
     """Whether to send error reports to the developers, None means undecided."""

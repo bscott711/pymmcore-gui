@@ -543,6 +543,7 @@ dev = [
     { name = "mdformat", specifier = ">=0.7.22" },
     { name = "mdformat-gfm", specifier = ">=1.0.0" },
     { name = "mdformat-tables", specifier = ">=1.0.0" },
+    { name = "pytest", specifier = ">=8.0" },
 ]
 
 [[package]]
