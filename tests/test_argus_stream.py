@@ -237,15 +237,16 @@ def test_build_session_header_happy_path() -> None:
     assert reason == ""
     assert header is not None
     assert header["base_name"] == "cooked_001"
-    assert header["output_dir"] == "/mmfs2/scratch/lab/cooked_001/Decon"
+    # raw_root is the declared session directory itself -- channel stores
+    # are named "<base_name>_<channel>.ome.zarr" directly under it (see
+    # opym.stream.rawmirror.store_path_for_channel on Argus), not nested
+    # under a base_name/Decon subdirectory.
+    assert header["raw_root"] == "/mmfs2/scratch/lab"
     assert header["dtype"] == "uint16"
     assert header["shape_zyx"] == [3, 6, 8]
     assert header["num_timepoints"] == 1
     assert header["channels"] == [0, 1]
     assert header["channel_names"] == ["488nm", "561nm"]
-    assert header["psf_paths"] is None
-    assert header["iterations"] is None
-    assert header["sheet_angle_deg"] == 60.0  # validated production default
 
 
 def test_build_session_header_rejects_multi_position() -> None:
@@ -281,36 +282,34 @@ def test_build_session_header_requires_gpfs_scratch_root() -> None:
     assert "gpfs_scratch_root" in reason
 
 
-def test_build_session_header_psf_paths_require_full_channel_coverage(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    settings = ArgusStreamSettingsV1(
-        gpfs_scratch_root="/scratch",
-        psf_paths={"488nm": "/scratch/psf/488.tif"},  # missing 561nm
-        dz_psf=0.1,
-        iterations=10,
-    )
-    header, _reason = _build_session_header(_save_seq(), _StubCore(), settings, [])
+def test_build_session_header_contains_every_field_the_receiver_requires() -> None:
+    """Contract test against `opym.stream.receiver.StreamReceiver.
+    _handle_session_start` (a DIFFERENT repo, on Argus -- not importable
+    here, so this hardcodes the required-key list rather than a live
+    schema check). This is exactly the class of bug found on the rig: an
+    earlier header shape had `output_dir` instead of `raw_root`, which the
+    receiver's `header["raw_root"]` lookup raised `KeyError` on, silently
+    rejecting the whole session (every frame dropped as unknown). If this
+    test starts failing, opym_local's receiver.py's own required-key set
+    has likely changed and this client needs updating to match -- check
+    `~/projects/opym_local/src/opym/stream/receiver.py` on Argus, not just
+    this repo, before "fixing" it here.
+    """
+    settings = ArgusStreamSettingsV1(gpfs_scratch_root="/mmfs2/scratch/lab")
+    header, reason = _build_session_header(_save_seq(), _StubCore(), settings, [])
+    assert reason == ""
     assert header is not None
-    assert header["psf_paths"] is None
-    assert header["dz_psf"] is None
-    assert header["iterations"] is None
-    assert "not every channel" in caplog.text
-
-
-def test_build_session_header_psf_paths_full_coverage_preserves_order() -> None:
-    settings = ArgusStreamSettingsV1(
-        gpfs_scratch_root="/scratch",
-        psf_paths={"561nm": "/scratch/psf/561.tif", "488nm": "/scratch/psf/488.tif"},
-        dz_psf=0.1,
-        iterations=10,
-    )
-    header, _reason = _build_session_header(_save_seq(), _StubCore(), settings, [])
-    assert header is not None
-    # order follows channel_names (488nm, 561nm), not the settings dict order
-    assert header["psf_paths"] == ["/scratch/psf/488.tif", "/scratch/psf/561.tif"]
-    assert header["dz_psf"] == 0.1
-    assert header["iterations"] == 10
+    required = {
+        "raw_root",
+        "base_name",
+        "channels",
+        "channel_names",
+        "dtype",
+        "shape_zyx",
+        "num_timepoints",
+        "z_step_um",
+    }
+    assert required <= header.keys()
 
 
 # ----------------------------------------------------------------------------

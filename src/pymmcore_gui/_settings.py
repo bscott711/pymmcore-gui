@@ -276,43 +276,16 @@ class ArgusStreamSettingsV1(BaseMMSettings):
     is to warn, not to drop data -- see ``_argus_stream._session``.
     """
     gpfs_scratch_root: str = ""
-    """GPFS root PetaKit5D writes final Decon/DSR output under.
+    """GPFS ``raw_root`` each streamed session is declared under.
 
-    Each session's ``output_dir`` header field is
-    ``<gpfs_scratch_root>/<base_name>/Decon``. Streaming refuses to start
-    if this is unset.
+    The directory a Globus transfer would have dropped this session into,
+    e.g. ``.../DataUpload/<session>/`` -- matches
+    ``opym.stream.rawmirror.store_path_for_channel``'s own convention on the
+    Argus side: each channel's raw store is named
+    ``<base_name>_<channel_name>.ome.zarr`` directly under this root, not
+    nested under a ``base_name`` subdirectory. Streaming refuses to start if
+    this is unset.
     """
-    sheet_angle_deg: float = 60.0
-    """OPM light-sheet angle, in degrees.
-
-    Default is the validated production value confirmed by the Argus side
-    (used consistently across ``opym.petakit``, ``run_petakit_server.m``,
-    ``run_napari_opym.py``, and the ``psf_tools/*`` scripts) -- override only
-    if this system's hardware geometry actually differs.
-    """
-    interp_method: str = "cubic"
-    """PetaKit5D interpolation method (receiver default is also "cubic")."""
-    rl_method: str = "simple"
-    """PetaKit5D Richardson-Lucy method (receiver default is also "simple")."""
-    iterations: int | None = None
-    """Richardson-Lucy iteration count. ``None`` along with an empty
-    ``psf_paths`` gives deskew-only processing (no deconvolution)."""
-    psf_paths: dict[str, str] = Field(default_factory=dict)
-    """Per-channel PSF file paths (GPFS paths), keyed by channel name.
-
-    "Channel name" matches whatever ``channel_names`` ends up being for a
-    given run: spectral-region names (e.g. ``"GFP_488"``) when spectral
-    cropping is active for that sequence, otherwise the raw MDA sequence's
-    laser/config preset names. If any channel used in a streamed sequence is
-    missing an entry here, the whole session falls back to deskew-only
-    (``psf_paths`` omitted on the wire) rather than sending a
-    partial/misaligned list -- see
-    ``_argus_stream._session._build_session_header``.
-    """
-    dz_psf: float | None = None
-    """The PSF's own z-step, in microns. Optional even when ``psf_paths`` is
-    set -- the receiver falls back to reading it from the PSF file's own
-    ImageJ metadata -- but sending it avoids a per-frame file read."""
 
 
 class MdaWriterSettingsV1(BaseMMSettings):
