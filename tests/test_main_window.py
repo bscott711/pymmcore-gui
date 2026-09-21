@@ -425,3 +425,50 @@ def test_close_with_running_mda_declined_keeps_open(
     # clean up: cancel the still-running acquisition before the test ends
     core.mda.cancel()
     thread.join(2)
+
+
+# ----------------------------------------------------------------------------
+# Argus streaming: tunnel lifecycle
+# ----------------------------------------------------------------------------
+
+
+def test_argus_tunnel_starts_at_launch_when_enabled(
+    qtbot: QtBot,
+    qapp: QApplication,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The SSH tunnel must be warm before any acquisition starts, not spun
+    up just-in-time on the first MDA run -- a JIT start used to race
+    ``_RunWorker``'s own ``connect()`` + ``SESSION_START`` against the
+    tunnel's local port not being forwarded yet, right at the start of
+    every single run. See ``_main_window.py``'s Argus streaming setup
+    comment for the history."""
+    from pymmcore_gui._argus_stream._tunnel import ArgusTunnelManager
+
+    settings.argus_stream.enabled = True
+    started: list[bool] = []
+    monkeypatch.setattr(ArgusTunnelManager, "start", lambda self: started.append(True))
+
+    gui = MicroManagerGUI()
+    qtbot.addWidget(gui)
+
+    assert started == [True]
+
+
+def test_argus_tunnel_not_started_at_launch_when_disabled(
+    qtbot: QtBot,
+    qapp: QApplication,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pymmcore_gui._argus_stream._tunnel import ArgusTunnelManager
+
+    assert settings.argus_stream.enabled is False  # default
+    started: list[bool] = []
+    monkeypatch.setattr(ArgusTunnelManager, "start", lambda self: started.append(True))
+
+    gui = MicroManagerGUI()
+    qtbot.addWidget(gui)
+
+    assert started == []

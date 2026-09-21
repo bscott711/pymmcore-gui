@@ -37,12 +37,24 @@ _VALID_TYPES = frozenset(
 class SessionStartHeader(TypedDict):
     """``SESSION_START`` header -- sent once, before any ``FRAME`` message.
 
-    Fields map directly onto the Argus side's ``opym.petakit.submit_pipeline_job``
-    parameters, since the receiver has no other source for them.
+    Fields match ``opym.stream.receiver.StreamReceiver._handle_session_start``
+    (Argus side, canonical -- read directly from Argus, not from this
+    file's own history). The receiver writes each channel straight into a
+    raw OME-Zarr mirror store under ``raw_root`` (``opym.stream.rawmirror``);
+    it does not submit a processing ticket itself, and does not read decon
+    parameters (PSF, wiener_alpha, edge_erosion, rl_method, iterations) from
+    this handshake at all -- those are resolved entirely server-side from
+    the ``OPYM_DECON_PSF`` env var, same as a batch/Globus-landed dataset.
+    An earlier draft of this header targeted a since-rewritten receiver that
+    took an ``output_dir`` and consumed PSF paths directly; sending that
+    shape to the current receiver has ``raw_root`` missing, which the
+    receiver rejects outright (every frame silently dropped as an unknown
+    session) -- see ``opym.stream.protocol``'s own module docstring for the
+    field-by-field spec this must keep matching.
     """
 
     base_name: str
-    output_dir: str
+    raw_root: str
     dtype: str
     shape_zyx: list[int]
     num_timepoints: int
@@ -50,13 +62,7 @@ class SessionStartHeader(TypedDict):
     channel_names: list[str]
     z_step_um: float
     xy_pixel_size: float
-    sheet_angle_deg: float
     t_interval_s: float
-    interp_method: str
-    rl_method: str
-    iterations: int | None
-    psf_paths: list[str] | None
-    dz_psf: float | None
 
 
 class FrameHeader(TypedDict):

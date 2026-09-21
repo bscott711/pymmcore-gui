@@ -25,7 +25,6 @@ streaming were disabled.
 from __future__ import annotations
 
 import logging
-import posixpath
 import queue
 import threading
 import time
@@ -170,7 +169,13 @@ def _build_session_header(
         return None, "ArgusStreamSettingsV1.gpfs_scratch_root is not configured"
 
     base_name = _strip_known_suffix(str(save_name))
-    output_dir = posixpath.join(settings.gpfs_scratch_root, base_name, "Decon")
+    # The GPFS directory a Globus transfer would have dropped this session
+    # into, e.g. ".../DataUpload/<session>/" -- each channel's raw store is
+    # named "<base_name>_<channel_name>.ome.zarr" directly under it (see
+    # opym.stream.rawmirror.store_path_for_channel on Argus). NOT a
+    # base_name subdirectory -- that nesting is unique to decon_stage/,
+    # written server-side, not by this client.
+    raw_root = settings.gpfs_scratch_root
 
     if active_spectral:
         channel_names = [c.name for c in active_spectral]
@@ -187,24 +192,10 @@ def _build_session_header(
         yx_shape = (int(mmcore.getImageHeight()), int(mmcore.getImageWidth()))
     channels = list(range(len(channel_names)))
 
-    # Only use psf_paths if *every* channel has a configured PSF -- a partial
-    # mapping would silently misalign psf_paths[i] with the wrong channel on
-    # the receiver side, so fall back to deskew-only instead of guessing.
-    psf_paths: list[str] | None = None
-    dz_psf: float | None = None
-    iterations: int | None = None
-    if all(name in settings.psf_paths for name in channel_names):
-        psf_paths = [settings.psf_paths[name] for name in channel_names]
-        dz_psf = settings.dz_psf
-        iterations = settings.iterations
-    elif settings.psf_paths:
-        logger.warning(
-            "Argus stream: not every channel %s has a configured PSF path "
-            "(psf_paths=%s) -- falling back to deskew-only for this run",
-            channel_names,
-            sorted(settings.psf_paths),
-        )
-
+    # Decon parameters (PSF, iterations, rl_method, ...) are NOT part of
+    # this handshake -- the receiver resolves them entirely server-side
+    # from OPYM_DECON_PSF, same as a batch/Globus-landed dataset. See
+    # SessionStartHeader's docstring.
     z_step_um = getattr(sequence.z_plan, "step", None) or 0.0
     t_interval = getattr(sequence.time_plan, "interval", None)
     t_interval_s = t_interval.total_seconds() if t_interval is not None else 0.0
@@ -213,7 +204,7 @@ def _build_session_header(
 
     header: SessionStartHeader = {
         "base_name": base_name,
-        "output_dir": output_dir,
+        "raw_root": raw_root,
         "dtype": _dtype_str(mmcore),
         "shape_zyx": [pos_sizes.get("z", 1), *yx_shape],
         "num_timepoints": pos_sizes.get("t", 1),
@@ -221,13 +212,7 @@ def _build_session_header(
         "channel_names": channel_names,
         "z_step_um": float(z_step_um),
         "xy_pixel_size": float(mmcore.getPixelSizeUm() or 0.0),
-        "sheet_angle_deg": settings.sheet_angle_deg,
         "t_interval_s": float(t_interval_s),
-        "interp_method": settings.interp_method,
-        "rl_method": settings.rl_method,
-        "iterations": iterations,
-        "psf_paths": psf_paths,
-        "dz_psf": dz_psf,
     }
     return header, ""
 
@@ -461,6 +446,13 @@ class ArgusStreamSession:
         self._laser_group = settings.spectral.laser_config_group
         self._all_lasers_preset = settings.spectral.all_lasers_preset
 
+        # Fallback only -- the primary start is app-launch time, in
+        # _main_window.py, specifically so the SSH handshake is already
+        # warm before any acquisition begins. start() is idempotent (a
+        # no-op once already running), so this only does real work if
+        # ArgusStreamSettingsV1.enabled was flipped True after this app
+        # session launched; that first run then still pays the JIT
+        # tunnel-startup cost racing _RunWorker's own connect() below.
         self._tunnel.start()
         self._assembler.reset(sequence)
         self._worker = _RunWorker(

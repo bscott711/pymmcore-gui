@@ -276,43 +276,16 @@ class ArgusStreamSettingsV1(BaseMMSettings):
     is to warn, not to drop data -- see ``_argus_stream._session``.
     """
     gpfs_scratch_root: str = ""
-    """GPFS root PetaKit5D writes final Decon/DSR output under.
+    """GPFS ``raw_root`` each streamed session is declared under.
 
-    Each session's ``output_dir`` header field is
-    ``<gpfs_scratch_root>/<base_name>/Decon``. Streaming refuses to start
-    if this is unset.
+    The directory a Globus transfer would have dropped this session into,
+    e.g. ``.../DataUpload/<session>/`` -- matches
+    ``opym.stream.rawmirror.store_path_for_channel``'s own convention on the
+    Argus side: each channel's raw store is named
+    ``<base_name>_<channel_name>.ome.zarr`` directly under this root, not
+    nested under a ``base_name`` subdirectory. Streaming refuses to start if
+    this is unset.
     """
-    sheet_angle_deg: float = 60.0
-    """OPM light-sheet angle, in degrees.
-
-    Default is the validated production value confirmed by the Argus side
-    (used consistently across ``opym.petakit``, ``run_petakit_server.m``,
-    ``run_napari_opym.py``, and the ``psf_tools/*`` scripts) -- override only
-    if this system's hardware geometry actually differs.
-    """
-    interp_method: str = "cubic"
-    """PetaKit5D interpolation method (receiver default is also "cubic")."""
-    rl_method: str = "simple"
-    """PetaKit5D Richardson-Lucy method (receiver default is also "simple")."""
-    iterations: int | None = None
-    """Richardson-Lucy iteration count. ``None`` along with an empty
-    ``psf_paths`` gives deskew-only processing (no deconvolution)."""
-    psf_paths: dict[str, str] = Field(default_factory=dict)
-    """Per-channel PSF file paths (GPFS paths), keyed by channel name.
-
-    "Channel name" matches whatever ``channel_names`` ends up being for a
-    given run: spectral-region names (e.g. ``"GFP_488"``) when spectral
-    cropping is active for that sequence, otherwise the raw MDA sequence's
-    laser/config preset names. If any channel used in a streamed sequence is
-    missing an entry here, the whole session falls back to deskew-only
-    (``psf_paths`` omitted on the wire) rather than sending a
-    partial/misaligned list -- see
-    ``_argus_stream._session._build_session_header``.
-    """
-    dz_psf: float | None = None
-    """The PSF's own z-step, in microns. Optional even when ``psf_paths`` is
-    set -- the receiver falls back to reading it from the PSF file's own
-    ImageJ metadata -- but sending it avoids a per-frame file read."""
 
 
 class MdaWriterSettingsV1(BaseMMSettings):
@@ -340,6 +313,47 @@ class MdaWriterSettingsV1(BaseMMSettings):
     """
 
 
+class FocusOffsetSettingsV1(BaseMMSettings):
+    """Per-excitation-wavelength focus (Z) offset configuration.
+
+    Corrects axial chromatic aberration on the ASI SPIM rig: CRISP holds one
+    physical plane, but each excitation wavelength focuses slightly
+    differently. When enabled, a small per-wavelength Z offset is applied at
+    the per-volume channel switch by shifting the CRISP lock setpoint (see
+    ``pymmcore_gui.asi_z_stack.engine.ASISPIMEngine``); the offset travels
+    into the sequence as ``useq.Channel.z_offset`` (see
+    ``pymmcore_gui.widgets._mda_widget``).
+
+    Offsets are stored **absolute** -- each measured against one calibration
+    datum -- and ``locked_preset`` picks the runtime zero, so re-locking CRISP
+    on a different channel never needs the offsets re-measured.
+    """
+
+    enabled: bool = False
+    """Master on/off switch for the whole feature."""
+    laser_config_group: str = "Lasers"
+    """MM config group whose presets name the excitation wavelengths."""
+    all_lasers_preset: str = "AllLasers"
+    """Simultaneous-multi-wavelength preset -- never given an offset."""
+    crisp_label: str = "CRISPAFocus:P:34"
+    """CRISP AutoFocus device servoing the focus piezo. Empty => auto-discover."""
+    counts_per_um: float | None = None
+    """Signed CRISP lock-offset counts per micron of focus shift, from the
+    bench probe (``crisp_focus_offset_tuning.probe_lock_offset_response``).
+    ``None`` falls back to the device's own
+    ``|Calibration Gain| / Calibration Range(um)`` sensitivity."""
+    locked_preset: str = ""
+    """Which wavelength CRISP is currently focused/locked on -- the runtime
+    zero that gets no net move. Empty => use the running sequence's first
+    channel."""
+    apply_live: bool = False
+    """Auto-apply the active channel's offset during ordinary live preview
+    (opt-in; off by default -- otherwise it silently fights the CRISPy panel)."""
+    offsets: dict[str, float] = Field(default_factory=dict)
+    """Per-preset focus offset in microns, absolute vs the calibration datum,
+    keyed by laser-preset name (e.g. ``{"561nm": 0.35}``)."""
+
+
 class SettingsV1(BaseMMSettings):
     """Global settings for the PyMMCore GUI."""
 
@@ -355,6 +369,7 @@ class SettingsV1(BaseMMSettings):
     )
     argus_stream: ArgusStreamSettingsV1 = Field(default_factory=ArgusStreamSettingsV1)
     mda_writer: MdaWriterSettingsV1 = Field(default_factory=MdaWriterSettingsV1)
+    focus: FocusOffsetSettingsV1 = Field(default_factory=FocusOffsetSettingsV1)
 
     send_error_reports: bool | None = None
     """Whether to send error reports to the developers, None means undecided."""
