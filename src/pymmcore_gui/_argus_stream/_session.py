@@ -446,6 +446,13 @@ class ArgusStreamSession:
         self._laser_group = settings.spectral.laser_config_group
         self._all_lasers_preset = settings.spectral.all_lasers_preset
 
+        # Fallback only -- the primary start is app-launch time, in
+        # _main_window.py, specifically so the SSH handshake is already
+        # warm before any acquisition begins. start() is idempotent (a
+        # no-op once already running), so this only does real work if
+        # ArgusStreamSettingsV1.enabled was flipped True after this app
+        # session launched; that first run then still pays the JIT
+        # tunnel-startup cost racing _RunWorker's own connect() below.
         self._tunnel.start()
         self._assembler.reset(sequence)
         self._worker = _RunWorker(

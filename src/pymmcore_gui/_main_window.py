@@ -243,17 +243,25 @@ class MicroManagerGUI(QMainWindow):
         # A plain (non-QObject) object connected directly to core.mda.events,
         # like NDVViewersManager, so it shares no thread with the local disk
         # writers -- see _argus_stream._session's module docstring. The
-        # tunnel is app-lifetime and started lazily by ArgusStreamSession the
-        # first time a run is both enabled and eligible, so simply flipping
-        # ArgusStreamSettingsV1.enabled (no restart needed) takes effect on
-        # the next MDA run.
-
+        # tunnel is app-lifetime: started HERE (not lazily on first MDA run)
+        # so the SSH handshake is already warm by the time any acquisition
+        # starts -- ArgusStreamSession.sequenceStarted used to call
+        # ArgusTunnelManager.start() itself, which raced _RunWorker's own
+        # connect()+SESSION_START against the tunnel's local port not being
+        # forwarded yet, right at the start of every single run. That call
+        # stays in sequenceStarted too (ArgusTunnelManager.start() is
+        # idempotent -- a no-op once already running) purely as a fallback
+        # for ArgusStreamSettingsV1.enabled being flipped True mid-session
+        # without an app restart: that one first run afterward still pays
+        # the JIT cost, every run after it doesn't.
         argus_settings = Settings.instance().argus_stream
         self._argus_tunnel = ArgusTunnelManager(
             argus_settings.ssh_host,
             argus_settings.local_port,
             argus_settings.remote_port,
         )
+        if argus_settings.enabled:
+            self._argus_tunnel.start()
         self._argus_status_relay = _ArgusStatusRelay(self)
         self._argus_stream = ArgusStreamSession(
             self._mmc,
