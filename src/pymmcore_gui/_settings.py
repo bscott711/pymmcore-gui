@@ -276,15 +276,18 @@ class ArgusStreamSettingsV1(BaseMMSettings):
     is to warn, not to drop data -- see ``_argus_stream._session``.
     """
     gpfs_scratch_root: str = ""
-    """GPFS ``raw_root`` each streamed session is declared under.
+    """GPFS root the local save directory structure is mirrored under.
 
-    The directory a Globus transfer would have dropped this session into,
-    e.g. ``.../DataUpload/<session>/`` -- matches
-    ``opym.stream.rawmirror.store_path_for_channel``'s own convention on the
-    Argus side: each channel's raw store is named
-    ``<base_name>_<channel_name>.ome.zarr`` directly under this root, not
-    nested under a ``base_name`` subdirectory. Streaming refuses to start if
-    this is unset.
+    Each run's actual ``raw_root`` is this root plus the MDA save widget's
+    own ``save_dir``, drive letter stripped -- e.g. a local save to
+    ``S:/20260922-SVO-YG_0.1umBead_PSF/...`` streams to
+    ``<gpfs_scratch_root>/20260922-SVO-YG_0.1umBead_PSF/...``, matching
+    what a Globus transfer of the same local tree would have produced.
+    Each channel's raw store is then named
+    ``<base_name>_<channel_name>.ome.zarr`` directly under THAT (see
+    ``opym.stream.rawmirror.store_path_for_channel`` on the Argus side),
+    not nested under a further ``base_name`` subdirectory. Streaming
+    refuses to start if this is unset.
     """
 
 

@@ -25,10 +25,12 @@ streaming were disabled.
 from __future__ import annotations
 
 import logging
+import posixpath
 import queue
 import threading
 import time
 from enum import Enum
+from pathlib import PureWindowsPath
 from typing import TYPE_CHECKING, Literal, cast
 from uuid import uuid4
 
@@ -163,19 +165,26 @@ def _build_session_header(
 
     meta = sequence.metadata.get(PYMMCW_METADATA_KEY, {})
     save_name = meta.get("save_name")
+    save_dir = meta.get("save_dir")
     if not save_name:
         return None, "no experiment name set in the MDA save widget"
+    if not save_dir:
+        return None, "no save directory set in the MDA save widget"
     if not settings.gpfs_scratch_root:
         return None, "ArgusStreamSettingsV1.gpfs_scratch_root is not configured"
 
     base_name = _strip_known_suffix(str(save_name))
-    # The GPFS directory a Globus transfer would have dropped this session
-    # into, e.g. ".../DataUpload/<session>/" -- each channel's raw store is
-    # named "<base_name>_<channel_name>.ome.zarr" directly under it (see
-    # opym.stream.rawmirror.store_path_for_channel on Argus). NOT a
-    # base_name subdirectory -- that nesting is unique to decon_stage/,
-    # written server-side, not by this client.
-    raw_root = settings.gpfs_scratch_root
+    # Mirror the local save directory's structure under gpfs_scratch_root,
+    # stripping only the drive letter -- e.g. local "S:/2026.../Bead_PSF"
+    # streams to "<gpfs_scratch_root>/2026.../Bead_PSF" (see
+    # ArgusStreamSettingsV1.gpfs_scratch_root's docstring). Each channel's
+    # raw store is then named "<base_name>_<channel_name>.ome.zarr" directly
+    # under THAT (see opym.stream.rawmirror.store_path_for_channel on
+    # Argus) -- not a base_name subdirectory of it; that nesting is unique
+    # to decon_stage/, written server-side, not by this client.
+    local_dir = PureWindowsPath(str(save_dir))
+    session_parts = local_dir.relative_to(local_dir.anchor).parts
+    raw_root = posixpath.join(settings.gpfs_scratch_root, *session_parts)
 
     if active_spectral:
         channel_names = [c.name for c in active_spectral]

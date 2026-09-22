@@ -237,16 +237,48 @@ def test_build_session_header_happy_path() -> None:
     assert reason == ""
     assert header is not None
     assert header["base_name"] == "cooked_001"
-    # raw_root is the declared session directory itself -- channel stores
-    # are named "<base_name>_<channel>.ome.zarr" directly under it (see
-    # opym.stream.rawmirror.store_path_for_channel on Argus), not nested
-    # under a base_name/Decon subdirectory.
-    assert header["raw_root"] == "/mmfs2/scratch/lab"
+    # raw_root mirrors the local save_dir's structure under
+    # gpfs_scratch_root, drive letter stripped (_save_seq's save_dir is
+    # "S:/exp") -- channel stores are named "<base_name>_<channel>.ome.zarr"
+    # directly under THAT (see opym.stream.rawmirror.store_path_for_channel
+    # on Argus), not nested under a further base_name/Decon subdirectory.
+    assert header["raw_root"] == "/mmfs2/scratch/lab/exp"
     assert header["dtype"] == "uint16"
     assert header["shape_zyx"] == [3, 6, 8]
     assert header["num_timepoints"] == 1
     assert header["channels"] == [0, 1]
     assert header["channel_names"] == ["488nm", "561nm"]
+
+
+def test_build_session_header_raw_root_mirrors_nested_save_dir_structure() -> None:
+    """A multi-segment local path is preserved in full, not just its last part."""
+    settings = ArgusStreamSettingsV1(
+        gpfs_scratch_root="/mmfs1/scratch/jacks.local/microscopy"
+    )
+    seq = _save_seq(
+        metadata={
+            PYMMCW_KEY: {
+                "save_dir": "S:/20260922-SVO-YG_0.1umBead_PSF",
+                "save_name": "Bead_001.ome.zarr",
+            }
+        }
+    )
+    header, reason = _build_session_header(seq, _StubCore(), settings, [])
+    assert reason == ""
+    assert header is not None
+    assert (
+        header["raw_root"]
+        == "/mmfs1/scratch/jacks.local/microscopy/20260922-SVO-YG_0.1umBead_PSF"
+    )
+    assert header["base_name"] == "Bead_001"
+
+
+def test_build_session_header_requires_save_dir() -> None:
+    seq = _save_seq(metadata={PYMMCW_KEY: {"save_name": "cooked_001.ome.zarr"}})
+    settings = ArgusStreamSettingsV1(gpfs_scratch_root="/scratch")
+    header, reason = _build_session_header(seq, _StubCore(), settings, [])
+    assert header is None
+    assert "save directory" in reason
 
 
 def test_build_session_header_rejects_multi_position() -> None:
