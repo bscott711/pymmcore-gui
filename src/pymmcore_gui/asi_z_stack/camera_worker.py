@@ -72,6 +72,16 @@ class CameraWorkerConfig:
     shm_name: str = ""
     slot_nbytes: int = 0
     n_slots: int = 8
+    stderr_log_file: str = ""
+    """Sibling file this worker's stderr/stdout is redirected to (see
+    :func:`~pymmcore_gui.asi_z_stack.worker_pool._worker_stderr_file`).
+    Empty means leave stderr as inherited from the parent process. Exists
+    because a spawned multiprocessing child on Windows, under a GUI app
+    with no attached console, has _log()'s stderr diagnostics go nowhere
+    visible -- confirmed on the rig 2026-09-22: a worker hung during
+    _apply_snapshot (most likely the TriggerMode set -- see diagnostics.py's
+    "Level Trigger hangs" note) with zero trace of which call it was stuck
+    on, anywhere."""
 
 
 def _log(camera_label: str, message: str) -> None:
@@ -321,6 +331,19 @@ def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
         the main process.
     """
     label = config.camera_label
+    if config.stderr_log_file:
+        # Redirect BEFORE anything else runs, so even a startup failure
+        # (the except block just below) or a hang with zero further output
+        # still leaves whatever _log()/traceback lines did fire somewhere
+        # recoverable -- see CameraWorkerConfig.stderr_log_file's docstring.
+        # Best-effort: falling back to inherited stderr beats crashing the
+        # worker over a logging setup failure.
+        try:
+            log_file = open(config.stderr_log_file, "a", buffering=1)
+            sys.stderr = log_file
+            sys.stdout = log_file
+        except OSError:
+            pass
     try:
         mmc = CMMCorePlus()
         mmc.setCircularBufferMemoryFootprint(config.circular_buffer_mb)

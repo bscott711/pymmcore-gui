@@ -86,6 +86,38 @@ def _worker_log_file(camera_label: str) -> str:
     return str(current.with_name(f"{current.stem}-worker-{safe_label}{current.suffix}"))
 
 
+def _worker_stderr_file(camera_label: str) -> str:
+    """Compute a per-worker stderr/stdout capture file, sibling to its log.
+
+    ``camera_worker.py``'s own diagnostic ``_log()`` calls print to stderr,
+    which a spawned ``multiprocessing`` child has no visible destination
+    for under a GUI app launched with no attached console -- confirmed on
+    the rig 2026-09-22: a worker hung during startup with zero trace of
+    which call it was stuck on anywhere, once the process was gone. Reuses
+    the same naming convention as :func:`_worker_log_file` so both files
+    sit next to each other.
+
+    Parameters
+    ----------
+    camera_label : str
+        The camera this worker owns, used to make its file name unique.
+
+    Returns
+    -------
+    str
+        A sibling file path, or ``""`` (meaning "leave stderr as inherited,
+        don't redirect") if the main process has no logfile configured --
+        there is no sensible sibling location to pick in that case.
+    """
+    current = current_logfile(_pymmcore_plus_logger)
+    if current is None:
+        return ""
+    safe_label = re.sub(r"[^\w-]", "_", camera_label)
+    return str(
+        current.with_name(f"{current.stem}-worker-{safe_label}-stderr{current.suffix}")
+    )
+
+
 class WorkerDiedError(RuntimeError):
     """A camera worker process exited unexpectedly (e.g. a native crash).
 
@@ -143,6 +175,7 @@ class CameraWorkerHandle:
             shm_name=shm.name,
             slot_nbytes=self.slot_nbytes,
             n_slots=self.n_slots,
+            stderr_log_file=_worker_stderr_file(self.camera_label),
         )
         parent_conn, child_conn = ctx.Pipe(duplex=True)
         self.conn = parent_conn
