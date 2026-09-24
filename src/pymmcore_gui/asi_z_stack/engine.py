@@ -28,6 +28,7 @@ from .camera_handoff import (
 from .camera_worker import CameraWorkerConfig
 from .common import AcquisitionSettings, HardwareConstants
 from .worker_pool import CameraWorkerHandle, CameraWorkerPool, WorkerDiedError
+from .z_scan import compute_galvo_scan
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,9 @@ class _ASITriggerEngineBase(MDAEngine):
         self._snapshot: CameraHandoffSnapshot | None = None
         self._worker_pool: CameraWorkerPool | None = None
         self._piezo_pos_at_setup: float | None = None
+        # Plan positions of the galvo sweep, in slice order; used to give each
+        # frame its real z_pos. Empty when nothing scans (stationary engine).
+        self._z_positions: tuple[float, ...] = ()
 
     def _set_event_z(self, event: MDAEvent) -> None:
         """No-op: Z-stepping here is done entirely by the galvo hardware trigger.
@@ -87,10 +91,11 @@ class _ASITriggerEngineBase(MDAEngine):
         position -- the *bottom* of the intended range for the default
         ``go_up=True`` direction -- physically moving the piezo (this rig's
         Core-Focus device) by ``-range/2`` before the galvo stack even
-        triggers. Since the galvo's own sweep is always centered on wherever
-        the focus device physically sits at trigger time
-        (``SingleAxisYOffset(deg)`` is hardcoded to ``"0.0"`` in
-        ``setup_sequence``), that stray pre-move shifts the whole optical
+        triggers. Since the galvo's own sweep is positioned relative to
+        wherever the focus device physically sits at trigger time (its
+        ``SingleAxisYOffset(deg)`` is computed from the z-plan against that
+        position in ``setup_sequence`` -- see :mod:`.z_scan`), that stray
+        pre-move shifts the whole optical
         stack by another ``range/2`` in the same direction -- landing the
         pre-acquisition focus at the very last slice instead of the middle,
         and leaving the piezo parked away from where the user left it
@@ -528,7 +533,18 @@ class _ASITriggerEngineBase(MDAEngine):
                 new_index = {**event.index, "z": slice_idx}
                 if n_cameras > 1:
                     new_index["cam"] = cam_index
-                sub_event = event.model_copy(update={"index": new_index})
+                update: dict[str, object] = {"index": new_index}
+                # The collapsed event carries slice 0's z_pos; shift it to
+                # the plane this slice actually imaged.
+                if (
+                    event.z_pos is not None
+                    and self._z_positions
+                    and slice_idx < len(self._z_positions)
+                ):
+                    update["z_pos"] = event.z_pos + (
+                        self._z_positions[slice_idx] - self._z_positions[0]
+                    )
+                sub_event = event.model_copy(update=update)
 
                 runner_time_ms = (
                     (time.perf_counter() - runner_t0) * 1000.0 if runner_t0 else 0.0
@@ -594,6 +610,41 @@ class ASISPIMEngine(_ASITriggerEngineBase):
     def __init__(self, mmc: CMMCorePlus, hw: HardwareConstants):
         super().__init__(mmc, hw)
         self._master_axis_label = hw.galvo_a_label
+        # Galvo SingleAxisYOffset(deg) from before the MDA, restored in
+        # teardown so Live doesn't keep imaging a shifted plane afterwards.
+        self._galvo_offset_before: str | None = None
+
+    def _check_galvo_reach(self, amplitude_deg: float, offset_deg: float) -> None:
+        """Raise if the requested sweep falls outside the galvo's property limits.
+
+        Checked before any hardware is touched, so an unreachable Top/Bottom
+        (or Above/Below) range fails loudly instead of being silently clipped
+        by the card.
+        """
+        mmc = self.mmcore
+        label = self.hw.galvo_a_label
+        slope = self.hw.slice_calibration_slope_um_per_deg
+        if mmc.hasPropertyLimits(label, "SingleAxisYOffset(deg)"):
+            lo = mmc.getPropertyLowerLimit(label, "SingleAxisYOffset(deg)")
+            hi = mmc.getPropertyUpperLimit(label, "SingleAxisYOffset(deg)")
+            half = abs(amplitude_deg) / 2
+            if offset_deg - half < lo or offset_deg + half > hi:
+                raise ValueError(
+                    "Z stack is outside the galvo's reach: it spans "
+                    f"{(offset_deg - half) * slope:+.2f} to "
+                    f"{(offset_deg + half) * slope:+.2f} um from current focus, "
+                    f"but the galvo covers {lo * slope:+.2f} to {hi * slope:+.2f} "
+                    "um. Move focus closer to the range or shrink it."
+                )
+        if mmc.hasPropertyLimits(label, "SingleAxisYAmplitude(deg)"):
+            lo = mmc.getPropertyLowerLimit(label, "SingleAxisYAmplitude(deg)")
+            hi = mmc.getPropertyUpperLimit(label, "SingleAxisYAmplitude(deg)")
+            if not lo <= amplitude_deg <= hi:
+                raise ValueError(
+                    f"Z stack range {amplitude_deg * slope:+.2f} um needs a galvo "
+                    f"amplitude of {amplitude_deg:.4f} deg, outside the card's "
+                    f"[{lo}, {hi}] deg limits."
+                )
 
     def setup_sequence(self, sequence: MDASequence) -> SummaryMetaV1 | None:
         """Prepare hardware and calculate Z-stack parameters."""
@@ -602,20 +653,31 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         self._reset_channel_config_cache()
         self._snapshot_piezo_position()
 
-        # 1. Calculate Z-stack parameters
+        # 1. Calculate Z-stack parameters. The piezo never moves, so every
+        # Z Stack mode (Range Around / Above-Below / Top-Bottom) is realized
+        # purely through the galvo sweep's signed amplitude and its offset
+        # from current focus -- see z_scan.py.
         if sequence.z_plan:
-            z_positions = list(sequence.z_plan)
-            self._num_slices = len(z_positions)
-            step_size_um = (
-                abs(z_positions[1] - z_positions[0]) if self._num_slices > 1 else 0.0
+            scan = compute_galvo_scan(
+                sequence.z_plan,
+                current_focus_um=self.mmcore.getZPosition(),
+                slope_um_per_deg=self.hw.slice_calibration_slope_um_per_deg,
             )
-            amplitude_um = (self._num_slices - 1) * step_size_um
-            galvo_amplitude_deg = (
-                amplitude_um / self.hw.slice_calibration_slope_um_per_deg
+            self._num_slices = scan.num_slices
+            self._z_positions = scan.z_positions
+            galvo_amplitude_deg = scan.amplitude_deg
+            galvo_offset_deg = scan.offset_deg
+            self._check_galvo_reach(galvo_amplitude_deg, galvo_offset_deg)
+            logger.info(
+                f"Z plan {type(sequence.z_plan).__name__}: {scan.num_slices} "
+                f"slices, step {scan.step_um:+.3f} um, center "
+                f"{scan.center_offset_um:+.3f} um from current focus."
             )
         else:
             self._num_slices = 1
+            self._z_positions = ()
             galvo_amplitude_deg = 0.0
+            galvo_offset_deg = 0.0
 
         # 2. Determine exposure
         if (
@@ -706,7 +768,14 @@ class ASISPIMEngine(_ASITriggerEngineBase):
             self.hw.galvo_a_label, "SingleAxisXAmplitude(deg)", "0.0"
         )
         self.mmcore.setProperty(self.hw.galvo_a_label, "SingleAxisXOffset(deg)", "0.0")
-        self.mmcore.setProperty(self.hw.galvo_a_label, "SingleAxisYOffset(deg)", "0.0")
+        self._galvo_offset_before = self.mmcore.getProperty(
+            self.hw.galvo_a_label, "SingleAxisYOffset(deg)"
+        )
+        self.mmcore.setProperty(
+            self.hw.galvo_a_label,
+            "SingleAxisYOffset(deg)",
+            f"{galvo_offset_deg:.4f}",
+        )
         self.mmcore.setProperty(self.hw.galvo_a_label, "SPIMNumSlicesPerPiezo", "1")
         self.mmcore.setProperty(
             self.hw.galvo_a_label,
@@ -736,6 +805,7 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         logger.info(
             f"--- PLogic and Camera ready --- "
             f"(slices={self._num_slices}, amplitude={galvo_amplitude_deg:.4f}deg, "
+            f"offset={galvo_offset_deg:.4f}deg, "
             f"exposure={self._exposure_ms:.1f}ms)"
         )
 
@@ -751,6 +821,15 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         set_plogic_evaluation_clock(self.hw.tiger_comm_hub_label, running=False)
         if self.hw.galvo_a_label in self.mmcore.getLoadedDevices():
             self.mmcore.setProperty(self.hw.galvo_a_label, "SPIMState", "Idle")
+            # Undo this run's sweep-center shift (Above/Below, Top/Bottom) so
+            # Live/Snap image the same plane they did before the MDA.
+            if self._galvo_offset_before is not None:
+                self.mmcore.setProperty(
+                    self.hw.galvo_a_label,
+                    "SingleAxisYOffset(deg)",
+                    self._galvo_offset_before,
+                )
+                self._galvo_offset_before = None
 
         # Belt-and-suspenders: exec_event's own finally block already closes
         # any shutter-gated laser it opened after every burst, so this is

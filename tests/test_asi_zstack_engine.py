@@ -471,6 +471,108 @@ def test_setup_sequence_resets_channel_config_cache(
     assert core._last_config == ("", "")
 
 
+# --- Z Stack mode -> galvo sweep offset/amplitude ---
+
+
+def _setup_spim_engine(
+    monkeypatch: pytest.MonkeyPatch, focus_um: float = 0.0
+) -> tuple[MagicMock, ASISPIMEngine]:
+    """ASISPIMEngine with PLogic side effects stubbed and a readable galvo core."""
+    monkeypatch.setattr(
+        engine_module, "configure_plogic_for_dual_nrt_pulses", MagicMock()
+    )
+    monkeypatch.setattr(engine_module, "set_plogic_evaluation_clock", MagicMock())
+    monkeypatch.setattr(engine_module, "summary_metadata", MagicMock(return_value=None))
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=1)
+    core.getExposure.return_value = 10.0
+    core.getImageWidth.return_value = 2
+    core.getImageHeight.return_value = 2
+    core.getBytesPerPixel.return_value = 2
+    core.getZPosition.return_value = focus_um
+    core.getProperty.return_value = "0.1234"
+    core.hasPropertyLimits.return_value = False
+    return core, cast("ASISPIMEngine", engine)
+
+
+def _galvo_value(core: MagicMock, prop: str) -> float:
+    values = [
+        c.args[2]
+        for c in core.setProperty.call_args_list
+        if c.args[:2] == ("Scanner:AB:33", prop)
+    ]
+    return float(values[-1])
+
+
+@pytest.mark.parametrize(
+    ("z_plan", "focus", "offset_um", "amplitude_um"),
+    [
+        (useq.ZRangeAround(range=10, step=1), 0.0, 0.0, 10.0),
+        (useq.ZAboveBelow(above=10, below=0, step=1), 0.0, 5.0, 10.0),
+        (useq.ZAboveBelow(above=0, below=10, step=1), 0.0, -5.0, 10.0),
+        (useq.ZTopBottom(top=110, bottom=100, step=1), 100.0, 5.0, 10.0),
+        (useq.ZRangeAround(range=10, step=1, go_up=False), 0.0, 0.0, -10.0),
+    ],
+)
+def test_setup_sequence_honors_z_stack_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    z_plan: useq.ZPlan,
+    focus: float,
+    offset_um: float,
+    amplitude_um: float,
+) -> None:
+    """Each Z Stack mode sets its own galvo sweep center/direction, not always 0."""
+    core, engine = _setup_spim_engine(monkeypatch, focus_um=focus)
+    engine.setup_sequence(useq.MDASequence(z_plan=z_plan))
+
+    slope = engine.hw.slice_calibration_slope_um_per_deg
+    assert _galvo_value(core, "SingleAxisYOffset(deg)") == pytest.approx(
+        offset_um / slope, abs=1e-4
+    )
+    assert _galvo_value(core, "SingleAxisYAmplitude(deg)") == pytest.approx(
+        amplitude_um / slope, abs=1e-4
+    )
+
+
+def test_teardown_restores_galvo_offset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Live/Snap after an off-center MDA must image the original plane again."""
+    core, engine = _setup_spim_engine(monkeypatch)
+    monkeypatch.setattr(engine_module.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(engine, "_reclaim_from_workers", MagicMock())
+    core.getLoadedDevices.return_value = ["Scanner:AB:33"]
+    seq = useq.MDASequence(z_plan=useq.ZAboveBelow(above=10, below=0, step=1))
+
+    engine.setup_sequence(seq)
+    engine.teardown_sequence(seq)
+
+    assert _galvo_value(core, "SingleAxisYOffset(deg)") == pytest.approx(0.1234)
+
+
+def test_setup_sequence_rejects_unreachable_top_bottom(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Top/Bottom range beyond the galvo's limits fails before any hardware call."""
+    core, engine = _setup_spim_engine(monkeypatch, focus_um=0.0)
+    core.hasPropertyLimits.return_value = True
+    core.getPropertyLowerLimit.return_value = -1.0
+    core.getPropertyUpperLimit.return_value = 1.0
+    seq = useq.MDASequence(z_plan=useq.ZTopBottom(top=500, bottom=490, step=1))
+
+    with pytest.raises(ValueError, match="outside the galvo's reach"):
+        engine.setup_sequence(seq)
+    core.setProperty.assert_not_called()
+
+
+def test_exec_event_sets_per_slice_z_pos() -> None:
+    """Every frame carries the z it imaged, not the collapsed event's slice-0 z."""
+    _core, engine, pool = _make_engine(n_cameras=1, n_slices=3)
+    engine._z_positions = (0.0, 2.0, 4.0)
+    _queue_frames(pool, [("cam0", 0), ("cam0", 1), ("cam0", 2)])
+
+    payloads = list(engine.exec_event(useq.MDAEvent(index={"t": 0}, z_pos=100.0)))
+
+    assert [sub.z_pos for _img, sub, _meta in payloads] == [100.0, 102.0, 104.0]
+
+
 # --- Shutter-gated laser (561): whole-stack-open instead of per-slice blanking ---
 #
 # The 561 line is a CW laser behind a physical mechanical shutter (Oxxius
