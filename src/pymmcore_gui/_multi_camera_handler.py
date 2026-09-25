@@ -92,7 +92,21 @@ def physical_camera_labels(mmcore: CMMCorePlus) -> list[str]:
     For a ``Multi Camera`` device this reads the ``Physical Camera N``
     properties (one label per channel). For a plain camera device returns a
     single-element list containing the active camera device.
+
+    When a :class:`~pymmcore_gui.asi_z_stack.camera_worker_service.
+    CameraWorkerService` is active for this session, *mmcore* itself never
+    has Camera-1/Camera-2 loaded (they live permanently in worker
+    processes) -- resolve from the service's own static label list instead.
+    This one fallback is what lets every other camera-label consumer in the
+    app (``MultiCameraHandler``, the MDA widget, the spectral-channel/camera-
+    alignment widgets, ``NDVViewersManager``, Argus streaming) keep working
+    unmodified once the service is active.
     """
+    from pymmcore_gui.asi_z_stack.camera_worker_service import CameraWorkerService
+
+    if (svc := CameraWorkerService.get_active()) is not None:
+        return list(svc.camera_labels)
+
     n = mmcore.getNumberOfCameraChannels()
     if n <= 1:
         return [mmcore.getCameraDevice()]

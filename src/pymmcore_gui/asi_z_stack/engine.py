@@ -2,6 +2,7 @@
 import logging
 import time
 from collections.abc import Iterable, Iterator
+from typing import TYPE_CHECKING
 
 import numpy as np
 from pymmcore_plus import CMMCorePlus
@@ -20,15 +21,13 @@ from .asi_controller import (
     set_laser_outputs,
     set_plogic_evaluation_clock,
 )
-from .camera_handoff import (
-    CameraHandoffSnapshot,
-    release_cameras_for_workers,
-    reload_cameras_after_handoff,
-)
-from .camera_worker import CameraWorkerConfig
+from .camera_worker_service import CameraWorkerService
 from .common import AcquisitionSettings, HardwareConstants
-from .worker_pool import CameraWorkerHandle, CameraWorkerPool, WorkerDiedError
+from .worker_pool import CameraWorkerPool, WorkerDiedError
 from .z_scan import compute_galvo_scan
+
+if TYPE_CHECKING:
+    from .camera_handoff import CameraHandoffSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -204,63 +203,48 @@ class _ASITriggerEngineBase(MDAEngine):
             )
 
     def _handoff_to_workers(self) -> None:
-        """Release every physical camera and spawn one worker process per camera.
+        """Acquire the session's persistent camera worker pool for this MDA run.
 
-        Replaces the old ``_arm_cameras`` -- instead of switching each
-        physical camera's ``TriggerMode`` while it stays loaded in the main
-        process (behind the ``Multi Camera`` composite), the main process
-        lets go of every physical camera entirely and hands it to its own
-        worker subprocess (see :mod:`~pymmcore_gui.asi_z_stack.worker_pool`).
-        Each worker owns its camera's ``pvcam64.dll`` in its own address
-        space, so a driver-level crash during concurrent dual-camera
-        acquisition can, at worst, take down one disposable worker instead of
-        the whole app. :meth:`_reclaim_from_workers` undoes this.
+        Camera-1/Camera-2 now live permanently in worker processes owned by
+        :class:`~pymmcore_gui.asi_z_stack.camera_worker_service.
+        CameraWorkerService` (spawned once, at config load -- see
+        ``_main_window.py::_on_system_config_loaded``), not spawned fresh per
+        MDA run. This just claims exclusive use of the already-running pool
+        for the duration of this sequence (stopping Live first if it was
+        running) -- see :meth:`~pymmcore_gui.asi_z_stack.camera_worker_service.
+        CameraWorkerService.acquire_for_mda`. :meth:`_reclaim_from_workers`
+        releases the claim; it does **not** shut the pool down or reload
+        cameras into the main process -- that's the service's job, for the
+        whole session, not this engine's.
 
         Called lazily from :meth:`exec_event` on its first invocation, not
-        from ``setup_sequence`` -- ``MDARunner`` emits ``sequenceStarted``
-        immediately after ``setup_sequence`` returns, and both
-        ``MultiCameraHandler.sequenceStarted`` and
-        ``NDVViewersManager._on_sequence_started`` independently call
-        ``physical_camera_labels(mmc)`` right then to eagerly create one
-        writer/viewer per physical camera, which needs the cameras to still
-        be loaded at that moment. By the time the first ``exec_event`` call
-        happens, ``sequenceStarted`` has already fired, so releasing the
-        cameras here is safe.
+        from ``setup_sequence`` -- kept that way for a minimal diff even
+        though the original reason for deferring it (cameras needing to
+        stay loaded in-process until after ``sequenceStarted``, for
+        ``MultiCameraHandler``/``NDVViewersManager`` to enumerate them) no
+        longer applies: those now resolve camera labels through the service
+        too (see ``_multi_camera_handler.physical_camera_labels``), not
+        through the main-process core.
 
-        Caches ``pixel_size_um`` here (while the cameras are still loaded)
-        because it's needed for per-frame metadata built later in
-        :meth:`exec_event`, once the cameras -- and the Camera-role-dependent
-        core methods that would otherwise supply it -- are gone.
+        Caches ``pixel_size_um`` here via the main-process core --
+        believed camera-role-independent (tied to the active pixel-size
+        config/objective, not a loaded camera device), unlike the other
+        Camera-role-dependent methods this class avoids post-handoff. Not
+        yet bench-verified under the persistent design specifically.
         """
         mmc = self.mmcore
         self._pixel_size_um = mmc.getPixelSizeUm(True)
-        self._snapshot = release_cameras_for_workers(mmc, self.hw)
-
-        def _worker_for(label: str) -> CameraWorkerHandle:
-            snap = self._snapshot
-            assert snap is not None
-            cam = snap.per_camera.get(label)
-            return CameraWorkerHandle(
-                camera_label=label,
-                config=CameraWorkerConfig(
-                    camera_label=label,
-                    adapter_device_name=label,
-                    property_snapshot=cam.property_values if cam else {},
-                    roi=cam.roi if cam else None,
-                    circular_buffer_mb=self.hw.worker_circular_buffer_mb,
-                ),
-                height=snap.image_height,
-                width=snap.image_width,
-                dtype=snap.dtype_str,
-                n_slots=self.hw.frame_ring_slots_per_camera,
+        svc = CameraWorkerService.get_active()
+        if svc is None or svc.geometry is None:
+            raise RuntimeError(
+                "Camera worker service is not active for this session -- "
+                "cannot run a hardware-triggered MDA without it."
             )
-
-        self._worker_pool = CameraWorkerPool(
-            [_worker_for(label) for label in self._snapshot.camera_labels]
-        )
-        self._worker_pool.spawn_all(ready_timeout=self.hw.worker_ready_timeout_s)
+        self._snapshot = svc.geometry
+        self._worker_pool = svc.acquire_for_mda()
         logger.info(
-            f"Camera worker pool ready: {self._snapshot.camera_labels} "
+            f"Acquired persistent camera worker pool for MDA: "
+            f"{self._snapshot.camera_labels} "
             f"({self._snapshot.image_width}x{self._snapshot.image_height} "
             f"{self._snapshot.dtype_str})."
         )
@@ -272,23 +256,23 @@ class _ASITriggerEngineBase(MDAEngine):
         :class:`~pymmcore_plus.mda.MDARunner` calls ``teardown_sequence``
         unconditionally on completion, cancellation, *or* any exception out
         of ``setup_sequence``/``exec_event`` -- this may run against a
-        partial handoff (e.g. the pool spawned but ``setup_sequence`` raised
-        before finishing).
+        partial handoff (e.g. ``_handoff_to_workers`` raised before
+        finishing). Lighter-weight than the old per-MDA version: no
+        ``shutdown_all``/``reload_cameras_after_handoff`` -- the pool and the
+        cameras' worker-process ownership are session-lifetime, owned by
+        ``CameraWorkerService``, not this engine.
         """
         if self._worker_pool is not None:
-            try:
-                self._worker_pool.shutdown_all(
-                    timeout=self.hw.worker_shutdown_timeout_s
-                )
-            except Exception:
-                logger.error("Error shutting down camera worker pool.", exc_info=True)
+            svc = CameraWorkerService.get_active()
+            if svc is not None:
+                try:
+                    svc.release_from_mda()
+                except Exception:
+                    logger.error(
+                        "Error releasing camera worker pool from MDA.", exc_info=True
+                    )
             self._worker_pool = None
-        if self._snapshot is not None:
-            try:
-                reload_cameras_after_handoff(self.mmcore, self.hw, self._snapshot)
-            except Exception:
-                logger.error("Error reloading cameras after handoff.", exc_info=True)
-            self._snapshot = None
+        self._snapshot = None
 
     def _warn_if_circular_buffer_too_small(self, per_camera_images: int) -> None:
         """Log a warning if a worker's circular buffer can't fit one z-stack.
@@ -297,16 +281,22 @@ class _ASITriggerEngineBase(MDAEngine):
         circular buffer (``HardwareConstants.worker_circular_buffer_mb``) --
         unlike the old single shared 30 GB main-process buffer this replaces,
         each worker's buffer only ever needs to hold *one* camera's frames,
-        not ``n_cameras`` worth. Must run against the main process's core
-        *before* :meth:`_handoff_to_workers` releases the cameras -- it needs
-        their live image geometry, which isn't available once they're gone.
-        Mirrors an earlier, hard-won lesson from the old single-buffer
-        design: never resize a circular buffer after a camera is armed for
-        external triggering (that crashed PVCAM's driver,
-        ``pvcam64.dll``, exception ``0xc0000409`` / STATUS_STACK_BUFFER_OVERRUN,
-        even more reliably than the wraparound it was meant to prevent) --
-        so this only warns, it never resizes anything itself. Each worker
-        sizes its own buffer once at startup, before arming -- see
+        not ``n_cameras`` worth. Reads image geometry from
+        :class:`~pymmcore_gui.asi_z_stack.camera_worker_service.
+        CameraWorkerService`'s cached geometry, **not** the main process's
+        core -- under the persistent-worker design the cameras are already
+        released from the main process long before ``setup_sequence`` (which
+        calls this) runs, so ``mmc.getImageWidth()``/etc. would misbehave
+        here if used directly (this is a real bug this class had until the
+        persistent-worker redesign; ``_handoff_to_workers`` used to run
+        *after* this call, not before -- it no longer does). Mirrors an
+        earlier, hard-won lesson from the old single-buffer design: never
+        resize a circular buffer after a camera is armed for external
+        triggering (that crashed PVCAM's driver, ``pvcam64.dll``, exception
+        ``0xc0000409`` / STATUS_STACK_BUFFER_OVERRUN, even more reliably than
+        the wraparound it was meant to prevent) -- so this only warns, it
+        never resizes anything itself. Each worker sizes its own buffer once
+        at startup, before arming -- see
         :func:`~pymmcore_gui.asi_z_stack.camera_worker.run_camera_worker`.
 
         Parameters
@@ -315,10 +305,17 @@ class _ASITriggerEngineBase(MDAEngine):
             The number of frames one camera's z-stack will produce (not
             multiplied by camera count -- each worker only buffers its own).
         """
-        mmc = self.mmcore
-        bytes_per_frame = (
-            mmc.getImageWidth() * mmc.getImageHeight() * mmc.getBytesPerPixel()
-        )
+        svc = CameraWorkerService.get_active()
+        geometry = svc.geometry if svc is not None else None
+        if geometry is not None:
+            bytes_per_frame = (
+                geometry.image_width * geometry.image_height * geometry.bytes_per_pixel
+            )
+        else:
+            mmc = self.mmcore
+            bytes_per_frame = (
+                mmc.getImageWidth() * mmc.getImageHeight() * mmc.getBytesPerPixel()
+            )
         if bytes_per_frame <= 0:
             return
         required_mb = (bytes_per_frame * per_camera_images * 1.5) / (1024 * 1024)
@@ -712,23 +709,23 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         ):
             self._exposure_ms = sequence.channels[0].exposure
         else:
-            self._exposure_ms = self.mmcore.getExposure()
+            svc = CameraWorkerService.get_active()
+            self._exposure_ms = (
+                svc.last_known_exposure_ms
+                if svc is not None
+                else self.mmcore.getExposure()
+            )
 
         # 3. Prepare Hardware
         logger.info("--- SEQUENCE STARTED: Preparing PLogic and Camera ---")
         self._original_autoshutter = self.mmcore.getAutoShutter()
         self.mmcore.setAutoShutter(False)
-        # Circular-buffer sizing needs live image geometry, so it must run
-        # against the main process's core before the cameras are released.
-        # The handoff itself is deliberately NOT done here: MDARunner emits
-        # sequenceStarted right after setup_sequence returns, and both
-        # MultiCameraHandler.sequenceStarted and
-        # NDVViewersManager._on_sequence_started independently call
-        # physical_camera_labels(mmc) at that point to eagerly create one
-        # writer/viewer per physical camera -- which needs the cameras still
-        # loaded. _handoff_to_workers() runs lazily on the first exec_event
-        # call instead, which always happens after sequenceStarted has
-        # already fired.
+        # Circular-buffer sizing reads geometry from CameraWorkerService,
+        # not the main-process core -- see _warn_if_circular_buffer_too_small's
+        # docstring. The pool handoff itself is deliberately NOT done here,
+        # kept lazy in exec_event as before -- see _handoff_to_workers's
+        # docstring for why (a smaller reason now than it used to be, but the
+        # structure is kept for a minimal diff).
         self._warn_if_circular_buffer_too_small(self._num_slices)
 
         settings = AcquisitionSettings(
@@ -950,7 +947,12 @@ class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
         ):
             self._exposure_ms = sequence.channels[0].exposure
         else:
-            self._exposure_ms = self.mmcore.getExposure()
+            svc = CameraWorkerService.get_active()
+            self._exposure_ms = (
+                svc.last_known_exposure_ms
+                if svc is not None
+                else self.mmcore.getExposure()
+            )
 
         # 3. Prepare hardware
         logger.info(
@@ -958,17 +960,12 @@ class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
         )
         self._original_autoshutter = self.mmcore.getAutoShutter()
         self.mmcore.setAutoShutter(False)
-        # Circular-buffer sizing needs live image geometry, so it must run
-        # against the main process's core before the cameras are released.
-        # The handoff itself is deliberately NOT done here: MDARunner emits
-        # sequenceStarted right after setup_sequence returns, and both
-        # MultiCameraHandler.sequenceStarted and
-        # NDVViewersManager._on_sequence_started independently call
-        # physical_camera_labels(mmc) at that point to eagerly create one
-        # writer/viewer per physical camera -- which needs the cameras still
-        # loaded. _handoff_to_workers() runs lazily on the first exec_event
-        # call instead, which always happens after sequenceStarted has
-        # already fired.
+        # Circular-buffer sizing reads geometry from CameraWorkerService,
+        # not the main-process core -- see _warn_if_circular_buffer_too_small's
+        # docstring. The pool handoff itself is deliberately NOT done here,
+        # kept lazy in exec_event as before -- see _handoff_to_workers's
+        # docstring for why (a smaller reason now than it used to be, but the
+        # structure is kept for a minimal diff).
         self._warn_if_circular_buffer_too_small(self._num_slices)
 
         settings = AcquisitionSettings(

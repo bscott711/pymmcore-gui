@@ -226,6 +226,16 @@ class MicroManagerGUI(QMainWindow):
 
         # get global CMMCorePlus instance
         self._mmc = mmcore or CMMCorePlus.instance()
+
+        # Owns the persistent dual-PVCAM camera worker pool, if this
+        # session's hardware needs it (see _on_system_config_loaded and
+        # camera_worker_service.py's module docstring). Constructed
+        # unconditionally, up front -- it's a no-op/inactive object for
+        # demo/single-camera/non-ASI configs.
+        from pymmcore_gui.asi_z_stack.camera_worker_service import CameraWorkerService
+
+        self._camera_worker_service = CameraWorkerService(self)
+
         self._mmc.events.systemConfigurationLoaded.connect(
             self._on_system_config_loaded
         )
@@ -517,6 +527,22 @@ class MicroManagerGUI(QMainWindow):
             settings.last_config = None
         settings.flush()
 
+        # Release Camera-1/Camera-2 to the persistent camera worker service
+        # (a no-op for demo/single-camera/non-ASI configs) FIRST, before any
+        # other systemConfigurationLoaded listener runs -- this handler is
+        # connected first (see __init__), so every other listener that needs
+        # camera labels (MultiCameraHandler.sequenceStarted,
+        # NDVViewersManager.create_default_camera_previews, the spectral/
+        # camera-alignment widgets, etc.) can already resolve them via
+        # CameraWorkerService.get_active() by the time it's their turn to
+        # react -- even though the worker *processes* themselves haven't
+        # finished spawning yet (that's the slow, async half, chained below
+        # after the buffer grow). See camera_worker_service.py's module
+        # docstring for the full rationale.
+        from pymmcore_gui.asi_z_stack.common import HardwareConstants
+
+        self._camera_worker_service.begin_release(self._mmc, HardwareConstants())
+
         # On ASI/PLogic configs, raise the fiber-optic global shutter and set up
         # the always-on cell so software snap/live can gate the laser BNCs, and
         # enable the galvo's beam once for the session (matching the
@@ -535,19 +561,23 @@ class MicroManagerGUI(QMainWindow):
         ensure_global_shutter_open()
         ensure_beam_enabled()
 
-        # The buffer grow (if any) runs on a background thread and can take a
-        # few seconds for tens of GB -- disable Live for that window so it
-        # can't start a sequence acquisition against the main-process core
-        # while its circular buffer is mid-resize (see
-        # asi_controller.circular_buffer_growing). Resolves synchronously,
-        # with no visible flicker, when no growth is actually needed.
+        # Live stays disabled until BOTH the circular-buffer grow (if any)
+        # and the persistent camera worker pool (if this config needs one)
+        # are ready -- so it can't start a sequence acquisition against a
+        # main-process core whose circular buffer is mid-resize (see
+        # asi_controller.circular_buffer_growing), nor against a worker pool
+        # that hasn't finished spawning yet. Resolves synchronously, with no
+        # visible flicker, when neither is actually needed.
         live_action = self.get_action(CoreAction.TOGGLE_LIVE)
         live_action.setEnabled(False)
 
-        def _on_buffer_ready() -> None:
+        def _on_camera_service_ready() -> None:
             with suppress(RuntimeError):
                 live_action.setEnabled(bool(self._mmc.getCameraDevice()))
             self.bufferReady.emit()
+
+        def _on_buffer_ready() -> None:
+            self._camera_worker_service.spawn_async(on_ready=_on_camera_service_ready)
 
         ensure_circular_buffer_capacity_async(on_done=_on_buffer_ready)
 
@@ -618,7 +648,9 @@ class MicroManagerGUI(QMainWindow):
             logger.exception("Error shutting down Argus stream on close")
         self._argus_tunnel.stop()
         try:
-            shutdown_mmcore(self._mmc)
+            shutdown_mmcore(
+                self._mmc, camera_worker_service=self._camera_worker_service
+            )
         except Exception:
             logger.exception("Error during mmcore shutdown on close")
         return super().closeEvent(a0)
@@ -674,6 +706,17 @@ class MicroManagerGUI(QMainWindow):
             except KeyError:
                 self.nm.show_warning_message(
                     f"Unable to reload widget key stored in settings: {key!r}",
+                )
+            except Exception:
+                # A widget's own construction can fail for reasons outside our
+                # control (e.g. a stock pymmcore_widgets widget that assumes
+                # every device referenced by a config group is currently
+                # loaded -- not true right after a persistent camera worker
+                # service releases Camera-1/Camera-2). One broken dock must
+                # never prevent the rest of the window from opening.
+                logger.exception(f"Failed to reload widget {key!r} from settings")
+                self.nm.show_warning_message(
+                    f"Failed to reopen {key!r} (see log for details).",
                 )
 
         # restore position and size of the main window

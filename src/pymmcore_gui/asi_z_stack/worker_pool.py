@@ -35,9 +35,13 @@ from .camera_worker import CameraWorkerConfig, run_camera_worker
 from .worker_messages import (
     ArmCmd,
     ArmedMsg,
+    ArmLiveCmd,
     ErrorMsg,
     FrameMsg,
+    GetROICmd,
     ReadyMsg,
+    RoiMsg,
+    SetROICmd,
     ShutdownCmd,
     SlotFreeCmd,
     StalledMsg,
@@ -233,6 +237,44 @@ class CameraWorkerHandle:
         )
         return arr.copy()
 
+    def set_roi(
+        self, x: int, y: int, w: int, h: int, timeout: float = 5.0
+    ) -> tuple[int, int, int, int]:
+        """Set this worker's camera ROI and return the ROI now in effect.
+
+        Only valid while the worker is idle (not mid-arm/drain) -- callers
+        (:class:`~pymmcore_gui.asi_z_stack.camera_worker_service.
+        CameraWorkerService`) are responsible for enforcing that; this is a
+        plain synchronous request/response over the same pipe ``iter_frames``
+        streams frames over, safe here only because no concurrent
+        ``FrameMsg`` traffic is possible while idle.
+        """
+        assert self.conn is not None
+        self.conn.send(SetROICmd(self.camera_label, x, y, w, h))
+        return self._recv_roi(timeout)
+
+    def get_roi(self, timeout: float = 5.0) -> tuple[int, int, int, int]:
+        """Read this worker's camera ROI. Only valid while the worker is idle."""
+        assert self.conn is not None
+        self.conn.send(GetROICmd(self.camera_label))
+        return self._recv_roi(timeout)
+
+    def _recv_roi(self, timeout: float) -> tuple[int, int, int, int]:
+        assert self.conn is not None
+        if not self.conn.poll(timeout):
+            raise TimeoutError(
+                f"{self.camera_label} did not respond to an ROI request "
+                f"within {timeout:.1f}s"
+            )
+        msg = self.conn.recv()
+        if not isinstance(msg, RoiMsg):
+            raise RuntimeError(
+                f"{self.camera_label}: unexpected reply to ROI request: {msg!r}"
+            )
+        if msg.error is not None:
+            raise RuntimeError(f"{self.camera_label}: {msg.error}")
+        return msg.x, msg.y, msg.w, msg.h
+
 
 class CameraWorkerPool:
     """Orchestrates a set of :class:`CameraWorkerHandle` for one MDA run."""
@@ -271,6 +313,48 @@ class CameraWorkerPool:
             assert worker.conn is not None
             worker.conn.send(ArmCmd(n_images))
         self._wait_for_all(ArmedMsg, armed_timeout)
+
+    def arm_live_all(self, armed_timeout: float = 10.0) -> None:
+        """Arm every worker for unbounded, free-running acquisition.
+
+        Live counterpart to :meth:`arm_all` -- no target frame count, since
+        there's nothing to over-arm/under-arm against (no hardware trigger).
+        Frames are then drained the same way, via :meth:`iter_frames`, until
+        :meth:`stop_all` is called.
+
+        Parameters
+        ----------
+        armed_timeout : float
+            Seconds to wait for every worker's
+            :class:`~pymmcore_gui.asi_z_stack.worker_messages.ArmedMsg`.
+        """
+        for worker in self.workers:
+            assert worker.conn is not None
+            worker.conn.send(ArmLiveCmd())
+        self._wait_for_all(ArmedMsg, armed_timeout)
+
+    def _worker_for(self, camera_label: str) -> CameraWorkerHandle:
+        for worker in self.workers:
+            if worker.camera_label == camera_label:
+                return worker
+        raise KeyError(f"No camera worker for {camera_label!r}")
+
+    def set_roi(
+        self, camera_label: str, x: int, y: int, w: int, h: int, timeout: float = 5.0
+    ) -> tuple[int, int, int, int]:
+        """Set *camera_label*'s ROI via its worker. Only valid while idle.
+
+        The pool itself does not enforce "must be idle" -- that policy lives
+        on :class:`~pymmcore_gui.asi_z_stack.camera_worker_service.
+        CameraWorkerService`, which is the only intended caller.
+        """
+        return self._worker_for(camera_label).set_roi(x, y, w, h, timeout)
+
+    def get_roi(
+        self, camera_label: str, timeout: float = 5.0
+    ) -> tuple[int, int, int, int]:
+        """Read *camera_label*'s current ROI via its worker. Only valid while idle."""
+        return self._worker_for(camera_label).get_roi(timeout)
 
     def iter_frames(
         self, stall_timeout_s: float = 5.0

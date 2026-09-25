@@ -59,7 +59,7 @@ class GuiMDAWidget(MDAWidget):
     """:class:`pymmcore_widgets.MDAWidget` with multi-camera aware saving.
 
     When the active camera is a *Multi Camera* device (i.e.
-    ``getNumberOfCameraChannels() > 1``) and the chosen output is a save path,
+    ``len(physical_camera_labels(mmc)) > 1``) and the chosen output is a save path,
     the output is wrapped in a handler so that each physical camera is written
     to its own file. Single-camera, non-spectral saves are routed through the
     same vendored :func:`~pymmcore_gui._vendored.mda_handlers.handler_for_path`
@@ -110,7 +110,7 @@ class GuiMDAWidget(MDAWidget):
                 if spectral.enabled:
                     active_cams = set(physical_camera_labels(self._mmc))
                     self._warn_no_spectral_match(spectral, active_cams)
-                if self._mmc.getNumberOfCameraChannels() > 1:
+                if len(physical_camera_labels(self._mmc)) > 1:
                     output = MultiCameraHandler(
                         output,
                         mmcore=self._mmc,
@@ -194,11 +194,9 @@ class GuiMDAWidget(MDAWidget):
             meta = sequence.metadata.get(PYMMCW_METADATA_KEY, {})
             writer_format = meta.get("format", "ome-zarr")
             return [channel_output_path(base, ch, writer_format) for ch in save]
-        if self._mmc.getNumberOfCameraChannels() > 1:
-            return [
-                per_camera_path(base, label)
-                for label in physical_camera_labels(self._mmc)
-            ]
+        labels = physical_camera_labels(self._mmc)
+        if len(labels) > 1:
+            return [per_camera_path(base, label) for label in labels]
         return []
 
     def _warn_no_spectral_match(

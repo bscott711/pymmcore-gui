@@ -29,9 +29,13 @@ from .asi_controller import preferred_external_trigger_mode
 from .worker_messages import (
     ArmCmd,
     ArmedMsg,
+    ArmLiveCmd,
     ErrorMsg,
     FrameMsg,
+    GetROICmd,
     ReadyMsg,
+    RoiMsg,
+    SetROICmd,
     ShutdownCmd,
     SlotFreeCmd,
     StalledMsg,
@@ -206,6 +210,21 @@ def _wait_for_free_slot(
     return None
 
 
+def _stop_and_clear(mmc: CMMCorePlus, label: str) -> None:
+    """Stop the camera's sequence (if running) and drop any buffered frames.
+
+    Called at the end of every arm/drain cycle (bounded or live). New
+    requirement now that a worker is armed/drained/stopped repeatedly across
+    a whole session (Live toggles, Snaps, MDA runs) rather than exactly once
+    per process lifetime, as it was when this module was MDA-only -- without
+    this, frames left over in the camera's own circular buffer from one
+    cycle could bleed into the next arm cycle's first frames.
+    """
+    if mmc.isSequenceRunning(label):
+        mmc.stopSequenceAcquisition(label)
+    mmc.clearCircularBuffer()
+
+
 def _drain_sequence(
     mmc: CMMCorePlus,
     conn: Connection,
@@ -248,7 +267,7 @@ def _drain_sequence(
     while images_collected < n_images:
         stop_signal = _drain_incoming(conn, free_slots)
         if stop_signal is not None:
-            mmc.stopSequenceAcquisition(label)
+            _stop_and_clear(mmc, label)
             conn.send(StoppedMsg(label, images_collected))
             return stop_signal is ShutdownCmd
 
@@ -257,7 +276,7 @@ def _drain_sequence(
             if not free_slots:
                 stop_signal = _wait_for_free_slot(conn, free_slots, label)
                 if stop_signal is not None:
-                    mmc.stopSequenceAcquisition(label)
+                    _stop_and_clear(mmc, label)
                     conn.send(StoppedMsg(label, images_collected))
                     return stop_signal is ShutdownCmd
 
@@ -286,6 +305,7 @@ def _drain_sequence(
             images_collected += 1
             last_image_time = time.monotonic()
         elif not mmc.isSequenceRunning():
+            _stop_and_clear(mmc, label)
             conn.send(
                 ErrorMsg(
                     camera_label=label,
@@ -317,10 +337,116 @@ def _drain_sequence(
     # We deliberately armed for more than n_images (see _ARM_COUNT_PADDING),
     # so the camera's own stopOnOverflow won't have ended the sequence yet --
     # our software count reaching the true target is what decides "done".
-    if mmc.isSequenceRunning(label):
-        mmc.stopSequenceAcquisition(label)
+    _stop_and_clear(mmc, label)
     conn.send(StoppedMsg(label, images_collected))
     return False
+
+
+def _drain_live(
+    mmc: CMMCorePlus,
+    conn: Connection,
+    shm: SharedMemory,
+    config: CameraWorkerConfig,
+) -> bool:
+    """Pop frames off the camera's circular buffer indefinitely until a stop.
+
+    Free-running counterpart to :func:`_drain_sequence` for Live streaming:
+    no target frame count, no ``_ARM_COUNT_PADDING`` over-arm/software-stop
+    dance (there's no hardware trigger jitter to race here -- the camera is
+    simply told to run and told to stop). Kept as a separate function rather
+    than threading an optional ``n_images`` through ``_drain_sequence`` so
+    that function's hard-won, bench-tested bounded-arm logic stays untouched.
+
+    Parameters
+    ----------
+    mmc : CMMCorePlus
+        The worker's own core instance, already armed via
+        ``startContinuousSequenceAcquisition``.
+    conn : Connection
+        The pipe to the main process.
+    shm : SharedMemory
+        The attached frame ring buffer to write pixel data into.
+    config : CameraWorkerConfig
+        Supplies ``camera_label`` and ``slot_nbytes``.
+
+    Returns
+    -------
+    bool
+        ``True`` if a ``ShutdownCmd`` ended this drain (caller must exit the
+        process), ``False`` for an ordinary ``StopCmd`` or an unexpected
+        sequence stop (caller returns to waiting for the next arm command).
+    """
+    label = config.camera_label
+    free_slots = list(range(config.n_slots))
+    slice_idx = 0
+    images_collected = 0
+    last_image_time = time.monotonic()
+
+    while True:
+        stop_signal = _drain_incoming(conn, free_slots)
+        if stop_signal is not None:
+            _stop_and_clear(mmc, label)
+            conn.send(StoppedMsg(label, images_collected))
+            return stop_signal is ShutdownCmd
+
+        remaining = mmc.getRemainingImageCount()
+        if remaining > 0:
+            if not free_slots:
+                stop_signal = _wait_for_free_slot(conn, free_slots, label)
+                if stop_signal is not None:
+                    _stop_and_clear(mmc, label)
+                    conn.send(StoppedMsg(label, images_collected))
+                    return stop_signal is ShutdownCmd
+
+            slot = free_slots.pop(0)
+            img, mm_meta = mmc.popNextImageAndMD()
+            try:
+                camera_metadata = dict(mm_meta.items())
+            except Exception:
+                camera_metadata = {}
+
+            data = img.tobytes()
+            offset = slot * config.slot_nbytes
+            shm.buf[offset : offset + len(data)] = data
+            conn.send(
+                FrameMsg(
+                    camera_label=label,
+                    slot_index=slot,
+                    slice_idx=slice_idx,
+                    nbytes=len(data),
+                    camera_metadata=camera_metadata,
+                    images_remaining=remaining - 1,
+                    worker_perf_counter=time.perf_counter(),
+                )
+            )
+            slice_idx += 1
+            images_collected += 1
+            last_image_time = time.monotonic()
+        elif not mmc.isSequenceRunning():
+            _stop_and_clear(mmc, label)
+            conn.send(
+                ErrorMsg(
+                    camera_label=label,
+                    exc_type="RuntimeError",
+                    message=(
+                        f"Live sequence stopped unexpectedly after "
+                        f"{images_collected} images."
+                    ),
+                    traceback_text="",
+                )
+            )
+            return False
+        else:
+            now = time.monotonic()
+            if now - last_image_time > _STALL_TIMEOUT_S:
+                conn.send(
+                    StalledMsg(
+                        camera_label=label,
+                        images_collected=images_collected,
+                        seconds_since_last_image=now - last_image_time,
+                    )
+                )
+            time.sleep(0.005)
 
 
 def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
@@ -399,11 +525,45 @@ def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
                     )
                 if shutdown_requested:
                     break
+            elif isinstance(cmd, ArmLiveCmd):
+                shutdown_requested = False
+                try:
+                    mmc.startContinuousSequenceAcquisition(0)
+                    conn.send(ArmedMsg(label))
+                    shutdown_requested = _drain_live(mmc, conn, shm, config)
+                except Exception:
+                    _log(label, f"live arm/drain failed:\n{traceback.format_exc()}")
+                    conn.send(
+                        ErrorMsg(
+                            camera_label=label,
+                            exc_type="AcquisitionError",
+                            message="worker failed during live arm/drain",
+                            traceback_text=traceback.format_exc(),
+                        )
+                    )
+                if shutdown_requested:
+                    break
             elif isinstance(cmd, StopCmd):
                 if mmc.isSequenceRunning(label):
                     mmc.stopSequenceAcquisition(label)
             elif isinstance(cmd, ShutdownCmd):
                 break
+            elif isinstance(cmd, SetROICmd):
+                # Only reachable here (the idle command loop), never mid-drain
+                # -- ROI changes only make sense while this camera isn't
+                # streaming, matching the real hardware constraint.
+                try:
+                    mmc.setROI(label, cmd.x, cmd.y, cmd.w, cmd.h)
+                    x, y, w, h = mmc.getROI(label)
+                    conn.send(RoiMsg(label, x, y, w, h))
+                except Exception as exc:
+                    conn.send(RoiMsg(label, 0, 0, 0, 0, error=str(exc)))
+            elif isinstance(cmd, GetROICmd):
+                try:
+                    x, y, w, h = mmc.getROI(label)
+                    conn.send(RoiMsg(label, x, y, w, h))
+                except Exception as exc:
+                    conn.send(RoiMsg(label, 0, 0, 0, 0, error=str(exc)))
     finally:
         try:
             if mmc.isSequenceRunning(label):

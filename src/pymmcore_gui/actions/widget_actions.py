@@ -100,8 +100,26 @@ def create_mda_widget(parent: QWidget) -> pmmw.MDAWidget:
     return GuiMDAWidget(parent=parent, mmcore=_get_core(parent))
 
 
-def create_camera_roi(parent: QWidget) -> pmmw.CameraRoiWidget:
-    """Create the Camera ROI widget."""
+def create_camera_roi(parent: QWidget) -> QWidget:
+    """Create the Camera ROI widget.
+
+    Camera-1/Camera-2 are never loaded on the main-process core once a
+    persistent :class:`~pymmcore_gui.asi_z_stack.camera_worker_service.
+    CameraWorkerService` is active, so the stock ``pymmcore_widgets.
+    CameraRoiWidget`` (which calls ``mmcore.setROI``/``getROI`` directly)
+    would go permanently inert for them. Swap in a small worker-aware
+    replacement in that case; fall back to the stock widget otherwise
+    (demo/single-camera/non-ASI configs -- unaffected, unchanged).
+    """
+    from pymmcore_gui.asi_z_stack.camera_worker_service import CameraWorkerService
+
+    if (svc := CameraWorkerService.get_active()) is not None:
+        from pymmcore_gui.widgets._worker_camera_roi_widget import (
+            WorkerCameraRoiWidget,
+        )
+
+        return WorkerCameraRoiWidget(parent=parent, service=svc)
+
     from pymmcore_widgets import CameraRoiWidget
 
     return CameraRoiWidget(parent=parent, mmcore=_get_core(parent))

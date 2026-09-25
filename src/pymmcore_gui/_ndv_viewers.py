@@ -12,9 +12,10 @@ from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QWidget
 from PyQt6Ads import CDockWidget
 
-from pymmcore_gui._multi_camera_handler import without_cam_index
+from pymmcore_gui._multi_camera_handler import physical_camera_labels, without_cam_index
 from pymmcore_gui._numpy_display_store import NumpyDisplayStore
 from pymmcore_gui._settings import SettingsV1
+from pymmcore_gui.asi_z_stack.camera_worker_service import CameraWorkerService
 from pymmcore_gui.widgets.image_preview._pygfx_preview import PygfxPreview
 
 if TYPE_CHECKING:
@@ -226,11 +227,18 @@ class NDVViewersManager(QObject):
         self._mda_camera_handlers: dict[str, NumpyDisplayStore] = {}
         self._mda_camera_viewers: dict[str, ndv.ArrayViewer] = {}
 
+        # Camera worker service (persistent dual-PVCAM worker processes) --
+        # see _sync_worker_service_connection for why this is re-evaluated
+        # on every config load rather than connected once here.
+        self._connected_worker_service: CameraWorkerService | None = None
+
         ev = self._mmc.events
         ev.imageSnapped.connect(self._on_image_snapped)
         ev.sequenceAcquisitionStarted.connect(self._on_streaming_started)
         ev.continuousSequenceAcquisitionStarted.connect(self._on_streaming_started)
         ev.propertyChanged.connect(self._on_property_changed)
+        ev.systemConfigurationLoaded.connect(self._sync_worker_service_connection)
+        self._sync_worker_service_connection()
 
         mda_ev = self._mmc.mda.events
         mda_ev.sequenceStarted.connect(self._on_sequence_started)
@@ -246,23 +254,15 @@ class NDVViewersManager(QObject):
     def _get_physical_camera_labels(self) -> list[str]:
         """Return the list of physical camera labels behind the active camera device.
 
-        For a ``Multi Camera`` device this reads the ``Physical Camera N``
-        properties.  For a plain camera device returns a single-element list.
+        Delegates to the shared ``_multi_camera_handler.physical_camera_labels``,
+        which falls back to ``CameraWorkerService``'s static label list when a
+        persistent worker service is active (Camera-1/Camera-2 are then never
+        loaded on ``self._mmc`` at all) -- one fix point instead of this
+        method independently re-deriving the same thing from
+        ``getNumberOfCameraChannels``/``getPhysicalCameraDevice``, which would
+        return empty/stale results once the cameras are worker-owned.
         """
-        cam = self._mmc.getCameraDevice()
-        n = self._mmc.getNumberOfCameraChannels()
-        if n <= 1:
-            return [cam]
-        # Resolve each channel via the same helper the preview fetch uses
-        # (getPhysicalCameraDevice -> "Physical Camera N" property) so the dock
-        # keys and the frame-dict keys are guaranteed identical.
-        labels: list[str] = []
-        for i in range(n):
-            try:
-                labels.append(self._mmc.getPhysicalCameraDevice(i) or f"Camera-ch{i}")
-            except Exception:
-                labels.append(f"Camera-ch{i}")
-        return labels
+        return physical_camera_labels(self._mmc)
 
     def _create_camera_preview(self, camera_label: str) -> PygfxPreview:
         """Create a new PygfxPreview dock for *camera_label* and emit the signal."""
@@ -405,8 +405,60 @@ class NDVViewersManager(QObject):
         return _on_frames
 
     # ------------------------------------------------------------------
+    # Camera worker service (persistent dual-PVCAM worker processes)
+    # ------------------------------------------------------------------
+
+    def _sync_worker_service_connection(self) -> None:
+        """(Re)connect to the active ``CameraWorkerService``, if any.
+
+        Re-evaluated on every ``systemConfigurationLoaded`` rather than
+        connected once, since the active service instance can change (or
+        disappear/reappear) across a config reload -- see
+        ``CameraWorkerService.prepare_for_reload``.
+        """
+        svc = CameraWorkerService.get_active()
+        if svc is self._connected_worker_service:
+            return
+        if self._connected_worker_service is not None:
+            with suppress(RuntimeError, TypeError):
+                self._connected_worker_service.frameReady.disconnect(
+                    self._on_worker_frame
+                )
+        if svc is not None:
+            svc.frameReady.connect(self._on_worker_frame)
+        self._connected_worker_service = svc
+
+    def _on_worker_frame(
+        self,
+        camera_label: str,
+        slice_idx: int,
+        frame: np.ndarray,
+        camera_metadata: dict[str, Any],
+        images_remaining: int,
+    ) -> None:
+        """Display one Live or Snap frame delivered by a persistent camera worker.
+
+        Frames already arrive tagged with their physical camera at the
+        source (``FrameMsg.camera_label``), so -- unlike
+        ``_on_streaming_started``'s ``_multicam_frame_callback`` demuxing
+        below, which exists only to split one shared circular buffer --
+        this can dispatch straight to the right dock via a plain lookup.
+        """
+        if self._is_mda_running:
+            return
+        preview, _ = self._get_or_create_camera_preview(camera_label)
+        preview.append(frame)
+
+    # ------------------------------------------------------------------
     # Streaming / Snap handlers
     # ------------------------------------------------------------------
+    #
+    # NOTE: the two handlers below react to mmc's own sequence-acquisition/
+    # imageSnapped events, which never fire once Live/Snap route through a
+    # persistent CameraWorkerService (see core_actions.py) -- they stay
+    # fully functional, unmodified, for demo/single-camera/non-ASI rigs,
+    # and are simply dormant (never invoked) for the worker-owned rig,
+    # where _on_worker_frame above handles frame delivery instead.
 
     def _on_streaming_started(self) -> None:
         if self._is_mda_running:

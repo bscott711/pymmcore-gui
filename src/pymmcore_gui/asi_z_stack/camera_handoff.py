@@ -1,15 +1,23 @@
 """Snapshot, release, and reload the main process's cameras around a handoff.
 
-For the duration of one hardware-triggered MDA run, the main process's
-``CMMCorePlus`` lets go of ``Camera-1``/``Camera-2`` (and the ``Multi Camera``
-composite, if present) so that :mod:`~pymmcore_gui.asi_z_stack.worker_pool`
-subprocesses can each open one of them exclusively. :func:`release_cameras_for_workers`
-captures everything needed to put the main process back exactly how it was
-(:class:`CameraHandoffSnapshot`) and then unloads the camera devices;
-:func:`reload_cameras_after_handoff` reverses it once the worker pool has shut
-down. Live/Snap/the device-property browser/the Dual-ROI widget see no
-difference across an MDA run other than a brief window where the cameras
-aren't loaded.
+The main process's ``CMMCorePlus`` lets go of ``Camera-1``/``Camera-2`` (and
+the ``Multi Camera`` composite, if present) so that
+:mod:`~pymmcore_gui.asi_z_stack.worker_pool` subprocesses can each open one of
+them exclusively. :func:`release_cameras_for_workers` captures everything
+needed to put the main process back exactly how it was
+(:class:`CameraHandoffSnapshot`) and then unloads the camera devices.
+
+Used by :class:`~pymmcore_gui.asi_z_stack.camera_worker_service.
+CameraWorkerService`, which calls :func:`release_cameras_for_workers` once,
+at session startup (not per-MDA-run) -- the release is session-lifetime, not
+a brief window: once active, the main process's core essentially never has
+Camera-1/Camera-2 loaded again, and every other consumer that needs to know
+about them (the property browser, the Camera ROI widget, ``physical_camera_labels``
+callers) is expected to go through the service instead of the main-process
+core for as long as it's active. :func:`reload_cameras_after_handoff` is the
+reverse and is now only used as a best-effort recovery path if the worker
+processes themselves fail to spawn (see ``CameraWorkerService.spawn_async``)
+-- there is no longer a per-MDA-run teardown/reload cycle.
 """
 
 from __future__ import annotations

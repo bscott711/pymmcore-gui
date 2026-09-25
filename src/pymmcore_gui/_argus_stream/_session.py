@@ -126,7 +126,27 @@ def _camera_geometry(meta: SummaryMetaV1, mmcore: CMMCorePlus) -> CameraGeometry
     already report no camera at all (confirmed on the rig 2026-09-23:
     ``camera=''``, 0x0, 0 bytes/pixel). Falls back to the core only when the
     metadata has no image info.
+
+    When a persistent ``CameraWorkerService`` is active, its cached geometry
+    wins outright: Camera-1/Camera-2 are then never loaded on *mmcore*, so
+    both the summary metadata's image infos and the core itself describe a
+    cameraless core.
     """
+    from pymmcore_gui.asi_z_stack.camera_worker_service import CameraWorkerService
+
+    if (svc := CameraWorkerService.get_active()) is not None and (
+        snap := svc.geometry
+    ) is not None:
+        infos = meta.get("image_infos") or ()
+        pixel_size = float(infos[0].get("pixel_size_um") or 0.0) if infos else 0.0
+        return CameraGeometry(
+            labels=list(snap.camera_labels),
+            dtype=snap.dtype_str,
+            height=snap.image_height,
+            width=snap.image_width,
+            pixel_size_um=pixel_size or float(mmcore.getPixelSizeUm() or 0.0),
+        )
+
     infos = meta.get("image_infos") or ()
     if infos:
         first = infos[0]

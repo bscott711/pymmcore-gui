@@ -22,12 +22,15 @@ if TYPE_CHECKING:
 
     from pymmcore_plus import CMMCorePlus
 
+    from pymmcore_gui.asi_z_stack.camera_worker_service import CameraWorkerService
+
 logger = logging.getLogger("pymmcore_gui")
 
 _LIVE_STOP_TIMEOUT_S = 5.0
 _MDA_CANCEL_TIMEOUT_S = 10.0
 _UNLOAD_TIMEOUT_S = 10.0
 _WORKER_QUIESCE_TIMEOUT_S = 5.0
+_CAMERA_SERVICE_SHUTDOWN_TIMEOUT_S = 10.0
 _POLL_INTERVAL_S = 0.05
 
 _LAST_MDA_THREAD_ATTR = "_mmcore_gui_last_mda_thread"
@@ -63,10 +66,12 @@ def shutdown_mmcore(
     mmc: CMMCorePlus,
     *,
     mda_thread: Thread | None = None,
+    camera_worker_service: CameraWorkerService | None = None,
     live_stop_timeout: float = _LIVE_STOP_TIMEOUT_S,
     mda_cancel_timeout: float = _MDA_CANCEL_TIMEOUT_S,
     unload_timeout: float = _UNLOAD_TIMEOUT_S,
     worker_quiesce_timeout: float = _WORKER_QUIESCE_TIMEOUT_S,
+    camera_service_shutdown_timeout: float = _CAMERA_SERVICE_SHUTDOWN_TIMEOUT_S,
 ) -> None:
     """Stop any running acquisition and unload all devices from *mmc*.
 
@@ -80,14 +85,32 @@ def shutdown_mmcore(
     If *mda_thread* is not given, the thread from the most recent
     ``mmc.run_mda()`` call is used, provided :func:`track_mda_thread` has been
     called on *mmc* at some point (e.g. once at GUI startup).
+
+    *camera_worker_service*, if given and active, is shut down **first** --
+    before ``_stop_live``, whose ``mmc.isSequenceRunning()`` checks are
+    no-ops for cameras owned by worker processes (``mmc`` never sees them
+    running).
     """
     if mda_thread is None:
         mda_thread = getattr(mmc, _LAST_MDA_THREAD_ATTR, None)
+    if camera_worker_service is not None:
+        _shutdown_camera_worker_service(
+            camera_worker_service, camera_service_shutdown_timeout
+        )
     _stop_live(mmc, live_stop_timeout)
     _cancel_mda_and_wait(mmc, mda_thread, mda_cancel_timeout)
     _close_lasers()
     _quiesce_background_reads(worker_quiesce_timeout)
     _run_with_timeout(mmc.unloadAllDevices, unload_timeout, "unloadAllDevices")
+
+
+def _shutdown_camera_worker_service(
+    camera_worker_service: CameraWorkerService, timeout_s: float
+) -> None:
+    try:
+        camera_worker_service.shutdown(timeout=timeout_s)
+    except Exception:
+        logger.exception("Error shutting down persistent camera worker service")
 
 
 def _stop_live(mmc: CMMCorePlus, timeout_s: float) -> None:

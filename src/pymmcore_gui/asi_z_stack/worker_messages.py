@@ -28,6 +28,18 @@ class ArmCmd:
 
 
 @dataclass(frozen=True)
+class ArmLiveCmd:
+    """Arm the camera for unbounded, free-running acquisition.
+
+    Unlike :class:`ArmCmd`, there is no target frame count and no
+    ``stopOnOverflow`` race to dodge (no hardware trigger to race against) --
+    the worker streams frames via ``startContinuousSequenceAcquisition``
+    until a :class:`StopCmd`/:class:`ShutdownCmd` arrives. See
+    :func:`~pymmcore_gui.asi_z_stack.camera_worker._drain_live`.
+    """
+
+
+@dataclass(frozen=True)
 class SlotFreeCmd:
     """Tell the worker that shared-memory slot *slot_index* is free to reuse."""
 
@@ -42,6 +54,24 @@ class StopCmd:
 @dataclass(frozen=True)
 class ShutdownCmd:
     """Stop if running, unload the camera device, and exit the worker process."""
+
+
+@dataclass(frozen=True)
+class SetROICmd:
+    """Set this camera's hardware ROI. Only valid while the worker is idle."""
+
+    camera_label: str
+    x: int
+    y: int
+    w: int
+    h: int
+
+
+@dataclass(frozen=True)
+class GetROICmd:
+    """Read this camera's current hardware ROI. Only valid while idle."""
+
+    camera_label: str
 
 
 # ---------------------------------------------------------------------------
@@ -103,5 +133,25 @@ class ErrorMsg:
     traceback_text: str
 
 
-WorkerToMainMsg = ReadyMsg | ArmedMsg | FrameMsg | StoppedMsg | StalledMsg | ErrorMsg
-MainToWorkerMsg = ArmCmd | SlotFreeCmd | StopCmd | ShutdownCmd
+@dataclass(frozen=True)
+class RoiMsg:
+    """Reply to :class:`SetROICmd`/:class:`GetROICmd`: the ROI now in effect.
+
+    ``error`` is set (and ``x``/``y``/``w``/``h`` are meaningless zeros) if
+    the underlying ``setROI``/``getROI`` call raised.
+    """
+
+    camera_label: str
+    x: int
+    y: int
+    w: int
+    h: int
+    error: str | None = None
+
+
+WorkerToMainMsg = (
+    ReadyMsg | ArmedMsg | FrameMsg | StoppedMsg | StalledMsg | ErrorMsg | RoiMsg
+)
+MainToWorkerMsg = (
+    ArmCmd | ArmLiveCmd | SlotFreeCmd | StopCmd | ShutdownCmd | SetROICmd | GetROICmd
+)

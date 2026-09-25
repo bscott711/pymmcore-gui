@@ -757,7 +757,6 @@ def test_teardown_sequence_closes_all_lasers_when_flag_on(
     but guards against a run aborting between volumes rather than mid-burst.
     """
     monkeypatch.setattr(engine_module, "set_plogic_evaluation_clock", MagicMock())
-    monkeypatch.setattr(engine_module, "reload_cameras_after_handoff", MagicMock())
     monkeypatch.setattr(time, "sleep", MagicMock())
     mock_close_all_lasers = MagicMock()
     monkeypatch.setattr(engine_module, "close_all_lasers", mock_close_all_lasers)
@@ -774,7 +773,6 @@ def test_teardown_sequence_skips_close_all_lasers_when_flag_off(
 ) -> None:
     """The teardown safety net is itself gated by ``laser_open_full_stack``."""
     monkeypatch.setattr(engine_module, "set_plogic_evaluation_clock", MagicMock())
-    monkeypatch.setattr(engine_module, "reload_cameras_after_handoff", MagicMock())
     monkeypatch.setattr(time, "sleep", MagicMock())
     mock_close_all_lasers = MagicMock()
     monkeypatch.setattr(engine_module, "close_all_lasers", mock_close_all_lasers)

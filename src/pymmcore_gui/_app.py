@@ -240,7 +240,9 @@ def create_mmgui(
         with suppress(Exception):
             from pymmcore_gui._mmcore_shutdown import shutdown_mmcore
 
-            shutdown_mmcore(win.mmcore)
+            shutdown_mmcore(
+                win.mmcore, camera_worker_service=win._camera_worker_service
+            )
 
     app.aboutToQuit.connect(_on_about_to_quit)
 
