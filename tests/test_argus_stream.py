@@ -18,6 +18,7 @@ from pymmcore_gui._argus_stream._protocol import (
     MSG_RESUME,
     MSG_SESSION_END,
     MSG_SESSION_START,
+    AckHeader,
     MessageHeader,
     pack_message,
     unpack_message,
@@ -245,6 +246,20 @@ def test_volume_assembler_completes_one_volume_per_t_c() -> None:
         assert list(vol.array[:, 0, 0]) == [0, 1, 2]
 
 
+def test_volume_assembler_stamps_first_and_last_plane_times() -> None:
+    seq = useq.MDASequence(z_plan=useq.ZRangeAround(range=2, step=1))
+    asm = VolumeAssembler()
+    asm.reset(seq)
+    before = time.time()
+    vols = [
+        v
+        for event in seq
+        if (v := asm.add_frame(np.zeros((4, 4), "uint16"), event, {}))  # pyright: ignore[reportArgumentType]
+    ]
+    assert len(vols) == 1
+    assert before <= vols[0].acq_first_s <= vols[0].acq_last_s <= time.time()
+
+
 def test_volume_assembler_is_axis_order_agnostic() -> None:
     """z-planes delivered in reverse order still land at the right index."""
     seq = useq.MDASequence(z_plan=useq.ZRangeAround(range=2, step=1))
@@ -470,6 +485,9 @@ class _FakeReceiver:
         self.port = self.sock.bind_to_random_port("tcp://127.0.0.1")
         self.messages: list[tuple[bytes, str, dict, bytes | None]] = []
         self.auto_ack = True
+        # When set, ACKs carry server_time_s = time.time() + this skew, like
+        # the real receiver (whose clock the client must correct for).
+        self.clock_skew_s: float | None = None
         self._stop = threading.Event()
         self._identity: bytes | None = None
         self._session_id: str | None = None
@@ -498,15 +516,11 @@ class _FakeReceiver:
 
     def ack(self, through_frame_index: int) -> None:
         assert self._identity is not None and self._session_id is not None
+        header: AckHeader = {"through_frame_index": through_frame_index}
+        if self.clock_skew_s is not None:
+            header["server_time_s"] = time.time() + self.clock_skew_s
         self.sock.send_multipart(
-            [
-                self._identity,
-                *pack_message(
-                    MSG_ACK,
-                    self._session_id,
-                    {"through_frame_index": through_frame_index},
-                ),
-            ]
+            [self._identity, *pack_message(MSG_ACK, self._session_id, header)]
         )
 
     def send(self, msg_type: bytes, header: dict) -> None:
@@ -823,3 +837,46 @@ def test_output_format_defaults_to_both_and_rejects_unknown() -> None:
     assert ArgusStreamSettingsV1().output_format == "both"
     with pytest.raises(ValueError):
         ArgusStreamSettingsV1(output_format="png")  # pyright: ignore[reportArgumentType]
+
+
+def test_frames_carry_trace_timestamps_and_the_measured_clock_offset(
+    fake_receiver: _FakeReceiver,
+) -> None:
+    """opym-live-trace on Argus needs each volume's acquisition and send
+    times, plus how far this machine's clock is from Argus's (estimated from
+    the SESSION_START -> first ACK round trip)."""
+    fake_receiver.clock_skew_s = 1000.0
+    settings = _full_settings(
+        ArgusStreamSettingsV1(
+            enabled=True, local_port=fake_receiver.port, gpfs_scratch_root="/scratch"
+        )
+    )
+    session = ArgusStreamSession(
+        _StubCore(),  # pyright: ignore[reportArgumentType]
+        _NoopTunnel(),  # pyright: ignore[reportArgumentType]
+        get_settings=lambda: settings,
+    )
+    seq = _save_seq(z_plan=useq.ZRangeAround(range=1, step=1))
+    session.sequenceStarted(seq, {})  # pyright: ignore[reportArgumentType]
+    time.sleep(0.3)  # the first ACK lands before any volume completes
+    for event in seq:
+        session.frameReady(np.zeros((4, 4), dtype="uint16"), event, {})  # pyright: ignore[reportArgumentType]
+    session.sequenceFinished(seq)
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if any(m[0] == MSG_SESSION_END for m in fake_receiver.messages):
+            break
+        time.sleep(0.05)
+
+    frames = fake_receiver.frame_messages()
+    assert len(frames) == 2
+    for header, _payload in frames:
+        assert (
+            header["acq_first_s"]
+            <= header["acq_last_s"]
+            <= header["queued_s"]
+            <= header["sent_s"]
+        )
+        assert header["clock_offset_s"] == pytest.approx(1000.0, abs=0.5)
+    session.shutdown(timeout=1)

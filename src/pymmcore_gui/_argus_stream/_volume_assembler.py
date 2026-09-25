@@ -14,6 +14,7 @@ callers are responsible for only using this for eligible sequences.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -36,6 +37,10 @@ class Volume:
     """``(Z, Y, X)`` C-contiguous array."""
     timestamp: float
     camera_id: str | int | None
+    acq_first_s: float = 0.0
+    """Wall clock (``time.time()``) when this volume's first plane arrived."""
+    acq_last_s: float = 0.0
+    """Wall clock when its last plane arrived, i.e. when it completed."""
 
 
 @dataclass
@@ -44,6 +49,7 @@ class _Pending:
     seen: set[int] = field(default_factory=set)
     timestamp: float = 0.0
     camera_id: str | int | None = None
+    acq_first_s: float = field(default_factory=time.time)
 
 
 class VolumeAssembler:
@@ -114,4 +120,6 @@ class VolumeAssembler:
             array=pending.array,
             timestamp=pending.timestamp,
             camera_id=pending.camera_id,
+            acq_first_s=pending.acq_first_s,
+            acq_last_s=time.time(),
         )
