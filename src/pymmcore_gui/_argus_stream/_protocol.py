@@ -82,7 +82,17 @@ class SessionStartHeader(_SessionStartOptional):
     output_format: OutputFormat
 
 
-class FrameHeader(TypedDict):
+class _FrameTraceFields(TypedDict, total=False):
+    # Latency trace (opym.stream.trace on Argus). Epoch seconds on THIS
+    # machine's clock; Argus converts them with clock_offset_s.
+    acq_first_s: float
+    acq_last_s: float
+    queued_s: float
+    sent_s: float
+    clock_offset_s: float
+
+
+class FrameHeader(_FrameTraceFields):
     """``FRAME`` header -- one per acquired volume, sent alongside its bytes.
 
     ``t``/``c`` are this volume's own acquisition indices, not send order --
@@ -128,7 +138,13 @@ class SessionEndHeader(TypedDict):
     reason: Literal["complete", "idle_timeout", "client_abort"]
 
 
-class AckHeader(TypedDict):
+class _AckOptional(TypedDict, total=False):
+    # Argus's clock when it sent the ACK: lets the client estimate its clock
+    # offset for the FRAME trace fields.
+    server_time_s: float
+
+
+class AckHeader(_AckOptional):
     """``ACK`` header -- server -> client, unsolicited, not per-frame.
 
     ``through_frame_index`` is the highest ``frame_index`` such that every

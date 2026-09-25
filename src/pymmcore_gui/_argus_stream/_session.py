@@ -85,6 +85,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _STALE_ACK_S = 5.0
+# The SESSION_START -> first ACK round trip gives the clock offset for the
+# FRAME trace fields; a reply slower than this is too blurry to use.
+_MAX_OFFSET_RTT_S = 2.0
 # ~1/3 of the measured ~60 MB/s tunnel throughput (2026-09-21).
 _MIN_LINK_BYTES_PER_S = 20 * 1024 * 1024
 _POLL_TIMEOUT_MS = 200
@@ -339,6 +342,9 @@ class _RunWorker(threading.Thread):
             "camera_id": volume.camera_id,
             "shape_zyx": list(volume.array.shape),
             "dtype": str(volume.array.dtype),
+            "acq_first_s": volume.acq_first_s,
+            "acq_last_s": volume.acq_last_s,
+            "queued_s": time.time(),
         }
         payload = volume.array.tobytes()
         self._to_send.put((frame_index, header, payload))
@@ -371,8 +377,20 @@ class _RunWorker(threading.Thread):
         unacked_bytes = 0
         last_ack_time = time.monotonic()
         resume_pending = False
+        # Argus clock minus ours, from the SESSION_START -> first ACK round
+        # trip; sent with every FRAME once known (see _protocol.py).
+        clock_offset: float | None = None
+
+        def send_frame(header: FrameHeader, payload: bytes) -> None:
+            header["sent_s"] = time.time()
+            if clock_offset is not None:
+                header["clock_offset_s"] = clock_offset
+            sock.send_multipart(
+                pack_message(MSG_FRAME, self._session_id, header, payload)
+            )
 
         try:
+            start_sent_s = time.time()
             sock.send_multipart(
                 pack_message(MSG_SESSION_START, self._session_id, self._header)
             )
@@ -396,9 +414,7 @@ class _RunWorker(threading.Thread):
                         last_ack_time = time.monotonic()
                     unacked[frame_index] = (header, payload)
                     unacked_bytes += len(payload)
-                    sock.send_multipart(
-                        pack_message(MSG_FRAME, self._session_id, header, payload)
-                    )
+                    send_frame(header, payload)
                     drained_any = True
 
                 events = dict(poller.poll(timeout=_POLL_TIMEOUT_MS))
@@ -406,6 +422,13 @@ class _RunWorker(threading.Thread):
                     parts = sock.recv_multipart()
                     msg_type, _sid, ack_header, _payload = unpack_message(parts)
                     if msg_type == MSG_ACK:
+                        server_time = ack_header.get("server_time_s")
+                        if clock_offset is None and server_time is not None:
+                            now = time.time()
+                            if now - start_sent_s <= _MAX_OFFSET_RTT_S:
+                                clock_offset = cast("float", server_time) - (
+                                    (start_sent_s + now) / 2
+                                )
                         through = cast("int", ack_header.get("through_frame_index", -1))
                         for fi in [fi for fi in unacked if fi <= through]:
                             _, payload = unacked.pop(fi)
@@ -420,12 +443,7 @@ class _RunWorker(threading.Thread):
                             # so resending already-staged data is a safe
                             # no-op, not a duplicate ticket.
                             for frame_index in sorted(unacked):
-                                header, payload = unacked[frame_index]
-                                sock.send_multipart(
-                                    pack_message(
-                                        MSG_FRAME, self._session_id, header, payload
-                                    )
-                                )
+                                send_frame(*unacked[frame_index])
                             resume_pending = False
                     elif msg_type == MSG_QC and self._on_qc is not None:
                         # Advisory; a failing consumer must never stall the
