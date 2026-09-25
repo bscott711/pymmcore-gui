@@ -36,7 +36,7 @@ import threading
 import time
 from enum import Enum
 from pathlib import PureWindowsPath
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Literal, NamedTuple, cast
 from uuid import uuid4
 
 import numpy as np
@@ -85,6 +85,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _STALE_ACK_S = 5.0
+# ~1/3 of the measured ~60 MB/s tunnel throughput (2026-09-21).
+_MIN_LINK_BYTES_PER_S = 20 * 1024 * 1024
 _POLL_TIMEOUT_MS = 200
 _DTYPE_BY_BYTES_PER_PIXEL = {1: "uint8", 2: "uint16", 4: "uint32"}
 _SessionEndReason = Literal["complete", "idle_timeout", "client_abort"]
@@ -103,17 +105,54 @@ class StreamState(str, Enum):
     FINISHING = "finishing"
 
 
-def _dtype_str(mmcore: CMMCorePlus) -> str:
-    bpp = mmcore.getBytesPerPixel()
-    try:
-        return _DTYPE_BY_BYTES_PER_PIXEL[bpp]
-    except KeyError:
-        raise ValueError(f"Unsupported bytes-per-pixel for streaming: {bpp}") from None
+class CameraGeometry(NamedTuple):
+    """Camera identity and image format for one MDA run."""
+
+    labels: list[str]
+    dtype: str
+    height: int
+    width: int
+    pixel_size_um: float
+
+
+def _camera_geometry(meta: SummaryMetaV1, mmcore: CMMCorePlus) -> CameraGeometry:
+    """Read camera geometry from the run's summary metadata.
+
+    Prefers ``meta["image_infos"]``, which the engine builds in
+    ``setup_sequence`` while the cameras are still loaded. The live core is
+    not reliable here: ``sequenceStarted`` handlers run concurrently with the
+    MDA thread, and the ASI engines unload every camera into worker processes
+    on their first ``exec_event`` -- so by the time this runs, the core can
+    already report no camera at all (confirmed on the rig 2026-09-23:
+    ``camera=''``, 0x0, 0 bytes/pixel). Falls back to the core only when the
+    metadata has no image info.
+    """
+    infos = meta.get("image_infos") or ()
+    if infos:
+        first = infos[0]
+        if first.get("num_camera_adapter_channels", 1) > 1:
+            labels = [info["camera_label"] for info in infos[1:]]
+        else:
+            labels = [first["camera_label"]]
+        return CameraGeometry(
+            labels=labels,
+            dtype=first["dtype"],
+            height=int(first["height"]),
+            width=int(first["width"]),
+            pixel_size_um=float(first.get("pixel_size_um") or 0.0),
+        )
+    return CameraGeometry(
+        labels=physical_camera_labels(mmcore),
+        dtype=_DTYPE_BY_BYTES_PER_PIXEL.get(mmcore.getBytesPerPixel(), "unknown"),
+        height=int(mmcore.getImageHeight()),
+        width=int(mmcore.getImageWidth()),
+        pixel_size_um=float(mmcore.getPixelSizeUm() or 0.0),
+    )
 
 
 def _active_spectral_channels(
     sequence: useq.MDASequence,
-    mmcore: CMMCorePlus,
+    camera_labels: list[str],
     spectral: SpectralChannelSettingsV1,
 ) -> list[SpectralChannelConfig]:
     """Return the spectral-channel regions this run will crop, if any.
@@ -127,19 +166,18 @@ def _active_spectral_channels(
     """
     if not spectral.enabled:
         return []
-    active_cams = set(physical_camera_labels(mmcore))
     return channels_for_sequence(
         sequence,
         spectral.channels,
         spectral.laser_config_group,
         spectral.all_lasers_preset,
-        active_cams,
+        set(camera_labels),
     )
 
 
 def _build_session_header(
     sequence: useq.MDASequence,
-    mmcore: CMMCorePlus,
+    geometry: CameraGeometry,
     settings: ArgusStreamSettingsV1,
     active_spectral: list[SpectralChannelConfig],
 ) -> tuple[SessionStartHeader | None, str]:
@@ -149,8 +187,9 @@ def _build_session_header(
     ----------
     sequence : useq.MDASequence
         The MDA sequence about to run.
-    mmcore : CMMCorePlus
-        The core instance driving the acquisition.
+    geometry : CameraGeometry
+        This run's camera identity and image format, from
+        :func:`_camera_geometry`.
     settings : ArgusStreamSettingsV1
         Argus-streaming configuration.
     active_spectral : list[SpectralChannelConfig]
@@ -164,11 +203,13 @@ def _build_session_header(
     """
     if len(sequence.stage_positions) > 1:
         return None, "multi-position sequences are not supported in v1"
-    if not active_spectral and mmcore.getNumberOfCameraChannels() > 1:
+    if not active_spectral and len(geometry.labels) > 1:
         return None, (
             "multi-camera acquisitions require spectral-channel cropping to "
             "resolve camera identity into the channel axis"
         )
+    if geometry.dtype not in _DTYPE_BY_BYTES_PER_PIXEL.values():
+        return None, f"unsupported camera pixel type for streaming: {geometry.dtype}"
 
     meta = sequence.metadata.get(PYMMCW_METADATA_KEY, {})
     save_name = meta.get("save_name")
@@ -205,7 +246,7 @@ def _build_session_header(
         yx_shape = (crop_h, crop_w)
     else:
         channel_names = [ch.config for ch in sequence.channels] or ["Default"]
-        yx_shape = (int(mmcore.getImageHeight()), int(mmcore.getImageWidth()))
+        yx_shape = (geometry.height, geometry.width)
     channels = list(range(len(channel_names)))
 
     # Decon parameters (PSF, iterations, rl_method, ...) are NOT part of
@@ -221,14 +262,15 @@ def _build_session_header(
     header: SessionStartHeader = {
         "base_name": base_name,
         "raw_root": raw_root,
-        "dtype": _dtype_str(mmcore),
+        "dtype": geometry.dtype,
         "shape_zyx": [pos_sizes.get("z", 1), *yx_shape],
         "num_timepoints": pos_sizes.get("t", 1),
         "channels": channels,
         "channel_names": channel_names,
         "z_step_um": float(z_step_um),
-        "xy_pixel_size": float(mmcore.getPixelSizeUm() or 0.0),
+        "xy_pixel_size": geometry.pixel_size_um,
         "t_interval_s": float(t_interval_s),
+        "output_format": settings.output_format,
         "accepts": ["qc"],
     }
     return header, ""
@@ -326,6 +368,12 @@ class _RunWorker(threading.Thread):
                         frame_index, header, payload = self._to_send.get_nowait()
                     except queue.Empty:
                         break
+                    if not unacked:
+                        # The ACK clock only runs while something is in
+                        # flight -- otherwise a volume sent after a long idle
+                        # (e.g. a whole z-stack's acquisition) is instantly
+                        # "stale" and triggers a spurious RESUME + resend.
+                        last_ack_time = time.monotonic()
                     unacked[frame_index] = (header, payload)
                     unacked_bytes += len(payload)
                     sock.send_multipart(
@@ -367,7 +415,10 @@ class _RunWorker(threading.Thread):
                         except Exception:
                             logger.exception("Argus QC callback failed")
 
-                stale = time.monotonic() - last_ack_time > _STALE_ACK_S
+                # A single volume can be hundreds of MB; allow time to
+                # transfer what's outstanding before calling the link stale.
+                stale_after_s = _STALE_ACK_S + unacked_bytes / _MIN_LINK_BYTES_PER_S
+                stale = time.monotonic() - last_ack_time > stale_after_s
                 if stale and unacked and not resume_pending:
                     sock.send_multipart(pack_message(MSG_RESUME, self._session_id, {}))
                     resume_pending = True
@@ -457,11 +508,12 @@ class ArgusStreamSession:
             self._worker = None
             return
 
+        geometry = _camera_geometry(meta, self._mmc)
         active_spectral = _active_spectral_channels(
-            sequence, self._mmc, settings.spectral
+            sequence, geometry.labels, settings.spectral
         )
         header, reason = _build_session_header(
-            sequence, self._mmc, argus, active_spectral
+            sequence, geometry, argus, active_spectral
         )
         if header is None:
             logger.info("Argus stream skipped for this run: %s", reason)

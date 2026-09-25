@@ -23,8 +23,10 @@ from pymmcore_gui._argus_stream._protocol import (
     unpack_message,
 )
 from pymmcore_gui._argus_stream._session import (
+    CameraGeometry,
     _active_spectral_channels,
     _build_session_header,
+    _camera_geometry,
 )
 from pymmcore_gui._argus_stream._volume_assembler import VolumeAssembler
 from pymmcore_gui._settings import (
@@ -82,6 +84,49 @@ class _StubCore:
 
     def getPixelSizeUm(self) -> float:
         return self._pixel_size_um
+
+
+def _geom(core: _StubCore) -> CameraGeometry:
+    return _camera_geometry({}, core)  # pyright: ignore[reportArgumentType]
+
+
+def test_camera_geometry_prefers_summary_meta_over_unloaded_core() -> None:
+    """Rig failure 2026-09-23: by sequenceStarted the ASI engine had already
+    handed the cameras to worker processes, so the core reported no camera
+    and 0 bytes/pixel. The summary meta, built in setup_sequence, still has
+    the real geometry."""
+    unloaded = _StubCore(width=0, height=0, bytes_per_pixel=0, physical_cameras=[""])
+    meta = {
+        "image_infos": (
+            {
+                "camera_label": "Multi Camera",
+                "dtype": "uint16",
+                "height": 2400,
+                "width": 2400,
+                "pixel_size_um": 0.136,
+                "num_camera_adapter_channels": 2,
+            },
+            {"camera_label": "Camera-1", "dtype": "uint16", "height": 2400},
+            {"camera_label": "Camera-2", "dtype": "uint16", "height": 2400},
+        )
+    }
+    geom = _camera_geometry(meta, unloaded)  # pyright: ignore[reportArgumentType]
+    assert geom == CameraGeometry(
+        labels=["Camera-1", "Camera-2"],
+        dtype="uint16",
+        height=2400,
+        width=2400,
+        pixel_size_um=0.136,
+    )
+
+
+def test_build_session_header_skips_unknown_dtype() -> None:
+    settings = ArgusStreamSettingsV1(gpfs_scratch_root="/scratch")
+    header, reason = _build_session_header(
+        _save_seq(), _geom(_StubCore(bytes_per_pixel=0)), settings, []
+    )
+    assert header is None
+    assert "pixel type" in reason
 
 
 def _spectral_channels() -> list[SpectralChannelConfig]:
@@ -234,7 +279,9 @@ def test_volume_assembler_no_z_plan_is_single_plane_volume() -> None:
 
 def test_build_session_header_happy_path() -> None:
     settings = ArgusStreamSettingsV1(gpfs_scratch_root="/mmfs2/scratch/lab")
-    header, reason = _build_session_header(_save_seq(), _StubCore(), settings, [])
+    header, reason = _build_session_header(
+        _save_seq(), _geom(_StubCore()), settings, []
+    )
     assert reason == ""
     assert header is not None
     assert header["base_name"] == "cooked_001"
@@ -264,7 +311,7 @@ def test_build_session_header_raw_root_mirrors_nested_save_dir_structure() -> No
             }
         }
     )
-    header, reason = _build_session_header(seq, _StubCore(), settings, [])
+    header, reason = _build_session_header(seq, _geom(_StubCore()), settings, [])
     assert reason == ""
     assert header is not None
     assert (
@@ -277,7 +324,7 @@ def test_build_session_header_raw_root_mirrors_nested_save_dir_structure() -> No
 def test_build_session_header_requires_save_dir() -> None:
     seq = _save_seq(metadata={PYMMCW_KEY: {"save_name": "cooked_001.ome.zarr"}})
     settings = ArgusStreamSettingsV1(gpfs_scratch_root="/scratch")
-    header, reason = _build_session_header(seq, _StubCore(), settings, [])
+    header, reason = _build_session_header(seq, _geom(_StubCore()), settings, [])
     assert header is None
     assert "save directory" in reason
 
@@ -285,7 +332,7 @@ def test_build_session_header_requires_save_dir() -> None:
 def test_build_session_header_rejects_multi_position() -> None:
     seq = _save_seq(stage_positions=[(0, 0), (1, 1)])
     settings = ArgusStreamSettingsV1(gpfs_scratch_root="/scratch")
-    header, reason = _build_session_header(seq, _StubCore(), settings, [])
+    header, reason = _build_session_header(seq, _geom(_StubCore()), settings, [])
     assert header is None
     assert "multi-position" in reason
 
@@ -294,7 +341,10 @@ def test_build_session_header_rejects_uncropped_multi_camera() -> None:
     """Without spectral cropping, multi-camera has no channel-axis resolution."""
     settings = ArgusStreamSettingsV1(gpfs_scratch_root="/scratch")
     header, reason = _build_session_header(
-        _save_seq(), _StubCore(num_channels=2), settings, []
+        _save_seq(),
+        _geom(_StubCore(num_channels=2, physical_cameras=["Camera-1", "Camera-2"])),
+        settings,
+        [],
     )
     assert header is None
     assert "multi-camera" in reason
@@ -303,14 +353,16 @@ def test_build_session_header_rejects_uncropped_multi_camera() -> None:
 def test_build_session_header_requires_save_name() -> None:
     seq = useq.MDASequence(channels=["488nm"])  # pyright: ignore[reportArgumentType]
     settings = ArgusStreamSettingsV1(gpfs_scratch_root="/scratch")
-    header, reason = _build_session_header(seq, _StubCore(), settings, [])
+    header, reason = _build_session_header(seq, _geom(_StubCore()), settings, [])
     assert header is None
     assert "experiment name" in reason
 
 
 def test_build_session_header_requires_gpfs_scratch_root() -> None:
     settings = ArgusStreamSettingsV1()  # gpfs_scratch_root unset
-    header, reason = _build_session_header(_save_seq(), _StubCore(), settings, [])
+    header, reason = _build_session_header(
+        _save_seq(), _geom(_StubCore()), settings, []
+    )
     assert header is None
     assert "gpfs_scratch_root" in reason
 
@@ -329,7 +381,9 @@ def test_build_session_header_contains_every_field_the_receiver_requires() -> No
     this repo, before "fixing" it here.
     """
     settings = ArgusStreamSettingsV1(gpfs_scratch_root="/mmfs2/scratch/lab")
-    header, reason = _build_session_header(_save_seq(), _StubCore(), settings, [])
+    header, reason = _build_session_header(
+        _save_seq(), _geom(_StubCore()), settings, []
+    )
     assert reason == ""
     assert header is not None
     required = {
@@ -347,7 +401,7 @@ def test_build_session_header_contains_every_field_the_receiver_requires() -> No
 
 def test_build_session_header_asks_for_live_qc() -> None:
     settings = ArgusStreamSettingsV1(gpfs_scratch_root="/mmfs2/scratch/lab")
-    header, _ = _build_session_header(_save_seq(), _StubCore(), settings, [])
+    header, _ = _build_session_header(_save_seq(), _geom(_StubCore()), settings, [])
     assert header is not None
     assert header["accepts"] == ["qc"]
 
@@ -360,14 +414,13 @@ def test_build_session_header_asks_for_live_qc() -> None:
 def test_active_spectral_channels_disabled_returns_empty() -> None:
     seq = _save_seq()
     spectral = _spectral_settings(enabled=False)
-    assert _active_spectral_channels(seq, _StubCore(), spectral) == []
+    assert _active_spectral_channels(seq, ["Camera"], spectral) == []
 
 
 def test_active_spectral_channels_resolves_dual_camera() -> None:
     seq = _save_seq(channels=[{"config": ALL_LASERS, "group": LASER_GROUP}])
     spectral = _spectral_settings()
-    mmcore = _StubCore(num_channels=2, physical_cameras=["Camera-1", "Camera-2"])
-    active = _active_spectral_channels(seq, mmcore, spectral)
+    active = _active_spectral_channels(seq, ["Camera-1", "Camera-2"], spectral)
     assert [c.name for c in active] == [
         "GFP_488",
         "CalceinViolet_405",
@@ -384,7 +437,7 @@ def test_build_session_header_spectral_allows_multi_camera() -> None:
     mmcore = _StubCore(num_channels=2, physical_cameras=["Camera-1", "Camera-2"])
     active = _spectral_channels()
 
-    header, reason = _build_session_header(seq, mmcore, argus_settings, active)
+    header, reason = _build_session_header(seq, _geom(mmcore), argus_settings, active)
     assert reason == ""
     assert header is not None
     assert header["channels"] == [0, 1, 2, 3]
@@ -546,7 +599,8 @@ def test_session_skips_ineligible_run_without_touching_network(
     )
     states: list[StreamState] = []
     session = ArgusStreamSession(
-        _StubCore(num_channels=2),  # uncropped multi-camera -> ineligible
+        # uncropped multi-camera -> ineligible
+        _StubCore(num_channels=2, physical_cameras=["Camera-1", "Camera-2"]),
         _NoopTunnel(),  # pyright: ignore[reportArgumentType]
         get_settings=lambda: settings,
         on_state_changed=lambda s, _d: states.append(s),
@@ -714,3 +768,58 @@ def test_session_hands_qc_verdicts_to_the_callback_and_keeps_streaming(
         time.sleep(0.05)
     assert fake_receiver.messages[-1][0] == MSG_SESSION_END
     session.shutdown(timeout=1)
+
+
+def test_session_no_spurious_resume_after_long_idle_before_first_volume(
+    fake_receiver: _FakeReceiver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rig 2026-09-23: nothing is sent while a z-stack acquires, so the first
+    volume went out with the last ACK already long past _STALE_ACK_S and was
+    instantly treated as stale -- RESUME + resend every run, even though the
+    receiver ACKed promptly."""
+    monkeypatch.setattr(session_mod, "_STALE_ACK_S", 0.2)
+    settings = _full_settings(
+        ArgusStreamSettingsV1(
+            enabled=True, local_port=fake_receiver.port, gpfs_scratch_root="/scratch"
+        )
+    )
+    states: list[StreamState] = []
+    session = ArgusStreamSession(
+        _StubCore(),
+        _NoopTunnel(),  # pyright: ignore[reportArgumentType]
+        get_settings=lambda: settings,
+        on_state_changed=lambda s, _d: states.append(s),
+    )
+    seq = _save_seq(z_plan=None, channels=["488nm"])
+    session.sequenceStarted(seq, {})  # pyright: ignore[reportArgumentType]
+    time.sleep(0.6)  # "acquisition" idle, well past _STALE_ACK_S
+    session.frameReady(np.zeros((4, 4), dtype="uint16"), next(iter(seq)), {})  # pyright: ignore[reportArgumentType]
+    session.sequenceFinished(seq)
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if any(m[0] == MSG_SESSION_END for m in fake_receiver.messages):
+            break
+        time.sleep(0.05)
+
+    assert not any(m[0] == MSG_RESUME for m in fake_receiver.messages)
+    assert StreamState.RECONNECTING not in states
+    assert len(fake_receiver.frame_messages()) == 1
+    session.shutdown(timeout=1)
+
+
+@pytest.mark.parametrize("fmt", ["both", "ome-zarr", "tiff"])
+def test_build_session_header_carries_output_format(fmt: str) -> None:
+    settings = ArgusStreamSettingsV1(gpfs_scratch_root="/scratch", output_format=fmt)  # pyright: ignore[reportArgumentType]
+    header, reason = _build_session_header(
+        _save_seq(), _geom(_StubCore()), settings, []
+    )
+    assert reason == ""
+    assert header is not None
+    assert header["output_format"] == fmt
+
+
+def test_output_format_defaults_to_both_and_rejects_unknown() -> None:
+    assert ArgusStreamSettingsV1().output_format == "both"
+    with pytest.raises(ValueError):
+        ArgusStreamSettingsV1(output_format="png")  # pyright: ignore[reportArgumentType]

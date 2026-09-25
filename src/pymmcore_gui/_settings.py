@@ -289,6 +289,14 @@ class ArgusStreamSettingsV1(BaseMMSettings):
     not nested under a further ``base_name`` subdirectory. Streaming
     refuses to start if this is unset.
     """
+    output_format: Literal["both", "ome-zarr", "tiff"] = "both"
+    """Format the processed (deskewed/deconvolved) result is kept in on Argus.
+
+    ``"tiff"``: per-frame OME-TIFFs, which ChimeraX opens directly.
+    ``"ome-zarr"``: one pyramidal OME-Zarr per run (napari); the TIFF frames
+    are removed once the zarr copy is verified. ``"both"``: keep both, at
+    roughly twice the disk. PetaKit5D's MIPs are kept in every mode.
+    """
 
 
 class MdaWriterSettingsV1(BaseMMSettings):

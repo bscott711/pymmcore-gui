@@ -35,6 +35,15 @@ _VALID_TYPES = frozenset(
 )
 
 
+OutputFormat = Literal["tiff", "ome-zarr", "both"]
+"""Format the processed (DSR) result is kept in on Argus.
+
+Matches ``opym.stream.rawmirror.OUTPUT_FORMATS``: ``"tiff"`` keeps the
+OME-TIFF frames (ChimeraX), ``"ome-zarr"`` replaces them with one OME-Zarr
+(napari), ``"both"`` keeps both.
+"""
+
+
 class _SessionStartOptional(TypedDict, total=False):
     # Server -> client message types this client understands beyond ACK.
     # ["qc"] asks for MSG_QC; a receiver without live QC just never sends it.
@@ -70,6 +79,7 @@ class SessionStartHeader(_SessionStartOptional):
     z_step_um: float
     xy_pixel_size: float
     t_interval_s: float
+    output_format: OutputFormat
 
 
 class FrameHeader(TypedDict):
