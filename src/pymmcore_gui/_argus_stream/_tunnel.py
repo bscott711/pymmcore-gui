@@ -38,25 +38,12 @@ class ArgusTunnelManager:
         Local end of the forward -- what the ZMQ ``DEALER`` socket connects to.
     remote_port : int
         Port the Argus-side receiver binds to on ``127.0.0.1``.
-    reverse_port : int
-        Argus-side loopback port for a reverse forward back to this
-        machine's own local SSH server (``-R <reverse_port>:localhost:22``),
-        so Argus can deploy code changes to this machine over the same
-        connection. ``0`` (the default) omits ``-R`` entirely -- this
-        manager then behaves exactly as it did before this option existed.
     """
 
-    def __init__(
-        self,
-        ssh_host: str,
-        local_port: int,
-        remote_port: int,
-        reverse_port: int = 0,
-    ) -> None:
+    def __init__(self, ssh_host: str, local_port: int, remote_port: int) -> None:
         self._ssh_host = ssh_host
         self._local_port = local_port
         self._remote_port = remote_port
-        self._reverse_port = reverse_port
         self._proc: subprocess.Popen[bytes] | None = None
         self._monitor_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -104,10 +91,8 @@ class ArgusTunnelManager:
             "ServerAliveCountMax=3",
             "-L",
             f"{self._local_port}:127.0.0.1:{self._remote_port}",
+            self._ssh_host,
         ]
-        if self._reverse_port:
-            cmd += ["-R", f"{self._reverse_port}:localhost:22"]
-        cmd.append(self._ssh_host)
         creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         return subprocess.Popen(
             cmd,
@@ -128,14 +113,11 @@ class ArgusTunnelManager:
 
             logger.info(
                 "Argus SSH tunnel started (pid=%s, %s -> 127.0.0.1:%d via "
-                "127.0.0.1:%d%s)",
+                "127.0.0.1:%d)",
                 self._proc.pid,
                 self._ssh_host,
                 self._remote_port,
                 self._local_port,
-                f"; reverse admin port {self._reverse_port} open on Argus"
-                if self._reverse_port
-                else "",
             )
             while not self._stop_event.is_set():
                 if self._proc.poll() is not None:
