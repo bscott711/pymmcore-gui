@@ -260,6 +260,39 @@ def test_volume_assembler_stamps_first_and_last_plane_times() -> None:
     assert before <= vols[0].acq_first_s <= vols[0].acq_last_s <= time.time()
 
 
+def test_volume_assembler_slab_mode_hands_out_consecutive_planes() -> None:
+    seq = useq.MDASequence(z_plan=useq.ZRangeAround(range=4, step=1))  # 5 planes
+    asm = VolumeAssembler()
+    asm.reset(seq)
+    events = list(seq)
+    got = []
+    for event in events:
+        frame = np.full((4, 4), event.index["z"], dtype="uint16")
+        got.append(asm.add_plane(frame, event, {}, slab_planes=2))  # pyright: ignore[reportArgumentType]
+    # A 2-plane slab after planes 1 and 3; the 1-plane remainder at the end.
+    assert [len(g) for g in got] == [0, 1, 0, 1, 1]
+    slabs = [v for g in got for v in g]
+    assert [(v.z0, v.array.shape[0], v.nz) for v in slabs] == [
+        (0, 2, 5),
+        (2, 2, 5),
+        (4, 1, 5),
+    ]
+    assert [list(v.array[:, 0, 0]) for v in slabs] == [[0, 1], [2, 3], [4]]
+    assert all(v.acq_first_s <= v.acq_last_s for v in slabs)
+
+
+def test_volume_assembler_slab_waits_for_a_gap_to_fill() -> None:
+    seq = useq.MDASequence(z_plan=useq.ZRangeAround(range=2, step=1))  # 3 planes
+    asm = VolumeAssembler()
+    asm.reset(seq)
+    ev = {e.index["z"]: e for e in seq}
+    zero = np.zeros((4, 4), "uint16")
+    assert asm.add_plane(zero, ev[1], {}, slab_planes=1) == []  # pyright: ignore[reportArgumentType]
+    assert asm.add_plane(zero, ev[2], {}, slab_planes=1) == []  # pyright: ignore[reportArgumentType]
+    out = asm.add_plane(zero, ev[0], {}, slab_planes=1)  # pyright: ignore[reportArgumentType]
+    assert [v.z0 for v in out] == [0, 1, 2]
+
+
 def test_volume_assembler_is_axis_order_agnostic() -> None:
     """z-planes delivered in reverse order still land at the right index."""
     seq = useq.MDASequence(z_plan=useq.ZRangeAround(range=2, step=1))
@@ -488,6 +521,8 @@ class _FakeReceiver:
         # When set, ACKs carry server_time_s = time.time() + this skew, like
         # the real receiver (whose clock the client must correct for).
         self.clock_skew_s: float | None = None
+        # Advertised in every ACK when set (the real receiver sends ["slabs"]).
+        self.features: list[str] | None = None
         self._stop = threading.Event()
         self._identity: bytes | None = None
         self._session_id: str | None = None
@@ -519,6 +554,8 @@ class _FakeReceiver:
         header: AckHeader = {"through_frame_index": through_frame_index}
         if self.clock_skew_s is not None:
             header["server_time_s"] = time.time() + self.clock_skew_s
+        if self.features is not None:
+            header["features"] = self.features
         self.sock.send_multipart(
             [self._identity, *pack_message(MSG_ACK, self._session_id, header)]
         )
@@ -879,4 +916,140 @@ def test_frames_carry_trace_timestamps_and_the_measured_clock_offset(
             <= header["sent_s"]
         )
         assert header["clock_offset_s"] == pytest.approx(1000.0, abs=0.5)
+    session.shutdown(timeout=1)
+
+
+def _wait_for_session_end(receiver: _FakeReceiver) -> None:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if any(m[0] == MSG_SESSION_END for m in receiver.messages):
+            return
+        time.sleep(0.05)
+
+
+def test_volumes_stream_as_slabs_once_argus_advertises_them(
+    fake_receiver: _FakeReceiver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_receiver.features = ["slabs"]
+    monkeypatch.setattr(session_mod, "_SLAB_TARGET_BYTES", 1)  # 1 plane/slab
+    settings = _full_settings(
+        ArgusStreamSettingsV1(
+            enabled=True, local_port=fake_receiver.port, gpfs_scratch_root="/scratch"
+        )
+    )
+    session = ArgusStreamSession(
+        _StubCore(),  # pyright: ignore[reportArgumentType]
+        _NoopTunnel(),  # pyright: ignore[reportArgumentType]
+        get_settings=lambda: settings,
+    )
+    seq = _save_seq(z_plan=useq.ZRangeAround(range=1, step=1), channels=["488nm"])
+    session.sequenceStarted(seq, {})  # pyright: ignore[reportArgumentType]
+    time.sleep(0.3)  # the first ACK (with features) lands before any plane
+    for event in seq:
+        frame = np.full((4, 4), event.index["z"] + 1, dtype="uint16")
+        session.frameReady(frame, event, {})  # pyright: ignore[reportArgumentType]
+    session.sequenceFinished(seq)
+    _wait_for_session_end(fake_receiver)
+
+    frames = fake_receiver.frame_messages()
+    assert [(h["z0"], h["nz"], h["shape_zyx"]) for h, _p in frames] == [
+        (0, 2, [1, 4, 4]),
+        (1, 2, [1, 4, 4]),
+    ]
+    assert [np.frombuffer(p or b"", "uint16")[0] for _h, p in frames] == [1, 2]
+    assert [h["frame_index"] for h, _p in frames] == [0, 1]
+    session.shutdown(timeout=1)
+
+
+def test_whole_volumes_without_the_slabs_feature(fake_receiver: _FakeReceiver) -> None:
+    """An older receiver never advertises slabs, so it only ever gets whole
+    volumes -- no z0 field it wouldn't understand."""
+    settings = _full_settings(
+        ArgusStreamSettingsV1(
+            enabled=True, local_port=fake_receiver.port, gpfs_scratch_root="/scratch"
+        )
+    )
+    session = ArgusStreamSession(
+        _StubCore(),  # pyright: ignore[reportArgumentType]
+        _NoopTunnel(),  # pyright: ignore[reportArgumentType]
+        get_settings=lambda: settings,
+    )
+    seq = _save_seq(z_plan=useq.ZRangeAround(range=1, step=1), channels=["488nm"])
+    session.sequenceStarted(seq, {})  # pyright: ignore[reportArgumentType]
+    time.sleep(0.3)
+    _feed_frames(session, seq)
+    _wait_for_session_end(fake_receiver)
+    [(header, _payload)] = fake_receiver.frame_messages()
+    assert "z0" not in header and header["shape_zyx"] == [2, 4, 4]
+    session.shutdown(timeout=1)
+
+
+def _feed_frames(session: ArgusStreamSession, seq: useq.MDASequence) -> None:
+    for event in seq:
+        session.frameReady(np.zeros((4, 4), dtype="uint16"), event, {})  # pyright: ignore[reportArgumentType]
+    session.sequenceFinished(seq)
+
+
+def test_runs_go_direct_when_argus_answers_there() -> None:
+    direct, tunnel = _FakeReceiver(), _FakeReceiver()
+    try:
+        settings = _full_settings(
+            ArgusStreamSettingsV1(
+                enabled=True,
+                local_port=tunnel.port,
+                direct_endpoint=f"tcp://127.0.0.1:{direct.port}",
+                gpfs_scratch_root="/scratch",
+            )
+        )
+        states: list[tuple[StreamState, str]] = []
+        session = ArgusStreamSession(
+            _StubCore(),  # pyright: ignore[reportArgumentType]
+            _NoopTunnel(),  # pyright: ignore[reportArgumentType]
+            get_settings=lambda: settings,
+            on_state_changed=lambda s, d: states.append((s, d)),
+        )
+        seq = _save_seq(z_plan=None, channels=["488nm"])
+        session.sequenceStarted(seq, {})  # pyright: ignore[reportArgumentType]
+        _feed_frames(session, seq)
+        _wait_for_session_end(direct)
+        assert next(m[0] for m in direct.messages) == MSG_SESSION_START
+        assert len(direct.frame_messages()) == 1
+        assert tunnel.messages == []
+        assert (StreamState.STREAMING, "direct") in states
+        session.shutdown(timeout=1)
+    finally:
+        direct.close()
+        tunnel.close()
+
+
+def test_runs_fall_back_to_the_tunnel_when_direct_is_unreachable(
+    fake_receiver: _FakeReceiver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(session_mod, "_DIRECT_HANDSHAKE_S", 0.3)
+    dead = zmq.Context.instance().socket(zmq.ROUTER)
+    dead_port = dead.bind_to_random_port("tcp://127.0.0.1")
+    dead.close(linger=0)  # nothing listens there any more
+    settings = _full_settings(
+        ArgusStreamSettingsV1(
+            enabled=True,
+            local_port=fake_receiver.port,
+            direct_endpoint=f"tcp://127.0.0.1:{dead_port}",
+            gpfs_scratch_root="/scratch",
+        )
+    )
+    states: list[tuple[StreamState, str]] = []
+    session = ArgusStreamSession(
+        _StubCore(),  # pyright: ignore[reportArgumentType]
+        _NoopTunnel(),  # pyright: ignore[reportArgumentType]
+        get_settings=lambda: settings,
+        on_state_changed=lambda s, d: states.append((s, d)),
+    )
+    seq = _save_seq(z_plan=None, channels=["488nm"])
+    session.sequenceStarted(seq, {})  # pyright: ignore[reportArgumentType]
+    _feed_frames(session, seq)
+    _wait_for_session_end(fake_receiver)
+    types = [m[0] for m in fake_receiver.messages]
+    assert types[0] == MSG_SESSION_START and types[-1] == MSG_SESSION_END
+    assert len(fake_receiver.frame_messages()) == 1
+    assert (StreamState.STREAMING, "SSH tunnel") in states
     session.shutdown(timeout=1)

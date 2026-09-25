@@ -92,7 +92,14 @@ class _FrameTraceFields(TypedDict, total=False):
     clock_offset_s: float
 
 
-class FrameHeader(_FrameTraceFields):
+class _FrameSlabFields(TypedDict, total=False):
+    # Only once an ACK advertised "slabs": this FRAME carries planes
+    # [z0, z0 + shape_zyx[0]) of an nz-plane volume.
+    z0: int
+    nz: int
+
+
+class FrameHeader(_FrameTraceFields, _FrameSlabFields):
     """``FRAME`` header -- one per acquired volume, sent alongside its bytes.
 
     ``t``/``c`` are this volume's own acquisition indices, not send order --
@@ -142,6 +149,8 @@ class _AckOptional(TypedDict, total=False):
     # Argus's clock when it sent the ACK: lets the client estimate its clock
     # offset for the FRAME trace fields.
     server_time_s: float
+    # What this receiver supports beyond the base protocol ("slabs").
+    features: list[str]
 
 
 class AckHeader(_AckOptional):

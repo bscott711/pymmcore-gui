@@ -21,6 +21,16 @@ skipped, same as multi-position. Anything skipped is reported via a logged
 reason and a status callback, and still saves locally exactly as if
 streaming were disabled.
 
+Transport: when ``ArgusStreamSettingsV1.direct_endpoint`` is set, each run
+first connects straight to Argus over 10 GbE. If Argus hasn't answered
+SESSION_START within ``_DIRECT_HANDSHAKE_S``, the run falls back to the SSH
+tunnel, which stays up for exactly that. The tunnel topped out around
+33 MB/s, the largest delay in the live view (2026-09-25).
+
+Slabs: once Argus's first ACK advertises ``"slabs"``, each volume is sent as
+runs of about ``_SLAB_TARGET_BYTES`` of consecutive planes while it is still
+being acquired, instead of in one piece after its last plane.
+
 Live QC: every session asks for ``MSG_QC`` (``accepts: ["qc"]``). Argus's
 verdict on each timepoint -- is the cell cut off by a face of the volume,
 drifting out, defocused, bleaching, and what to change -- is handed to the
@@ -85,6 +95,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _STALE_ACK_S = 5.0
+# How long a run waits for Argus to answer SESSION_START over the direct
+# endpoint before falling back to the SSH tunnel.
+_DIRECT_HANDSHAKE_S = 3.0
+# Slab size: big enough that per-message overhead is negligible, small
+# enough that the last slab of a stack leaves right after its last plane.
+_SLAB_TARGET_BYTES = 16 * 1024 * 1024
+# SESSION_END must actually leave before the socket closes: with LINGER=0 it
+# was dropped, and both 100-timepoint runs on 2026-09-25 ended only by the
+# receiver's 10-minute idle timeout (holding its GPU lease all that time).
+_SESSION_END_LINGER_MS = 2000
 # The SESSION_START -> first ACK round trip gives the clock offset for the
 # FRAME trace fields; a reply slower than this is too blurry to use.
 _MAX_OFFSET_RTT_S = 2.0
@@ -315,10 +335,15 @@ class _RunWorker(threading.Thread):
         buffer_budget_bytes: int,
         on_state: Callable[[StreamState, str], None],
         on_qc: Callable[[QCHeader], None] | None = None,
+        direct_endpoint: str = "",
     ) -> None:
         super().__init__(name="ArgusStreamWorker", daemon=True)
         self._session_id = session_id
         self._local_port = local_port
+        self._direct_endpoint = direct_endpoint
+        # Set once an ACK advertises "slabs": the acquisition thread then
+        # starts new volumes in slab mode (see ArgusStreamSession).
+        self.slabs_enabled = threading.Event()
         self._header = header
         self._buffer_budget_bytes = buffer_budget_bytes
         self._on_state = on_state
@@ -331,7 +356,10 @@ class _RunWorker(threading.Thread):
         self._finish_reason: _SessionEndReason = "complete"
 
     def submit(self, volume: Volume) -> int:
-        """Queue one completed volume for sending; returns its ``frame_index``."""
+        """Queue one completed volume (or slab) for sending.
+
+        Returns its ``frame_index``.
+        """
         frame_index = self._next_frame_index
         self._next_frame_index += 1
         header: FrameHeader = {
@@ -346,6 +374,9 @@ class _RunWorker(threading.Thread):
             "acq_last_s": volume.acq_last_s,
             "queued_s": time.time(),
         }
+        if volume.nz is not None:
+            header["z0"] = volume.z0
+            header["nz"] = volume.nz
         payload = volume.array.tobytes()
         self._to_send.put((frame_index, header, payload))
         return frame_index
@@ -360,16 +391,44 @@ class _RunWorker(threading.Thread):
         self._abort_event.set()
         self._finish_event.set()
 
-    def run(self) -> None:
-        self._on_state(StreamState.CONNECTING, "")
-
-        ctx = zmq.Context.instance()
-        sock = ctx.socket(zmq.DEALER)
+    def _open_socket(self, endpoint: str) -> zmq.Socket:
+        sock = zmq.Context.instance().socket(zmq.DEALER)
         sock.setsockopt(zmq.IDENTITY, self._session_id.encode("utf-8"))
         sock.setsockopt(zmq.SNDHWM, 50)
         sock.setsockopt(zmq.LINGER, 0)
-        sock.connect(f"tcp://127.0.0.1:{self._local_port}")
+        sock.connect(endpoint)
+        return sock
 
+    def _start_session(self) -> tuple[zmq.Socket, str, float]:
+        """Connect and send SESSION_START, directly if Argus answers in time.
+
+        Falls back to the SSH tunnel otherwise. Returns the socket, a label
+        for the route taken, and when SESSION_START was sent (for the
+        clock-offset round trip). A direct answer is left unread for the main
+        loop, which also takes the clock offset and features from it.
+        """
+        start = pack_message(MSG_SESSION_START, self._session_id, self._header)
+        if self._direct_endpoint:
+            sock = self._open_socket(self._direct_endpoint)
+            sent_s = time.time()
+            sock.send_multipart(start)
+            if sock.poll(int(_DIRECT_HANDSHAKE_S * 1000)):
+                return sock, "direct", sent_s
+            sock.close(linger=0)
+            logger.warning(
+                "Argus direct endpoint %s did not answer within %.0f s; "
+                "streaming this run through the SSH tunnel",
+                self._direct_endpoint,
+                _DIRECT_HANDSHAKE_S,
+            )
+        sock = self._open_socket(f"tcp://127.0.0.1:{self._local_port}")
+        sent_s = time.time()
+        sock.send_multipart(start)
+        return sock, "SSH tunnel", sent_s
+
+    def run(self) -> None:
+        self._on_state(StreamState.CONNECTING, "")
+        sock, route, start_sent_s = self._start_session()
         poller = zmq.Poller()
         poller.register(sock, zmq.POLLIN)
 
@@ -389,12 +448,9 @@ class _RunWorker(threading.Thread):
                 pack_message(MSG_FRAME, self._session_id, header, payload)
             )
 
+        session_ended = False
         try:
-            start_sent_s = time.time()
-            sock.send_multipart(
-                pack_message(MSG_SESSION_START, self._session_id, self._header)
-            )
-            self._on_state(StreamState.STREAMING, "")
+            self._on_state(StreamState.STREAMING, route)
 
             while True:
                 if self._abort_event.is_set():
@@ -422,6 +478,8 @@ class _RunWorker(threading.Thread):
                     parts = sock.recv_multipart()
                     msg_type, _sid, ack_header, _payload = unpack_message(parts)
                     if msg_type == MSG_ACK:
+                        if "slabs" in cast("list", ack_header.get("features") or ()):
+                            self.slabs_enabled.set()
                         server_time = ack_header.get("server_time_s")
                         if clock_offset is None and server_time is not None:
                             now = time.time()
@@ -469,7 +527,7 @@ class _RunWorker(threading.Thread):
                 elif stale and unacked:
                     self._on_state(StreamState.RECONNECTING, "")
                 elif drained_any or not unacked:
-                    self._on_state(StreamState.STREAMING, "")
+                    self._on_state(StreamState.STREAMING, route)
 
                 if (
                     self._finish_event.is_set()
@@ -490,8 +548,9 @@ class _RunWorker(threading.Thread):
             sock.send_multipart(
                 pack_message(MSG_SESSION_END, self._session_id, {"reason": reason})
             )
+            session_ended = True
         finally:
-            sock.close(linger=0)
+            sock.close(linger=_SESSION_END_LINGER_MS if session_ended else 0)
             self._on_state(StreamState.IDLE, "")
 
 
@@ -580,6 +639,7 @@ class ArgusStreamSession:
             buffer_budget_bytes=argus.buffer_budget_mb * 1024 * 1024,
             on_state=self._emit_state,
             on_qc=self._on_qc,
+            direct_endpoint=argus.direct_endpoint,
         )
         self._all_workers = [w for w in self._all_workers if w.is_alive()]
         self._all_workers.append(self._worker)
@@ -588,9 +648,16 @@ class ArgusStreamSession:
     def _submit_if_complete(
         self, frame: np.ndarray, event: useq.MDAEvent, meta: FrameMetaV1
     ) -> None:
-        volume = self._assembler.add_frame(frame, event, meta)
-        if volume is not None and self._worker is not None:
-            self._worker.submit(volume)
+        worker = self._worker
+        if worker is None:
+            return
+        slab_planes = (
+            max(1, _SLAB_TARGET_BYTES // max(1, frame.nbytes))
+            if worker.slabs_enabled.is_set()
+            else 0
+        )
+        for ready in self._assembler.add_plane(frame, event, meta, slab_planes):
+            worker.submit(ready)
 
     def frameReady(
         self, frame: np.ndarray, event: useq.MDAEvent, meta: FrameMetaV1
