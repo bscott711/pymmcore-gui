@@ -46,6 +46,7 @@ from ._notification_manager import NotificationManager
 from ._settings import Settings
 from .actions import CoreAction, QCoreAction, WidgetAction, WidgetActionInfo
 from .actions._action_info import ActionInfo
+from .widgets._camera_toolbar import CameraToolBar
 from .widgets._toolbars import OCToolBar
 
 if TYPE_CHECKING:
@@ -170,10 +171,7 @@ class MicroManagerGUI(QMainWindow):
     # Toolbars are a mapping of strings to either a list of ActionKeys or a callable
     # that takes a CMMCorePlus instance and QMainWindow and returns a QToolBar.
     TOOLBARS: Mapping[str, ToolDictValue] = {
-        Toolbar.CAMERA_ACTIONS: [
-            CoreAction.SNAP,
-            CoreAction.TOGGLE_LIVE,
-        ],
+        Toolbar.CAMERA_ACTIONS: CameraToolBar,
         Toolbar.OPTICAL_CONFIGS: OCToolBar,
         # Toolbar.SHUTTERS: ShuttersToolbar,
         Toolbar.WIDGETS: [

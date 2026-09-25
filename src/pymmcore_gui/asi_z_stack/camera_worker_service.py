@@ -56,7 +56,7 @@ from .common import HardwareConstants
 from .worker_pool import CameraWorkerHandle, CameraWorkerPool
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
     import numpy as np
     from pymmcore_plus import CMMCorePlus
@@ -179,6 +179,8 @@ class CameraWorkerService(QObject):
     frameReady = pyqtSignal(str, int, object, object, int)
     #: (group, preset) after apply_worker_config succeeds.
     workerConfigChanged = pyqtSignal(str, str)
+    #: New Snap/Live exposure (ms) after set_exposure succeeds.
+    exposureChanged = pyqtSignal(float)
     liveStateChanged = pyqtSignal(bool)
     liveErrored = pyqtSignal(str)
     #: Internal: "camera_label has a new latest Live frame waiting." Carries
@@ -303,6 +305,14 @@ class CameraWorkerService(QObject):
             released.add(role)
         self._worker_config_groups = _detach_unloadable_config_groups(mmc, released)
         self._snapshot = release_cameras_for_workers(mmc, hw)
+        # What the workers will actually start with (their Exposure property
+        # is restored from this snapshot), rather than the composite's value.
+        for cam in self._snapshot.per_camera.values():
+            try:
+                self.last_known_exposure_ms = float(cam.property_values["Exposure"])
+                break
+            except (KeyError, ValueError):
+                continue
         with self._lock:
             self._state = CameraWorkerServiceState.SPAWNING
         type(self)._active = self
@@ -646,7 +656,51 @@ class CameraWorkerService(QObject):
             One of that group's presets.
         """
         cfg = self._worker_config_groups[group]
-        settings = cfg.presets[preset]
+        per_camera: dict[str, list[tuple[str, str]]] = {}
+        main_process: list[tuple[str, str, str]] = []
+        for dev, prop, val in cfg.presets[preset]:
+            if dev in self.camera_labels:
+                per_camera.setdefault(dev, []).append((prop, val))
+            elif self._mmc is not None and dev in self._mmc.getLoadedDevices():
+                main_process.append((dev, prop, val))
+            else:
+                logger.debug(f"Skipping {group}/{preset}: {dev} is not loaded.")
+
+        self._set_camera_properties(per_camera, main_process)
+        cfg.current = preset
+        self.workerConfigChanged.emit(group, preset)
+
+    def set_exposure(self, exposure_ms: float) -> None:
+        """Set every worker-owned camera's exposure for Snap/Live.
+
+        The main-process core has no camera to take ``setExposure``. A
+        hardware-triggered MDA doesn't use this (Level Trigger: PLogic's pulse
+        width sets the exposure) but does fall back to
+        :attr:`last_known_exposure_ms` when a sequence carries no exposure.
+
+        Parameters
+        ----------
+        exposure_ms : float
+            Exposure in milliseconds.
+        """
+        value = f"{exposure_ms:g}"
+        self._set_camera_properties(
+            {label: [("Exposure", value)] for label in self.camera_labels}
+        )
+        self.last_known_exposure_ms = exposure_ms
+        self.exposureChanged.emit(exposure_ms)
+
+    def _set_camera_properties(
+        self,
+        per_camera: dict[str, list[tuple[str, str]]],
+        main_process: Sequence[tuple[str, str, str]] = (),
+    ) -> None:
+        """Set properties on worker-owned cameras (and any main-process devices).
+
+        Live is stopped around the change and restarted, since the worker only
+        takes property commands while idle and PVCAM rejects settings like
+        ``Port`` mid-acquisition. Refused while an MDA holds the pool.
+        """
         with self._lock:
             state = self._state
             pool = self._pool
@@ -656,16 +710,6 @@ class CameraWorkerService(QObject):
             raise RuntimeError(
                 f"Camera workers are not ready yet (state={state.name})."
             )
-
-        per_camera: dict[str, list[tuple[str, str]]] = {}
-        main_process: list[tuple[str, str, str]] = []
-        for dev, prop, val in settings:
-            if dev in self.camera_labels:
-                per_camera.setdefault(dev, []).append((prop, val))
-            elif self._mmc is not None and dev in self._mmc.getLoadedDevices():
-                main_process.append((dev, prop, val))
-            else:
-                logger.debug(f"Skipping {group}/{preset}: {dev} is not loaded.")
 
         was_live = state is CameraWorkerServiceState.LIVE
         if was_live:
@@ -685,8 +729,6 @@ class CameraWorkerService(QObject):
         finally:
             if was_live:
                 self.start_live()
-        cfg.current = preset
-        self.workerConfigChanged.emit(group, preset)
 
     # ------------------------------------------------------------------
     # ROI (Camera ROI widget)

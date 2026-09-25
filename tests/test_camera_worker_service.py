@@ -216,3 +216,79 @@ def test_snap_arms_internal_trigger_and_drains(core: CMMCorePlus) -> None:
     assert pool.arm_all.call_args.kwargs["external_trigger"] is False
     pool.stop_and_drain.assert_called_once()
     pool.stop_all.assert_not_called()
+
+
+def test_set_exposure_routes_to_every_worker(core: CMMCorePlus) -> None:
+    pool = _FakePool()
+    svc = _service(core, pool)
+    seen: list[float] = []
+    svc.exposureChanged.connect(seen.append)
+
+    svc.set_exposure(25.5)
+
+    assert pool.calls == [
+        ("Camera-1", (("Exposure", "25.5"),)),
+        ("Camera-2", (("Exposure", "25.5"),)),
+    ]
+    assert svc.last_known_exposure_ms == 25.5
+    assert seen == [25.5]
+    assert svc._snapshot is not None
+    assert svc._snapshot.per_camera["Camera-2"].property_values["Exposure"] == "25.5"
+
+
+def test_set_exposure_refused_during_mda(core: CMMCorePlus) -> None:
+    pool = _FakePool()
+    svc = _service(core, pool)
+    svc.last_known_exposure_ms = 10.0
+    svc._state = CameraWorkerServiceState.MDA
+    with pytest.raises(RuntimeError, match="MDA"):
+        svc.set_exposure(50.0)
+    assert pool.calls == []
+    assert svc.last_known_exposure_ms == 10.0
+
+
+def test_exposure_widget_uses_service_when_active(
+    qtbot: QtBot, core: CMMCorePlus
+) -> None:
+    from pymmcore_gui.widgets._exposure_widget import ExposureWidget
+
+    core.unloadDevice("Camera")  # like the rig: no camera in the main core
+    pool = _FakePool()
+    svc = _service(core, pool)
+    svc.last_known_exposure_ms = 12.0
+    CameraWorkerService._active = svc
+    try:
+        wdg = ExposureWidget(core)
+        qtbot.addWidget(wdg)
+        assert wdg.isEnabled()
+        assert wdg.spin.value() == 12.0
+
+        wdg.spin.setValue(40.0)
+        assert pool.calls[-1] == ("Camera-2", (("Exposure", "40"),))
+        assert svc.last_known_exposure_ms == 40.0
+
+        # A refused change shows a warning and reverts the box.
+        svc._state = CameraWorkerServiceState.MDA
+        with patch("pymmcore_gui.widgets._exposure_widget.QMessageBox.warning") as w:
+            wdg.spin.setValue(80.0)
+        w.assert_called_once()
+        assert wdg.spin.value() == 40.0
+    finally:
+        CameraWorkerService._active = None
+
+
+def test_exposure_widget_uses_core_without_service(
+    qtbot: QtBot, core: CMMCorePlus
+) -> None:
+    from pymmcore_gui.widgets._exposure_widget import ExposureWidget
+
+    wdg = ExposureWidget(core)
+    qtbot.addWidget(wdg)
+    assert wdg.spin.value() == pytest.approx(core.getExposure())
+
+    wdg.spin.setValue(33.0)
+    assert core.getExposure() == pytest.approx(33.0)
+
+    # Under a QApplication, core events are Qt signals delivered via the loop.
+    core.setExposure(7.0)
+    qtbot.waitUntil(lambda: wdg.spin.value() == pytest.approx(7.0), timeout=2000)

@@ -472,3 +472,14 @@ def test_argus_tunnel_not_started_at_launch_when_disabled(
     qtbot.addWidget(gui)
 
     assert started == []
+
+
+def test_camera_toolbar_has_snap_live_and_exposure(gui: MicroManagerGUI) -> None:
+    from pymmcore_gui.widgets._camera_toolbar import CameraToolBar
+
+    toolbar = gui.findChild(CameraToolBar)
+    assert toolbar is not None
+    assert toolbar.objectName() == "Camera Actions"  # saved layouts still restore
+    assert gui.get_action(CoreAction.SNAP) in toolbar.actions()
+    assert gui.get_action(CoreAction.TOGGLE_LIVE) in toolbar.actions()
+    assert toolbar.exposure.spin.value() == pytest.approx(gui._mmc.getExposure())
