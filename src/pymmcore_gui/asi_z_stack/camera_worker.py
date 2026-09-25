@@ -243,6 +243,7 @@ def _drain_sequence(
     slice_idx = 0
     images_collected = 0
     last_image_time = time.monotonic()
+    last_stall_report = 0.0
 
     while images_collected < n_images:
         stop_signal = _drain_incoming(conn, free_slots)
@@ -299,7 +300,11 @@ def _drain_sequence(
             return False
         else:
             now = time.monotonic()
-            if now - last_image_time > _STALL_TIMEOUT_S:
+            if (
+                now - last_image_time > _STALL_TIMEOUT_S
+                and now - last_stall_report >= 1.0
+            ):
+                last_stall_report = now
                 conn.send(
                     StalledMsg(
                         camera_label=label,

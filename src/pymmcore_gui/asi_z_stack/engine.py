@@ -330,6 +330,31 @@ class _ASITriggerEngineBase(MDAEngine):
                 "HardwareConstants.worker_circular_buffer_mb."
             )
 
+    def _fit_slice_period_to_exposure(self) -> None:
+        """Stretch the galvo card's per-slice period to cover the exposure.
+
+        The card's slice period is max(delay+duration) over its scan/camera/
+        laser phases, and nothing else here sets it -- measured on the rig
+        (2026-09-23) at a fixed ~36 ms (SPIMDelayBeforeLaser 25.75 +
+        SPIMLaserDuration 10) regardless of exposure. With a 100 ms exposure
+        the non-retriggerable PLogic camera pulse swallowed most slice
+        triggers, the cameras got ~50 of 301 frames, and the run stalled.
+        Lasers and cameras are driven by PLogic, not the card's own laser
+        output, so this only lengthens each slice; at 10 ms exposure it
+        leaves the card exactly as it was.
+        """
+        self.mmcore.setProperty(
+            self.hw.galvo_a_label, "SPIMLaserDuration(ms)", f"{self._exposure_ms:.4f}"
+        )
+        delay_before_laser = float(
+            self.mmcore.getProperty(self.hw.galvo_a_label, "SPIMDelayBeforeLaser(ms)")
+        )
+        logger.info(
+            f"Galvo slice period >= {delay_before_laser + self._exposure_ms:.2f} ms "
+            f"(SPIMDelayBeforeLaser {delay_before_laser:.2f} + "
+            f"SPIMLaserDuration {self._exposure_ms:.2f})."
+        )
+
     def _reset_channel_config_cache(self) -> None:
         """Force the next per-channel config switch to actually happen.
 
@@ -787,7 +812,8 @@ class ASISPIMEngine(_ASITriggerEngineBase):
             "SPIMDelayBeforeSide(ms)",
             str(self.hw.delay_before_side_ms),
         )
-        # Deliberately not touching ASI's native per-slice camera/laser
+        self._fit_slice_period_to_exposure()
+        # Deliberately not touching ASI's other native per-slice camera/laser
         # trigger properties (SPIMDelayBeforeScan(ms), SPIMDelayBeforeCamera(ms),
         # SPIMCameraDuration(ms), SPIMDelayBeforeLaser(ms), SPIMLaserDuration(ms))
         # -- the microscope-control sibling repo's confirmed-working engine
@@ -1007,6 +1033,7 @@ class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
             "SPIMDelayBeforeSide(ms)",
             str(self.hw.delay_before_side_ms),
         )
+        self._fit_slice_period_to_exposure()
 
         # 5. Arm the piezo in parallel, also held stationary. Matches ASI's
         # reference (prepareControllerForAquisition_Side): the piezo is

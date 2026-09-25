@@ -292,6 +292,11 @@ class CameraWorkerPool:
             workers.
         """
         active = {w.camera_label: w for w in self.workers}
+        frames_seen = dict.fromkeys(active, 0)
+        # Measured from the last *frame*, not the last message: a stalled
+        # worker keeps sending StalledMsg, which used to reset this guard
+        # forever -- the MDA hung with no error and could not be cancelled.
+        last_frame_time = time.monotonic()
         while active:
             conn_map: dict[Any, CameraWorkerHandle] = {}
             sentinel_map: dict[Any, CameraWorkerHandle] = {}
@@ -300,11 +305,17 @@ class CameraWorkerPool:
                 conn_map[worker.conn] = worker
                 sentinel_map[worker.process.sentinel] = worker
 
-            ready = mp_wait([*conn_map, *sentinel_map], timeout=stall_timeout_s)
+            remaining_s = stall_timeout_s - (time.monotonic() - last_frame_time)
+            ready = (
+                mp_wait([*conn_map, *sentinel_map], timeout=remaining_s)
+                if remaining_s > 0
+                else []
+            )
             if not ready:
                 raise TimeoutError(
-                    f"no message from any camera worker for {stall_timeout_s:.1f}s "
-                    f"(still waiting on {sorted(active)})"
+                    f"no frame from any camera worker for {stall_timeout_s:.1f}s "
+                    f"(frames received so far: {frames_seen}; still waiting on "
+                    f"{sorted(active)}) -- the cameras stopped being triggered"
                 )
 
             for obj in ready:
@@ -316,6 +327,8 @@ class CameraWorkerPool:
                 if isinstance(msg, FrameMsg):
                     img = worker.read_frame(msg.slot_index, msg.nbytes)
                     worker.conn.send(SlotFreeCmd(msg.slot_index))  # type: ignore[union-attr]
+                    frames_seen[worker.camera_label] += 1
+                    last_frame_time = time.monotonic()
                     yield (
                         worker.camera_label,
                         msg.slice_idx,
