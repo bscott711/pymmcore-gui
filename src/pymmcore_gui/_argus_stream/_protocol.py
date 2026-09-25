@@ -19,7 +19,7 @@ itself, so there is no additional length-prefixing to implement.
 
 from __future__ import annotations
 
-from typing import Literal, TypedDict
+from typing import Any, Literal, TypedDict
 
 import msgpack
 
@@ -28,13 +28,20 @@ MSG_FRAME = b"FRAME"
 MSG_SESSION_END = b"SESSION_END"
 MSG_ACK = b"ACK"
 MSG_RESUME = b"RESUME"
+MSG_QC = b"QC"
 
 _VALID_TYPES = frozenset(
-    {MSG_SESSION_START, MSG_FRAME, MSG_SESSION_END, MSG_ACK, MSG_RESUME}
+    {MSG_SESSION_START, MSG_FRAME, MSG_SESSION_END, MSG_ACK, MSG_RESUME, MSG_QC}
 )
 
 
-class SessionStartHeader(TypedDict):
+class _SessionStartOptional(TypedDict, total=False):
+    # Server -> client message types this client understands beyond ACK.
+    # ["qc"] asks for MSG_QC; a receiver without live QC just never sends it.
+    accepts: list[str]
+
+
+class SessionStartHeader(_SessionStartOptional):
     """``SESSION_START`` header -- sent once, before any ``FRAME`` message.
 
     Fields match ``opym.stream.receiver.StreamReceiver._handle_session_start``
@@ -84,6 +91,27 @@ class FrameHeader(TypedDict):
     dtype: str
 
 
+class QCHeader(TypedDict, total=False):
+    """``QC`` header -- server -> client, only if ``accepts`` has ``"qc"``.
+
+    The Argus live QC service's verdict on one timepoint, forwarded as it
+    wrote it (``opym.stream.protocol`` documents the fields). Advisory only:
+    nothing on Argus waits for a reply. There are two per timepoint:
+    ``stage == "raw"`` about a second after the frames land (coverage, drift,
+    focus, signal), then ``"dsr"`` once deskewed (adds the cell's box).
+    Unknown fields must be ignored; new ones may be added.
+    """
+
+    seq: int
+    session_id: str
+    t: int
+    stage: str
+    verdict: Literal["ok", "warn", "act", "no_cell"]
+    flags: list[str]
+    advice: list[dict[str, Any]]
+    metrics: dict[str, Any]
+
+
 class SessionEndHeader(TypedDict):
     """``SESSION_END`` header."""
 
@@ -110,7 +138,12 @@ class ResumeHeader(TypedDict):
 
 
 MessageHeader = (
-    SessionStartHeader | FrameHeader | SessionEndHeader | AckHeader | ResumeHeader
+    SessionStartHeader
+    | FrameHeader
+    | SessionEndHeader
+    | AckHeader
+    | ResumeHeader
+    | QCHeader
 )
 
 

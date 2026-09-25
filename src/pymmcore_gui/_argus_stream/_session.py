@@ -20,6 +20,11 @@ channel. An uncropped multi-camera acquisition has no such resolution and is
 skipped, same as multi-position. Anything skipped is reported via a logged
 reason and a status callback, and still saves locally exactly as if
 streaming were disabled.
+
+Live QC: every session asks for ``MSG_QC`` (``accepts: ["qc"]``). Argus's
+verdict on each timepoint -- is the cell cut off by a face of the volume,
+drifting out, defocused, bleaching, and what to change -- is handed to the
+``on_qc`` callback, from the sender thread (marshal it before touching Qt).
 """
 
 from __future__ import annotations
@@ -49,10 +54,12 @@ from pymmcore_gui._vendored.mda_handlers._util import position_sizes
 from ._protocol import (
     MSG_ACK,
     MSG_FRAME,
+    MSG_QC,
     MSG_RESUME,
     MSG_SESSION_END,
     MSG_SESSION_START,
     FrameHeader,
+    QCHeader,
     SessionStartHeader,
     pack_message,
     unpack_message,
@@ -222,6 +229,7 @@ def _build_session_header(
         "z_step_um": float(z_step_um),
         "xy_pixel_size": float(mmcore.getPixelSizeUm() or 0.0),
         "t_interval_s": float(t_interval_s),
+        "accepts": ["qc"],
     }
     return header, ""
 
@@ -241,6 +249,7 @@ class _RunWorker(threading.Thread):
         header: SessionStartHeader,
         buffer_budget_bytes: int,
         on_state: Callable[[StreamState, str], None],
+        on_qc: Callable[[QCHeader], None] | None = None,
     ) -> None:
         super().__init__(name="ArgusStreamWorker", daemon=True)
         self._session_id = session_id
@@ -248,6 +257,7 @@ class _RunWorker(threading.Thread):
         self._header = header
         self._buffer_budget_bytes = buffer_budget_bytes
         self._on_state = on_state
+        self._on_qc = on_qc
 
         self._to_send: queue.Queue[tuple[int, FrameHeader, bytes]] = queue.Queue()
         self._next_frame_index = 0
@@ -349,6 +359,13 @@ class _RunWorker(threading.Thread):
                                     )
                                 )
                             resume_pending = False
+                    elif msg_type == MSG_QC and self._on_qc is not None:
+                        # Advisory; a failing consumer must never stall the
+                        # send/ACK loop.
+                        try:
+                            self._on_qc(cast("QCHeader", ack_header))
+                        except Exception:
+                            logger.exception("Argus QC callback failed")
 
                 stale = time.monotonic() - last_ack_time > _STALE_ACK_S
                 if stale and unacked and not resume_pending:
@@ -404,11 +421,13 @@ class ArgusStreamSession:
         tunnel: ArgusTunnelManager,
         get_settings: Callable[[], SettingsV1],
         on_state_changed: Callable[[StreamState, str], None] | None = None,
+        on_qc: Callable[[QCHeader], None] | None = None,
     ) -> None:
         self._mmc = mmcore
         self._tunnel = tunnel
         self._get_settings = get_settings
         self._on_state_changed = on_state_changed
+        self._on_qc = on_qc
         self._assembler = VolumeAssembler()
         # The worker for the run currently in progress -- frameReady routes
         # to this one. Cleared at sequenceFinished/sequenceCanceled, but the
@@ -470,6 +489,7 @@ class ArgusStreamSession:
             header=header,
             buffer_budget_bytes=argus.buffer_budget_mb * 1024 * 1024,
             on_state=self._emit_state,
+            on_qc=self._on_qc,
         )
         self._all_workers = [w for w in self._all_workers if w.is_alive()]
         self._all_workers.append(self._worker)

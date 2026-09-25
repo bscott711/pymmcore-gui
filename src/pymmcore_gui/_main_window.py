@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections import deque
 from collections.abc import Callable
 from contextlib import suppress
 from enum import Enum
@@ -141,6 +142,7 @@ class _ArgusStatusRelay(QObject):
     """
 
     stateChanged = pyqtSignal(str, str)
+    qcReceived = pyqtSignal(object)  # a QCHeader dict
 
 
 _ARGUS_STATE_TEXT = {
@@ -201,6 +203,7 @@ class MicroManagerGUI(QMainWindow):
             WidgetAction.CRISP,
             WidgetAction.SPECTRAL_CHANNELS,
             WidgetAction.CAMERA_ALIGNMENT,
+            WidgetAction.ARGUS_QC,
         ],
         Menu.HELP: [],
     }
@@ -270,7 +273,12 @@ class MicroManagerGUI(QMainWindow):
             on_state_changed=lambda state, detail: (
                 self._argus_status_relay.stateChanged.emit(state.value, detail)
             ),
+            on_qc=self._argus_status_relay.qcReceived.emit,
         )
+        # Recent QC verdicts, so the Argus QC panel shows the run so far when
+        # it's opened mid-acquisition.
+        self.argus_qc_history: deque[dict] = deque(maxlen=200)
+        self.argus_qc_received = self._argus_status_relay.qcReceived
         argus_mda_ev = self._mmc.mda.events
         argus_mda_ev.sequenceStarted.connect(self._argus_stream.sequenceStarted)
         argus_mda_ev.frameReady.connect(self._argus_stream.frameReady)
@@ -286,6 +294,9 @@ class MicroManagerGUI(QMainWindow):
         self._argus_status_label = QLabel(_ARGUS_STATE_TEXT[StreamState.DISABLED])
         self._argus_status_relay.stateChanged.connect(self._on_argus_state_changed)
         self._status_bar.addPermanentWidget(self._argus_status_label)
+        self._argus_qc_label = QLabel("")
+        self._argus_status_relay.qcReceived.connect(self._on_argus_qc)
+        self._status_bar.addPermanentWidget(self._argus_qc_label)
 
         self.bell_button = QPushButton(QIconifyIcon("codicon:bell"), None)
         self.bell_button.setFixedWidth(20)
@@ -615,6 +626,17 @@ class MicroManagerGUI(QMainWindow):
     def _on_argus_state_changed(self, state: str, detail: str) -> None:
         text = _ARGUS_STATE_TEXT.get(StreamState(state), f"Argus: {state}")
         self._argus_status_label.setText(f"{text} ({detail})" if detail else text)
+
+    def _on_argus_qc(self, rec: dict) -> None:
+        from pymmcore_gui.widgets._argus_qc import VERDICT_COLORS
+
+        self.argus_qc_history.append(rec)
+        verdict = str(rec.get("verdict", ""))
+        self._argus_qc_label.setText(f"QC t={rec.get('t', '?')}: {verdict}")
+        self._argus_qc_label.setStyleSheet(
+            f"color: {VERDICT_COLORS.get(verdict, '#808080')}; font-weight: bold;"
+        )
+        self._argus_qc_label.setToolTip("\n".join(rec.get("flags") or []))
 
     def _confirm_close_with_running_mda(self) -> bool:
         box = QMessageBox(
