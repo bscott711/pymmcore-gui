@@ -100,3 +100,44 @@ def test_iter_frames_times_out_when_worker_only_reports_stalls() -> None:
     finally:
         stop.set()
         spammer.join(timeout=1)
+
+
+def test_set_properties_round_trip_and_error() -> None:
+    import threading
+    from multiprocessing import Pipe
+
+    import pytest
+
+    from pymmcore_gui.asi_z_stack.worker_messages import (
+        PropertiesSetMsg,
+        SetPropertiesCmd,
+    )
+    from pymmcore_gui.asi_z_stack.worker_pool import CameraWorkerHandle
+
+    parent, child = Pipe(duplex=True)
+    handle = CameraWorkerHandle(
+        "Camera-1",
+        None,  # type: ignore[arg-type]
+        height=1,
+        width=1,
+        dtype="uint16",
+        n_slots=1,
+    )
+    handle.conn = parent
+    received: list[SetPropertiesCmd] = []
+
+    def _reply(error: str | None) -> None:
+        received.append(child.recv())
+        child.send(PropertiesSetMsg("Camera-1", error=error))
+
+    t = threading.Thread(target=_reply, args=(None,))
+    t.start()
+    handle.set_properties((("Port", "Sensitivity"),), timeout=2.0)
+    t.join()
+    assert received == [SetPropertiesCmd("Camera-1", (("Port", "Sensitivity"),))]
+
+    t = threading.Thread(target=_reply, args=("Invalid property value",))
+    t.start()
+    with pytest.raises(RuntimeError, match="Invalid property value"):
+        handle.set_properties((("Port", "Bogus"),), timeout=2.0)
+    t.join()

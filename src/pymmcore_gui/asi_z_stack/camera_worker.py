@@ -33,8 +33,10 @@ from .worker_messages import (
     ErrorMsg,
     FrameMsg,
     GetROICmd,
+    PropertiesSetMsg,
     ReadyMsg,
     RoiMsg,
+    SetPropertiesCmd,
     SetROICmd,
     ShutdownCmd,
     SlotFreeCmd,
@@ -558,6 +560,15 @@ def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
                     conn.send(RoiMsg(label, x, y, w, h))
                 except Exception as exc:
                     conn.send(RoiMsg(label, 0, 0, 0, 0, error=str(exc)))
+            elif isinstance(cmd, SetPropertiesCmd):
+                # Idle-loop only, like SetROICmd: e.g. PVCAM rejects a Port
+                # change while a sequence is running.
+                try:
+                    for prop, value in cmd.values:
+                        mmc.setProperty(label, prop, value)
+                    conn.send(PropertiesSetMsg(label))
+                except Exception as exc:
+                    conn.send(PropertiesSetMsg(label, error=str(exc)))
             elif isinstance(cmd, GetROICmd):
                 try:
                     x, y, w, h = mmc.getROI(label)

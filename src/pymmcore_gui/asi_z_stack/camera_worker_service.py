@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, ClassVar
 
@@ -61,6 +62,77 @@ if TYPE_CHECKING:
     from pymmcore_plus import CMMCorePlus
 
 logger = logging.getLogger(__name__)
+
+
+def has_camera(mmc: CMMCorePlus) -> bool:
+    """Whether Snap/Live have a camera to act on.
+
+    ``mmc.getCameraDevice()`` is ``""`` once the service has released the
+    cameras (unloading the current camera clears the Core camera role), so a
+    plain truthiness check on it would leave Snap/Live disabled for the whole
+    session on the worker-owned rig.
+
+    Parameters
+    ----------
+    mmc : CMMCorePlus
+        The main-process core.
+    """
+    return bool(mmc.getCameraDevice()) or CameraWorkerService.get_active() is not None
+
+
+@dataclass
+class WorkerConfigGroup:
+    """A config group that touches a device the main process no longer has.
+
+    Captured by :meth:`CameraWorkerService.begin_release` while every device
+    is still loaded, then deleted from the main-process core: once a
+    referenced device is unloaded, ``getCurrentConfig``/``setConfig`` on the
+    group raise ``No device with label ...``, which takes down every
+    consumer that walks all groups (the Config Groups widget, MDA summary
+    metadata). Presets are applied through
+    :meth:`CameraWorkerService.apply_worker_config` instead.
+    """
+
+    #: preset name -> ordered (device, property, value) settings.
+    presets: dict[str, tuple[tuple[str, str, str], ...]]
+    #: The preset in effect at release time ("" if none matched), then
+    #: whatever apply_worker_config last applied.
+    current: str
+
+
+def _detach_unloadable_config_groups(
+    mmc: CMMCorePlus, released: set[str]
+) -> dict[str, WorkerConfigGroup]:
+    """Capture and delete every config group that references a *released* device.
+
+    Must run while the *released* devices are still loaded (for
+    ``getCurrentConfig``).
+
+    Parameters
+    ----------
+    mmc : CMMCorePlus
+        The main-process core.
+    released : set[str]
+        Labels of every device about to be unloaded from *mmc*.
+    """
+    groups: dict[str, WorkerConfigGroup] = {}
+    for group in mmc.getAvailableConfigGroups():
+        presets = {
+            str(preset): tuple(
+                (dev, prop, val) for dev, prop, val in mmc.getConfigData(group, preset)
+            )
+            for preset in mmc.getAvailableConfigs(group)
+        }
+        if not any(dev in released for s in presets.values() for dev, _, _ in s):
+            continue
+        try:
+            current = str(mmc.getCurrentConfig(group))
+        except Exception:
+            current = ""
+        groups[str(group)] = WorkerConfigGroup(presets=presets, current=current)
+    for name in groups:
+        mmc.deleteConfigGroup(name)
+    return groups
 
 
 class CameraWorkerServiceState(Enum):
@@ -105,6 +177,8 @@ class CameraWorkerService(QObject):
     #: typed ``object`` (not ``np.ndarray``/``dict`` directly) for
     #: guaranteed-safe PyQt signal marshaling.
     frameReady = pyqtSignal(str, int, object, object, int)
+    #: (group, preset) after apply_worker_config succeeds.
+    workerConfigChanged = pyqtSignal(str, str)
     liveStateChanged = pyqtSignal(bool)
     liveErrored = pyqtSignal(str)
     #: Internal: "camera_label has a new latest Live frame waiting." Carries
@@ -117,6 +191,7 @@ class CameraWorkerService(QObject):
         self._state = CameraWorkerServiceState.INACTIVE
         self._pool: CameraWorkerPool | None = None
         self._snapshot: CameraHandoffSnapshot | None = None
+        self._worker_config_groups: dict[str, WorkerConfigGroup] = {}
         self._live_thread: threading.Thread | None = None
         #: Latest undelivered Live frame per camera, written by the drain
         #: thread and consumed on the GUI thread. Guarded by self._lock.
@@ -167,6 +242,11 @@ class CameraWorkerService(QObject):
         """Cached image/camera geometry captured once at :meth:`begin_release`."""
         return self._snapshot
 
+    @property
+    def worker_config_groups(self) -> dict[str, WorkerConfigGroup]:
+        """Config groups moved off the main-process core at :meth:`begin_release`."""
+        return self._worker_config_groups
+
     # ------------------------------------------------------------------
     # Startup (see _main_window.py::_on_system_config_loaded)
     # ------------------------------------------------------------------
@@ -214,6 +294,14 @@ class CameraWorkerService(QObject):
             self.last_known_exposure_ms = mmc.getExposure()
         except Exception:
             pass
+        # Everything release_cameras_for_workers is about to unload: the
+        # physical cameras plus the Multi Camera composite (when it's the
+        # Core camera). Groups referencing any of them must come off the core
+        # first -- see WorkerConfigGroup.
+        released = set(labels)
+        if len(labels) > 1 and (role := mmc.getCameraDevice()):
+            released.add(role)
+        self._worker_config_groups = _detach_unloadable_config_groups(mmc, released)
         self._snapshot = release_cameras_for_workers(mmc, hw)
         with self._lock:
             self._state = CameraWorkerServiceState.SPAWNING
@@ -341,6 +429,7 @@ class CameraWorkerService(QObject):
             was_active = self._state is not CameraWorkerServiceState.INACTIVE
             self._state = CameraWorkerServiceState.INACTIVE
         self._snapshot = None
+        self._worker_config_groups = {}
         if type(self)._active is self:
             type(self)._active = None
         if pool is not None:
@@ -521,6 +610,70 @@ class CameraWorkerService(QObject):
         with self._lock:
             if self._state is CameraWorkerServiceState.MDA:
                 self._state = CameraWorkerServiceState.IDLE
+
+    # ------------------------------------------------------------------
+    # Config groups touching worker-owned cameras
+    # ------------------------------------------------------------------
+
+    def apply_worker_config(self, group: str, preset: str) -> None:
+        """Apply *preset* of a :attr:`worker_config_groups` group.
+
+        Settings on a worker-owned camera go to that camera's worker; settings
+        on devices still loaded in the main process go to ``mmc.setProperty``;
+        settings on other released devices (the ``Multi Camera`` composite,
+        which exists in neither place anymore) are skipped. Live is stopped
+        around the change and restarted, since PVCAM rejects settings like
+        ``Port`` mid-acquisition. Refused while an MDA holds the pool.
+
+        Parameters
+        ----------
+        group : str
+            A key of :attr:`worker_config_groups`.
+        preset : str
+            One of that group's presets.
+        """
+        cfg = self._worker_config_groups[group]
+        settings = cfg.presets[preset]
+        with self._lock:
+            state = self._state
+            pool = self._pool
+        if state is CameraWorkerServiceState.MDA:
+            raise RuntimeError("Cannot change camera settings while an MDA is running.")
+        if pool is None:
+            raise RuntimeError(
+                f"Camera workers are not ready yet (state={state.name})."
+            )
+
+        per_camera: dict[str, list[tuple[str, str]]] = {}
+        main_process: list[tuple[str, str, str]] = []
+        for dev, prop, val in settings:
+            if dev in self.camera_labels:
+                per_camera.setdefault(dev, []).append((prop, val))
+            elif self._mmc is not None and dev in self._mmc.getLoadedDevices():
+                main_process.append((dev, prop, val))
+            else:
+                logger.debug(f"Skipping {group}/{preset}: {dev} is not loaded.")
+
+        was_live = state is CameraWorkerServiceState.LIVE
+        if was_live:
+            self.stop_live()
+        try:
+            for label, values in per_camera.items():
+                pool.set_properties(label, tuple(values))
+                # Keep the respawn snapshot current, so a worker restarted by
+                # spawn_async's recovery path comes back with these settings.
+                if self._snapshot is not None and (
+                    cam := self._snapshot.per_camera.get(label)
+                ):
+                    cam.property_values.update(values)
+            if self._mmc is not None:
+                for dev, prop, val in main_process:
+                    self._mmc.setProperty(dev, prop, val)
+        finally:
+            if was_live:
+                self.start_live()
+        cfg.current = preset
+        self.workerConfigChanged.emit(group, preset)
 
     # ------------------------------------------------------------------
     # ROI (Camera ROI widget)

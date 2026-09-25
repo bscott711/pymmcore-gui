@@ -105,13 +105,15 @@ def toggle_live(action: QCoreAction, checked: bool) -> None:
 
 
 def _init_snap_image(action: QCoreAction) -> None:
+    from pymmcore_gui.asi_z_stack.camera_worker_service import has_camera
+
     mmc = action.mmc
 
     def _on_load() -> None:
         # the action's underlying Qt widget may already be gone (e.g. a core
         # event fired during app shutdown, after this action's window closed)
         with suppress(RuntimeError):
-            action.setEnabled(bool(mmc.getCameraDevice()))
+            action.setEnabled(has_camera(mmc))
 
     mmc.events.systemConfigurationLoaded.connect(_on_load)
 
@@ -119,7 +121,10 @@ def _init_snap_image(action: QCoreAction) -> None:
 
 
 def _init_toggle_live(action: QCoreAction) -> None:
-    from pymmcore_gui.asi_z_stack.camera_worker_service import CameraWorkerService
+    from pymmcore_gui.asi_z_stack.camera_worker_service import (
+        CameraWorkerService,
+        has_camera,
+    )
 
     mmc = action.mmc
     connected_service: CameraWorkerService | None = None
@@ -145,7 +150,7 @@ def _init_toggle_live(action: QCoreAction) -> None:
 
     def _on_load() -> None:
         with suppress(RuntimeError):
-            action.setEnabled(bool(mmc.getCameraDevice()))
+            action.setEnabled(has_camera(mmc))
         _sync_service_connection()
 
     mmc.events.systemConfigurationLoaded.connect(_on_load)

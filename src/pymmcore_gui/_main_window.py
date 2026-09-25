@@ -539,6 +539,7 @@ class MicroManagerGUI(QMainWindow):
         # finished spawning yet (that's the slow, async half, chained below
         # after the buffer grow). See camera_worker_service.py's module
         # docstring for the full rationale.
+        from pymmcore_gui.asi_z_stack.camera_worker_service import has_camera
         from pymmcore_gui.asi_z_stack.common import HardwareConstants
 
         self._camera_worker_service.begin_release(self._mmc, HardwareConstants())
@@ -573,7 +574,7 @@ class MicroManagerGUI(QMainWindow):
 
         def _on_camera_service_ready() -> None:
             with suppress(RuntimeError):
-                live_action.setEnabled(bool(self._mmc.getCameraDevice()))
+                live_action.setEnabled(has_camera(self._mmc))
             self.bufferReady.emit()
 
         def _on_buffer_ready() -> None:

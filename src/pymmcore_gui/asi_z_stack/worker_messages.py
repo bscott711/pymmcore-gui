@@ -74,6 +74,19 @@ class GetROICmd:
     camera_label: str
 
 
+@dataclass(frozen=True)
+class SetPropertiesCmd:
+    """Set camera properties, in order. Only valid while the worker is idle.
+
+    Used to apply config-group presets that touch a worker-owned camera
+    (e.g. a ``Port`` preset), since the main process no longer has the
+    camera loaded to call ``setConfig`` against.
+    """
+
+    camera_label: str
+    values: tuple[tuple[str, str], ...]
+
+
 # ---------------------------------------------------------------------------
 # Worker -> main process
 # ---------------------------------------------------------------------------
@@ -149,9 +162,31 @@ class RoiMsg:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class PropertiesSetMsg:
+    """Reply to :class:`SetPropertiesCmd`; ``error`` is set if any set failed."""
+
+    camera_label: str
+    error: str | None = None
+
+
 WorkerToMainMsg = (
-    ReadyMsg | ArmedMsg | FrameMsg | StoppedMsg | StalledMsg | ErrorMsg | RoiMsg
+    ReadyMsg
+    | ArmedMsg
+    | FrameMsg
+    | StoppedMsg
+    | StalledMsg
+    | ErrorMsg
+    | RoiMsg
+    | PropertiesSetMsg
 )
 MainToWorkerMsg = (
-    ArmCmd | ArmLiveCmd | SlotFreeCmd | StopCmd | ShutdownCmd | SetROICmd | GetROICmd
+    ArmCmd
+    | ArmLiveCmd
+    | SlotFreeCmd
+    | StopCmd
+    | ShutdownCmd
+    | SetROICmd
+    | GetROICmd
+    | SetPropertiesCmd
 )

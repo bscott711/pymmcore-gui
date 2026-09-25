@@ -39,8 +39,10 @@ from .worker_messages import (
     ErrorMsg,
     FrameMsg,
     GetROICmd,
+    PropertiesSetMsg,
     ReadyMsg,
     RoiMsg,
+    SetPropertiesCmd,
     SetROICmd,
     ShutdownCmd,
     SlotFreeCmd,
@@ -259,6 +261,28 @@ class CameraWorkerHandle:
         self.conn.send(GetROICmd(self.camera_label))
         return self._recv_roi(timeout)
 
+    def set_properties(
+        self, values: tuple[tuple[str, str], ...], timeout: float = 5.0
+    ) -> None:
+        """Set this worker's camera properties, in order. Only valid while idle.
+
+        Same idle-only request/response contract as :meth:`set_roi`.
+        """
+        assert self.conn is not None
+        self.conn.send(SetPropertiesCmd(self.camera_label, values))
+        if not self.conn.poll(timeout):
+            raise TimeoutError(
+                f"{self.camera_label} did not respond to a property request "
+                f"within {timeout:.1f}s"
+            )
+        msg = self.conn.recv()
+        if not isinstance(msg, PropertiesSetMsg):
+            raise RuntimeError(
+                f"{self.camera_label}: unexpected reply to property request: {msg!r}"
+            )
+        if msg.error is not None:
+            raise RuntimeError(f"{self.camera_label}: {msg.error}")
+
     def _recv_roi(self, timeout: float) -> tuple[int, int, int, int]:
         assert self.conn is not None
         if not self.conn.poll(timeout):
@@ -355,6 +379,15 @@ class CameraWorkerPool:
     ) -> tuple[int, int, int, int]:
         """Read *camera_label*'s current ROI via its worker. Only valid while idle."""
         return self._worker_for(camera_label).get_roi(timeout)
+
+    def set_properties(
+        self,
+        camera_label: str,
+        values: tuple[tuple[str, str], ...],
+        timeout: float = 5.0,
+    ) -> None:
+        """Set *camera_label*'s properties via its worker. Only valid while idle."""
+        self._worker_for(camera_label).set_properties(values, timeout)
 
     def iter_frames(
         self, stall_timeout_s: float = 5.0

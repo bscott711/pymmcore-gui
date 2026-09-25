@@ -126,7 +126,23 @@ def create_camera_roi(parent: QWidget) -> QWidget:
 
 
 def create_config_groups(parent: QWidget) -> pmmw.GroupPresetTableWidget:
-    """Create the Config Groups widget."""
+    """Create the Config Groups widget.
+
+    Worker-aware when a persistent camera worker service is active, so config
+    groups touching Camera-1/Camera-2 stay usable (see
+    ``WorkerGroupPresetTableWidget``), mirroring :func:`create_camera_roi`.
+    """
+    from pymmcore_gui.asi_z_stack.camera_worker_service import CameraWorkerService
+
+    if (svc := CameraWorkerService.get_active()) is not None:
+        from pymmcore_gui.widgets._worker_group_preset_table import (
+            WorkerGroupPresetTableWidget,
+        )
+
+        return WorkerGroupPresetTableWidget(
+            svc, parent=parent, mmcore=_get_core(parent)
+        )
+
     from pymmcore_widgets import GroupPresetTableWidget
 
     return GroupPresetTableWidget(parent=parent, mmcore=_get_core(parent))
