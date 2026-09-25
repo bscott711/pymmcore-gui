@@ -14,6 +14,7 @@ from pymmcore_gui._argus_stream import _session as session_mod
 from pymmcore_gui._argus_stream._protocol import (
     MSG_ACK,
     MSG_FRAME,
+    MSG_QC,
     MSG_RESUME,
     MSG_SESSION_END,
     MSG_SESSION_START,
@@ -344,6 +345,13 @@ def test_build_session_header_contains_every_field_the_receiver_requires() -> No
     assert required <= header.keys()
 
 
+def test_build_session_header_asks_for_live_qc() -> None:
+    settings = ArgusStreamSettingsV1(gpfs_scratch_root="/mmfs2/scratch/lab")
+    header, _ = _build_session_header(_save_seq(), _StubCore(), settings, [])
+    assert header is not None
+    assert header["accepts"] == ["qc"]
+
+
 # ----------------------------------------------------------------------------
 # spectral cropping + multi-camera resolution
 # ----------------------------------------------------------------------------
@@ -446,6 +454,12 @@ class _FakeReceiver:
                     {"through_frame_index": through_frame_index},
                 ),
             ]
+        )
+
+    def send(self, msg_type: bytes, header: dict) -> None:
+        assert self._identity is not None and self._session_id is not None
+        self.sock.send_multipart(
+            [self._identity, *pack_message(msg_type, self._session_id, header)]
         )
 
     def frame_messages(self) -> list[tuple[dict, bytes | None]]:
@@ -645,4 +659,58 @@ def test_session_resends_unacked_frames_after_resume(
     assert frames[0][0]["frame_index"] == frames[1][0]["frame_index"] == 0
 
     session.sequenceCanceled(seq)
+    session.shutdown(timeout=1)
+
+
+def test_session_hands_qc_verdicts_to_the_callback_and_keeps_streaming(
+    fake_receiver: _FakeReceiver,
+) -> None:
+    """MSG_QC from Argus reaches on_qc; a consumer that raises can't stall
+    the send/ACK loop."""
+    settings = _full_settings(
+        ArgusStreamSettingsV1(
+            enabled=True, local_port=fake_receiver.port, gpfs_scratch_root="/scratch"
+        )
+    )
+    got: list[dict] = []
+
+    def on_qc(header: dict) -> None:
+        got.append(header)
+        if len(got) == 1:
+            raise RuntimeError("consumer bug")
+
+    session = ArgusStreamSession(
+        _StubCore(),
+        _NoopTunnel(),  # pyright: ignore[reportArgumentType]
+        get_settings=lambda: settings,
+        on_qc=on_qc,  # pyright: ignore[reportArgumentType]
+    )
+    seq = _save_seq(z_plan=useq.ZRangeAround(range=1, step=1))
+    session.sequenceStarted(seq, {})  # pyright: ignore[reportArgumentType]
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not fake_receiver.messages:
+        time.sleep(0.02)
+    assert fake_receiver.messages[0][0] == MSG_SESSION_START
+    assert fake_receiver.messages[0][2]["accepts"] == ["qc"]
+    for t, verdict in ((0, "act"), (1, "ok")):
+        fake_receiver.send(
+            MSG_QC,
+            {"seq": t, "t": t, "stage": "raw", "verdict": verdict, "flags": []},
+        )
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and len(got) < 2:
+        time.sleep(0.02)
+    assert [(h["t"], h["verdict"]) for h in got] == [(0, "act"), (1, "ok")]
+
+    for event in seq:
+        frame = np.zeros((4, 4), dtype="uint16")
+        session.frameReady(frame, event, {})  # pyright: ignore[reportArgumentType]
+    session.sequenceFinished(seq)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if MSG_SESSION_END in [m[0] for m in fake_receiver.messages]:
+            break
+        time.sleep(0.05)
+    assert fake_receiver.messages[-1][0] == MSG_SESSION_END
     session.shutdown(timeout=1)

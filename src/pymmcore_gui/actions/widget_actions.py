@@ -44,6 +44,7 @@ class WidgetAction(ActionKey):
     CRISP = "pymmcore_gui.crisp_widget"
     SPECTRAL_CHANNELS = "pymmcore_gui.spectral_channel_config"
     CAMERA_ALIGNMENT = "pymmcore_gui.camera_alignment_widget"
+    ARGUS_QC = "pymmcore_gui.argus_qc_widget"
 
 
 # ######################## Functions that create widgets #########################
@@ -167,6 +168,18 @@ def create_camera_alignment_widget(parent: QWidget) -> QWidget:
     from pymmcore_gui.widgets.camera_alignment import CameraAlignmentWidget
 
     return CameraAlignmentWidget(parent=parent, mmcore=_get_core(parent))
+
+
+def create_argus_qc_widget(parent: QWidget) -> QWidget:
+    """Create the Argus live-QC panel, fed by the main window's stream relay."""
+    from pymmcore_gui.widgets._argus_qc import ArgusQCWidget
+
+    widget = ArgusQCWidget(parent=parent)
+    if win := _get_mm_main_window(parent):
+        for rec in win.argus_qc_history:
+            widget.update_qc(rec)
+        win.argus_qc_received.connect(widget.update_qc)
+    return widget
 
 
 # ######################## WidgetAction Enum #########################
@@ -297,6 +310,14 @@ show_spectral_channels = WidgetActionInfo(
     icon="mdi:grid-large",
     create_widget=create_spectral_channel_config,
     dock_area=DockWidgetArea.LeftDockWidgetArea,
+)
+
+show_argus_qc = WidgetActionInfo(
+    key=WidgetAction.ARGUS_QC,
+    text="Argus QC",
+    icon="mdi:clipboard-check-outline",
+    create_widget=create_argus_qc_widget,
+    dock_area=DockWidgetArea.RightDockWidgetArea,
 )
 
 show_camera_alignment = WidgetActionInfo(
