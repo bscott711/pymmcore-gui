@@ -262,6 +262,7 @@ class MicroManagerGUI(QMainWindow):
             argus_settings.ssh_host,
             argus_settings.local_port,
             argus_settings.remote_port,
+            argus_settings.deploy_reverse_port,
         )
         if argus_settings.enabled:
             self._argus_tunnel.start()
