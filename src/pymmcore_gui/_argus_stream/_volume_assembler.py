@@ -1,11 +1,12 @@
-"""Assemble per-z-plane ``frameReady`` frames into complete (t, c) volumes.
+"""Assemble per-z-plane ``frameReady`` frames into (t, c) volumes or slabs.
 
-Argus's ``FRAME`` message is one complete volume per ``(t, c)``, not a raw 2D
-plane (see ``_protocol.py``). This module accumulates the z-planes of a
-z-stack into one C-contiguous array and reports completion the instant the
-last plane lands, so :class:`~pymmcore_gui._argus_stream._session.ArgusStreamSession`
-can stream each volume the moment it's ready rather than waiting for the
-whole acquisition.
+Argus's ``FRAME`` message carries either one complete volume per ``(t, c)``
+or, once the receiver advertises ``"slabs"``, a run of consecutive z-planes
+of one (see ``_protocol.py``). This module accumulates the z-planes of a
+z-stack into one C-contiguous array. In volume mode it reports the volume
+the instant its last plane lands. In slab mode it hands out each run of
+``slab_planes`` consecutive planes as soon as the run is complete, so the
+volume is already on its way while the stack is still being acquired.
 
 Scoped to single-position sequences (see
 :class:`~pymmcore_gui._settings.ArgusStreamSettingsV1`'s docstring) --
@@ -41,6 +42,10 @@ class Volume:
     """Wall clock (``time.time()``) when this volume's first plane arrived."""
     acq_last_s: float = 0.0
     """Wall clock when its last plane arrived, i.e. when it completed."""
+    z0: int = 0
+    """First plane of ``array`` within its volume (slabs only)."""
+    nz: int | None = None
+    """The whole volume's plane count for a slab; ``None`` for a volume."""
 
 
 @dataclass
@@ -50,6 +55,10 @@ class _Pending:
     timestamp: float = 0.0
     camera_id: str | int | None = None
     acq_first_s: float = field(default_factory=time.time)
+    slab_planes: int = 0
+    """Fixed when the volume's first plane lands; 0 = whole-volume mode."""
+    next_z: int = 0
+    """Slab mode: the first plane not yet handed out."""
 
 
 class VolumeAssembler:
@@ -89,6 +98,26 @@ class VolumeAssembler:
             Frame metadata; used only for ``camera_device`` and
             ``runner_time_ms`` when starting a new volume.
         """
+        ready = self.add_plane(frame, event, meta)
+        return ready[0] if ready else None
+
+    def add_plane(
+        self,
+        frame: np.ndarray,
+        event: useq.MDAEvent,
+        meta: FrameMetaV1,
+        slab_planes: int = 0,
+    ) -> list[Volume]:
+        """Add one 2D plane; return whatever it made ready to send.
+
+        With ``slab_planes == 0`` that's the whole volume once its last plane
+        lands, as :meth:`add_frame`. Otherwise it's every run of
+        ``slab_planes`` consecutive planes (the last run may be shorter)
+        that is now complete, starting at the first plane not yet handed
+        out. Planes arriving out of z order simply hold a slab back until
+        the gap fills. ``slab_planes`` is fixed per volume by the volume's
+        first plane, so a volume never switches mode halfway.
+        """
         t = event.index.get("t", 0)
         c = event.index.get("c", 0)
         z = event.index.get("z", 0)
@@ -100,6 +129,7 @@ class VolumeAssembler:
                 array=np.zeros((self._expected_z, *frame.shape), dtype=frame.dtype),
                 camera_id=meta.get("camera_device"),
                 timestamp=float(meta.get("runner_time_ms", 0.0)),
+                slab_planes=max(0, slab_planes),
             )
             self._pending[key] = pending
 
@@ -109,17 +139,44 @@ class VolumeAssembler:
         # would, without an extra allocation.
         pending.array[z] = frame
         pending.seen.add(z)
+        complete = len(pending.seen) >= self._expected_z
+        if complete:
+            del self._pending[key]
 
-        if len(pending.seen) < self._expected_z:
-            return None
+        if not pending.slab_planes:
+            if not complete:
+                return []
+            return [
+                Volume(
+                    t=t,
+                    c=c,
+                    array=pending.array,
+                    timestamp=pending.timestamp,
+                    camera_id=pending.camera_id,
+                    acq_first_s=pending.acq_first_s,
+                    acq_last_s=time.time(),
+                )
+            ]
 
-        del self._pending[key]
-        return Volume(
-            t=t,
-            c=c,
-            array=pending.array,
-            timestamp=pending.timestamp,
-            camera_id=pending.camera_id,
-            acq_first_s=pending.acq_first_s,
-            acq_last_s=time.time(),
-        )
+        ready = []
+        nz = self._expected_z
+        while pending.next_z < nz:
+            z0 = pending.next_z
+            end = min(z0 + pending.slab_planes, nz)
+            if any(k not in pending.seen for k in range(z0, end)):
+                break
+            ready.append(
+                Volume(
+                    t=t,
+                    c=c,
+                    array=pending.array[z0:end],
+                    timestamp=pending.timestamp,
+                    camera_id=pending.camera_id,
+                    acq_first_s=pending.acq_first_s,
+                    acq_last_s=time.time(),
+                    z0=z0,
+                    nz=nz,
+                )
+            )
+            pending.next_z = end
+        return ready

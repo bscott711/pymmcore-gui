@@ -262,6 +262,16 @@ class ArgusStreamSettingsV1(BaseMMSettings):
     """Master on/off switch for the whole feature."""
     ssh_host: str = "Argus"
     """``Host`` alias from the user's ``~/.ssh/config`` to tunnel through."""
+    direct_endpoint: str = ""
+    """Argus's direct 10 GbE endpoint, e.g. ``tcp://137.216.250.14:5556``.
+
+    Empty: stream through the SSH tunnel only. Set: each run connects here
+    first and falls back to the tunnel if Argus doesn't answer within a few
+    seconds. The tunnel moved ~33 MB/s; this link runs at 10 GbE. It is plain
+    TCP, accepted by Argus only from this PC's IP (``opym-receive``'s
+    ``OPYM_STREAM_ALLOW_IPS``) and allowed through the site firewall only
+    from here.
+    """
     local_port: int = 5555
     """Local end of the SSH port-forward that the ZMQ DEALER connects to."""
     remote_port: int = 5555

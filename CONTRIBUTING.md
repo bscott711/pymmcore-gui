@@ -132,6 +132,26 @@ git remote set-url origin Argus:/home/SDSMT.LOCAL/bscott/projects/pymmcore-gui
 and make sure the checked-out branch has an upstream to pull from
 (`git branch --set-upstream-to=origin/<branch>`).
 
+## Streaming to Argus over the direct 10 GbE link
+
+By default each acquisition streams to Argus through the SSH tunnel, which
+tops out around 33 MB/s. Once Argus's firewall admits this PC on TCP 5556,
+point the stream straight at Argus in `pmm_settings.json` (in the app's
+user-data directory):
+
+```json
+"argus_stream": {
+  "direct_endpoint": "tcp://137.216.250.14:5556"
+}
+```
+
+Each run then connects there first. It falls back to the tunnel on its own
+if Argus hasn't answered within a few seconds, and the status bar shows
+which route a run took ("Argus: streaming (direct)" or "... (SSH tunnel)").
+On Argus, `opym-receive` must list this PC's IP in `OPYM_STREAM_ALLOW_IPS`.
+The link is plain TCP, restricted to this PC by that allowlist and by the
+firewall.
+
 ## Creating a bundled application
 
 We use [PyInstaller](https://pyinstaller.org/) to freeze the application into a
