@@ -10,6 +10,35 @@ function Show-ErrorBox($message) {
     ) | Out-Null
 }
 
+# Pick up code changes before launching -- deliberately here, not inside the
+# app: this runs before pymmcore_gui's process even starts, so there is no
+# acquisition in progress yet to disrupt, unlike an in-app auto-update would
+# risk. Never blocks or alarms on failure (no network, a dirty tree, a
+# diverged branch, git missing) -- launches with whatever is already checked
+# out and just logs why, same as if this step didn't exist. Pulls whatever
+# remote/branch is already configured (`git pull --ff-only`, no args), so
+# this launcher doesn't need to know whether `origin` points at GitHub or at
+# Argus -- see update.log next to this script, and CONTRIBUTING.md's
+# "Deploying to the acquisition PC" section for how to point it at either.
+$pullLog = Join-Path $PSScriptRoot 'update.log'
+try {
+    $git = (Get-Command git -ErrorAction Stop).Source
+    $before = & $git rev-parse HEAD 2>$null
+    $pullOutput = & $git pull --ff-only 2>&1
+    $pullExit = $LASTEXITCODE  # capture before the next git call overwrites it
+    $after = & $git rev-parse HEAD 2>$null
+    $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    if ($pullExit -eq 0 -and $before -ne $after) {
+        Add-Content -Path $pullLog -Value "$stamp updated $before -> $after"
+    }
+    elseif ($pullExit -ne 0) {
+        Add-Content -Path $pullLog -Value "$stamp pull failed, launching as-is: $pullOutput"
+    }
+}
+catch {
+    Add-Content -Path $pullLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') git not available, skipping update check: $($_.Exception.Message)"
+}
+
 try {
     $ErrorActionPreference = 'Stop'
     & (Join-Path $PSScriptRoot '.venv\Scripts\Activate.ps1')

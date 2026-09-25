@@ -269,19 +269,6 @@ class ArgusStreamSettingsV1(BaseMMSettings):
 
     Matches ``opym.stream.receiver.DEFAULT_BIND_ADDR`` (``tcp://127.0.0.1:5555``).
     """
-    deploy_reverse_port: int = 0
-    """Argus-side loopback port for an SSH *reverse* forward back to this
-    machine's own local SSH server (``-R <port>:localhost:22``), so code
-    changes here (this repo) can be deployed from Argus without anyone at
-    this console. ``0`` disables it -- the default, since it needs Windows
-    OpenSSH Server running locally (loopback only; it is never exposed to
-    the network -- only reachable back through this same outbound SSH
-    connection) and Argus's own key in this account's ``authorized_keys``.
-    Piggybacks on the one persistent tunnel connection
-    :class:`~pymmcore_gui._argus_stream._tunnel.ArgusTunnelManager` already
-    keeps open, rather than a second connection someone has to remember to
-    start by hand.
-    """
     buffer_budget_mb: int = 4096
     """RAM budget for buffered-but-unacked volumes before raising an alarm.
 
