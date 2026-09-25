@@ -47,14 +47,18 @@ def test_drain_incoming_returns_stop_cmd() -> None:
     conn = _mock_conn([SlotFreeCmd(0), StopCmd()])
     free_slots: list[int] = []
 
-    assert _drain_incoming(conn, free_slots) is StopCmd
+    assert isinstance(_drain_incoming(conn, free_slots), StopCmd)
     assert free_slots == [0]
 
 
 def test_drain_incoming_shutdown_wins_over_stop_regardless_of_order() -> None:
     """``ShutdownCmd`` always outranks a ``StopCmd`` seen in the same drain pass."""
-    assert _drain_incoming(_mock_conn([StopCmd(), ShutdownCmd()]), []) is ShutdownCmd
-    assert _drain_incoming(_mock_conn([ShutdownCmd(), StopCmd()]), []) is ShutdownCmd
+    assert isinstance(
+        _drain_incoming(_mock_conn([StopCmd(), ShutdownCmd()]), []), ShutdownCmd
+    )
+    assert isinstance(
+        _drain_incoming(_mock_conn([ShutdownCmd(), StopCmd()]), []), ShutdownCmd
+    )
 
 
 def test_wait_for_free_slot_returns_none_once_slot_frees() -> None:
@@ -74,9 +78,54 @@ def test_wait_for_free_slot_returns_shutdown_cmd() -> None:
     ``ShutdownCmd`` at all, so a worker blocked here waiting for a free
     ring-buffer slot would never be unblocked by ``shutdown_all()``.
     """
-    assert _wait_for_free_slot(_mock_conn([ShutdownCmd()]), [], "cam0") is ShutdownCmd
+    assert isinstance(
+        _wait_for_free_slot(_mock_conn([ShutdownCmd()]), [], "cam0"), ShutdownCmd
+    )
 
 
 def test_wait_for_free_slot_returns_stop_cmd() -> None:
     """A ``StopCmd`` while waiting for a slot is reported."""
-    assert _wait_for_free_slot(_mock_conn([StopCmd()]), [], "cam0") is StopCmd
+    assert isinstance(_wait_for_free_slot(_mock_conn([StopCmd()]), [], "cam0"), StopCmd)
+
+
+def test_drain_incoming_keeps_latest_stop_token() -> None:
+    stop = _drain_incoming(_mock_conn([StopCmd(1), StopCmd(2)]), [])
+    assert isinstance(stop, StopCmd)
+    assert stop.token == 2
+
+
+def _trigger_core(current: str, allowed: tuple[str, ...]) -> MagicMock:
+    core = MagicMock()
+    core.hasProperty.return_value = True
+    core.getAllowedPropertyValues.return_value = allowed
+    core.getProperty.return_value = current
+    return core
+
+
+def test_internal_trigger_mode_prefers_pre_handoff_mode() -> None:
+    from pymmcore_gui.asi_z_stack.camera_worker import _internal_trigger_mode
+
+    allowed = ("Internal Trigger", "Timed", "Edge Trigger", "Level Trigger")
+    core = _trigger_core("Level Trigger", allowed)
+    assert _internal_trigger_mode(core, "Camera-1", "Timed") == "Timed"
+    # An external snapshot value never counts as the free-running mode.
+    assert _internal_trigger_mode(core, "Camera-1", "Level Trigger") == (
+        "Internal Trigger"
+    )
+    assert _internal_trigger_mode(core, "Camera-1", None) == "Internal Trigger"
+    assert (
+        _internal_trigger_mode(_trigger_core("x", ("Edge Trigger",)), "c", None) is None
+    )
+
+
+def test_set_trigger_mode_skips_noop() -> None:
+    from pymmcore_gui.asi_z_stack.camera_worker import _set_trigger_mode
+
+    core = _trigger_core("Internal Trigger", ())
+    _set_trigger_mode(core, "Camera-1", "Internal Trigger")
+    core.setProperty.assert_not_called()
+    _set_trigger_mode(core, "Camera-1", "Level Trigger")
+    core.setProperty.assert_called_once_with("Camera-1", "TriggerMode", "Level Trigger")
+    core.setProperty.reset_mock()
+    _set_trigger_mode(core, "Camera-1", None)
+    core.setProperty.assert_not_called()

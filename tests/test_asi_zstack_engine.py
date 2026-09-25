@@ -171,7 +171,7 @@ def test_exec_event_cancel_stops_workers() -> None:
     with pytest.raises(StopIteration):
         gen.send("cancel")
 
-    pool.stop_all.assert_called_once()
+    pool.stop_and_drain.assert_called_once()
 
 
 def test_exec_event_worker_died_stops_survivor_and_reraises() -> None:
@@ -187,7 +187,7 @@ def test_exec_event_worker_died_stops_survivor_and_reraises() -> None:
     with pytest.raises(WorkerDiedError):
         list(engine.exec_event(useq.MDAEvent(index={"t": 0})))
 
-    pool.stop_all.assert_called_once()
+    pool.stop_and_drain.assert_called_once()
 
 
 def test_event_iterator_collapses_z_stack() -> None:
@@ -346,7 +346,7 @@ def test_exec_event_timeout_stops_workers_and_reraises() -> None:
     handling: only ``WorkerDiedError`` triggered a stop, so a plain
     ``TimeoutError`` (worker_pool.py's stall guard) or a worker's own
     ``ErrorMsg``-derived ``RuntimeError`` left the survivor running with no
-    stop signal. ``exec_event`` now calls ``stop_all()`` in a ``finally``
+    stop signal. ``exec_event`` now calls ``stop_and_drain()`` in a ``finally``
     block that covers every exit path.
     """
     _core, engine, pool = _make_engine(n_cameras=2, n_slices=3)
@@ -357,7 +357,7 @@ def test_exec_event_timeout_stops_workers_and_reraises() -> None:
     with pytest.raises(TimeoutError):
         list(engine.exec_event(useq.MDAEvent(index={"t": 0})))
 
-    pool.stop_all.assert_called_once()
+    pool.stop_and_drain.assert_called_once()
 
 
 def test_exec_event_generator_close_stops_workers() -> None:
@@ -384,11 +384,11 @@ def test_exec_event_generator_close_stops_workers() -> None:
     next(gen)
     gen.close()
 
-    pool.stop_all.assert_called_once()
+    pool.stop_and_drain.assert_called_once()
 
 
 def test_exec_event_normal_completion_also_stops_workers() -> None:
-    """Ordinary, uncancelled completion also calls ``stop_all()`` exactly once.
+    """Ordinary, uncancelled completion also calls ``stop_and_drain()`` exactly once.
 
     New (safe, intentional) side effect of moving ``stop_all()`` into a
     ``finally`` block: it now fires on every exit path, including normal
@@ -403,7 +403,7 @@ def test_exec_event_normal_completion_also_stops_workers() -> None:
 
     list(engine.exec_event(useq.MDAEvent(index={"t": 0})))
 
-    pool.stop_all.assert_called_once()
+    pool.stop_and_drain.assert_called_once()
 
 
 def test_reset_channel_config_cache_clears_last_config() -> None:

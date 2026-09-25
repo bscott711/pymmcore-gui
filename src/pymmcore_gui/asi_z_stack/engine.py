@@ -610,7 +610,10 @@ class _ASITriggerEngineBase(MDAEngine):
                     False,
                     self.hw.plogic_always_on_cell,
                 )
-            self._worker_pool.stop_all()
+            # stop_and_drain, not stop_all: the pool is session-persistent,
+            # so frames left queued by a cancel/error would otherwise be read
+            # by the next Snap/Live/MDA as its own.
+            self._worker_pool.stop_and_drain(timeout=self.hw.worker_shutdown_timeout_s)
 
 
 class ASISPIMEngine(_ASITriggerEngineBase):

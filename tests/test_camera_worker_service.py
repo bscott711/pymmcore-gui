@@ -196,3 +196,23 @@ def test_worker_group_table_lists_and_applies_worker_groups(
         combo.textActivated.emit("Speed")
     warn.assert_called_once()
     assert combo.currentText() == "Sensitivity"
+
+
+def test_snap_arms_internal_trigger_and_drains(core: CMMCorePlus) -> None:
+    from unittest.mock import MagicMock
+
+    import numpy as np
+
+    pool = MagicMock()
+    frame = np.zeros((2, 2), dtype="uint16")
+    pool.iter_frames.return_value = iter(
+        [("Camera-1", 0, frame, {}, 0), ("Camera-2", 0, frame, {}, 0)]
+    )
+    svc = _service(core, pool)
+
+    frames = svc.snap()
+
+    assert set(frames) == {"Camera-1", "Camera-2"}
+    assert pool.arm_all.call_args.kwargs["external_trigger"] is False
+    pool.stop_and_drain.assert_called_once()
+    pool.stop_all.assert_not_called()

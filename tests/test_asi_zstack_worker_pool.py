@@ -141,3 +141,73 @@ def test_set_properties_round_trip_and_error() -> None:
     with pytest.raises(RuntimeError, match="Invalid property value"):
         handle.set_properties((("Port", "Bogus"),), timeout=2.0)
     t.join()
+
+
+def _pipe_handle(label: str):  # type: ignore[no-untyped-def]
+    from multiprocessing import Pipe
+    from types import SimpleNamespace
+
+    from pymmcore_gui.asi_z_stack.worker_pool import CameraWorkerHandle
+
+    parent, child = Pipe(duplex=True)
+    never_ready, keep_open = Pipe(duplex=False)
+    handle = CameraWorkerHandle(
+        label,
+        None,  # type: ignore[arg-type]
+        height=1,
+        width=1,
+        dtype="uint16",
+        n_slots=1,
+    )
+    handle.conn = parent
+    handle.process = SimpleNamespace(sentinel=never_ready, exitcode=None)  # type: ignore[assignment]
+    return handle, child, keep_open
+
+
+def test_stop_and_drain_discards_leftovers_up_to_token() -> None:
+    """Snap's early break used to leave frames + a StoppedMsg queued, which the
+    persistent pool's next iter_frames read as its own."""
+    import threading
+
+    from pymmcore_gui.asi_z_stack.worker_messages import (
+        FrameMsg,
+        SlotFreeCmd,
+        StopCmd,
+        StoppedMsg,
+    )
+    from pymmcore_gui.asi_z_stack.worker_pool import CameraWorkerPool
+
+    handle, child, _keep = _pipe_handle("Camera-1")
+    seen: list[object] = []
+
+    def _worker() -> None:
+        # Leftovers from the interrupted cycle, then the natural end.
+        child.send(FrameMsg("Camera-1", 0, 1, 2))
+        child.send(StoppedMsg("Camera-1", 2))
+        # stop_and_drain sends its StopCmd before reading anything.
+        cmd = child.recv()
+        seen.append(cmd)
+        child.send(StoppedMsg("Camera-1", 0, cmd.token))
+
+    t = threading.Thread(target=_worker)
+    t.start()
+    CameraWorkerPool([handle]).stop_and_drain(timeout=2.0)
+    t.join()
+
+    assert isinstance(seen[0], StopCmd)
+    assert seen[0].token
+    assert handle.conn is not None
+    assert not handle.conn.poll(0.1)  # nothing left for the next command
+    # The leftover frame's slot was handed back.
+    assert child.recv() == SlotFreeCmd(0)
+
+
+def test_stop_and_drain_times_out_without_raising() -> None:
+    import time
+
+    from pymmcore_gui.asi_z_stack.worker_pool import CameraWorkerPool
+
+    handle, _child, _keep = _pipe_handle("Camera-1")
+    start = time.monotonic()
+    CameraWorkerPool([handle]).stop_and_drain(timeout=0.3)
+    assert time.monotonic() - start < 2.0

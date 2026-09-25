@@ -487,6 +487,13 @@ class CameraWorkerService(QObject):
             thread.join(
                 timeout if timeout is not None else self.hw.worker_shutdown_timeout_s
             )
+        if thread is None or not thread.is_alive():
+            # The drain thread normally consumes each worker's StoppedMsg, but
+            # if it died early (stall/error) the rest of the stream is still
+            # queued. Only safe once it's gone: two readers can't share a pipe.
+            pool.stop_and_drain(timeout=self.hw.worker_shutdown_timeout_s)
+        else:
+            logger.warning("Live drain thread did not exit; pipes left undrained.")
         with self._lock:
             self._live_thread = None
 
@@ -548,7 +555,7 @@ class CameraWorkerService(QObject):
     # Snap
     # ------------------------------------------------------------------
 
-    def snap(self, timeout: float = 30.0) -> dict[str, np.ndarray]:
+    def snap(self, timeout: float = 5.0) -> dict[str, np.ndarray]:
         """Grab one frame per camera, synchronously (matches today's blocking Snap UX).
 
         Called on the GUI thread, so :attr:`frameReady` is emitted directly
@@ -567,7 +574,11 @@ class CameraWorkerService(QObject):
 
         frames: dict[str, np.ndarray] = {}
         needed = set(self.camera_labels)
-        pool.arm_all(1, armed_timeout=self.hw.worker_arm_timeout_s)
+        # Internal trigger: outside an MDA nothing fires the external one, so
+        # an externally-triggered Snap just times out with zero frames.
+        pool.arm_all(
+            1, armed_timeout=self.hw.worker_arm_timeout_s, external_trigger=False
+        )
         try:
             for camera_label, slice_idx, img, meta, remaining in pool.iter_frames(
                 stall_timeout_s=timeout
@@ -578,7 +589,9 @@ class CameraWorkerService(QObject):
                 if not needed:
                     break
         finally:
-            pool.stop_all()
+            # Snap breaks out of an over-armed sequence after one frame per
+            # camera: drain the rest so the next arm doesn't read it.
+            pool.stop_and_drain(timeout=self.hw.worker_shutdown_timeout_s)
         return frames
 
     # ------------------------------------------------------------------

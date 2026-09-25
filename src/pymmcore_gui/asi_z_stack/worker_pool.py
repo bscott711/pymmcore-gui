@@ -18,6 +18,7 @@ creates and owns (workers only attach to it); control messages travel over a
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import time
@@ -306,6 +307,7 @@ class CameraWorkerPool:
     def __init__(self, workers: list[CameraWorkerHandle]) -> None:
         self.workers = workers
         self._ctx = get_context("spawn")
+        self._stop_token = 0
 
     def spawn_all(self, ready_timeout: float = 30.0) -> None:
         """Start every worker process and wait for all of them to report ready.
@@ -320,7 +322,13 @@ class CameraWorkerPool:
             worker.spawn(self._ctx)
         self._wait_for_all(ReadyMsg, ready_timeout)
 
-    def arm_all(self, n_images: int, armed_timeout: float = 10.0) -> None:
+    def arm_all(
+        self,
+        n_images: int,
+        armed_timeout: float = 10.0,
+        *,
+        external_trigger: bool = True,
+    ) -> None:
         """Arm every worker for *n_images* frames and wait for all acks.
 
         Parameters
@@ -332,10 +340,13 @@ class CameraWorkerPool:
         armed_timeout : float
             Seconds to wait for every worker's
             :class:`~pymmcore_gui.asi_z_stack.worker_messages.ArmedMsg`.
+        external_trigger : bool
+            ``True`` (MDA) to wait for the hardware trigger; ``False`` (Snap)
+            to free-run on the camera's internal trigger.
         """
         for worker in self.workers:
             assert worker.conn is not None
-            worker.conn.send(ArmCmd(n_images))
+            worker.conn.send(ArmCmd(n_images, external_trigger=external_trigger))
         self._wait_for_all(ArmedMsg, armed_timeout)
 
     def arm_live_all(self, armed_timeout: float = 10.0) -> None:
@@ -472,6 +483,70 @@ class CameraWorkerPool:
                     worker.conn.send(StopCmd())
                 except OSError:
                     pass
+
+    def stop_and_drain(self, timeout: float = 10.0) -> None:
+        """Stop every worker and discard everything it sent before acknowledging.
+
+        Leaves each pipe empty and each worker idle, so the next command's
+        reply isn't preceded by leftovers from this cycle. A plain
+        :meth:`stop_all` doesn't: breaking out of :meth:`iter_frames` early
+        (Snap takes one frame of an over-armed sequence; an MDA cancel) left
+        the rest of that cycle's ``FrameMsg``/``StoppedMsg`` queued, and the
+        persistent pool's *next* :meth:`iter_frames` read them as its own --
+        stale frames first, then a stale ``StoppedMsg`` ending it early.
+
+        Best-effort: a dead worker is skipped and a timeout is logged, not
+        raised, since this runs in ``finally`` blocks.
+
+        Parameters
+        ----------
+        timeout : float
+            Total seconds to wait for every worker's acknowledgement.
+        """
+        self._stop_token += 1
+        token = self._stop_token
+        pending: dict[str, CameraWorkerHandle] = {}
+        for worker in self.workers:
+            if worker.conn is None or worker.conn.closed:
+                continue
+            try:
+                worker.conn.send(StopCmd(token))
+            except OSError:
+                continue
+            pending[worker.camera_label] = worker
+
+        deadline = time.monotonic() + timeout
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _pymmcore_plus_logger.warning(
+                    f"Camera workers {sorted(pending)} did not acknowledge stop "
+                    f"within {timeout:.1f}s."
+                )
+                return
+            conn_map: dict[Any, CameraWorkerHandle] = {
+                w.conn: w for w in pending.values()
+            }
+            sentinel_map: dict[Any, CameraWorkerHandle] = {
+                w.process.sentinel: w for w in pending.values() if w.process
+            }
+            for obj in mp_wait([*conn_map, *sentinel_map], timeout=remaining):
+                if obj in sentinel_map:
+                    pending.pop(sentinel_map[obj].camera_label, None)
+                    continue
+                worker = conn_map[obj]
+                try:
+                    msg = worker.conn.recv()  # type: ignore[union-attr]
+                except (EOFError, OSError):
+                    pending.pop(worker.camera_label, None)
+                    continue
+                if isinstance(msg, FrameMsg):
+                    # Free the slot so a worker blocked waiting for one can
+                    # still see the StopCmd.
+                    with contextlib.suppress(OSError):
+                        worker.conn.send(SlotFreeCmd(msg.slot_index))  # type: ignore[union-attr]
+                elif isinstance(msg, StoppedMsg) and msg.token == token:
+                    pending.pop(worker.camera_label, None)
 
     def shutdown_all(self, timeout: float = 10.0) -> None:
         """Send every worker a ``ShutdownCmd``, join, and release shared memory.
