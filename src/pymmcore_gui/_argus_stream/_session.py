@@ -55,7 +55,7 @@ import time
 from collections import deque
 from enum import Enum
 from pathlib import PureWindowsPath
-from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple, cast
 from uuid import uuid4
 
 import numpy as np
@@ -519,6 +519,17 @@ class _RunWorker(threading.Thread):
         # Set when this run stops streaming (see "Pause" above): the
         # acquisition thread then stops assembling volumes for it.
         self.paused = threading.Event()
+        # What happened on the wire, logged when the run ends (and read by
+        # the replay tool): bytes per link, what went out more than once,
+        # and every recovery.
+        self.stats: dict[str, Any] = {
+            "sent_bytes": [],
+            "resent_bytes": 0,
+            "link_drops": 0,
+            "requeued": 0,
+            "resumes": 0,
+            "resyncs": 0,
+        }
         self._header = header
         self._buffer_budget_bytes = buffer_budget_bytes
         self._budget = budget
@@ -633,6 +644,7 @@ class _RunWorker(threading.Thread):
         clock_offset: float | None = None
         next_link = 0
         rate_mark = (time.monotonic(), [0] * n_links)
+        ever_sent: set[int] = set()
         end_link: _Link | None = None
         # SESSION_END is confirmed by the receiver's final ACK; until then it
         # is resent every _END_RETRY_S (on the next link), _END_TRIES times.
@@ -694,6 +706,9 @@ class _RunWorker(threading.Thread):
                 queued.discard(fi)
                 sent_on[fi] = link.index
                 link.sent_bytes += len(payload)
+                if fi in ever_sent:
+                    self.stats["resent_bytes"] += len(payload)
+                ever_sent.add(fi)
                 sent_any = True
             return sent_any
 
@@ -712,6 +727,7 @@ class _RunWorker(threading.Thread):
                         start["resume_through"] = acked_through
                     if send(pack_message(MSG_SESSION_START, sid, start)):  # type: ignore[arg-type]
                         resync_sent = True
+                        self.stats["resyncs"] += 1
                         logger.warning(
                             "Argus no longer knows this run's session; "
                             "resuming it after frame %d",
@@ -799,6 +815,8 @@ class _RunWorker(threading.Thread):
                     if went_down:
                         lost = [fi for fi, k in sent_on.items() if k == link.index]
                         requeue(lost)
+                        self.stats["link_drops"] += 1
+                        self.stats["requeued"] += len(lost)
                         logger.warning(
                             "Argus link %d (%s) dropped; resending its %d "
                             "unACKed volume(s) on the others",
@@ -808,7 +826,7 @@ class _RunWorker(threading.Thread):
                         )
                     if came_up:
                         last_ack_time = now if unacked else last_ack_time
-                        logger.debug("Argus link %d up (%s)", link.index, link.endpoint)
+                        logger.info("Argus link %d up (%s)", link.index, link.endpoint)
 
                 ending = self._finish_event.is_set() and not unacked and not pending
                 if end_confirmed:
@@ -881,6 +899,7 @@ class _RunWorker(threading.Thread):
                 stale = time.monotonic() - last_ack_time > stale_after_s
                 if stale and unacked and not (resume_sent or resync_sent):
                     resume_sent = send(pack_message(MSG_RESUME, sid, {})) is not None
+                    self.stats["resumes"] += resume_sent
 
                 total = unacked_bytes
                 if self._budget is not None:
@@ -934,6 +953,19 @@ class _RunWorker(threading.Thread):
                 )
                 end_link = send(pack_message(MSG_SESSION_END, sid, {"reason": reason}))
         finally:
+            self.stats["sent_bytes"] = [link.sent_bytes for link in links]
+            logger.info(
+                "Argus run over %s: sent %s MB by link, %.0f MB of it resent; "
+                "%d link drop(s) (%d volumes requeued), %d RESUME(s), "
+                "%d resync(s)",
+                route,
+                [round(b / 1e6) for b in self.stats["sent_bytes"]],
+                self.stats["resent_bytes"] / 1e6,
+                self.stats["link_drops"],
+                self.stats["requeued"],
+                self.stats["resumes"],
+                self.stats["resyncs"],
+            )
             for link in links:
                 link.close(_SESSION_END_LINGER_MS if link is end_link else 0)
             if self._budget is not None:
