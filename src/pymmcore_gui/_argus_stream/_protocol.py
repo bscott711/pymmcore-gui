@@ -99,7 +99,14 @@ class _FrameSlabFields(TypedDict, total=False):
     nz: int
 
 
-class FrameHeader(_FrameTraceFields, _FrameSlabFields):
+class _FrameCodecFields(TypedDict, total=False):
+    # Only once an ACK advertised "blosc": "blosc" means the payload is one
+    # blosc frame of the raw bytes (lz4 + bitshuffle). shape_zyx and dtype
+    # always describe the decoded data.
+    codec: str
+
+
+class FrameHeader(_FrameTraceFields, _FrameSlabFields, _FrameCodecFields):
     """``FRAME`` header -- one per acquired volume, sent alongside its bytes.
 
     ``t``/``c`` are this volume's own acquisition indices, not send order --

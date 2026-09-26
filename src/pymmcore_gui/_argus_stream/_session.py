@@ -319,6 +319,18 @@ def _build_session_header(
     return header, ""
 
 
+def _compress(payload: bytes, dtype: str) -> bytes:
+    """Compress one FRAME payload into a blosc frame (``codec: "blosc"``).
+
+    lz4 + bitshuffle over the pixel type: ~2.5x on camera frames.
+    """
+    from numcodecs import blosc
+
+    return blosc.compress(
+        np.frombuffer(payload, dtype=dtype), b"lz4", 5, blosc.BITSHUFFLE
+    )
+
+
 class _RunWorker(threading.Thread):
     """Owns one MDA run's ZMQ DEALER socket and the send/ACK loop.
 
@@ -336,11 +348,13 @@ class _RunWorker(threading.Thread):
         on_state: Callable[[StreamState, str], None],
         on_qc: Callable[[QCHeader], None] | None = None,
         direct_endpoint: str = "",
+        compress_over_tunnel: bool = False,
     ) -> None:
         super().__init__(name="ArgusStreamWorker", daemon=True)
         self._session_id = session_id
         self._local_port = local_port
         self._direct_endpoint = direct_endpoint
+        self._compress_over_tunnel = compress_over_tunnel
         # Set once an ACK advertises "slabs": the acquisition thread then
         # starts new volumes in slab mode (see ArgusStreamSession).
         self.slabs_enabled = threading.Event()
@@ -434,6 +448,10 @@ class _RunWorker(threading.Thread):
 
         unacked: dict[int, tuple[FrameHeader, bytes]] = {}
         unacked_bytes = 0
+        # Compress (here, on this thread) once Argus accepts it, and only
+        # through the tunnel -- see ArgusStreamSettingsV1.compress_over_tunnel.
+        may_compress = self._compress_over_tunnel and route == "SSH tunnel"
+        blosc_ok = False
         last_ack_time = time.monotonic()
         resume_pending = False
         # Argus clock minus ours, from the SESSION_START -> first ACK round
@@ -462,6 +480,9 @@ class _RunWorker(threading.Thread):
                         frame_index, header, payload = self._to_send.get_nowait()
                     except queue.Empty:
                         break
+                    if may_compress and blosc_ok:
+                        payload = _compress(payload, header["dtype"])
+                        header["codec"] = "blosc"
                     if not unacked:
                         # The ACK clock only runs while something is in
                         # flight -- otherwise a volume sent after a long idle
@@ -478,8 +499,11 @@ class _RunWorker(threading.Thread):
                     parts = sock.recv_multipart()
                     msg_type, _sid, ack_header, _payload = unpack_message(parts)
                     if msg_type == MSG_ACK:
-                        if "slabs" in cast("list", ack_header.get("features") or ()):
+                        features = cast("list", ack_header.get("features") or ())
+                        if "slabs" in features:
                             self.slabs_enabled.set()
+                        if "blosc" in features:
+                            blosc_ok = True
                         server_time = ack_header.get("server_time_s")
                         if clock_offset is None and server_time is not None:
                             now = time.time()
@@ -640,6 +664,7 @@ class ArgusStreamSession:
             on_state=self._emit_state,
             on_qc=self._on_qc,
             direct_endpoint=argus.direct_endpoint,
+            compress_over_tunnel=argus.compress_over_tunnel,
         )
         self._all_workers = [w for w in self._all_workers if w.is_alive()]
         self._all_workers.append(self._worker)

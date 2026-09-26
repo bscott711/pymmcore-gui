@@ -30,7 +30,7 @@ USER_DATA_DIR = Path(user_data_dir(appname=APP_NAME))
 USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
 SETTINGS_FILE_NAME = USER_DATA_DIR / "pmm_settings.json"
 TESTING = "PYTEST_VERSION" in os.environ
-_GLOBAL_SETTINGS: "None | SettingsV1" = None
+_GLOBAL_SETTINGS: "SettingsV1 | None" = None
 
 
 class BaseMMSettings(BaseSettings):
@@ -271,6 +271,12 @@ class ArgusStreamSettingsV1(BaseMMSettings):
     TCP, accepted by Argus only from this PC's IP (``opym-receive``'s
     ``OPYM_STREAM_ALLOW_IPS``) and allowed through the site firewall only
     from here.
+    """
+    compress_over_tunnel: bool = True
+    """Compress frames (blosc: lz4 + bitshuffle, ~2.5x on camera data) when
+    streaming through the SSH tunnel, if Argus accepts them. The tunnel moves
+    ~33 MB/s, so this is ~2.5x the frames per second; the direct link is
+    faster than one thread can compress, so frames always go to it raw.
     """
     local_port: int = 5555
     """Local end of the SSH port-forward that the ZMQ DEALER connects to."""
