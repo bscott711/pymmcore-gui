@@ -71,8 +71,16 @@ def _channel_stores(path: Path) -> list[tuple[str, str, Path]]:
 def _as_tzyx(store: Path) -> Any:
     node: Any = zarr.open(str(store), mode="r")
     arr = node["p0"] if hasattr(node, "array_keys") else node
-    while arr.ndim > 4:  # (t, c, z, y, x) with one channel per store
-        arr = arr[:, 0] if arr.shape[1] == 1 else arr[0]
+    if arr.ndim == 5:  # (t, c, z, y, x): the MDA save writes one channel per store
+        if arr.shape[1] != 1:
+            raise SystemExit(
+                f"{store.name} holds {arr.shape[1]} channels; expected one"
+            )
+        arr = arr[:, 0]
+    if arr.ndim not in (3, 4):
+        raise SystemExit(
+            f"{store.name}: can't read a {arr.ndim}-D array as (t, z, y, x)"
+        )
     if arr.ndim == 3:
         arr = arr[np.newaxis]
     return arr
