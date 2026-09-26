@@ -182,7 +182,17 @@ def main(argv: list[str] | None = None) -> int:
             }
         ]
     }
+    captured: list[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(self.format(record))
+
+    capture = _Capture(logging.INFO)
+    capture.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logging.getLogger("pymmcore_gui._argus_stream").addHandler(capture)
     session.sequenceStarted(seq, summary)  # type: ignore[arg-type]
+    worker = session._worker
     time.sleep(1.0)
     plane_s = args.stack_s / (nz * len(arrays))
     start = time.monotonic()
@@ -222,9 +232,15 @@ def main(argv: list[str] | None = None) -> int:
         "stack_s": args.stack_s,
         "all_sent_after_last_plane_s": round(drained_s, 2),
         "states": sorted({s for s, _ in states}),
+        "stats": worker.stats if worker is not None else {},
+        "log": captured[-300:],
         "sha1": manifest,
     }
-    print(json.dumps({k: v for k, v in report.items() if k != "sha1"}, indent=1))
+    print(
+        json.dumps(
+            {k: v for k, v in report.items() if k not in ("sha1", "log")}, indent=1
+        )
+    )
     try:
         subprocess.run(
             ["ssh", *args.ssh_arg, host, f"cat > {args.name}.replay.json"],
