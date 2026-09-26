@@ -1053,3 +1053,69 @@ def test_runs_fall_back_to_the_tunnel_when_direct_is_unreachable(
     assert len(fake_receiver.frame_messages()) == 1
     assert (StreamState.STREAMING, "SSH tunnel") in states
     session.shutdown(timeout=1)
+
+
+def _stream_one_volume(
+    receiver: _FakeReceiver, compress: bool = True, direct: bool = False
+) -> list[tuple[dict, bytes | None]]:
+    endpoint = f"tcp://127.0.0.1:{receiver.port}"
+    settings = _full_settings(
+        ArgusStreamSettingsV1(
+            enabled=True,
+            local_port=1 if direct else receiver.port,
+            direct_endpoint=endpoint if direct else "",
+            compress_over_tunnel=compress,
+            gpfs_scratch_root="/scratch",
+        )
+    )
+    session = ArgusStreamSession(
+        _StubCore(),  # pyright: ignore[reportArgumentType]
+        _NoopTunnel(),  # pyright: ignore[reportArgumentType]
+        get_settings=lambda: settings,
+    )
+    seq = _save_seq(z_plan=useq.ZRangeAround(range=1, step=1), channels=["488nm"])
+    session.sequenceStarted(seq, {})  # pyright: ignore[reportArgumentType]
+    time.sleep(0.3)  # the first ACK (with features) lands before any plane
+    for event in seq:
+        frame = np.full((4, 4), 100 + event.index["z"], dtype="uint16")
+        session.frameReady(frame, event, {})  # pyright: ignore[reportArgumentType]
+    session.sequenceFinished(seq)
+    _wait_for_session_end(receiver)
+    session.shutdown(timeout=1)
+    return receiver.frame_messages()
+
+
+def test_frames_go_compressed_through_the_tunnel_once_argus_accepts_them(
+    fake_receiver: _FakeReceiver,
+) -> None:
+    from numcodecs import blosc
+
+    fake_receiver.features = ["blosc"]
+    [(header, payload)] = _stream_one_volume(fake_receiver)
+    assert header["codec"] == "blosc" and header["shape_zyx"] == [2, 4, 4]
+    vol = np.frombuffer(blosc.decompress(payload or b""), "uint16").reshape(2, 4, 4)
+    assert vol[0, 0, 0] == 100 and vol[1, 0, 0] == 101
+
+
+def test_frames_go_raw_unless_argus_accepts_compression(
+    fake_receiver: _FakeReceiver,
+) -> None:
+    [(header, payload)] = _stream_one_volume(fake_receiver)
+    assert "codec" not in header and len(payload or b"") == 2 * 4 * 4 * 2
+
+
+def test_compression_can_be_turned_off(fake_receiver: _FakeReceiver) -> None:
+    fake_receiver.features = ["blosc"]
+    [(header, _p)] = _stream_one_volume(fake_receiver, compress=False)
+    assert "codec" not in header
+
+
+def test_the_direct_link_always_gets_raw_frames() -> None:
+    """One thread compresses slower than 10 GbE moves raw bytes."""
+    direct = _FakeReceiver()
+    try:
+        direct.features = ["blosc"]
+        [(header, _p)] = _stream_one_volume(direct, direct=True)
+        assert "codec" not in header
+    finally:
+        direct.close()
