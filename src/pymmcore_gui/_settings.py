@@ -284,13 +284,15 @@ class ArgusStreamSettingsV1(BaseMMSettings):
     With several ``stream_links``, link k's forward listens on
     ``local_port + k``.
     """
-    stream_links: int = 1
+    stream_links: int = 4
     """Parallel connections each run streams over.
 
-    Through the tunnel, each link is its own SSH forward, and they're sent
-    over together. One SSH connection moves ~33 MB/s to Argus however fast
-    the network is (sshd's fixed 2 MB window per round trip), so N links move
-    about N times that. Measure with
+    Through the tunnel, each link is its own SSH forward (and ssh process).
+    One SSH connection is capped by sshd's fixed 2 MB window per round trip,
+    however fast the network is; measured from the rig on 2026-09-26: 1 link
+    63 MB/s, 2: 128, 4: 255, 8: 514. 4 links carry ~600 MB/s of camera data
+    after compression. Only used once Argus advertises "links"; otherwise
+    link 0 carries everything. Measure with
     ``python -m pymmcore_gui._argus_stream.linkbench``. Read at app launch.
     """
     ssh_processes: int = 0
@@ -309,6 +311,15 @@ class ArgusStreamSettingsV1(BaseMMSettings):
 
     Sized generously (several volumes deep) since the policy on exceeding it
     is to warn, not to drop data -- see ``_argus_stream._session``.
+    """
+    buffer_hard_cap_mb: int = 0
+    """RAM the stream may hold unsent, across runs, before it gives up.
+
+    Past it (Argus unreachable for too long), the current run stops
+    streaming: its unsent volumes are dropped, Argus is told not to keep
+    the partial copy, and the run goes to Argus by Globus instead.
+    Acquisition and the local save are never affected. 0 means a quarter of
+    this PC's RAM.
     """
     gpfs_scratch_root: str = ""
     """GPFS root the local save directory structure is mirrored under.

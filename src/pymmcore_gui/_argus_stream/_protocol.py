@@ -8,8 +8,10 @@ this file exists purely so the acquisition client has zero dependency on the
 no business on the Windows acquisition workstation).
 
 Transport: ZeroMQ ``DEALER`` (this client) <-> ``ROUTER`` (Argus receiver),
-one TCP connection reached through an SSH local port-forward (see
-``_tunnel.py``). Every message is a ZMQ multipart message::
+reached through SSH local port-forwards (see ``_tunnel.py``). Link 0's
+identity is the session_id; once an ACK advertises ``"links"``, extra links
+k >= 1 carry the same session with identity ``"<session_id>#<k>"``. Every
+message is a ZMQ multipart message::
 
     [msg_type, session_id, msgpack_header, raw_payload?]
 
@@ -48,6 +50,10 @@ class _SessionStartOptional(TypedDict, total=False):
     # Server -> client message types this client understands beyond ACK.
     # ["qc"] asks for MSG_QC; a receiver without live QC just never sends it.
     accepts: list[str]
+    # Only when re-opening a session Argus answered ``unknown_session`` for
+    # (it restarted or timed the session out): every frame_index up to this
+    # was already ACKed. Needs the "resume" feature.
+    resume_through: int
 
 
 class SessionStartHeader(_SessionStartOptional):
@@ -149,15 +155,24 @@ class QCHeader(TypedDict, total=False):
 class SessionEndHeader(TypedDict):
     """``SESSION_END`` header."""
 
-    reason: Literal["complete", "idle_timeout", "client_abort"]
+    # "paused": this run stopped streaming mid-way (Argus unreachable longer
+    # than the send buffer holds); Argus won't keep its partial copy.
+    reason: Literal["complete", "idle_timeout", "client_abort", "paused"]
 
 
 class _AckOptional(TypedDict, total=False):
     # Argus's clock when it sent the ACK: lets the client estimate its clock
     # offset for the FRAME trace fields.
     server_time_s: float
-    # What this receiver supports beyond the base protocol ("slabs").
+    # What this receiver supports beyond the base protocol: "slabs",
+    # "blosc", "links", "resume".
     features: list[str]
+    # Argus has no open session with this id: re-send SESSION_START with
+    # resume_through, then everything unACKed.
+    unknown_session: bool
+    # The final ACK, sent once Argus has closed the session: it confirms
+    # SESSION_END.
+    ended: bool
 
 
 class AckHeader(_AckOptional):

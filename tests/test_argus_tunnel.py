@@ -56,6 +56,7 @@ def test_ssh_notices_a_dead_peer_quickly_and_extra_args_precede_the_host() -> No
         "ServerAliveInterval=5",
         "ServerAliveCountMax=3",
         "ConnectTimeout=10",
+        "Ciphers=^aes128-gcm@openssh.com,aes256-gcm@openssh.com",
     ):
         assert opt in cmd
 

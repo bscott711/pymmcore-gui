@@ -24,8 +24,14 @@ streaming were disabled.
 Transport: when ``ArgusStreamSettingsV1.direct_endpoint`` is set, each run
 first connects straight to Argus over 10 GbE. If Argus hasn't answered
 SESSION_START within ``_DIRECT_HANDSHAKE_S``, the run falls back to the SSH
-tunnel, which stays up for exactly that. The tunnel topped out around
+tunnel, which stays up for exactly that. One tunnel tops out around
 33 MB/s, the largest delay in the live view (2026-09-25).
+
+Links: that cap is per SSH connection (sshd allows 2 MB per ~60 ms round
+trip), not the network's. So once Argus advertises ``"links"``, each run
+sends over ``stream_links`` connections at once -- through the tunnel, one
+SSH forward each -- and resends whatever a dropped link was carrying on the
+others straight away (see :class:`_RunWorker`).
 
 Slabs: once Argus's first ACK advertises ``"slabs"``, each volume is sent as
 runs of about ``_SLAB_TARGET_BYTES`` of consecutive planes while it is still
@@ -40,18 +46,22 @@ drifting out, defocused, bleaching, and what to change -- is handed to the
 from __future__ import annotations
 
 import logging
+import os
 import posixpath
 import queue
+import sys
 import threading
 import time
+from collections import deque
 from enum import Enum
 from pathlib import PureWindowsPath
-from typing import TYPE_CHECKING, Literal, NamedTuple, cast
+from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, cast
 from uuid import uuid4
 
 import numpy as np
 import zmq
 from pymmcore_widgets.useq_widgets import PYMMCW_METADATA_KEY
+from zmq.utils.monitor import recv_monitor_message
 
 from pymmcore_gui._multi_camera_handler import physical_camera_labels, without_cam_index
 from pymmcore_gui._spectral_channel_handler import (
@@ -74,6 +84,7 @@ from ._protocol import (
     pack_message,
     unpack_message,
 )
+from ._tunnel import link_endpoints
 from ._volume_assembler import Volume, VolumeAssembler
 
 if TYPE_CHECKING:
@@ -111,8 +122,27 @@ _MAX_OFFSET_RTT_S = 2.0
 # ~1/3 of the measured ~60 MB/s tunnel throughput (2026-09-21).
 _MIN_LINK_BYTES_PER_S = 20 * 1024 * 1024
 _POLL_TIMEOUT_MS = 200
+# Per link: a message or two queued in ZMQ is enough to keep a tunnel busy,
+# and the next one goes to whichever link has room.
+_LINK_SNDHWM = 2
+# End-to-end liveness through the tunnel: a link whose path went silent is
+# dropped (and its volumes resent elsewhere) within the timeout, even while
+# its ssh process still looks alive.
+# A link's queue (SNDHWM plus ssh's window) drains in well under a second
+# at ~60 MB/s, so a PING that sees no reply in 5 s means a dead path, not a
+# busy one. (A black-holed tunnel held its volumes back 10 s at 10 s.)
+_HEARTBEAT_IVL_MS = 1000
+_HEARTBEAT_TIMEOUT_MS = 5000
+_HEARTBEAT_TTL_MS = 10000
+_RECONNECT_IVL_MS = 250
+_RECONNECT_IVL_MAX_MS = 5000
+_RATE_LOG_S = 30.0
+_END_RETRY_S = 2.0
+_END_TRIES = 5
+# If the RAM can't be read; the setting's 0 otherwise means a quarter of it.
+_FALLBACK_HARD_CAP_BYTES = 8 * 1024**3
 _DTYPE_BY_BYTES_PER_PIXEL = {1: "uint8", 2: "uint16", 4: "uint32"}
-_SessionEndReason = Literal["complete", "idle_timeout", "client_abort"]
+_SessionEndReason = Literal["complete", "idle_timeout", "client_abort", "paused"]
 
 
 class StreamState(str, Enum):
@@ -126,6 +156,7 @@ class StreamState(str, Enum):
     RECONNECTING = "reconnecting"
     BACKLOG_ALARM = "backlog_alarm"
     FINISHING = "finishing"
+    PAUSED = "paused"
 
 
 class CameraGeometry(NamedTuple):
@@ -334,37 +365,166 @@ def _compress(payload: bytes, dtype: str) -> bytes:
     )
 
 
-class _RunWorker(threading.Thread):
-    """Owns one MDA run's ZMQ DEALER socket and the send/ACK loop.
+class _BufferBudget:
+    """RAM the senders of every run hold, against one hard cap.
 
-    All socket I/O and ``_unacked`` bookkeeping happens on this thread only.
+    Summed across runs: a run that finished during an outage keeps its
+    unsent volumes while the next run starts buffering its own.
+    """
+
+    def __init__(self, cap_bytes: int) -> None:
+        self.cap_bytes = cap_bytes
+        self._lock = threading.Lock()
+        self._held: dict[int, int] = {}
+
+    def update(self, owner: object, nbytes: int) -> int:
+        """Record what ``owner`` holds now; return the total across owners."""
+        with self._lock:
+            if nbytes:
+                self._held[id(owner)] = nbytes
+            else:
+                self._held.pop(id(owner), None)
+            return sum(self._held.values())
+
+
+def _physical_ram_bytes() -> int:
+    """Total physical RAM, or 0 if it can't be read."""
+    if sys.platform == "win32":
+        import ctypes
+
+        class _MemoryStatus(ctypes.Structure):
+            _fields_: ClassVar = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = _MemoryStatus()
+        status.dwLength = ctypes.sizeof(status)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return int(status.ullTotalPhys)
+        return 0
+    try:
+        return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
+    except (ValueError, OSError, AttributeError):
+        return 0
+
+
+def hard_cap_bytes(setting_mb: int) -> int:
+    """The send buffer's hard cap: the setting, or a quarter of the RAM if 0."""
+    if setting_mb > 0:
+        return setting_mb * 1024 * 1024
+    ram = _physical_ram_bytes()
+    return ram // 4 if ram else _FALLBACK_HARD_CAP_BYTES
+
+
+class _Link:
+    """One connection of a run: a DEALER socket and its connection monitor.
+
+    ``up`` follows the monitor. It turns true once the ZMTP handshake with
+    the receiver completes, which through a tunnel proves the whole path.
+    It turns false when the connection drops, including a heartbeat timeout
+    on a path that went silent while its ``ssh`` still looks alive.
+    """
+
+    def __init__(self, index: int, endpoint: str, identity: str) -> None:
+        self.index = index
+        self.endpoint = endpoint
+        self.up = False
+        self.sent_bytes = 0
+        sock = zmq.Context.instance().socket(zmq.DEALER)
+        sock.setsockopt(zmq.IDENTITY, identity.encode("utf-8"))
+        sock.setsockopt(zmq.SNDHWM, _LINK_SNDHWM)
+        sock.setsockopt(zmq.LINGER, 0)
+        # Link 0 queues SESSION_START while its tunnel is still coming up;
+        # the others queue nothing while disconnected.
+        sock.setsockopt(zmq.IMMEDIATE, 1 if index else 0)
+        sock.setsockopt(zmq.HEARTBEAT_IVL, _HEARTBEAT_IVL_MS)
+        sock.setsockopt(zmq.HEARTBEAT_TIMEOUT, _HEARTBEAT_TIMEOUT_MS)
+        sock.setsockopt(zmq.HEARTBEAT_TTL, _HEARTBEAT_TTL_MS)
+        sock.setsockopt(zmq.RECONNECT_IVL, _RECONNECT_IVL_MS)
+        sock.setsockopt(zmq.RECONNECT_IVL_MAX, _RECONNECT_IVL_MAX_MS)
+        self.monitor = sock.get_monitor_socket(
+            zmq.EVENT_HANDSHAKE_SUCCEEDED | zmq.EVENT_DISCONNECTED
+        )
+        sock.connect(endpoint)
+        self.sock = sock
+
+    def poll_events(self) -> tuple[bool, bool]:
+        """Apply queued monitor events; return (came up, went down)."""
+        came_up = went_down = False
+        while self.monitor.poll(0):
+            event = recv_monitor_message(self.monitor)["event"]
+            if event == zmq.EVENT_HANDSHAKE_SUCCEEDED:
+                self.up, came_up = True, True
+            elif event == zmq.EVENT_DISCONNECTED:
+                self.up, went_down = False, True
+        return came_up, went_down
+
+    def close(self, linger_ms: int = 0) -> None:
+        self.sock.disable_monitor()
+        self.monitor.close(linger=0)
+        self.sock.close(linger=linger_ms)
+
+
+class _RunWorker(threading.Thread):
+    """Owns one MDA run's links and the send/ACK loop.
+
+    All socket I/O and ``unacked`` bookkeeping happens on this thread only.
     :meth:`submit` is the sole entry point called from the acquisition
     thread; it is a cheap, non-blocking queue append.
+
+    Links: link 0 sends SESSION_START. Once an ACK advertises ``"links"``,
+    links 1..N-1 open too, and every volume or slab goes out on whichever
+    link is up and has room (``_LINK_SNDHWM``), so faster links carry more.
+    When a link drops, what was last sent on it and is still unACKed is
+    resent on the others at once. The stale-ACK RESUME is only a backstop.
+
+    Resume: if Argus answers ``unknown_session`` (the receiver restarted,
+    or timed the session out), SESSION_START is sent again with
+    ``resume_through`` and then everything unACKed.
+
+    Pause: if what every run holds unsent passes the hard cap, this run
+    stops streaming for good. Its buffer is dropped, SESSION_END "paused"
+    tells Argus not to keep its partial copy, and the run goes to Argus by
+    Globus instead. Acquisition and local saving never wait on any of this.
     """
 
     def __init__(
         self,
         session_id: str,
-        local_port: int,
+        endpoints: list[str],
         header: SessionStartHeader,
         buffer_budget_bytes: int,
         on_state: Callable[[StreamState, str], None],
         on_qc: Callable[[QCHeader], None] | None = None,
         direct_endpoint: str = "",
         compress_over_tunnel: bool = False,
+        budget: _BufferBudget | None = None,
     ) -> None:
         super().__init__(name="ArgusStreamWorker", daemon=True)
         self._session_id = session_id
-        self._local_port = local_port
+        self._endpoints = endpoints or ["tcp://127.0.0.1:5555"]
         self._direct_endpoint = direct_endpoint
         self._compress_over_tunnel = compress_over_tunnel
         # Set once an ACK advertises "slabs": the acquisition thread then
         # starts new volumes in slab mode (see ArgusStreamSession).
         self.slabs_enabled = threading.Event()
+        # Set when this run stops streaming (see "Pause" above): the
+        # acquisition thread then stops assembling volumes for it.
+        self.paused = threading.Event()
         self._header = header
         self._buffer_budget_bytes = buffer_budget_bytes
+        self._budget = budget
         self._on_state = on_state
         self._on_qc = on_qc
+        self._last_state: tuple[StreamState, str] | None = None
 
         self._to_send: queue.Queue[tuple[int, FrameHeader, bytes]] = queue.Queue()
         self._next_frame_index = 0
@@ -400,7 +560,8 @@ class _RunWorker(threading.Thread):
 
     def finish(self, reason: _SessionEndReason = "complete") -> None:
         """Request a graceful stop: drain and fully ACK before SESSION_END."""
-        self._finish_reason = reason
+        if not self.paused.is_set():
+            self._finish_reason = reason
         self._finish_event.set()
 
     def abort(self) -> None:
@@ -408,177 +569,377 @@ class _RunWorker(threading.Thread):
         self._abort_event.set()
         self._finish_event.set()
 
-    def _open_socket(self, endpoint: str) -> zmq.Socket:
-        sock = zmq.Context.instance().socket(zmq.DEALER)
-        sock.setsockopt(zmq.IDENTITY, self._session_id.encode("utf-8"))
-        sock.setsockopt(zmq.SNDHWM, 50)
-        sock.setsockopt(zmq.LINGER, 0)
-        sock.connect(endpoint)
-        return sock
+    def _emit(self, state: StreamState, detail: str) -> None:
+        if (state, detail) != self._last_state:
+            self._last_state = (state, detail)
+            self._on_state(state, detail)
 
-    def _start_session(self) -> tuple[zmq.Socket, str, float]:
-        """Connect and send SESSION_START, directly if Argus answers in time.
+    def _start_session(self) -> tuple[_Link, str, float]:
+        """Open link 0 and send SESSION_START, directly if Argus answers.
 
-        Falls back to the SSH tunnel otherwise. Returns the socket, a label
-        for the route taken, and when SESSION_START was sent (for the
+        Falls back to the SSH tunnel otherwise. Returns link 0, a label for
+        the route taken, and when SESSION_START was sent (for the
         clock-offset round trip). A direct answer is left unread for the main
         loop, which also takes the clock offset and features from it.
         """
         start = pack_message(MSG_SESSION_START, self._session_id, self._header)
         if self._direct_endpoint:
-            sock = self._open_socket(self._direct_endpoint)
+            link = _Link(0, self._direct_endpoint, self._session_id)
             sent_s = time.time()
-            sock.send_multipart(start)
-            if sock.poll(int(_DIRECT_HANDSHAKE_S * 1000)):
-                return sock, "direct", sent_s
-            sock.close(linger=0)
+            link.sock.send_multipart(start)
+            if link.sock.poll(int(_DIRECT_HANDSHAKE_S * 1000)):
+                return link, "direct", sent_s
+            link.close()
             logger.warning(
                 "Argus direct endpoint %s did not answer within %.0f s; "
                 "streaming this run through the SSH tunnel",
                 self._direct_endpoint,
                 _DIRECT_HANDSHAKE_S,
             )
-        sock = self._open_socket(f"tcp://127.0.0.1:{self._local_port}")
+        link = _Link(0, self._endpoints[0], self._session_id)
         sent_s = time.time()
-        sock.send_multipart(start)
-        return sock, "SSH tunnel", sent_s
+        link.sock.send_multipart(start)
+        return link, "SSH tunnel", sent_s
 
     def run(self) -> None:
-        self._on_state(StreamState.CONNECTING, "")
-        sock, route, start_sent_s = self._start_session()
-        poller = zmq.Poller()
-        poller.register(sock, zmq.POLLIN)
+        self._emit(StreamState.CONNECTING, "")
+        sid = self._session_id
+        link0, route, start_sent_s = self._start_session()
+        n_links = len(self._endpoints)
+        endpoints = (
+            [self._direct_endpoint] * n_links if route == "direct" else self._endpoints
+        )
+        links = [link0]
+        self._emit(StreamState.STREAMING, route)
 
         unacked: dict[int, tuple[FrameHeader, bytes]] = {}
         unacked_bytes = 0
+        # Frame indices to send next, in order; resends go to the front.
+        pending: deque[int] = deque()
+        queued: set[int] = set()
+        sent_on: dict[int, int] = {}  # frame_index -> link it last went on
+        acked_through = -1
+        features: set[str] = set()
         # Compress (here, on this thread) once Argus accepts it, and only
         # through the tunnel -- see ArgusStreamSettingsV1.compress_over_tunnel.
         may_compress = self._compress_over_tunnel and route == "SSH tunnel"
-        blosc_ok = False
         last_ack_time = time.monotonic()
-        resume_pending = False
+        # A RESUME (stale-ACK backstop) or a resync SESSION_START is
+        # awaiting its ACK; that ACK makes everything unACKed go again.
+        resume_sent = False
+        resync_sent = False
         # Argus clock minus ours, from the SESSION_START -> first ACK round
         # trip; sent with every FRAME once known (see _protocol.py).
         clock_offset: float | None = None
+        next_link = 0
+        rate_mark = (time.monotonic(), [0] * n_links)
+        end_link: _Link | None = None
+        # SESSION_END is confirmed by the receiver's final ACK; until then it
+        # is resent every _END_RETRY_S (on the next link), _END_TRIES times.
+        end_sent_at: float | None = None
+        end_tries = 0
+        end_confirmed = False
 
-        def send_frame(header: FrameHeader, payload: bytes) -> None:
-            header["sent_s"] = time.time()
-            if clock_offset is not None:
-                header["clock_offset_s"] = clock_offset
-            sock.send_multipart(
-                pack_message(MSG_FRAME, self._session_id, header, payload)
+        def up_links() -> list[_Link]:
+            return [link for link in links if link.up]
+
+        def send(parts: list[bytes]) -> _Link | None:
+            """Hand ``parts`` to the next link that is up and has room."""
+            nonlocal next_link
+            up = up_links()
+            for i in range(len(up)):
+                link = up[(next_link + i) % len(up)]
+                try:
+                    link.sock.send_multipart(parts, flags=zmq.NOBLOCK, copy=False)
+                except zmq.Again:
+                    continue
+                next_link = (next_link + i + 1) % len(up)
+                return link
+            return None
+
+        def requeue(frame_indices: list[int]) -> None:
+            for fi in sorted(frame_indices, reverse=True):
+                sent_on.pop(fi, None)
+                if fi in unacked and fi not in queued:
+                    pending.appendleft(fi)
+                    queued.add(fi)
+
+        def compress(fi: int) -> None:
+            nonlocal unacked_bytes
+            header, payload = unacked[fi]
+            if may_compress and "blosc" in features and "codec" not in header:
+                packed = _compress(payload, header["dtype"])
+                header["codec"] = "blosc"
+                unacked[fi] = (header, packed)
+                unacked_bytes += len(packed) - len(payload)
+
+        def dispatch() -> bool:
+            """Send pending frames until every link is full; True if any went."""
+            sent_any = False
+            while pending and not resync_sent:
+                fi = pending[0]
+                if fi not in unacked:
+                    pending.popleft()
+                    queued.discard(fi)
+                    continue
+                compress(fi)
+                header, payload = unacked[fi]
+                header["sent_s"] = time.time()
+                if clock_offset is not None:
+                    header["clock_offset_s"] = clock_offset
+                link = send(pack_message(MSG_FRAME, sid, header, payload))
+                if link is None:
+                    break
+                pending.popleft()
+                queued.discard(fi)
+                sent_on[fi] = link.index
+                link.sent_bytes += len(payload)
+                sent_any = True
+            return sent_any
+
+        def on_ack(ack: dict[str, object]) -> None:
+            nonlocal acked_through, unacked_bytes, last_ack_time, clock_offset
+            nonlocal resume_sent, resync_sent
+            features.update(cast("list[str]", ack.get("features") or ()))
+            if "slabs" in features:
+                self.slabs_enabled.set()
+            if ack.get("unknown_session"):
+                # Argus lost this session (restart, or idle timeout): start
+                # it again where it stood, then resend what's unACKed.
+                if "resume" in features and not resync_sent:
+                    start = dict(self._header)
+                    if acked_through >= 0:
+                        start["resume_through"] = acked_through
+                    if send(pack_message(MSG_SESSION_START, sid, start)):  # type: ignore[arg-type]
+                        resync_sent = True
+                        logger.warning(
+                            "Argus no longer knows this run's session; "
+                            "resuming it after frame %d",
+                            acked_through,
+                        )
+                return
+            server_time = ack.get("server_time_s")
+            if clock_offset is None and server_time is not None:
+                now = time.time()
+                if now - start_sent_s <= _MAX_OFFSET_RTT_S:
+                    clock_offset = cast("float", server_time) - (
+                        (start_sent_s + now) / 2
+                    )
+            through = cast("int", ack.get("through_frame_index", -1))
+            acked_through = max(acked_through, through)
+            for fi in [fi for fi in unacked if fi <= through]:
+                _, payload = unacked.pop(fi)
+                unacked_bytes -= len(payload)
+                sent_on.pop(fi, None)
+            last_ack_time = time.monotonic()
+            if resume_sent or resync_sent:
+                # The reply to a RESUME or resync: per protocol, resend
+                # everything still unACKed, in frame_index order -- the
+                # receiver dedupes, so resending staged data is a no-op.
+                requeue(list(unacked))
+                resume_sent = resync_sent = False
+            if "links" in features and len(links) < n_links:
+                links.extend(
+                    _Link(k, endpoints[k], f"{sid}#{k}")
+                    for k in range(len(links), n_links)
+                )
+                logger.info("Argus stream: %d links over the %s", n_links, route)
+
+        def pause(total: int) -> None:
+            nonlocal unacked_bytes
+            self.paused.set()
+            self._finish_reason = "paused"
+            self._finish_event.set()
+            unacked.clear()
+            pending.clear()
+            queued.clear()
+            sent_on.clear()
+            unacked_bytes = 0
+            while True:
+                try:
+                    self._to_send.get_nowait()
+                except queue.Empty:
+                    break
+            logger.error(
+                "Argus stream PAUSED for this run: %d MiB could not be sent "
+                "(cap %d MiB). Acquisition and the local save continue; send "
+                "this run to Argus by Globus.",
+                total // 2**20,
+                (self._budget.cap_bytes if self._budget else 0) // 2**20,
             )
 
-        session_ended = False
         try:
-            self._on_state(StreamState.STREAMING, route)
-
             while True:
                 if self._abort_event.is_set():
                     break
+                now = time.monotonic()
 
-                drained_any = False
+                # Intake: everything the acquisition thread queued.
                 while True:
                     try:
                         frame_index, header, payload = self._to_send.get_nowait()
                     except queue.Empty:
                         break
-                    if may_compress and blosc_ok:
-                        payload = _compress(payload, header["dtype"])
-                        header["codec"] = "blosc"
+                    if self.paused.is_set():
+                        continue
                     if not unacked:
                         # The ACK clock only runs while something is in
                         # flight -- otherwise a volume sent after a long idle
                         # (e.g. a whole z-stack's acquisition) is instantly
                         # "stale" and triggers a spurious RESUME + resend.
-                        last_ack_time = time.monotonic()
+                        last_ack_time = now
                     unacked[frame_index] = (header, payload)
                     unacked_bytes += len(payload)
-                    send_frame(header, payload)
-                    drained_any = True
+                    compress(frame_index)
+                    pending.append(frame_index)
+                    queued.add(frame_index)
 
-                events = dict(poller.poll(timeout=_POLL_TIMEOUT_MS))
-                if sock in events:
-                    parts = sock.recv_multipart()
-                    msg_type, _sid, ack_header, _payload = unpack_message(parts)
-                    if msg_type == MSG_ACK:
-                        features = cast("list", ack_header.get("features") or ())
-                        if "slabs" in features:
-                            self.slabs_enabled.set()
-                        if "blosc" in features:
-                            blosc_ok = True
-                        server_time = ack_header.get("server_time_s")
-                        if clock_offset is None and server_time is not None:
-                            now = time.time()
-                            if now - start_sent_s <= _MAX_OFFSET_RTT_S:
-                                clock_offset = cast("float", server_time) - (
-                                    (start_sent_s + now) / 2
-                                )
-                        through = cast("int", ack_header.get("through_frame_index", -1))
-                        for fi in [fi for fi in unacked if fi <= through]:
-                            _, payload = unacked.pop(fi)
-                            unacked_bytes -= len(payload)
-                        last_ack_time = time.monotonic()
-                        if resume_pending:
-                            # This ACK is the RESUME's reply. Per protocol,
-                            # explicitly resend everything still unacked (in
-                            # frame_index order) rather than relying on ZMQ's
-                            # own outbound buffering having survived the
-                            # disconnect -- the receiver dedupes by (t, c),
-                            # so resending already-staged data is a safe
-                            # no-op, not a duplicate ticket.
-                            for frame_index in sorted(unacked):
-                                send_frame(*unacked[frame_index])
-                            resume_pending = False
-                    elif msg_type == MSG_QC and self._on_qc is not None:
-                        # Advisory; a failing consumer must never stall the
-                        # send/ACK loop.
-                        try:
-                            self._on_qc(cast("QCHeader", ack_header))
-                        except Exception:
-                            logger.exception("Argus QC callback failed")
+                for link in links:
+                    came_up, went_down = link.poll_events()
+                    if went_down:
+                        lost = [fi for fi, k in sent_on.items() if k == link.index]
+                        requeue(lost)
+                        logger.warning(
+                            "Argus link %d (%s) dropped; resending its %d "
+                            "unACKed volume(s) on the others",
+                            link.index,
+                            link.endpoint,
+                            len(lost),
+                        )
+                    if came_up:
+                        last_ack_time = now if unacked else last_ack_time
+                        logger.debug("Argus link %d up (%s)", link.index, link.endpoint)
 
+                ending = self._finish_event.is_set() and not unacked and not pending
+                if end_confirmed:
+                    break
+                if ending and self._to_send.empty():
+                    due = end_sent_at is None or now - end_sent_at >= _END_RETRY_S
+                    if due and end_tries >= _END_TRIES:
+                        logger.warning(
+                            "Argus never confirmed this run's SESSION_END; it "
+                            "will close the session itself after its idle timeout"
+                        )
+                        break
+                    if due:
+                        carrier = send(
+                            pack_message(
+                                MSG_SESSION_END, sid, {"reason": self._finish_reason}
+                            )
+                        )
+                        if carrier is not None:
+                            end_link, end_sent_at = carrier, now
+                            end_tries += 1
+
+                drained_any = dispatch()
+
+                poller = zmq.Poller()
+                for link in links:
+                    flags = zmq.POLLIN
+                    if link.up and (pending or ending) and not resync_sent:
+                        flags |= zmq.POLLOUT
+                    poller.register(link.sock, flags)
+                    poller.register(link.monitor, zmq.POLLIN)
+                events = dict(
+                    poller.poll(timeout=0 if drained_any else _POLL_TIMEOUT_MS)
+                )
+                for link in links:
+                    if not events.get(link.sock, 0) & zmq.POLLIN:
+                        continue
+                    while link.sock.poll(0):
+                        msg_type, _sid, reply, _payload = unpack_message(
+                            link.sock.recv_multipart()
+                        )
+                        if msg_type == MSG_ACK and end_sent_at is not None:
+                            # The final ACK ("ended"), or "unknown" (it had
+                            # already closed the session), confirms
+                            # SESSION_END. A receiver without "resume" marks
+                            # neither, so any ACK has to do.
+                            end_confirmed = bool(
+                                reply.get("ended")
+                                or reply.get("unknown_session")
+                                or "resume" not in features
+                            )
+                        elif msg_type == MSG_ACK:
+                            on_ack(reply)
+                        elif msg_type == MSG_QC and self._on_qc is not None:
+                            # Advisory; a failing consumer must never stall
+                            # the send/ACK loop.
+                            try:
+                                self._on_qc(cast("QCHeader", reply))
+                            except Exception:
+                                logger.exception("Argus QC callback failed")
+
+                up = up_links()
+                if not up:
+                    # Nothing is in flight while every link is down: that's
+                    # handled by resending on reconnect, not by staleness.
+                    last_ack_time = time.monotonic()
                 # A single volume can be hundreds of MB; allow time to
                 # transfer what's outstanding before calling the link stale.
                 stale_after_s = _STALE_ACK_S + unacked_bytes / _MIN_LINK_BYTES_PER_S
                 stale = time.monotonic() - last_ack_time > stale_after_s
-                if stale and unacked and not resume_pending:
-                    sock.send_multipart(pack_message(MSG_RESUME, self._session_id, {}))
-                    resume_pending = True
+                if stale and unacked and not (resume_sent or resync_sent):
+                    resume_sent = send(pack_message(MSG_RESUME, sid, {})) is not None
 
-                if unacked_bytes > self._buffer_budget_bytes:
-                    self._on_state(
+                total = unacked_bytes
+                if self._budget is not None:
+                    total = self._budget.update(self, unacked_bytes)
+                    if (
+                        not self._finish_event.is_set()
+                        and total > self._budget.cap_bytes
+                    ):
+                        pause(total)
+                        self._budget.update(self, 0)
+                        self._emit(
+                            StreamState.PAUSED,
+                            "link down too long; local save is complete, "
+                            "send this run by Globus",
+                        )
+                        continue
+
+                label = route if n_links == 1 else f"{route} x{len(up)}/{n_links}"
+                if self.paused.is_set():
+                    pass
+                elif unacked_bytes > self._buffer_budget_bytes:
+                    self._emit(
                         StreamState.BACKLOG_ALARM,
                         f"{unacked_bytes // (1024 * 1024)} MiB unacked",
                     )
-                elif stale and unacked:
-                    self._on_state(StreamState.RECONNECTING, "")
-                elif drained_any or not unacked:
-                    self._on_state(StreamState.STREAMING, route)
+                elif (stale or not up) and unacked:
+                    self._emit(StreamState.RECONNECTING, label)
+                elif self._finish_event.is_set():
+                    self._emit(StreamState.FINISHING, f"{len(unacked)} volumes unacked")
+                else:
+                    self._emit(StreamState.STREAMING, label)
 
-                if (
-                    self._finish_event.is_set()
-                    and self._to_send.empty()
-                    and not unacked
-                ):
-                    break
-                if self._finish_event.is_set() and not self._abort_event.is_set():
-                    self._on_state(
-                        StreamState.FINISHING, f"{len(unacked)} volumes unacked"
-                    )
+                t_mark, bytes_mark = rate_mark
+                if n_links > 1 and time.monotonic() - t_mark >= _RATE_LOG_S:
+                    dt = time.monotonic() - t_mark
+                    sent_now = [link.sent_bytes for link in links]
+                    rates = [
+                        (b - (bytes_mark[i] if i < len(bytes_mark) else 0)) / dt / 1e6
+                        for i, b in enumerate(sent_now)
+                    ]
+                    if any(rates):
+                        logger.info(
+                            "Argus links MB/s: %s",
+                            " ".join(f"{r:.0f}" for r in rates),
+                        )
+                    rate_mark = (time.monotonic(), sent_now)
 
-            reason = (
-                self._finish_reason
-                if not self._abort_event.is_set()
-                else ("client_abort")
-            )
-            sock.send_multipart(
-                pack_message(MSG_SESSION_END, self._session_id, {"reason": reason})
-            )
-            session_ended = True
+            if self._abort_event.is_set() and end_link is None:
+                reason: _SessionEndReason = (
+                    "paused" if self.paused.is_set() else "client_abort"
+                )
+                end_link = send(pack_message(MSG_SESSION_END, sid, {"reason": reason}))
         finally:
-            sock.close(linger=_SESSION_END_LINGER_MS if session_ended else 0)
-            self._on_state(StreamState.IDLE, "")
+            for link in links:
+                link.close(_SESSION_END_LINGER_MS if link is end_link else 0)
+            if self._budget is not None:
+                self._budget.update(self, 0)
+            if not self.paused.is_set():
+                self._on_state(StreamState.IDLE, "")
 
 
 class ArgusStreamSession:
@@ -604,6 +965,8 @@ class ArgusStreamSession:
         self._on_state_changed = on_state_changed
         self._on_qc = on_qc
         self._assembler = VolumeAssembler()
+        # What every run's sender holds unsent, against one hard cap.
+        self._budget = _BufferBudget(_FALLBACK_HARD_CAP_BYTES)
         # The worker for the run currently in progress -- frameReady routes
         # to this one. Cleared at sequenceFinished/sequenceCanceled, but the
         # worker itself may still be alive draining its unacked buffer in
@@ -659,15 +1022,17 @@ class ArgusStreamSession:
         # tunnel-startup cost racing _RunWorker's own connect() below.
         self._tunnel.start()
         self._assembler.reset(sequence)
+        self._budget.cap_bytes = hard_cap_bytes(argus.buffer_hard_cap_mb)
         self._worker = _RunWorker(
             session_id=str(uuid4()),
-            local_port=argus.local_port,
+            endpoints=link_endpoints(argus.local_port, argus.stream_links),
             header=header,
             buffer_budget_bytes=argus.buffer_budget_mb * 1024 * 1024,
             on_state=self._emit_state,
             on_qc=self._on_qc,
             direct_endpoint=argus.direct_endpoint,
             compress_over_tunnel=argus.compress_over_tunnel,
+            budget=self._budget,
         )
         self._all_workers = [w for w in self._all_workers if w.is_alive()]
         self._all_workers.append(self._worker)
@@ -700,6 +1065,10 @@ class ArgusStreamSession:
         region as its own channel.
         """
         if self._worker is None:
+            return
+        if self._worker.paused.is_set():
+            # This run stopped streaming (see _RunWorker): don't assemble.
+            self._assembler.clear()
             return
 
         if not self._active_spectral:
