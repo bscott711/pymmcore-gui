@@ -82,6 +82,10 @@ class VolumeAssembler:
         self._expected_z = pos_sizes.get("z", 1)
         self._pending.clear()
 
+    def clear(self) -> None:
+        """Drop every partly assembled volume (keeps the expected z-count)."""
+        self._pending.clear()
+
     def add_frame(
         self, frame: np.ndarray, event: useq.MDAEvent, meta: FrameMetaV1
     ) -> Volume | None:

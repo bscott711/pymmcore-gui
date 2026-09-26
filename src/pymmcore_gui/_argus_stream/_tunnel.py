@@ -53,6 +53,7 @@ _SERVER_ALIVE_INTERVAL_S = 5
 _SERVER_ALIVE_COUNT_MAX = 3
 _CONNECT_TIMEOUT_S = 10
 _STDERR_TAIL_LINES = 20
+_PREFERRED_CIPHERS = "aes128-gcm@openssh.com,aes256-gcm@openssh.com"
 
 
 def link_endpoints(local_port: int, links: int) -> list[str]:
@@ -118,6 +119,11 @@ class _SshProcess:
             f"ServerAliveCountMax={_SERVER_ALIVE_COUNT_MAX}",
             "-o",
             f"ConnectTimeout={_CONNECT_TIMEOUT_S}",
+            # AES-GCM first (the defaults stay as fallback): on the rig it
+            # moved the same MB/s for 30% less CPU (1.09 vs 1.56 cores over
+            # 4 links, 2026-09-26).
+            "-o",
+            f"Ciphers=^{_PREFERRED_CIPHERS}",
         ]
         for local, remote in self.forwards:
             cmd += ["-L", f"{local}:127.0.0.1:{remote}"]

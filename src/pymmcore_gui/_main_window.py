@@ -155,6 +155,7 @@ _ARGUS_STATE_TEXT = {
     StreamState.RECONNECTING: "Argus: reconnecting…",
     StreamState.BACKLOG_ALARM: "Argus: backlog!",
     StreamState.FINISHING: "Argus: finishing…",
+    StreamState.PAUSED: "Argus: PAUSED",
 }
 
 

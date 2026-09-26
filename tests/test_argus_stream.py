@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import contextlib
+import random
+import socket
 import threading
 import time
 from typing import TYPE_CHECKING, cast
@@ -38,7 +41,7 @@ from pymmcore_gui._settings import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
 PYMMCW_KEY = "pymmcore_widgets"
 LASER_GROUP = "Lasers"
@@ -517,12 +520,16 @@ class _FakeReceiver:
         self.sock = self.ctx.socket(zmq.ROUTER)
         self.port = self.sock.bind_to_random_port("tcp://127.0.0.1")
         self.messages: list[tuple[bytes, str, dict, bytes | None]] = []
+        # The link identity each message came from, parallel to messages.
+        self.identities: list[bytes] = []
         self.auto_ack = True
         # When set, ACKs carry server_time_s = time.time() + this skew, like
         # the real receiver (whose clock the client must correct for).
         self.clock_skew_s: float | None = None
         # Advertised in every ACK when set (the real receiver sends ["slabs"]).
         self.features: list[str] | None = None
+        # Answer SESSION_END with the final ACK ({"ended": true}).
+        self.confirm_end = True
         self._stop = threading.Event()
         self._identity: bytes | None = None
         self._session_id: str | None = None
@@ -540,9 +547,13 @@ class _FakeReceiver:
             msg_type, session_id, header, payload = unpack_message(rest)
             self._identity = identity
             self._session_id = session_id
+            self.identities.append(identity)
             self.messages.append((msg_type, session_id, header, payload))
             if not self.auto_ack:
                 continue
+            if msg_type == MSG_SESSION_END and self.confirm_end:
+                # The real receiver's final ACK.
+                self.send(MSG_ACK, {"through_frame_index": -1, "ended": True})
             if msg_type in (MSG_SESSION_START, MSG_FRAME, MSG_RESUME):
                 frame_indices = (
                     h["frame_index"] for t, _s, h, _p in self.messages if t == MSG_FRAME
@@ -1119,3 +1130,386 @@ def test_the_direct_link_always_gets_raw_frames() -> None:
         assert "codec" not in header
     finally:
         direct.close()
+
+
+# ----------------------------------------------------------------------------
+# Links: one run over several connections (one SSH tunnel each)
+# ----------------------------------------------------------------------------
+
+
+class _LinkProxy:
+    """A TCP forwarder standing in for one SSH tunnel.
+
+    A test can cut it (connections reset, port closed) or silence it
+    (connections stay open, nothing flows): the two ways a tunnel fails.
+    """
+
+    def __init__(self, listener: socket.socket, target_port: int) -> None:
+        self.listener = listener
+        self.target_port = target_port
+        self.silenced = threading.Event()
+        self._conns: list[socket.socket] = []
+        self._stop = threading.Event()
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self) -> None:
+        self.listener.settimeout(0.05)
+        while not self._stop.is_set():
+            try:
+                client, _ = self.listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            upstream = socket.create_connection(("127.0.0.1", self.target_port))
+            self._conns += [client, upstream]
+            for src, dst in ((client, upstream), (upstream, client)):
+                threading.Thread(
+                    target=self._pipe, args=(src, dst), daemon=True
+                ).start()
+
+    def _pipe(self, src: socket.socket, dst: socket.socket) -> None:
+        try:
+            while not self._stop.is_set():
+                data = src.recv(1 << 16)
+                if not data:
+                    break
+                while self.silenced.is_set() and not self._stop.is_set():
+                    time.sleep(0.01)
+                dst.sendall(data)
+        except OSError:
+            pass
+        for sock in (src, dst):
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+
+    def cut(self) -> None:
+        self._stop.set()
+        self.listener.close()
+        for sock in self._conns:
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+            sock.close()
+
+
+@pytest.fixture
+def link_proxies(
+    fake_receiver: _FakeReceiver,
+) -> Iterator[tuple[int, list[_LinkProxy]]]:
+    """Three proxies on consecutive ports in front of the fake receiver."""
+    for _ in range(100):
+        base = random.randint(20000, 60000)
+        listeners: list[socket.socket] = []
+        try:
+            for k in range(3):
+                sock = socket.socket()
+                sock.bind(("127.0.0.1", base + k))
+                sock.listen()
+                listeners.append(sock)
+        except OSError:
+            for sock in listeners:
+                sock.close()
+            continue
+        proxies = [_LinkProxy(sock, fake_receiver.port) for sock in listeners]
+        yield base, proxies
+        for proxy in proxies:
+            proxy.cut()
+        return
+    raise RuntimeError("no three consecutive free ports")
+
+
+def _links_session(
+    local_port: int, links: int = 3, **settings_kw: object
+) -> ArgusStreamSession:
+    settings = _full_settings(
+        ArgusStreamSettingsV1(
+            enabled=True,
+            local_port=local_port,
+            stream_links=links,
+            gpfs_scratch_root="/scratch",
+            **settings_kw,  # pyright: ignore[reportArgumentType]
+        )
+    )
+    return ArgusStreamSession(
+        _StubCore(),
+        _NoopTunnel(),  # pyright: ignore[reportArgumentType]
+        get_settings=lambda: settings,
+    )
+
+
+def _timelapse(n: int) -> useq.MDASequence:
+    return _save_seq(
+        z_plan=None, channels=["488nm"], time_plan={"interval": 0, "loops": n}
+    )
+
+
+def _wait(predicate: Callable[[], bool], timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
+def _frames_by_link(receiver: _FakeReceiver) -> list[tuple[int, bytes]]:
+    return [
+        (h["frame_index"], ident)
+        for (t, _s, h, _p), ident in zip(
+            receiver.messages, receiver.identities, strict=False
+        )
+        if t == MSG_FRAME
+    ]
+
+
+def test_links_open_once_argus_offers_them_and_share_the_volumes(
+    fake_receiver: _FakeReceiver, link_proxies: tuple[int, list[_LinkProxy]]
+) -> None:
+    fake_receiver.features = ["links"]
+    base, _proxies = link_proxies
+    session = _links_session(base)
+    seq = _timelapse(12)
+    session.sequenceStarted(seq, {})  # pyright: ignore[reportArgumentType]
+    time.sleep(0.5)  # the first ACK opens links 1 and 2
+    _feed_frames(session, seq)
+    _wait_for_session_end(fake_receiver)
+
+    sent = _frames_by_link(fake_receiver)
+    assert {fi for fi, _ in sent} == set(range(12))
+    sid = fake_receiver.messages[0][1]
+    assert {ident for _, ident in sent} == {
+        sid.encode(),
+        f"{sid}#1".encode(),
+        f"{sid}#2".encode(),
+    }
+    assert fake_receiver.messages[-1][0] == MSG_SESSION_END
+    session.shutdown(timeout=1)
+
+
+def test_an_older_receiver_without_links_gets_one_connection(
+    fake_receiver: _FakeReceiver, link_proxies: tuple[int, list[_LinkProxy]]
+) -> None:
+    fake_receiver.features = ["slabs"]
+    base, _proxies = link_proxies
+    session = _links_session(base)
+    seq = _timelapse(6)
+    session.sequenceStarted(seq, {})  # pyright: ignore[reportArgumentType]
+    time.sleep(0.3)
+    _feed_frames(session, seq)
+    _wait_for_session_end(fake_receiver)
+    sid = fake_receiver.messages[0][1].encode()
+    assert set(fake_receiver.identities) == {sid}
+    session.shutdown(timeout=1)
+
+
+def _stream_then_break_link_1(
+    receiver: _FakeReceiver,
+    base: int,
+    break_link: Callable[[], None],
+    break_first: bool,
+) -> tuple[ArgusStreamSession, useq.MDASequence]:
+    receiver.features = ["links"]
+    session = _links_session(base)
+    seq = _timelapse(12)
+    session.sequenceStarted(seq, {})  # pyright: ignore[reportArgumentType]
+    time.sleep(0.5)  # the first ACK opens links 1 and 2
+    receiver.auto_ack = False  # hold every volume unACKed
+    if break_first:
+        break_link()
+    for event in seq:
+        session.frameReady(np.zeros((4, 4), dtype="uint16"), event, {})  # pyright: ignore[reportArgumentType]
+    if not break_first:
+        assert _wait(lambda: len(_frames_by_link(receiver)) >= 12)
+        break_link()
+    return session, seq
+
+
+def _assert_link_1_volumes_resent_elsewhere(
+    receiver: _FakeReceiver, link_1_delivered: bool
+) -> None:
+    """Every volume arrives on links 0 and 2. A cut link delivered its
+    volumes before it broke; a silenced one never delivers them at all."""
+    sid = receiver.messages[0][1]
+    link1 = f"{sid}#1".encode()
+
+    def resent() -> bool:
+        sent = _frames_by_link(receiver)
+        on_link1 = {fi for fi, ident in sent if ident == link1}
+        elsewhere = {fi for fi, ident in sent if ident != link1}
+        if link_1_delivered and not on_link1:
+            return False
+        return elsewhere >= set(range(12))
+
+    assert _wait(resent, timeout=4)
+    # Resent because the link dropped, not by the slow stale-ACK backstop.
+    assert not any(m[0] == MSG_RESUME for m in receiver.messages)
+
+
+def test_a_cut_link_s_volumes_are_resent_on_the_others_at_once(
+    fake_receiver: _FakeReceiver, link_proxies: tuple[int, list[_LinkProxy]]
+) -> None:
+    base, proxies = link_proxies
+    session, seq = _stream_then_break_link_1(
+        fake_receiver, base, proxies[1].cut, break_first=False
+    )
+    _assert_link_1_volumes_resent_elsewhere(fake_receiver, link_1_delivered=True)
+    fake_receiver.auto_ack = True
+    fake_receiver.ack(11)
+    session.sequenceFinished(seq)
+    _wait_for_session_end(fake_receiver)
+    assert fake_receiver.messages[-1][0] == MSG_SESSION_END
+    session.shutdown(timeout=1)
+
+
+def test_a_silent_link_is_found_by_heartbeat_and_its_volumes_resent(
+    fake_receiver: _FakeReceiver,
+    link_proxies: tuple[int, list[_LinkProxy]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The nastiest failure: the tunnel's TCP connection stays open but
+    nothing flows (its ssh still looks alive)."""
+    monkeypatch.setattr(session_mod, "_HEARTBEAT_IVL_MS", 100)
+    monkeypatch.setattr(session_mod, "_HEARTBEAT_TIMEOUT_MS", 500)
+    monkeypatch.setattr(session_mod, "_HEARTBEAT_TTL_MS", 1000)
+    base, proxies = link_proxies
+    session, seq = _stream_then_break_link_1(
+        fake_receiver, base, proxies[1].silenced.set, break_first=True
+    )
+    _assert_link_1_volumes_resent_elsewhere(fake_receiver, link_1_delivered=False)
+    sid = fake_receiver.messages[0][1]
+    assert f"{sid}#1".encode() not in {i for _, i in _frames_by_link(fake_receiver)}
+    fake_receiver.auto_ack = True
+    fake_receiver.ack(11)
+    session.sequenceFinished(seq)
+    _wait_for_session_end(fake_receiver)
+    session.shutdown(timeout=1)
+
+
+def test_an_unknown_session_is_resumed_where_argus_last_acked(
+    fake_receiver: _FakeReceiver,
+) -> None:
+    """Argus restarted mid-run: SESSION_START again, with resume_through,
+    then everything unACKed."""
+    fake_receiver.features = ["resume"]
+    session = _links_session(fake_receiver.port, links=1)
+    seq = _timelapse(2)
+    events = list(seq)
+    session.sequenceStarted(seq, {})  # pyright: ignore[reportArgumentType]
+    session.frameReady(np.zeros((4, 4), dtype="uint16"), events[0], {})  # pyright: ignore[reportArgumentType]
+    assert _wait(lambda: len(fake_receiver.frame_messages()) == 1)
+    time.sleep(0.2)  # frame 0 ACKed
+    fake_receiver.auto_ack = False
+    session.frameReady(np.zeros((4, 4), dtype="uint16"), events[1], {})  # pyright: ignore[reportArgumentType]
+    assert _wait(lambda: len(fake_receiver.frame_messages()) == 2)
+
+    fake_receiver.send(
+        MSG_ACK,
+        {"through_frame_index": -1, "unknown_session": True, "features": ["resume"]},
+    )
+
+    def starts():
+        return [h for t, _s, h, _p in fake_receiver.messages if t == MSG_SESSION_START]
+
+    assert _wait(lambda: len(starts()) == 2)
+    assert starts()[1]["resume_through"] == 0
+    assert starts()[1]["base_name"] == starts()[0]["base_name"]
+
+    fake_receiver.ack(0)  # the resumed session's first ACK
+    resent = lambda: [h["frame_index"] for h, _p in fake_receiver.frame_messages()]  # noqa: E731
+    assert _wait(lambda: resent() == [0, 1, 1])
+    fake_receiver.auto_ack = True
+    fake_receiver.ack(1)
+    session.sequenceFinished(seq)
+    _wait_for_session_end(fake_receiver)
+    session.shutdown(timeout=1)
+
+
+def test_the_run_pauses_at_the_hard_cap_without_touching_acquisition(
+    fake_receiver: _FakeReceiver,
+) -> None:
+    fake_receiver.auto_ack = False  # Argus never confirms anything
+    states: list[StreamState] = []
+    settings = _full_settings(
+        ArgusStreamSettingsV1(
+            enabled=True,
+            local_port=fake_receiver.port,
+            gpfs_scratch_root="/scratch",
+            buffer_hard_cap_mb=1,
+        )
+    )
+    session = ArgusStreamSession(
+        _StubCore(),
+        _NoopTunnel(),  # pyright: ignore[reportArgumentType]
+        get_settings=lambda: settings,
+        on_state_changed=lambda s, _d: states.append(s),
+    )
+    seq = _timelapse(3)
+    events = list(seq)
+    session.sequenceStarted(seq, {})  # pyright: ignore[reportArgumentType]
+    big = np.zeros((1024, 1024), dtype="uint16")  # 2 MiB > the 1 MiB cap
+    session.frameReady(big, events[0], {})  # pyright: ignore[reportArgumentType]
+
+    def ended() -> list[dict]:
+        return [h for t, _s, h, _p in fake_receiver.messages if t == MSG_SESSION_END]
+
+    assert _wait(lambda: bool(ended()))
+    assert ended()[0]["reason"] == "paused"
+    assert StreamState.PAUSED in states
+    # Later frames aren't even assembled; the run's sender is gone.
+    session.frameReady(big, events[1], {})  # pyright: ignore[reportArgumentType]
+    session.sequenceFinished(seq)
+    time.sleep(0.3)
+    assert len(fake_receiver.frame_messages()) <= 1
+    assert states[-1] == StreamState.PAUSED
+    session.shutdown(timeout=1)
+
+
+def test_the_hard_cap_is_the_setting_or_a_quarter_of_the_ram() -> None:
+    assert session_mod.hard_cap_bytes(5) == 5 * 1024 * 1024
+    ram = session_mod._physical_ram_bytes()
+    assert ram > 0
+    assert session_mod.hard_cap_bytes(0) == ram // 4
+
+
+def test_session_end_is_resent_until_argus_confirms_it(
+    fake_receiver: _FakeReceiver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A SESSION_END lost with its link would leave Argus waiting out its
+    idle timeout (holding the GPUs), so it goes again until confirmed."""
+    monkeypatch.setattr(session_mod, "_END_RETRY_S", 0.2)
+    fake_receiver.features = ["resume"]
+    fake_receiver.confirm_end = False
+    session = _links_session(fake_receiver.port, links=1)
+    seq = _timelapse(1)
+    session.sequenceStarted(seq, {})  # pyright: ignore[reportArgumentType]
+    _feed_frames(session, seq)
+
+    def ends() -> int:
+        return sum(m[0] == MSG_SESSION_END for m in fake_receiver.messages)
+
+    assert _wait(lambda: ends() >= 2)
+    fake_receiver.send(MSG_ACK, {"through_frame_index": 0, "ended": True})
+    worker = session._all_workers[0]
+    worker.join(timeout=3)
+    assert not worker.is_alive()
+    session.shutdown(timeout=1)
+
+
+def test_a_plain_ack_after_session_end_is_not_its_confirmation(
+    fake_receiver: _FakeReceiver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(session_mod, "_END_RETRY_S", 0.2)
+    fake_receiver.features = ["resume"]
+    fake_receiver.confirm_end = False
+    session = _links_session(fake_receiver.port, links=1)
+    seq = _timelapse(1)
+    session.sequenceStarted(seq, {})  # pyright: ignore[reportArgumentType]
+    _feed_frames(session, seq)
+    assert _wait(lambda: any(m[0] == MSG_SESSION_END for m in fake_receiver.messages))
+    fake_receiver.ack(0)  # a stray periodic ACK
+    time.sleep(0.5)
+    assert session._all_workers[0].is_alive()
+    fake_receiver.send(MSG_ACK, {"through_frame_index": -1, "unknown_session": True})
+    session._all_workers[0].join(timeout=3)
+    assert not session._all_workers[0].is_alive()
+    session.shutdown(timeout=1)
