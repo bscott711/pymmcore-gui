@@ -6,25 +6,43 @@ Run on the acquisition PC, no microscope needed::
 
 Give it one channel's store; the run's other channels
 (``<base>_<Channel>_<wavelength>.ome.zarr`` next to it, as the MDA save
-writes them) come along. The first ``--timepoints`` volumes are read into
-RAM first (so disk reads can't distort the timing), then fed plane by plane
-through the same :class:`~pymmcore_gui._argus_stream._session.ArgusStreamSession`
-and tunnels the app uses, paced like the acquisition (``--stack-s`` per
-volume, ``--interval`` between timepoints), to a TEST receiver on Argus
-(``--remote-port``, default 5602), never the production one. A SHA-1 of every
-(t, c) volume is sent to Argus afterwards, so the copy there can be checked
-bit for bit.
+writes them) come along. Each volume is fed plane by plane through the same
+:class:`~pymmcore_gui._argus_stream._session.ArgusStreamSession` and tunnels
+the app uses, to a TEST receiver on Argus (``--remote-port``, default 5602),
+never the production one. A SHA-1 of every (t, c) volume is sent to Argus
+afterwards, so the copy there can be checked bit for bit.
+
+Pacing (``--pace``): by default the planes go out when the original run
+exposed them. The MDA save records every frame's ``runner_time_ms`` in each
+channel store's ``frame_meta``: the run's setup before its first plane, each
+channel's stack in turn (the 488 stack, then the 561 stack), the gap between
+them, and the time from one timepoint to the next. Those are replayed, from
+a template of the recorded timepoints (median per plane), for as many
+timepoints as asked for. The run's own z step comes from its recorded
+``useq_MDASequence``. A store with no frame times (or ``--pace fixed``) is
+paced by ``--stack-s`` per channel, channels one after the other, every
+``--interval``.
+
+A reader thread keeps the next few volumes (``--readahead`` timepoints) in
+RAM, so a long run never needs all of it at once; any time the send waits
+on the disk is reported as ``read_stall_s``, so a slow disk can't pass for
+network or processing lag.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import itertools
 import json
 import logging
+import queue
+import statistics
 import subprocess
 import sys
+import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -68,22 +86,165 @@ def _channel_stores(path: Path) -> list[tuple[str, str, Path]]:
     return [(*_split(s), s) for s in sorted(stores)]
 
 
-def _as_tzyx(store: Path) -> Any:
+def _array(store: Path) -> Any:
     node: Any = zarr.open(str(store), mode="r")
-    arr = node["p0"] if hasattr(node, "array_keys") else node
+    return node["p0"] if hasattr(node, "array_keys") else node
+
+
+def _as_tzyx(arr: Any, name: str) -> Any:
     if arr.ndim == 5:  # (t, c, z, y, x): the MDA save writes one channel per store
         if arr.shape[1] != 1:
-            raise SystemExit(
-                f"{store.name} holds {arr.shape[1]} channels; expected one"
-            )
+            raise SystemExit(f"{name} holds {arr.shape[1]} channels; expected one")
         arr = arr[:, 0]
     if arr.ndim not in (3, 4):
-        raise SystemExit(
-            f"{store.name}: can't read a {arr.ndim}-D array as (t, z, y, x)"
-        )
+        raise SystemExit(f"{name}: can't read a {arr.ndim}-D array as (t, z, y, x)")
     if arr.ndim == 3:
         arr = arr[np.newaxis]
     return arr
+
+
+# --- pacing -----------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Schedule:
+    """When each plane goes out.
+
+    Timepoint ``t``'s plane ``(c, z)`` at ``setup_s + t * interval_s +
+    offsets[(c, z)]`` seconds after the run starts.
+    """
+
+    source: str  # "recorded" or "fixed"
+    setup_s: float
+    interval_s: float
+    offsets: dict[tuple[int, int], float]
+
+    def at(self, t: int, c: int, z: int) -> float:
+        return self.setup_s + t * self.interval_s + self.offsets[(c, z)]
+
+    def order(self, n_t: int) -> list[tuple[float, int, int, int]]:
+        """Every plane of ``n_t`` timepoints as ``(time, t, c, z)``, in order."""
+        return sorted(
+            (self.at(t, c, z), t, c, z) for t in range(n_t) for c, z in self.offsets
+        )
+
+    def summary(self) -> dict[str, Any]:
+        """Per channel, its stack's length and start within a timepoint."""
+        chans: dict[int, list[float]] = {}
+        for (c, _z), s in self.offsets.items():
+            chans.setdefault(c, []).append(s)
+        return {
+            "pace": self.source,
+            "setup_s": round(self.setup_s, 3),
+            "interval_s": round(self.interval_s, 3),
+            "channel_start_s": {c: round(min(v), 3) for c, v in sorted(chans.items())},
+            "channel_stack_s": {
+                c: round(max(v) - min(v), 3) for c, v in sorted(chans.items())
+            },
+        }
+
+
+def fixed_schedule(
+    n_c: int, nz: int, *, stack_s: float, interval_s: float, setup_s: float = 1.0
+) -> Schedule:
+    """Channels one after the other, ``stack_s`` each, evenly paced planes."""
+    plane_s = stack_s / nz
+    offsets = {(c, z): (c * nz + z) * plane_s for c in range(n_c) for z in range(nz)}
+    return Schedule("fixed", setup_s, interval_s, offsets)
+
+
+def recorded_schedule(frame_meta: list[dict], n_c: int, nz: int) -> Schedule | None:
+    """The original run's pacing, from its frames' ``runner_time_ms``.
+
+    ``frame_meta``: every channel store's frame records together. Uses the
+    timepoints recorded in full (every channel, every plane): each plane's
+    offset from its timepoint's first plane (the median over them), the
+    median time between consecutive timepoints, and the first plane's time
+    after the run started (the MDA's own setup). None if no timepoint was
+    recorded in full.
+    """
+    per_t: dict[int, dict[tuple[int, int], float]] = {}
+    for m in frame_meta:
+        try:
+            idx = m["mda_event"]["index"]
+            ms = float(m["runner_time_ms"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        per_t.setdefault(int(idx.get("t", 0)), {})[
+            (int(idx.get("c", 0)), int(idx.get("z", 0)))
+        ] = ms / 1000.0
+    want = {(c, z) for c in range(n_c) for z in range(nz)}
+    full = sorted(t for t, planes in per_t.items() if want <= planes.keys())
+    if not full:
+        return None
+    starts = {t: min(per_t[t][k] for k in want) for t in full}
+    offsets = {
+        k: statistics.median(per_t[t][k] - starts[t] for t in full) for k in want
+    }
+    steps = [(starts[b] - starts[a]) / (b - a) for a, b in itertools.pairwise(full)]
+    last = max(offsets.values())
+    interval = statistics.median(steps) if steps else last + 1.0
+    setup = starts[full[0]] - full[0] * interval
+    return Schedule("recorded", max(0.0, setup), interval, offsets)
+
+
+def recorded_z_step(arrays: list[Any]) -> float | None:
+    """The run's z step, from the ``useq_MDASequence`` the MDA save records."""
+    for arr in arrays:
+        seq = dict(arr.attrs).get("useq_MDASequence")
+        if isinstance(seq, str):
+            try:
+                seq = json.loads(seq)
+            except ValueError:
+                continue
+        step = ((seq or {}).get("z_plan") or {}).get("step")
+        if step:
+            return float(step)
+    return None
+
+
+# --- reading ahead ------------------------------------------------------------
+
+
+class VolumeReader(threading.Thread):
+    """Reads (t, c) volumes in send order into a bounded queue.
+
+    Each is hashed as it's read. ``get`` hands them out and counts the time
+    spent waiting.
+    """
+
+    def __init__(self, arrays: list[Any], order: list[tuple[int, int]], depth: int):
+        super().__init__(daemon=True, name="replay-reader")
+        self._arrays = arrays
+        self._order = order
+        self._q: queue.Queue = queue.Queue(maxsize=max(1, depth))
+        self._ready: dict[tuple[int, int], np.ndarray] = {}
+        self.sha1: dict[str, str] = {}
+        self.stalls: list[float] = []
+        self.error: BaseException | None = None
+
+    def run(self) -> None:
+        try:
+            for t, c in self._order:
+                vol = np.ascontiguousarray(self._arrays[c][t])
+                self.sha1[f"{t},{c}"] = hashlib.sha1(vol.tobytes()).hexdigest()
+                self._q.put(((t, c), vol))
+        except BaseException as exc:  # reported by get()
+            self.error = exc
+            self._q.put(None)
+
+    def get(self, t: int, c: int) -> np.ndarray:
+        waited = time.monotonic()
+        while (t, c) not in self._ready:
+            item = self._q.get()
+            if item is None:
+                raise RuntimeError(f"reading volume t={t} c={c} failed") from self.error
+            self._ready[item[0]] = item[1]
+        self.stalls.append(time.monotonic() - waited)
+        return self._ready.pop((t, c))
+
+
+# --- the run ------------------------------------------------------------------
 
 
 class _Core:
@@ -99,8 +260,27 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("path", type=Path, help="one channel's .ome.zarr (or its folder)")
     ap.add_argument("--links", type=int, default=4)
     ap.add_argument("--timepoints", type=int, default=10)
-    ap.add_argument("--interval", type=float, default=5.0)
-    ap.add_argument("--stack-s", type=float, default=1.6)
+    ap.add_argument(
+        "--pace",
+        choices=("auto", "recorded", "fixed"),
+        default="auto",
+        help="recorded frame times (auto: when the store has them) or fixed",
+    )
+    ap.add_argument(
+        "--interval", type=float, default=None, help="s between timepoints (override)"
+    )
+    ap.add_argument(
+        "--stack-s", type=float, default=1.6, help="s per channel's stack (fixed pace)"
+    )
+    ap.add_argument(
+        "--setup-s",
+        type=float,
+        default=None,
+        help="s from the run's start to its first plane (override)",
+    )
+    ap.add_argument(
+        "--readahead", type=int, default=3, help="timepoints read ahead into RAM"
+    )
     ap.add_argument("--host", default=None, help="ssh Host alias (settings)")
     ap.add_argument("--remote-port", type=int, default=5602)
     ap.add_argument("--local-port", type=int, default=5800)
@@ -121,22 +301,46 @@ def main(argv: list[str] | None = None) -> int:
     host = args.host or Settings.instance().argus_stream.ssh_host
     channels = _channel_stores(args.path)
     base_name = channels[0][0]
-    arrays = [_as_tzyx(store) for _b, _c, store in channels]
+    raw = [_array(store) for _b, _c, store in channels]
+    arrays = [
+        _as_tzyx(a, store.name)
+        for a, (_b, _c, store) in zip(raw, channels, strict=True)
+    ]
+    n_c = len(arrays)
     n_t = min(args.timepoints, *(a.shape[0] for a in arrays))
+    nz, ny, nx = arrays[0].shape[1:]
+
+    schedule = None
+    if args.pace != "fixed":
+        metas = [m for a in raw for m in (dict(a.attrs).get("frame_meta") or [])]
+        schedule = recorded_schedule(metas, n_c, nz)
+        if schedule is None and args.pace == "recorded":
+            raise SystemExit(f"{args.path}: no complete recorded timepoint to pace by")
+    if schedule is None:
+        schedule = fixed_schedule(
+            n_c, nz, stack_s=args.stack_s, interval_s=args.interval or 5.0
+        )
+    if args.interval is not None or args.setup_s is not None:
+        schedule = Schedule(
+            schedule.source,
+            schedule.setup_s if args.setup_s is None else args.setup_s,
+            schedule.interval_s if args.interval is None else args.interval,
+            schedule.offsets,
+        )
+    dz = recorded_z_step(raw) or 0.5
     log.info(
-        "Reading %d timepoint(s) x %d channel(s) of %s from %s",
+        "Replaying %d timepoint(s) x %d channel(s) of %s from %s, %s",
         n_t,
-        len(arrays),
-        arrays[0].shape[1:],
+        n_c,
+        (nz, ny, nx),
         args.path,
+        json.dumps(schedule.summary()),
     )
-    vols = [[np.ascontiguousarray(a[t]) for a in arrays] for t in range(n_t)]
-    nz, ny, nx = vols[0][0].shape
-    manifest = {
-        f"{t},{c}": hashlib.sha1(v.tobytes()).hexdigest()
-        for t in range(n_t)
-        for c, v in enumerate(vols[t])
-    }
+
+    order = schedule.order(n_t)
+    volume_order = list(dict.fromkeys((t, c) for _s, t, c, _z in order))
+    reader = VolumeReader(arrays, volume_order, depth=args.readahead * n_c)
+    reader.start()
 
     tunnel = ArgusTunnelManager(
         host, args.local_port, args.remote_port, links=args.links, ssh_args=args.ssh_arg
@@ -161,8 +365,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     seq = useq.MDASequence(
         channels=[name for _b, name, _s in channels],
-        z_plan=useq.ZRangeAround(range=(nz - 1) * 0.5, step=0.5),
-        time_plan={"interval": args.interval, "loops": n_t},
+        z_plan=useq.ZRangeAround(range=(nz - 1) * dz, step=dz),
+        time_plan={"interval": schedule.interval_s, "loops": n_t},
         axis_order="tcz",
         metadata={
             "pymmcore_widgets": {
@@ -171,11 +375,12 @@ def main(argv: list[str] | None = None) -> int:
             }
         },
     )
+    events = {(e.index["t"], e.index["c"], e.index["z"]): e for e in seq}
     summary = {
         "image_infos": [
             {
                 "camera_label": "Replay",
-                "dtype": str(vols[0][0].dtype),
+                "dtype": str(arrays[0].dtype),
                 "height": ny,
                 "width": nx,
                 "pixel_size_um": 0.136,
@@ -191,25 +396,25 @@ def main(argv: list[str] | None = None) -> int:
     capture = _Capture(logging.INFO)
     capture.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logging.getLogger("pymmcore_gui._argus_stream").addHandler(capture)
+
+    # The run starts here, as the MDA's sequenceStarted does; its first plane
+    # comes setup_s later.
+    start = time.monotonic()
     session.sequenceStarted(seq, summary)  # type: ignore[arg-type]
     worker = session._worker
-    time.sleep(1.0)
-    plane_s = args.stack_s / (nz * len(arrays))
-    start = time.monotonic()
-    t_prev, t_start, k = -1, start, 0
-    for event in seq:
-        t, c, z = event.index["t"], event.index["c"], event.index["z"]
-        if t != t_prev:
-            t_prev, k = t, 0
-            while time.monotonic() < start + t * args.interval:
-                time.sleep(0.002)
-            t_start = time.monotonic()
-        meta = {"camera_device": "Replay", "runner_time_ms": 0.0}
-        session.frameReady(vols[t][c][z], event, meta)  # type: ignore[arg-type]
-        k += 1
-        ahead = t_start + k * plane_s - time.monotonic()
+    late: list[float] = []
+    current: tuple[int, int] | None = None
+    vol: np.ndarray | None = None
+    for due, t, c, z in order:
+        if (t, c) != current:
+            current, vol = (t, c), reader.get(t, c)
+        ahead = start + due - time.monotonic()
         if ahead > 0:
             time.sleep(ahead)
+        else:
+            late.append(-ahead)
+        meta = {"camera_device": "Replay", "runner_time_ms": due * 1000.0}
+        session.frameReady(vol[z], events[(t, c, z)], meta)  # type: ignore[arg-type,index]
     session.sequenceFinished(seq)
     last_plane = time.monotonic()
     while any(w.is_alive() for w in session._all_workers):
@@ -221,6 +426,7 @@ def main(argv: list[str] | None = None) -> int:
     session.shutdown(timeout=2)
     tunnel.stop()
 
+    stalls = reader.stalls
     report = {
         "name": args.name,
         "base_name": base_name,
@@ -228,13 +434,22 @@ def main(argv: list[str] | None = None) -> int:
         "timepoints": n_t,
         "channels": [name for _b, name, _s in channels],
         "shape_zyx": [nz, ny, nx],
-        "interval_s": args.interval,
-        "stack_s": args.stack_s,
+        "z_step_um": dz,
+        **schedule.summary(),
+        "read_stall_s": {
+            "total": round(sum(stalls), 3),
+            "max": round(max(stalls, default=0.0), 3),
+            "n_over_10ms": sum(s > 0.01 for s in stalls),
+        },
+        "planes_late_s": {
+            "n_over_10ms": sum(s > 0.01 for s in late),
+            "max": round(max(late, default=0.0), 3),
+        },
         "all_sent_after_last_plane_s": round(drained_s, 2),
         "states": sorted({s for s, _ in states}),
         "stats": worker.stats if worker is not None else {},
         "log": captured[-300:],
-        "sha1": manifest,
+        "sha1": reader.sha1,
     }
     print(
         json.dumps(
