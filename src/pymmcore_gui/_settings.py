@@ -279,7 +279,26 @@ class ArgusStreamSettingsV1(BaseMMSettings):
     faster than one thread can compress, so frames always go to it raw.
     """
     local_port: int = 5555
-    """Local end of the SSH port-forward that the ZMQ DEALER connects to."""
+    """Local end of the SSH port-forward that the ZMQ DEALER connects to.
+
+    With several ``stream_links``, link k's forward listens on
+    ``local_port + k``.
+    """
+    stream_links: int = 1
+    """Parallel connections each run streams over.
+
+    Through the tunnel, each link is its own SSH forward, and they're sent
+    over together. One SSH connection moves ~33 MB/s to Argus however fast
+    the network is (sshd's fixed 2 MB window per round trip), so N links move
+    about N times that. Measure with
+    ``python -m pymmcore_gui._argus_stream.linkbench``. Read at app launch.
+    """
+    ssh_processes: int = 0
+    """How many ``ssh`` processes carry the links; 0 means one per link.
+
+    Separate processes are separate TCP connections (and encrypt in
+    parallel); several links in one process share its connection.
+    """
     remote_port: int = 5555
     """Port ``opym-receive`` binds to on ``127.0.0.1`` on the Argus side.
 

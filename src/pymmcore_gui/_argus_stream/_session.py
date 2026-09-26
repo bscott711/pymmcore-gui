@@ -324,10 +324,13 @@ def _compress(payload: bytes, dtype: str) -> bytes:
 
     lz4 + bitshuffle over the pixel type: ~2.5x on camera frames.
     """
-    from numcodecs import blosc
+    from numcodecs import blosc  # pyright: ignore[reportAttributeAccessIssue]
 
-    return blosc.compress(
-        np.frombuffer(payload, dtype=dtype), b"lz4", 5, blosc.BITSHUFFLE
+    return cast(
+        "bytes",
+        blosc.compress(
+            np.frombuffer(payload, dtype=dtype), b"lz4", 5, blosc.BITSHUFFLE
+        ),
     )
 
 

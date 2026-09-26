@@ -176,6 +176,8 @@ module = [
     "pytestqt.*",
     "zarr.*",
     "msgpack.*",
+    "numcodecs.*",
+    "psutil.*",
 ]
 ignore_missing_imports = true
 
