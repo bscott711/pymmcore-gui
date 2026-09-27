@@ -74,11 +74,13 @@ from pymmcore_gui._vendored.mda_handlers._util import position_sizes
 from ._protocol import (
     MSG_ACK,
     MSG_FRAME,
+    MSG_PREPARE,
     MSG_QC,
     MSG_RESUME,
     MSG_SESSION_END,
     MSG_SESSION_START,
     FrameHeader,
+    PrepareHeader,
     QCHeader,
     SessionStartHeader,
     pack_message,
@@ -122,6 +124,10 @@ _MAX_OFFSET_RTT_S = 2.0
 # ~1/3 of the measured ~60 MB/s tunnel throughput (2026-09-21).
 _MIN_LINK_BYTES_PER_S = 20 * 1024 * 1024
 _POLL_TIMEOUT_MS = 200
+# PREPARE: the same plan again within this long isn't re-sent (every edit in
+# the MDA widget fires valueChanged). Never re-sent on a timer: Argus holds
+# backfill while a warm-up is fresh, and the MDA widget can stay open all day.
+_PREPARE_REPEAT_S = 60.0
 # Per link: a message or two queued in ZMQ is enough to keep a tunnel busy,
 # and the next one goes to whichever link has room.
 _LINK_SNDHWM = 2
@@ -249,6 +255,62 @@ def _active_spectral_channels(
     )
 
 
+def _unstreamable(
+    sequence: useq.MDASequence,
+    geometry: CameraGeometry,
+    active_spectral: list[SpectralChannelConfig],
+) -> str:
+    """Return why this run can't stream, or "" if it can.
+
+    Shape-wise only: the save name and directory are checked by
+    :func:`_build_session_header`.
+    """
+    if len(sequence.stage_positions) > 1:
+        return "multi-position sequences are not supported in v1"
+    if not active_spectral and len(geometry.labels) > 1:
+        return (
+            "multi-camera acquisitions require spectral-channel cropping to "
+            "resolve camera identity into the channel axis"
+        )
+    if geometry.dtype not in _DTYPE_BY_BYTES_PER_PIXEL.values():
+        return f"unsupported camera pixel type for streaming: {geometry.dtype}"
+    return ""
+
+
+def _volume_plan(
+    sequence: useq.MDASequence,
+    geometry: CameraGeometry,
+    active_spectral: list[SpectralChannelConfig],
+) -> PrepareHeader:
+    """Return what each streamed volume will be.
+
+    Shared by SESSION_START and PREPARE, so the shape Argus warms up for is
+    the one the run sends.
+    """
+    if active_spectral:
+        channel_names = [c.name for c in active_spectral]
+        # All regions share one size (enforced by the spectral-channel config
+        # UI -- see SpectralChannelConfig's docstring), so any one's rect
+        # gives the cropped Y/X shape every FRAME in this session will use.
+        # channels_for_sequence only ever returns regions with a drawn rect.
+        rect = active_spectral[0].rect
+        assert rect is not None
+        _x, _y, crop_w, crop_h = rect
+        yx_shape = (crop_h, crop_w)
+    else:
+        channel_names = [ch.config for ch in sequence.channels] or ["Default"]
+        yx_shape = (geometry.height, geometry.width)
+    pos_sizes = position_sizes(sequence)[0]
+    z_step_um = getattr(sequence.z_plan, "step", None) or 0.0
+    return {
+        "shape_zyx": [pos_sizes.get("z", 1), *yx_shape],
+        "z_step_um": float(z_step_um),
+        "dtype": geometry.dtype,
+        "num_timepoints": pos_sizes.get("t", 1),
+        "channel_names": channel_names,
+    }
+
+
 def _build_session_header(
     sequence: useq.MDASequence,
     geometry: CameraGeometry,
@@ -275,15 +337,8 @@ def _build_session_header(
         requires a single camera (there's no per-camera channel resolution
         without cropping).
     """
-    if len(sequence.stage_positions) > 1:
-        return None, "multi-position sequences are not supported in v1"
-    if not active_spectral and len(geometry.labels) > 1:
-        return None, (
-            "multi-camera acquisitions require spectral-channel cropping to "
-            "resolve camera identity into the channel axis"
-        )
-    if geometry.dtype not in _DTYPE_BY_BYTES_PER_PIXEL.values():
-        return None, f"unsupported camera pixel type for streaming: {geometry.dtype}"
+    if reason := _unstreamable(sequence, geometry, active_spectral):
+        return None, reason
 
     meta = sequence.metadata.get(PYMMCW_METADATA_KEY, {})
     save_name = meta.get("save_name")
@@ -308,40 +363,25 @@ def _build_session_header(
     session_parts = local_dir.relative_to(local_dir.anchor).parts
     raw_root = posixpath.join(settings.gpfs_scratch_root, *session_parts)
 
-    if active_spectral:
-        channel_names = [c.name for c in active_spectral]
-        # All regions share one size (enforced by the spectral-channel config
-        # UI -- see SpectralChannelConfig's docstring), so any one's rect
-        # gives the cropped Y/X shape every FRAME in this session will use.
-        # channels_for_sequence only ever returns regions with a drawn rect.
-        rect = active_spectral[0].rect
-        assert rect is not None
-        _x, _y, crop_w, crop_h = rect
-        yx_shape = (crop_h, crop_w)
-    else:
-        channel_names = [ch.config for ch in sequence.channels] or ["Default"]
-        yx_shape = (geometry.height, geometry.width)
-    channels = list(range(len(channel_names)))
+    plan = _volume_plan(sequence, geometry, active_spectral)
+    channel_names = plan["channel_names"]
 
     # Decon parameters (PSF, iterations, rl_method, ...) are NOT part of
     # this handshake -- the receiver resolves them entirely server-side
     # from OPYM_DECON_PSF, same as a batch/Globus-landed dataset. See
     # SessionStartHeader's docstring.
-    z_step_um = getattr(sequence.z_plan, "step", None) or 0.0
     t_interval = getattr(sequence.time_plan, "interval", None)
     t_interval_s = t_interval.total_seconds() if t_interval is not None else 0.0
-
-    pos_sizes = position_sizes(sequence)[0]
 
     header: SessionStartHeader = {
         "base_name": base_name,
         "raw_root": raw_root,
         "dtype": geometry.dtype,
-        "shape_zyx": [pos_sizes.get("z", 1), *yx_shape],
-        "num_timepoints": pos_sizes.get("t", 1),
-        "channels": channels,
+        "shape_zyx": plan["shape_zyx"],
+        "num_timepoints": plan["num_timepoints"],
+        "channels": list(range(len(channel_names))),
         "channel_names": channel_names,
-        "z_step_um": float(z_step_um),
+        "z_step_um": plan["z_step_um"],
         "xy_pixel_size": geometry.pixel_size_um,
         "t_interval_s": float(t_interval_s),
         "output_format": settings.output_format,
@@ -974,6 +1014,21 @@ class _RunWorker(threading.Thread):
                 self._on_state(StreamState.IDLE, "")
 
 
+def _send_prepare(endpoint: str, plan: PrepareHeader) -> None:
+    """Send one PREPARE on a connection of its own, under a fresh id.
+
+    It opens no session and nothing answers it. LINGER lets close() still
+    deliver it.
+    """
+    prepare_id = f"prepare-{uuid4()}"
+    sock = zmq.Context.instance().socket(zmq.DEALER)
+    sock.setsockopt(zmq.IDENTITY, prepare_id.encode("utf-8"))
+    sock.setsockopt(zmq.LINGER, _SESSION_END_LINGER_MS)
+    sock.connect(endpoint)
+    sock.send_multipart(pack_message(MSG_PREPARE, prepare_id, plan))
+    sock.close()
+
+
 class ArgusStreamSession:
     """Long-lived object mediating between one MDA run and the Argus stream.
 
@@ -1013,10 +1068,50 @@ class ArgusStreamSession:
         self._spectral_index: dict[str, int] = {}
         self._laser_group = ""
         self._all_lasers_preset = ""
+        # (shape, z step, dtype) of the last PREPARE and when it went out.
+        self._last_prepare: tuple[tuple, float] | None = None
 
     def _emit_state(self, state: StreamState, detail: str) -> None:
         if self._on_state_changed is not None:
             self._on_state_changed(state, detail)
+
+    def prepare(self, sequence: useq.MDASequence) -> bool:
+        """Ask Argus to warm a GPU server for the MDA being set up (``PREPARE``).
+
+        Then the run's first timepoint costs what the others do. Call it
+        whenever the plan changes; a plan already sent in the last minute
+        isn't sent again. Best effort, never raises; returns whether a
+        PREPARE went out.
+        """
+        try:
+            argus = self._get_settings().argus_stream
+            if not argus.enabled or self._mmc.mda.is_running():
+                return False
+            settings = self._get_settings()
+            geometry = _camera_geometry(cast("SummaryMetaV1", {}), self._mmc)
+            active_spectral = _active_spectral_channels(
+                sequence, geometry.labels, settings.spectral
+            )
+            if _unstreamable(sequence, geometry, active_spectral):
+                return False
+            plan = _volume_plan(sequence, geometry, active_spectral)
+            if plan["z_step_um"] <= 0 or min(plan["shape_zyx"]) <= 0:
+                return False
+            key = (tuple(plan["shape_zyx"]), plan["z_step_um"], plan["dtype"])
+            now = time.monotonic()
+            last = self._last_prepare
+            if last and last[0] == key and now - last[1] < _PREPARE_REPEAT_S:
+                return False
+            endpoint = link_endpoints(argus.local_port, argus.stream_links)[0]
+            _send_prepare(endpoint, plan)
+            self._last_prepare = (key, now)
+            logger.info(
+                "Argus PREPARE sent: %s at dz %s", plan["shape_zyx"], plan["z_step_um"]
+            )
+            return True
+        except Exception:
+            logger.exception("Argus PREPARE failed (the first timepoint is slower)")
+            return False
 
     def sequenceStarted(self, sequence: useq.MDASequence, meta: SummaryMetaV1) -> None:
         """Start streaming this run, if eligible and enabled."""

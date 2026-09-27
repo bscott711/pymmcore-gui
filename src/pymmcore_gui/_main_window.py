@@ -461,6 +461,8 @@ class MicroManagerGUI(QMainWindow):
                 return widget
 
             self._action_widgets[key] = widget
+            if key == WidgetAction.MDA_WIDGET:
+                self._watch_mda_plan(cast("MDAWidget", widget))
 
             action = self.get_action(key)
             dock = CDockWidget(info.text, self)
@@ -491,6 +493,26 @@ class MicroManagerGUI(QMainWindow):
             action.setChecked(True)
 
         return self._action_widgets[key]
+
+    def _watch_mda_plan(self, mda: MDAWidget) -> None:
+        """Warm Argus for the MDA being set up (``ArgusStreamSession.prepare``).
+
+        When the widget opens, and after each edit once the plan has been
+        still for a second.
+        """
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.setInterval(1000)
+
+        def prepare() -> None:
+            try:
+                self._argus_stream.prepare(mda.value())
+            except Exception:  # a half-edited plan; the next edit retries
+                logger.debug("no MDA plan to prepare", exc_info=True)
+
+        timer.timeout.connect(prepare)
+        mda.valueChanged.connect(timer.start)
+        timer.start()
 
     def get_dock_widget(self, key: str) -> CDockWidget:
         """Get the QDockWidget for `key`.

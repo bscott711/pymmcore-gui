@@ -31,9 +31,18 @@ MSG_SESSION_END = b"SESSION_END"
 MSG_ACK = b"ACK"
 MSG_RESUME = b"RESUME"
 MSG_QC = b"QC"
+MSG_PREPARE = b"PREPARE"
 
 _VALID_TYPES = frozenset(
-    {MSG_SESSION_START, MSG_FRAME, MSG_SESSION_END, MSG_ACK, MSG_RESUME, MSG_QC}
+    {
+        MSG_SESSION_START,
+        MSG_FRAME,
+        MSG_SESSION_END,
+        MSG_ACK,
+        MSG_RESUME,
+        MSG_QC,
+        MSG_PREPARE,
+    }
 )
 
 
@@ -194,6 +203,26 @@ class ResumeHeader(TypedDict):
     """
 
 
+class _PrepareOptional(TypedDict, total=False):
+    dtype: str
+    num_timepoints: int
+    channel_names: list[str]
+
+
+class PrepareHeader(_PrepareOptional):
+    """``PREPARE`` header -- client -> server, while an MDA is being set up.
+
+    Argus warms a GPU server for this plan so the run's first timepoint costs
+    what the others do. Sent on a connection of its own with a fresh id (no
+    session is opened, nothing answers); send it again when the plan
+    changes. The warm-up holds for ~10 min after the last one (see
+    ``opym.stream.protocol`` and ``opym.lanes.WARM_LEASE_MAX_AGE_S``).
+    """
+
+    shape_zyx: list[int]
+    z_step_um: float
+
+
 MessageHeader = (
     SessionStartHeader
     | FrameHeader
@@ -201,6 +230,7 @@ MessageHeader = (
     | AckHeader
     | ResumeHeader
     | QCHeader
+    | PrepareHeader
 )
 
 

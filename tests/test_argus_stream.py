@@ -17,6 +17,7 @@ from pymmcore_gui._argus_stream import _session as session_mod
 from pymmcore_gui._argus_stream._protocol import (
     MSG_ACK,
     MSG_FRAME,
+    MSG_PREPARE,
     MSG_QC,
     MSG_RESUME,
     MSG_SESSION_END,
@@ -31,6 +32,7 @@ from pymmcore_gui._argus_stream._session import (
     _active_spectral_channels,
     _build_session_header,
     _camera_geometry,
+    _volume_plan,
 )
 from pymmcore_gui._argus_stream._volume_assembler import VolumeAssembler
 from pymmcore_gui._settings import (
@@ -671,6 +673,98 @@ def test_session_skips_ineligible_run_without_touching_network(
     time.sleep(0.2)
     assert fake_receiver.messages == []
     assert StreamState.SKIPPED in states
+
+
+class _Mda:
+    def __init__(self) -> None:
+        self.running = False
+
+    def is_running(self) -> bool:
+        return self.running
+
+
+class _PlanCore(_StubCore):
+    """A core with an MDA runner, as ``prepare`` checks it isn't running."""
+
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)  # pyright: ignore[reportArgumentType]
+        self.mda = _Mda()
+
+
+def _prepare_session(
+    receiver: _FakeReceiver, core: _StubCore | None = None, *, enabled: bool = True
+) -> ArgusStreamSession:
+    settings = _full_settings(
+        ArgusStreamSettingsV1(
+            enabled=enabled, local_port=receiver.port, gpfs_scratch_root="/scratch"
+        )
+    )
+    return ArgusStreamSession(
+        core or _PlanCore(),  # pyright: ignore[reportArgumentType]
+        _NoopTunnel(),  # pyright: ignore[reportArgumentType]
+        get_settings=lambda: settings,
+    )
+
+
+def _prepares(receiver: _FakeReceiver) -> list[tuple[str, dict]]:
+    return [(sid, h) for t, sid, h, _p in receiver.messages if t == MSG_PREPARE]
+
+
+def test_prepare_sends_the_planned_volume_once_per_plan(
+    fake_receiver: _FakeReceiver,
+) -> None:
+    """Setting up the MDA warms Argus for the shape the run will send; edits
+    that don't change it aren't re-sent."""
+    session = _prepare_session(fake_receiver)
+    seq = _save_seq()
+    assert session.prepare(seq)
+    assert _wait(lambda: len(_prepares(fake_receiver)) == 1)
+    sid, header = _prepares(fake_receiver)[0]
+    assert sid.startswith("prepare-")
+    assert fake_receiver.identities[-1] == sid.encode()
+    assert header["shape_zyx"] == [3, 6, 8]
+    assert header["z_step_um"] == 1.0
+    assert header["channel_names"] == ["488nm", "561nm"]
+    # ...the shape SESSION_START will declare.
+    start, _ = _build_session_header(
+        seq, _geom(_StubCore()), ArgusStreamSettingsV1(gpfs_scratch_root="/s"), []
+    )
+    assert start is not None and start["shape_zyx"] == header["shape_zyx"]
+
+    assert not session.prepare(_save_seq(metadata={}))  # same plan, renamed
+    assert session.prepare(_save_seq(z_plan=useq.ZRangeAround(range=2, step=0.5)))
+    assert _wait(lambda: len(_prepares(fake_receiver)) == 2)
+    assert not any(t == MSG_SESSION_START for t, *_ in fake_receiver.messages)
+
+
+def test_prepare_sends_nothing_it_should_not(fake_receiver: _FakeReceiver) -> None:
+    running = _PlanCore()
+    running.mda.running = True
+    cases = [
+        _prepare_session(fake_receiver, enabled=False).prepare(_save_seq()),
+        _prepare_session(fake_receiver, running).prepare(_save_seq()),
+        _prepare_session(
+            fake_receiver, _PlanCore(num_channels=2, physical_cameras=["C1", "C2"])
+        ).prepare(_save_seq()),
+        _prepare_session(fake_receiver).prepare(_save_seq(z_plan=None)),
+        # a core without an MDA runner: logged, never raised
+        _prepare_session(fake_receiver, _StubCore()).prepare(_save_seq()),
+    ]
+    assert cases == [False] * len(cases)
+    time.sleep(0.2)
+    assert _prepares(fake_receiver) == []
+
+
+def test_volume_plan_matches_the_session_header() -> None:
+    seq = _save_seq()
+    geom = _geom(_StubCore())
+    plan = _volume_plan(seq, geom, [])
+    header, _ = _build_session_header(
+        seq, geom, ArgusStreamSettingsV1(gpfs_scratch_root="/s"), []
+    )
+    assert header is not None
+    for k in ("shape_zyx", "z_step_um", "dtype", "num_timepoints", "channel_names"):
+        assert header[k] == plan[k], k
 
 
 def test_session_spectral_crops_and_routes_dual_camera(
