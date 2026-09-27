@@ -794,6 +794,15 @@ class _RunWorker(threading.Thread):
                 # receiver dedupes, so resending staged data is a no-op.
                 requeue(list(unacked))
                 resume_sent = resync_sent = False
+            elif ack.get("resend"):
+                # Argus held frames back (its RAM disk was below its floor)
+                # and has room again: resend them now, not once the link
+                # would be called stale (minutes, with gigabytes unACKed).
+                logger.info(
+                    "Argus has room again; resending %d unACKed volume(s)",
+                    len(unacked),
+                )
+                requeue(list(unacked))
             if "links" in features and len(links) < n_links:
                 links.extend(
                     _Link(k, endpoints[k], f"{sid}#{k}")
