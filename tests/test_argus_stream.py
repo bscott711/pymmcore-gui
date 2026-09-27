@@ -872,6 +872,54 @@ def test_session_resends_unacked_frames_after_resume(
     session.shutdown(timeout=1)
 
 
+def test_session_resends_at_once_when_argus_asks(
+    fake_receiver: _FakeReceiver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Argus held a frame back (RAM disk below its floor), then has room: its
+    ACK with "resend" gets the frame sent again right away, with no RESUME
+    and no wait for the link to look stale."""
+    monkeypatch.setattr(session_mod, "_STALE_ACK_S", 60.0)
+    fake_receiver.auto_ack = False
+
+    settings = _full_settings(
+        ArgusStreamSettingsV1(
+            enabled=True,
+            local_port=fake_receiver.port,
+            gpfs_scratch_root="/scratch",
+            buffer_budget_mb=4096,
+        )
+    )
+    session = ArgusStreamSession(
+        _StubCore(),
+        _NoopTunnel(),  # pyright: ignore[reportArgumentType]
+        get_settings=lambda: settings,
+    )
+    seq = _save_seq(z_plan=None, channels=["488nm"])
+    session.sequenceStarted(seq, {})  # pyright: ignore[reportArgumentType]
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and not fake_receiver.messages:
+        time.sleep(0.02)
+    fake_receiver.ack(-1)  # SESSION_START accepted
+    event = next(iter(seq))
+    session.frameReady(np.zeros((4, 4), dtype="uint16"), event, {})  # pyright: ignore[reportArgumentType]
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and not fake_receiver.frame_messages():
+        time.sleep(0.02)
+    assert len(fake_receiver.frame_messages()) == 1  # held back: no ACK
+
+    fake_receiver.send(MSG_ACK, {"through_frame_index": -1, "resend": True})
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and len(fake_receiver.frame_messages()) < 2:
+        time.sleep(0.02)
+    frames = fake_receiver.frame_messages()
+    assert len(frames) == 2
+    assert frames[0][0]["frame_index"] == frames[1][0]["frame_index"] == 0
+    assert not any(m[0] == MSG_RESUME for m in fake_receiver.messages)
+
+    session.sequenceCanceled(seq)
+    session.shutdown(timeout=1)
+
+
 def test_session_hands_qc_verdicts_to_the_callback_and_keeps_streaming(
     fake_receiver: _FakeReceiver,
 ) -> None:

@@ -182,6 +182,9 @@ class _AckOptional(TypedDict, total=False):
     # The final ACK, sent once Argus has closed the session: it confirms
     # SESSION_END.
     ended: bool
+    # Argus dropped frames it couldn't stage (its RAM disk was below its
+    # floor) and has room again: resend everything unACKed now.
+    resend: bool
 
 
 class AckHeader(_AckOptional):
