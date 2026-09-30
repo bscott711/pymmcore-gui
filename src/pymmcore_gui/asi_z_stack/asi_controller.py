@@ -1,15 +1,20 @@
 # src/microscope/asi_z_stack/asi_controller.py
+from __future__ import annotations
+
 import logging
 import time
 from typing import TYPE_CHECKING
 
 from pymmcore_plus import CMMCorePlus
+from superqt.utils import create_worker
 
 from .common import HardwareConstants
 
 # Direct import - this fixes the Pylance error
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from .common import AcquisitionSettings
 
 logger = logging.getLogger(__name__)
@@ -231,17 +236,31 @@ def set_camera_trigger_mode(camera_label: str) -> bool:
 
 
 def configure_plogic_for_dual_nrt_pulses(
-    settings: "AcquisitionSettings",
+    settings: AcquisitionSettings,
     plogic_label: str,
     tiger_comm_hub_label: str,
-    plogic_laser_preset_num: int,
     plogic_camera_cell: int,
     pulses_per_ms: float,
     plogic_4khz_clock_addr: int,
     plogic_trigger_ttl_addr: int,
     plogic_laser_on_cell: int,
 ) -> None:
-    """Configures PLogic for two independent, synchronized NRT one-shot pulses."""
+    """Configures PLogic for two independent, synchronized NRT one-shot pulses.
+
+    Deliberately does not touch laser BNC routing (no preset load): which
+    physical laser cell 10 drives is exclusively the ``"Lasers"`` ConfigGroup's
+    ``OutputChannel`` property's job (set per-MDA-channel by the stock
+    ``MDAEngine``/``_set_event_channel``). This function previously loaded
+    PLogic preset 30 here first -- confirmed against ASI's own Tiger PLogic
+    documentation to be "diSPIM: simultaneous 4-color" (wires BNC5-8 *all* to
+    cell 10 at once), a different preset family entirely from the single-laser
+    presets (5-8) ``OutputChannel`` uses. Loading it unconditionally on every
+    sequence setup forced "all lasers on" as a transient baseline that a
+    channel's own config switch could, in some cases, never correct (see
+    ``_ASITriggerEngineBase._reset_channel_config_cache``) -- removed rather
+    than fixed in place, since this function has no business selecting a
+    laser preset at all.
+    """
     plogic_addr_prefix = plogic_label.split(":")[-1]
     hub_prop = "OnlySendSerialCommandOnChange"
     original_hub_setting = get_property(tiger_comm_hub_label, hub_prop)
@@ -253,11 +272,7 @@ def configure_plogic_for_dual_nrt_pulses(
         if original_hub_setting == "Yes":
             set_property(tiger_comm_hub_label, hub_prop, "No")
 
-        # 1. Program Laser Preset
-        _send(f"{plogic_addr_prefix}CCA X={plogic_laser_preset_num}")
-        logger.debug(f"Laser preset number: {plogic_laser_preset_num}")
-
-        # 2. Program Camera Pulse (NRT One-Shot #1)
+        # 1. Program Camera Pulse (NRT One-Shot #1)
         _send(f"M E={plogic_camera_cell}")
         camera_pulse_cycles = int(settings.camera_exposure_ms * pulses_per_ms)
         # Y (NRT one-shot mode) and Z (pulse length) must be bundled into a
@@ -269,7 +284,7 @@ def configure_plogic_for_dual_nrt_pulses(
             f"Y={plogic_4khz_clock_addr} Z=0"
         )
 
-        # 3. Program Laser Pulse (NRT One-Shot #2)
+        # 2. Program Laser Pulse (NRT One-Shot #2)
         _send(f"M E={plogic_laser_on_cell}")
         laser_pulse_cycles = int(settings.laser_trig_duration_ms * pulses_per_ms)
         _send(f"{plogic_addr_prefix}CCA Y=14 Z={laser_pulse_cycles}")
@@ -278,11 +293,11 @@ def configure_plogic_for_dual_nrt_pulses(
             f"Y={plogic_4khz_clock_addr} Z=0"
         )
 
-        # 4. Route Camera Trigger Cell Output to BNC1 (Address 33)
+        # 3. Route Camera Trigger Cell Output to BNC1 (Address 33)
         _send("M E=33")
         _send(f"{plogic_addr_prefix}CCA Z={plogic_camera_cell}")
 
-        # 5. Save the configuration
+        # 4. Save the configuration
         _send(f"{plogic_addr_prefix}SS Z")
         logger.info("PLogic configured for dual NRT pulses.")
 
@@ -437,8 +452,19 @@ def ensure_beam_enabled() -> None:
     set_property(_HW.galvo_a_label, "BeamEnabled", "Yes")
 
 
-def ensure_circular_buffer_capacity() -> None:
-    """Pre-allocate a large circular buffer once, at session startup.
+#: True while ensure_circular_buffer_capacity_async's background grow is in
+#: flight. core_actions.toggle_live checks this before starting a continuous
+#: sequence acquisition on the main-process core, since writing into the
+#: circular buffer while it's mid-resize is the same class of unsafe
+#: concurrent access documented below -- only ever True for the handful of
+#: seconds right after an ASI/PLogic config loads.
+circular_buffer_growing = False
+
+
+def ensure_circular_buffer_capacity_async(
+    on_done: Callable[[], None] | None = None,
+) -> None:
+    """Pre-allocate a large circular buffer once, off the GUI thread, at startup.
 
     No-op if the buffer is already at least ``HardwareConstants.
     circular_buffer_target_mb``. Deliberately session-level, not per-MDA:
@@ -451,27 +477,55 @@ def ensure_circular_buffer_capacity() -> None:
     already armed leaves the device adapter's buffer pointers stale
     relative to the newly-reallocated core buffer. Doing this once at
     launch, before any camera has been armed for anything, avoids that
-    entirely. The one-time allocation cost (a few seconds for tens of GB)
-    happens during app startup instead of in the middle of triggering an
-    acquisition; snap/live afterward read/write the same pre-sized buffer,
-    so they aren't slowed down by it. No-op if PLogic/the Tiger hub aren't
-    loaded (demo or non-ASI configs don't need this large a buffer).
+    entirely.
+
+    The one-time allocation itself (a few seconds for tens of GB) runs on a
+    background thread via :func:`superqt.utils.create_worker` instead of
+    blocking the Qt event loop, so the main window can appear and stay
+    responsive while it happens -- this used to run synchronously during
+    app startup, which froze the whole UI (no window, no event loop yet)
+    for the entire allocation. ``circular_buffer_growing`` is set for the
+    duration so other code can avoid touching the buffer while it's being
+    resized. ``on_done``, if given, is called on the GUI thread once the
+    buffer is confirmed ready -- synchronously, if no growth was needed.
+    No-op if PLogic/the Tiger hub aren't loaded (demo or non-ASI configs
+    don't need this large a buffer).
     """
+    global circular_buffer_growing
     if not _plogic_available():
+        if on_done is not None:
+            on_done()
         return
     target_mb = _HW.circular_buffer_target_mb
     current_mb = mmc.getCircularBufferMemoryFootprint()
     if current_mb >= target_mb:
+        if on_done is not None:
+            on_done()
         return
+
     logger.info(f"Growing circular buffer footprint {current_mb} -> {target_mb} MB.")
-    try:
-        mmc.setCircularBufferMemoryFootprint(target_mb)
-    except Exception:
+    circular_buffer_growing = True
+
+    def _on_finished() -> None:
+        global circular_buffer_growing
+        circular_buffer_growing = False
+        if on_done is not None:
+            on_done()
+
+    def _on_errored(exc: BaseException) -> None:
         logger.error(
             f"Failed to grow circular buffer to {target_mb} MB; keeping "
             f"{current_mb} MB.",
-            exc_info=True,
+            exc_info=exc,
         )
+
+    worker = create_worker(
+        mmc.setCircularBufferMemoryFootprint, target_mb, _start_thread=True
+    )
+    # signals.finished is a no-arg Signal(); superqt's stub over-generalizes
+    # it to SigInst[None], which mypy reads as requiring a one-arg callable.
+    worker.finished.connect(_on_finished)  # type: ignore[arg-type]
+    worker.errored.connect(_on_errored)
 
 
 def _selected_laser_bncs() -> list[int]:

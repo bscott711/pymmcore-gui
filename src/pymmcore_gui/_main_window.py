@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections import deque
 from collections.abc import Callable
 from contextlib import suppress
 from enum import Enum
@@ -11,11 +12,14 @@ from weakref import WeakValueDictionary
 
 from pymmcore_plus import CMMCorePlus
 from pymmcore_widgets import ConfigWizard
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QCloseEvent, QGuiApplication, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDialog,
+    QHBoxLayout,
+    QLabel,
     QMainWindow,
     QMenu,
     QMenuBar,
@@ -23,17 +27,26 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QStatusBar,
     QToolBar,
+    QVBoxLayout,
     QWidget,
 )
-from PyQt6Ads import CDockManager, CDockWidget, SideBarLocation
+from PyQt6Ads import (
+    CDockAreaWidget,
+    CDockManager,
+    CDockWidget,
+    DockWidgetArea,
+    SideBarLocation,
+)
 from superqt import QIconifyIcon
 
+from ._argus_stream import ArgusStreamSession, ArgusTunnelManager, StreamState
 from ._mmcore_shutdown import shutdown_mmcore, track_mda_thread
 from ._ndv_viewers import NDVViewersManager
 from ._notification_manager import NotificationManager
 from ._settings import Settings
 from .actions import CoreAction, QCoreAction, WidgetAction, WidgetActionInfo
 from .actions._action_info import ActionInfo
+from .widgets._camera_toolbar import CameraToolBar
 from .widgets._toolbars import OCToolBar
 
 if TYPE_CHECKING:
@@ -117,16 +130,49 @@ def _create_window_menu(mmc: CMMCorePlus, parent: MicroManagerGUI) -> QMenu:
     return menu
 
 
+class _ArgusStatusRelay(QObject):
+    """Marshals :class:`ArgusStreamSession` status callbacks onto the GUI thread.
+
+    ``ArgusStreamSession``'s ``on_state_changed`` callback is invoked directly
+    from its per-run sender thread (see ``_argus_stream._session``), so it
+    can't touch Qt widgets itself. Routing it through a signal on a QObject
+    that lives on the GUI thread lets Qt's normal auto-queued cross-thread
+    connection handle the marshaling, the same mechanism
+    :class:`~pymmcore_gui._ndv_viewers.NDVViewersManager` relies on for
+    ``core.mda.events`` callbacks.
+    """
+
+    stateChanged = pyqtSignal(str, str)
+    qcReceived = pyqtSignal(object)  # a QCHeader dict
+
+
+_ARGUS_STATE_TEXT = {
+    StreamState.DISABLED: "Argus: off",
+    StreamState.IDLE: "Argus: idle",
+    StreamState.SKIPPED: "Argus: skipped",
+    StreamState.CONNECTING: "Argus: connecting…",
+    StreamState.STREAMING: "Argus: streaming",
+    StreamState.RECONNECTING: "Argus: reconnecting…",
+    StreamState.BACKLOG_ALARM: "Argus: backlog!",
+    StreamState.FINISHING: "Argus: finishing…",
+    StreamState.PAUSED: "Argus: PAUSED",
+}
+
+
 class MicroManagerGUI(QMainWindow):
     """Micro-Manager minimal GUI."""
+
+    # Emitted (possibly more than once, on every config load/reload) each
+    # time the session's ASI/PLogic circular-buffer grow is confirmed
+    # finished -- immediately, if no growth was needed. create_mmgui uses
+    # this to delay showing the main window at startup until it's actually
+    # safe to interact with; see _on_system_config_loaded.
+    bufferReady = pyqtSignal()
 
     # Toolbars are a mapping of strings to either a list of ActionKeys or a callable
     # that takes a CMMCorePlus instance and QMainWindow and returns a QToolBar.
     TOOLBARS: Mapping[str, ToolDictValue] = {
-        Toolbar.CAMERA_ACTIONS: [
-            CoreAction.SNAP,
-            CoreAction.TOGGLE_LIVE,
-        ],
+        Toolbar.CAMERA_ACTIONS: CameraToolBar,
         Toolbar.OPTICAL_CONFIGS: OCToolBar,
         # Toolbar.SHUTTERS: ShuttersToolbar,
         Toolbar.WIDGETS: [
@@ -155,6 +201,8 @@ class MicroManagerGUI(QMainWindow):
         Menu.PLUGINS: [
             WidgetAction.CRISP,
             WidgetAction.SPECTRAL_CHANNELS,
+            WidgetAction.CAMERA_ALIGNMENT,
+            WidgetAction.ARGUS_QC,
         ],
         Menu.HELP: [],
     }
@@ -177,6 +225,16 @@ class MicroManagerGUI(QMainWindow):
 
         # get global CMMCorePlus instance
         self._mmc = mmcore or CMMCorePlus.instance()
+
+        # Owns the persistent dual-PVCAM camera worker pool, if this
+        # session's hardware needs it (see _on_system_config_loaded and
+        # camera_worker_service.py's module docstring). Constructed
+        # unconditionally, up front -- it's a no-op/inactive object for
+        # demo/single-camera/non-ASI configs.
+        from pymmcore_gui.asi_z_stack.camera_worker_service import CameraWorkerService
+
+        self._camera_worker_service = CameraWorkerService(self)
+
         self._mmc.events.systemConfigurationLoaded.connect(
             self._on_system_config_loaded
         )
@@ -192,11 +250,64 @@ class MicroManagerGUI(QMainWindow):
             if hasattr(app, "exceptionRaised"):
                 cast("MMQApplication", app).exceptionRaised.connect(self._on_exception)
 
+        # Real-time Argus streaming (deskew/decon) -------------
+        #
+        # A plain (non-QObject) object connected directly to core.mda.events,
+        # like NDVViewersManager, so it shares no thread with the local disk
+        # writers -- see _argus_stream._session's module docstring. The
+        # tunnel is app-lifetime: started HERE (not lazily on first MDA run)
+        # so the SSH handshake is already warm by the time any acquisition
+        # starts -- ArgusStreamSession.sequenceStarted used to call
+        # ArgusTunnelManager.start() itself, which raced _RunWorker's own
+        # connect()+SESSION_START against the tunnel's local port not being
+        # forwarded yet, right at the start of every single run. That call
+        # stays in sequenceStarted too (ArgusTunnelManager.start() is
+        # idempotent -- a no-op once already running) purely as a fallback
+        # for ArgusStreamSettingsV1.enabled being flipped True mid-session
+        # without an app restart: that one first run afterward still pays
+        # the JIT cost, every run after it doesn't.
+        argus_settings = Settings.instance().argus_stream
+        self._argus_tunnel = ArgusTunnelManager(
+            argus_settings.ssh_host,
+            argus_settings.local_port,
+            argus_settings.remote_port,
+            links=argus_settings.stream_links,
+            ssh_processes=argus_settings.ssh_processes,
+        )
+        if argus_settings.enabled:
+            self._argus_tunnel.start()
+        self._argus_status_relay = _ArgusStatusRelay(self)
+        self._argus_stream = ArgusStreamSession(
+            self._mmc,
+            self._argus_tunnel,
+            get_settings=lambda: Settings.instance(),
+            on_state_changed=lambda state, detail: (
+                self._argus_status_relay.stateChanged.emit(state.value, detail)
+            ),
+            on_qc=self._argus_status_relay.qcReceived.emit,
+        )
+        # Recent QC verdicts, so the Argus QC panel shows the run so far when
+        # it's opened mid-acquisition.
+        self.argus_qc_history: deque[dict] = deque(maxlen=200)
+        self.argus_qc_received = self._argus_status_relay.qcReceived
+        argus_mda_ev = self._mmc.mda.events
+        argus_mda_ev.sequenceStarted.connect(self._argus_stream.sequenceStarted)
+        argus_mda_ev.frameReady.connect(self._argus_stream.frameReady)
+        argus_mda_ev.sequenceFinished.connect(self._argus_stream.sequenceFinished)
+        argus_mda_ev.sequenceCanceled.connect(self._argus_stream.sequenceCanceled)
+
         # Status bar -----------------------------------------
 
         self._status_bar = QStatusBar(self)
         self._status_bar.setMaximumHeight(26)
         self.setStatusBar(self._status_bar)
+
+        self._argus_status_label = QLabel(_ARGUS_STATE_TEXT[StreamState.DISABLED])
+        self._argus_status_relay.stateChanged.connect(self._on_argus_state_changed)
+        self._status_bar.addPermanentWidget(self._argus_status_label)
+        self._argus_qc_label = QLabel("")
+        self._argus_status_relay.qcReceived.connect(self._on_argus_qc)
+        self._status_bar.addPermanentWidget(self._argus_qc_label)
 
         self.bell_button = QPushButton(QIconifyIcon("codicon:bell"), None)
         self.bell_button.setFixedWidth(20)
@@ -225,6 +336,9 @@ class MicroManagerGUI(QMainWindow):
             CDockManager.eConfigFlag.DockAreaHasCloseButton, False
         )
         CDockManager.setConfigFlag(CDockManager.eConfigFlag.OpaqueSplitterResize, True)
+        # Split new docks evenly with their neighbor on insertion (e.g. two
+        # camera preview docks end up 50/50 instead of sized off widget hints).
+        CDockManager.setConfigFlag(CDockManager.eConfigFlag.EqualSplitOnInsertion, True)
         CDockManager.setAutoHideConfigFlag(
             CDockManager.eAutoHideFlag.AutoHideFeatureEnabled, True
         )
@@ -240,6 +354,13 @@ class MicroManagerGUI(QMainWindow):
         )
         self._central.setWidget(blank)
         self._central_dock_area = self.dock_manager.setCentralWidget(self._central)
+
+        # Per-camera preview dock AREAS (not just widgets), keyed by physical
+        # camera label -- populated in _on_previewer_created, consulted in
+        # _on_mda_viewer_created so each camera's MDA tab joins that camera's
+        # own preview area instead of a single shared central area. Reset
+        # fresh every session (not persisted) -- see _ensure_camera_previews.
+        self._camera_preview_areas: dict[str, CDockAreaWidget] = {}
 
         # QTimer.singleShot(0, self._restore_state)
 
@@ -340,6 +461,8 @@ class MicroManagerGUI(QMainWindow):
                 return widget
 
             self._action_widgets[key] = widget
+            if key == WidgetAction.MDA_WIDGET:
+                self._watch_mda_plan(cast("MDAWidget", widget))
 
             action = self.get_action(key)
             dock = CDockWidget(info.text, self)
@@ -370,6 +493,26 @@ class MicroManagerGUI(QMainWindow):
             action.setChecked(True)
 
         return self._action_widgets[key]
+
+    def _watch_mda_plan(self, mda: MDAWidget) -> None:
+        """Warm Argus for the MDA being set up (``ArgusStreamSession.prepare``).
+
+        When the widget opens, and after each edit once the plan has been
+        still for a second.
+        """
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.setInterval(1000)
+
+        def prepare() -> None:
+            try:
+                self._argus_stream.prepare(mda.value())
+            except Exception:  # a half-edited plan; the next edit retries
+                logger.debug("no MDA plan to prepare", exc_info=True)
+
+        timer.timeout.connect(prepare)
+        mda.valueChanged.connect(timer.start)
+        timer.start()
 
     def get_dock_widget(self, key: str) -> CDockWidget:
         """Get the QDockWidget for `key`.
@@ -407,24 +550,60 @@ class MicroManagerGUI(QMainWindow):
             settings.last_config = None
         settings.flush()
 
+        # Release Camera-1/Camera-2 to the persistent camera worker service
+        # (a no-op for demo/single-camera/non-ASI configs) FIRST, before any
+        # other systemConfigurationLoaded listener runs -- this handler is
+        # connected first (see __init__), so every other listener that needs
+        # camera labels (MultiCameraHandler.sequenceStarted,
+        # NDVViewersManager.create_default_camera_previews, the spectral/
+        # camera-alignment widgets, etc.) can already resolve them via
+        # CameraWorkerService.get_active() by the time it's their turn to
+        # react -- even though the worker *processes* themselves haven't
+        # finished spawning yet (that's the slow, async half, chained below
+        # after the buffer grow). See camera_worker_service.py's module
+        # docstring for the full rationale.
+        from pymmcore_gui.asi_z_stack.camera_worker_service import has_camera
+        from pymmcore_gui.asi_z_stack.common import HardwareConstants
+
+        self._camera_worker_service.begin_release(self._mmc, HardwareConstants())
+
         # On ASI/PLogic configs, raise the fiber-optic global shutter and set up
         # the always-on cell so software snap/live can gate the laser BNCs, and
         # enable the galvo's beam once for the session (matching the
         # microscope-control sibling repo's confirmed-working engine, which
         # does this once at startup rather than per-MDA-run). Also
         # pre-allocate a large circular buffer once here -- see
-        # ensure_circular_buffer_capacity's docstring for why this must
+        # ensure_circular_buffer_capacity_async's docstring for why this must
         # never happen mid-acquisition. All three are no-ops for demo /
         # non-ASI configs.
         from pymmcore_gui.asi_z_stack.asi_controller import (
             ensure_beam_enabled,
-            ensure_circular_buffer_capacity,
+            ensure_circular_buffer_capacity_async,
             ensure_global_shutter_open,
         )
 
         ensure_global_shutter_open()
         ensure_beam_enabled()
-        ensure_circular_buffer_capacity()
+
+        # Live stays disabled until BOTH the circular-buffer grow (if any)
+        # and the persistent camera worker pool (if this config needs one)
+        # are ready -- so it can't start a sequence acquisition against a
+        # main-process core whose circular buffer is mid-resize (see
+        # asi_controller.circular_buffer_growing), nor against a worker pool
+        # that hasn't finished spawning yet. Resolves synchronously, with no
+        # visible flicker, when neither is actually needed.
+        live_action = self.get_action(CoreAction.TOGGLE_LIVE)
+        live_action.setEnabled(False)
+
+        def _on_camera_service_ready() -> None:
+            with suppress(RuntimeError):
+                live_action.setEnabled(has_camera(self._mmc))
+            self.bufferReady.emit()
+
+        def _on_buffer_ready() -> None:
+            self._camera_worker_service.spawn_async(on_ready=_on_camera_service_ready)
+
+        ensure_circular_buffer_capacity_async(on_done=_on_buffer_ready)
 
         self._register_mda_engine()
 
@@ -488,10 +667,32 @@ class MicroManagerGUI(QMainWindow):
             return
         self._save_state()
         try:
-            shutdown_mmcore(self._mmc)
+            self._argus_stream.shutdown()
+        except Exception:
+            logger.exception("Error shutting down Argus stream on close")
+        self._argus_tunnel.stop()
+        try:
+            shutdown_mmcore(
+                self._mmc, camera_worker_service=self._camera_worker_service
+            )
         except Exception:
             logger.exception("Error during mmcore shutdown on close")
         return super().closeEvent(a0)
+
+    def _on_argus_state_changed(self, state: str, detail: str) -> None:
+        text = _ARGUS_STATE_TEXT.get(StreamState(state), f"Argus: {state}")
+        self._argus_status_label.setText(f"{text} ({detail})" if detail else text)
+
+    def _on_argus_qc(self, rec: dict) -> None:
+        from pymmcore_gui.widgets._argus_qc import VERDICT_COLORS
+
+        self.argus_qc_history.append(rec)
+        verdict = str(rec.get("verdict", ""))
+        self._argus_qc_label.setText(f"QC t={rec.get('t', '?')}: {verdict}")
+        self._argus_qc_label.setStyleSheet(
+            f"color: {VERDICT_COLORS.get(verdict, '#808080')}; font-weight: bold;"
+        )
+        self._argus_qc_label.setToolTip("\n".join(rec.get("flags") or []))
 
     def _confirm_close_with_running_mda(self) -> bool:
         box = QMessageBox(
@@ -530,6 +731,17 @@ class MicroManagerGUI(QMainWindow):
                 self.nm.show_warning_message(
                     f"Unable to reload widget key stored in settings: {key!r}",
                 )
+            except Exception:
+                # A widget's own construction can fail for reasons outside our
+                # control (e.g. a stock pymmcore_widgets widget that assumes
+                # every device referenced by a config group is currently
+                # loaded -- not true right after a persistent camera worker
+                # service releases Camera-1/Camera-2). One broken dock must
+                # never prevent the rest of the window from opening.
+                logger.exception(f"Failed to reload widget {key!r} from settings")
+                self.nm.show_warning_message(
+                    f"Failed to reopen {key!r} (see log for details).",
+                )
 
         # restore position and size of the main window
         if geo := settings.window.geometry:
@@ -555,6 +767,24 @@ class MicroManagerGUI(QMainWindow):
         if show:
             self.show()
             self.nm.reposition_notifications()
+            # Defer past this event-loop iteration so the window actually
+            # paints before we potentially block on the one-time GPU/wgpu
+            # init that creating a camera preview triggers (see
+            # _ensure_camera_previews) -- otherwise that pause would land
+            # before the user ever sees the window at all.
+            QTimer.singleShot(0, self._ensure_camera_previews)
+
+    def _ensure_camera_previews(self) -> None:
+        """Proactively create + auto-arrange camera preview docks at startup.
+
+        Without this, Camera-1/Camera-2 preview docks only appear after the
+        user manually clicks Snap or Live, and have to be manually
+        rearranged into a split view every session. This also moves the
+        one-time GPU/wgpu initialization (shared with the first MDA's ndv
+        viewer) to this deliberate startup pause instead of blocking the
+        event loop mid-Acquire on the first MDA of a session.
+        """
+        self._viewers_manager.create_default_camera_previews()
 
     def _save_state(self) -> None:
         """Save the state of the window to settings."""
@@ -613,18 +843,74 @@ class MicroManagerGUI(QMainWindow):
         q_viewer.setObjectName(f"ndv-{sha}{suffix}")
         title = f"MDA {sha}" + (f" — {camera_label}" if camera_label else "")
         q_viewer.setWindowTitle(title)
-        q_viewer.setWindowFlags(Qt.WindowType.Dialog)
 
-        dw = CDockWidget(f"ndv-{sha}{suffix}")
+        # Small header row with a "Lock current slice" toggle -- lets the
+        # user pin whichever z-index is currently displayed, so the view
+        # stops jumping to every new frame and only updates when a new
+        # frame arrives at that same z (see NDVViewersManager.set_viewer_z_locked
+        # / _update_mda_viewer). A no-op for sequences with no z axis.
+        container = QWidget(self)
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(0)
+        lock_row = QWidget(container)
+        lock_layout = QHBoxLayout(lock_row)
+        lock_layout.setContentsMargins(4, 2, 4, 2)
+        lock_checkbox = QCheckBox("Lock current slice", lock_row)
+        lock_checkbox.toggled.connect(
+            lambda checked, v=ndv_viewer: self._viewers_manager.set_viewer_z_locked(
+                v, checked
+            )
+        )
+        lock_layout.addWidget(lock_checkbox)
+        lock_layout.addStretch()
+        container_layout.addWidget(lock_row)
+        container_layout.addWidget(q_viewer)
+
+        # NOTE: don't call q_viewer.setWindowFlags(Qt.WindowType.Dialog) here --
+        # changing window flags on an already-parented widget forces Qt to hide
+        # and rebuild its native window handle, which (combined with the
+        # parentless CDockWidget below) was the cause of the whole main window
+        # visibly flickering/disappearing every time an MDA started. The
+        # viewer is going straight into a dock, not shown as a standalone
+        # dialog, so it doesn't need Dialog window flags.
+        dw = CDockWidget(f"ndv-{sha}{suffix}", self)
         # small hack ... we need to retain a pointer to the viewer
         # otherwise the viewer will be garbage collected
-        dw._viewer = ndv_viewer  # type: ignore
-        dw.setWidget(q_viewer)
+        dw._viewer = ndv_viewer
+        dw.setWidget(container)
         dw.setFeature(dw.DockWidgetFeature.DockWidgetFloatable, False)
+
+        # Route each camera's MDA tab to that camera's own preview area, so
+        # multi-camera MDAs don't all pile up as tabs in one shared area.
+        # Falls back to the shared central area for the single-camera case
+        # or if the tracked area reference has gone stale (e.g. the preview
+        # dock was closed/reparented in the meantime).
+        area = self._camera_preview_areas.get(camera_label) if camera_label else None
+        if area is not None:
+            try:
+                self.dock_manager.addDockWidgetTabToArea(dw, area)
+                return
+            except RuntimeError:
+                pass
         self.dock_manager.addDockWidgetTabToArea(dw, self._central_dock_area)
 
-    def _on_previewer_created(self, dock_widget: CDockWidget) -> None:
-        self.dock_manager.addDockWidgetTabToArea(dock_widget, self._central_dock_area)
+    def _on_previewer_created(
+        self, dock_widget: CDockWidget, camera_label: str = ""
+    ) -> None:
+        if self._camera_preview_areas:
+            # split beside the most recently placed camera preview, extending
+            # the row left-to-right as more cameras are discovered
+            target = next(reversed(self._camera_preview_areas.values()))
+            area = self.dock_manager.addDockWidget(
+                DockWidgetArea.RightDockWidgetArea, dock_widget, target
+            )
+        else:
+            area = self.dock_manager.addDockWidgetTabToArea(
+                dock_widget, self._central_dock_area
+            )
+        if area is not None and camera_label:
+            self._camera_preview_areas[camera_label] = area
 
     def _on_exception(self, exc: BaseException) -> None:
         """Show a notification when an exception is raised."""

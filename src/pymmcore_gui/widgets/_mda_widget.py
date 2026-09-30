@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from pymmcore_widgets import MDAWidget
 from pymmcore_widgets.useq_widgets import PYMMCW_METADATA_KEY
 
+from pymmcore_gui._async_writer import AsyncWriter
 from pymmcore_gui._multi_camera_handler import (
     MultiCameraHandler,
     per_camera_path,
@@ -22,6 +23,7 @@ from pymmcore_gui._spectral_channel_handler import (
     channel_output_path,
     channels_for_sequence,
 )
+from pymmcore_gui._vendored.mda_handlers import handler_for_path
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -57,10 +59,12 @@ class GuiMDAWidget(MDAWidget):
     """:class:`pymmcore_widgets.MDAWidget` with multi-camera aware saving.
 
     When the active camera is a *Multi Camera* device (i.e.
-    ``getNumberOfCameraChannels() > 1``) and the chosen output is a save path,
+    ``len(physical_camera_labels(mmc)) > 1``) and the chosen output is a save path,
     the output is wrapped in a handler so that each physical camera is written
-    to its own file. Single-camera acquisitions behave exactly as the base
-    widget.
+    to its own file. Single-camera, non-spectral saves are routed through the
+    same vendored :func:`~pymmcore_gui._vendored.mda_handlers.handler_for_path`
+    writer (rather than the base widget's default ``ome_writers`` sink) so
+    that no GUI save path pulls in ``ome_writers``'s tensorstore backend.
 
     If the image-splitter spectral-channel feature is enabled (see
     :class:`~pymmcore_gui._settings.SpectralChannelSettingsV1`), the regions
@@ -85,6 +89,9 @@ class GuiMDAWidget(MDAWidget):
     ) -> None:
         sequence = self.value()
         if isinstance(output, str | Path):
+            writer_cfg = SettingsV1.instance().mda_writer
+            zarr_compression = writer_cfg.zarr_compression
+            backlog_budget_bytes = writer_cfg.backlog_budget_mb * 1024**2
             save = self._spectral_channels_to_save(sequence)
             if save:
                 meta = sequence.metadata.get(PYMMCW_METADATA_KEY, {})
@@ -95,14 +102,37 @@ class GuiMDAWidget(MDAWidget):
                     SettingsV1.instance().spectral.all_lasers_preset,
                     writer_format=meta.get("format", "ome-zarr"),
                     mmcore=self._mmc,
+                    zarr_compression=zarr_compression,
+                    backlog_budget_bytes=backlog_budget_bytes,
                 )
             else:
                 spectral = SettingsV1.instance().spectral
                 if spectral.enabled:
                     active_cams = set(physical_camera_labels(self._mmc))
                     self._warn_no_spectral_match(spectral, active_cams)
-                if self._mmc.getNumberOfCameraChannels() > 1:
-                    output = MultiCameraHandler(output, mmcore=self._mmc)
+                if len(physical_camera_labels(self._mmc)) > 1:
+                    output = MultiCameraHandler(
+                        output,
+                        mmcore=self._mmc,
+                        zarr_compression=zarr_compression,
+                        backlog_budget_bytes=backlog_budget_bytes,
+                    )
+                else:
+                    # Route through the vendored, tensorstore-free writer
+                    # (OMEZarrWriter / OMETiffWriter / ImageSequenceWriter)
+                    # instead of letting a bare str/Path fall through to
+                    # pymmcore-plus's OmeWritersSink -> ome_writers -> its
+                    # (native) tensorstore backend. Wrap it in an AsyncWriter so
+                    # the disk I/O is off the shared MDA relay thread, bounded,
+                    # and can't die silently -- see _async_writer.py.
+                    output = cast(
+                        "SupportsFrameReady",
+                        AsyncWriter(
+                            handler_for_path(output, zarr_compression=zarr_compression),
+                            name="mda-save",
+                            backlog_budget_bytes=backlog_budget_bytes,
+                        ),
+                    )
         self._mmc.run_mda(sequence, output=output)
 
     def get_next_available_path(self, requested_path: Path) -> Path:
@@ -164,11 +194,9 @@ class GuiMDAWidget(MDAWidget):
             meta = sequence.metadata.get(PYMMCW_METADATA_KEY, {})
             writer_format = meta.get("format", "ome-zarr")
             return [channel_output_path(base, ch, writer_format) for ch in save]
-        if self._mmc.getNumberOfCameraChannels() > 1:
-            return [
-                per_camera_path(base, label)
-                for label in physical_camera_labels(self._mmc)
-            ]
+        labels = physical_camera_labels(self._mmc)
+        if len(labels) > 1:
+            return [per_camera_path(base, label) for label in labels]
         return []
 
     def _warn_no_spectral_match(

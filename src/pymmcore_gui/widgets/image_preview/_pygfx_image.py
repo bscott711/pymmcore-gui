@@ -76,6 +76,9 @@ class PygfxImagePreview(ImagePreviewBase):
         self._clims: tuple[float, float] | Literal["auto"] = "auto"
         self._cmap: Colormap = Colormap("gray")
         self._roi_overlays: list[pygfx.WorldObject] = []
+        # (x, y, w, h) to re-frame on, in place of full-frame, whenever the
+        # view is reset -- see set_default_zoom_rect / _apply_default_view.
+        self._default_zoom_rect: tuple[int, int, int, int] | None = None
 
         # IMAGE NODE
 
@@ -103,7 +106,7 @@ class PygfxImagePreview(ImagePreviewBase):
         camera.local.scale_y = -1
         self._scene.add(self._image_node)
         self._scene.add(self._camera)
-        self.reset_view()
+        self._apply_default_view()
         self._controller = pygfx.PanZoomController(
             camera, register_events=renderer, damping=2
         )
@@ -146,7 +149,7 @@ class PygfxImagePreview(ImagePreviewBase):
             # texture has wrong shape or format, recreate it
             self._texture = pygfx.Texture(data, dim=2)
             self._geometry.grid = self._texture
-            self.reset_view()
+            self._apply_default_view()
         self._image_node.visible = True
 
     @property
@@ -194,9 +197,71 @@ class PygfxImagePreview(ImagePreviewBase):
         """Set the interpolation method."""
         self._material.interpolation = interpolation
 
-    def reset_view(self, scale: float = 0.8) -> None:
+    def reset_view(self, scale: float = 1.0) -> None:
         """Reset the view so that the image fills the widget area."""
         self._camera.show_object(self._image_node, scale=scale)  # pyright: ignore [reportArgumentType]
+
+    def zoom_to_rect(
+        self, x: int, y: int, w: int, h: int, margin: float = 0.05
+    ) -> None:
+        """Frame the camera on a fixed pixel region instead of the whole image.
+
+        Parameters
+        ----------
+        x, y, w, h : int
+            Rectangle in full-frame pixel coordinates, same convention as
+            :meth:`set_roi_overlays` (``x``/``y`` are the top-left corner, in
+            array column/row units).
+        margin : float
+            Fractional padding added around the rect on each side, as a
+            fraction of its width/height (matches the 5% default margin used
+            by ndv's own pygfx canvas).
+        """
+        # Same pixel -> world mapping as set_roi_overlays: the pygfx Image
+        # quad spans local/world x in [-0.5, size_x - 0.5] (pixel centers at
+        # integer coordinates), so pixel -> world is a flat -0.5 shift.
+        x0, y0 = x - 0.5, y - 0.5
+        x1, y1 = x + w - 0.5, y + h - 0.5
+        pad_x = (x1 - x0) * margin
+        pad_y = (y1 - y0) * margin
+        self._camera.show_rect(
+            left=x0 - pad_x, right=x1 + pad_x, top=y0 - pad_y, bottom=y1 + pad_y
+        )
+
+    def set_default_zoom_rect(
+        self, rect: tuple[int, int, int, int] | None, *, apply: bool = True
+    ) -> None:
+        """Set the rect (if any) the view should re-frame on instead of full-frame.
+
+        ``append`` recreates the texture -- and, before this existed, always
+        called :meth:`reset_view` -- whenever the incoming frame's shape
+        doesn't match the current texture (e.g. the very first real frame
+        after the initial 1x1 placeholder, or a binning/ROI change). Without
+        remembering a preferred default, that reset silently snapped back to
+        full-frame and undid any zoom-to-ROI applied right after the preview
+        was created but before the first frame arrived.
+
+        Parameters
+        ----------
+        rect : tuple[int, int, int, int] | None
+            ``(x, y, w, h)`` in full-frame pixel coordinates to prefer, or
+            ``None`` to fall back to framing the whole image.
+        apply : bool
+            Whether to immediately reframe the view to *rect* now, or just
+            remember it for the next texture reset (e.g. when re-deriving
+            the rect after an ROI edit, so an already-open, possibly
+            manually-panned preview isn't yanked around). By default True.
+        """
+        self._default_zoom_rect = rect
+        if apply:
+            self._apply_default_view()
+
+    def _apply_default_view(self) -> None:
+        """Frame the view on ``_default_zoom_rect``, or the whole image if unset."""
+        if self._default_zoom_rect is not None:
+            self.zoom_to_rect(*self._default_zoom_rect)
+        else:
+            self.reset_view()
 
     def set_roi_overlays(
         self, rois: list[tuple[str, tuple[int, int, int, int]]]

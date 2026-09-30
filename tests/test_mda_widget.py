@@ -1,15 +1,19 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from unittest.mock import patch
+
+import numpy as np
+import pytest
+import useq
 
 from pymmcore_gui._spectral_channel_handler import _strip_known_suffix
 from pymmcore_gui.widgets._mda_widget import GuiMDAWidget
 
 if TYPE_CHECKING:
     from pathlib import Path
+    from threading import Thread
 
-    import useq
     from pymmcore_plus import CMMCorePlus
     from pytestqt.qtbot import QtBot
 
@@ -65,3 +69,57 @@ def test_next_available_path_non_split_uses_base_behavior(
         assert wdg.get_next_available_path(requested) == requested
         (tmp_path / "exp.ome.zarr").mkdir()
         assert wdg.get_next_available_path(requested) == tmp_path / "exp_001.ome.zarr"
+
+
+def test_single_camera_save_avoids_tensorstore(
+    mmcore: CMMCorePlus, qtbot: QtBot, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Single-camera, non-spectral saves route through the vendored writer.
+
+    Regression test for the disk-save half of the tensorstore-crash fix: a
+    bare str/Path output used to fall through to pymmcore-plus's
+    ``OmeWritersSink`` -> ``ome_writers`` -> its (native) tensorstore
+    backend. It's now routed through the same vendored, tensorstore-free
+    ``handler_for_path`` dispatcher the multi-camera/spectral paths already
+    use, and lands as a plain, re-openable OME-Zarr (v2) directory written by
+    the vendored ``OMEZarrWriter``.
+    """
+    ts = pytest.importorskip("tensorstore")
+    zarr = pytest.importorskip("zarr")
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise AssertionError("single-camera save must not create a tensorstore store")
+
+    monkeypatch.setattr(ts, "open", _boom)
+
+    wdg = GuiMDAWidget(mmcore=mmcore)
+    qtbot.addWidget(wdg)
+
+    sequence = useq.MDASequence(
+        channels=["DAPI"],  # pyright: ignore[reportArgumentType]
+        time_plan=useq.TIntervalLoops(interval=0, loops=2),  # pyright: ignore
+    )
+    monkeypatch.setattr(wdg, "value", lambda: sequence)
+
+    threads: list[Thread] = []
+    orig_run_mda = mmcore.run_mda
+
+    def _capture_run_mda(*args: Any, **kwargs: Any) -> Thread:
+        t = orig_run_mda(*args, **kwargs)
+        threads.append(t)
+        return t
+
+    monkeypatch.setattr(mmcore, "run_mda", _capture_run_mda)
+
+    out = tmp_path / "exp.ome.zarr"
+    wdg.execute_mda(out)
+
+    assert len(threads) == 1
+    threads[0].join(5)
+    assert not threads[0].is_alive()
+
+    assert out.exists()
+    group = zarr.open(str(out), mode="r")
+    arr = group["p0"]
+    # 2 timepoints written; trailing two dims are the frame (y, x).
+    assert int(np.prod(arr.shape[:-2])) == 2

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, cast
 
 from pymmcore_plus import CMMCorePlus
 
@@ -28,6 +28,10 @@ if TYPE_CHECKING:
     from pymmcore_gui._main_window import MicroManagerGUI
     from pymmcore_gui.widgets.image_preview._pygfx_preview import PygfxPreview
 
+# Vertical gap between a "top" region and its "bottom" sibling when a region
+# is auto-populated onto the opposite half of the same (or other) camera.
+_BOTTOM_BUFFER_PX = 40
+
 
 class _ChannelRow(QGroupBox):
     """Editable fields for one spectral channel (camera, laser, position).
@@ -52,6 +56,14 @@ class _ChannelRow(QGroupBox):
         self.laser_preset = QComboBox()
         self.laser_preset.setEditable(True)
 
+        # Which half of the image splitter's sensor this region occupies --
+        # used to auto-populate sibling regions when the first region on any
+        # camera is drawn (see SpectralChannelConfigWidget._sync_siblings).
+        # Named *_combo (not `position`) to avoid shadowing the `position`
+        # property below, which returns the (x, y) pixel position.
+        self.position_combo = QComboBox()
+        self.position_combo.addItems(["top", "bottom"])
+
         # Note: named *_spin (not x/y) to avoid shadowing QWidget.x()/.y().
         self.x_spin = QSpinBox()
         self.y_spin = QSpinBox()
@@ -63,6 +75,7 @@ class _ChannelRow(QGroupBox):
 
         form = QFormLayout(self)
         form.addRow("Camera", self.camera)
+        form.addRow("Position", self.position_combo)
         form.addRow("Laser preset", self.laser_preset)
 
         pos_row = QHBoxLayout()
@@ -83,6 +96,7 @@ class _ChannelRow(QGroupBox):
         if config.camera not in cameras:
             self.camera.addItem(config.camera)
         self.camera.setCurrentText(config.camera)
+        self.position_combo.setCurrentText(config.position)
         self.laser_preset.setCurrentText(config.laser_preset)
         x, y = (config.rect[0], config.rect[1]) if config.rect else (0, 0)
         self.set_position(x, y)
@@ -99,10 +113,12 @@ class _ChannelRow(QGroupBox):
         w, h = size
         x, y = self.position
         rect = (x, y, w, h) if w and h else None
+        position = cast("Literal['top', 'bottom']", self.position_combo.currentText())
         return SpectralChannelConfig(
             name=self.channel_name,
             camera=self.camera.currentText(),
             laser_preset=self.laser_preset.currentText(),
+            position=position,
             rect=rect,
         )
 
@@ -151,11 +167,20 @@ class SpectralChannelConfigWidget(QWidget):
         size_box = QGroupBox("Shared ROI size (px) — all regions share one size")
         size_box.setLayout(size_row)
 
+        # Two states: "pristine" (no row has a rect -- every row can draw, none
+        # can move) and "synced" (any row has a rect, set atomically for all 4
+        # by _sync_siblings -- every row's draw button is repurposed as "Clear
+        # ROIs" and every row can move). See _apply_button_states.
+        self._synced = any(c.is_ready for c in spectral.channels)
+
         self._rows = [_ChannelRow(c, cameras, self) for c in spectral.channels]
         for row in self._rows:
             self._populate_laser_presets(row)
-            row.draw_button.clicked.connect(lambda _checked=False, r=row: self._draw(r))
+            row.draw_button.clicked.connect(
+                lambda _checked=False, r=row: self._on_draw_button_clicked(r)
+            )
             row.move_button.clicked.connect(lambda _checked=False, r=row: self._move(r))
+        self._apply_button_states()
 
         save_button = QPushButton("Save")
         save_button.clicked.connect(self._save)
@@ -248,33 +273,82 @@ class SpectralChannelConfigWidget(QWidget):
         # pymmcore_gui._qt); both bindings are duck-type compatible at runtime.
         return _get_mm_main_window(self)  # type: ignore[arg-type]
 
-    def _preview_for(self, row: _ChannelRow) -> PygfxPreview | None:
+    def _preview_for_camera(self, camera_label: str) -> PygfxPreview | None:
         win = self._main_window()
         if win is None:
             return None
-        return win.viewers_manager.get_or_create_camera_preview(
-            row.camera.currentText()
-        )
+        return win.viewers_manager.get_or_create_camera_preview(camera_label)
+
+    def _preview_for(self, row: _ChannelRow) -> PygfxPreview | None:
+        return self._preview_for_camera(row.camera.currentText())
+
+    def _apply_button_states(self) -> None:
+        """Sync every row's draw/move buttons to the pristine/synced state.
+
+        Pristine (no region drawn yet): every row can draw; none can move.
+        Synced (the first region has been drawn and siblings auto-populated):
+        every row's draw button is repurposed as "Clear ROIs" (clicking it on
+        any row resets all 4 back to pristine); every row can move.
+        """
+        for row in self._rows:
+            if self._synced:
+                row.draw_button.setText("Clear ROIs")
+                row.move_button.setEnabled(True)
+            else:
+                row.draw_button.setText("Draw on Live View...")
+                row.move_button.setEnabled(False)
+
+    def _on_draw_button_clicked(self, row: _ChannelRow) -> None:
+        """Dispatch a row's (repurposable) draw button: draw, or clear all."""
+        if self._synced:
+            self._clear_all()
+        else:
+            self._draw(row)
 
     def _draw(self, row: _ChannelRow) -> None:
         if (preview := self._preview_for(row)) is not None:
             preview.begin_roi_draw(lambda rect: self._on_rect_drawn(row, preview, rect))
 
     def _move(self, row: _ChannelRow) -> None:
+        if not self._synced:
+            return  # pragma: no cover -- move_button is disabled until synced
         w, h = self._size
-        if not (w and h):
-            QMessageBox.information(
-                self,
-                "Draw a region first",
-                "Draw a region first to set the shared size, then you can drag "
-                "it to reposition.",
-            )
-            return
         if (preview := self._preview_for(row)) is not None:
             x, y = row.position
             preview.begin_roi_move(
                 (x, y, w, h), lambda rect: self._on_rect_moved(row, preview, rect)
             )
+
+    def _sync_siblings(
+        self, source_row: _ChannelRow, rect: tuple[int, int, int, int]
+    ) -> None:
+        """Derive every other row's position from *source_row*'s just-drawn rect.
+
+        Same splitter position (top/bottom), other camera -> identical rect.
+        Opposite splitter position -> same x, y shifted by the region height
+        plus a fixed buffer (down for top->bottom, up for bottom->top).
+        """
+        x, y, _w, h = rect
+        source_position = source_row.position_combo.currentText()
+        for row in self._rows:
+            if row is source_row:
+                continue
+            if row.position_combo.currentText() == source_position:
+                row.set_position(x, y)
+            elif source_position == "top":
+                row.set_position(x, y + h + _BOTTOM_BUFFER_PX)
+            else:
+                row.set_position(x, max(0, y - h - _BOTTOM_BUFFER_PX))
+
+    def _clear_all(self) -> None:
+        """Reset every region to undrawn and return to the pristine state."""
+        for row in self._rows:
+            row.set_position(0, 0)
+        self.width_spin.setValue(0)
+        self.height_spin.setValue(0)
+        self._synced = False
+        self._apply_button_states()
+        self._refresh_all_overlays()
 
     def _on_rect_drawn(
         self, row: _ChannelRow, preview: PygfxPreview, rect: tuple[int, int, int, int]
@@ -283,8 +357,12 @@ class SpectralChannelConfigWidget(QWidget):
         row.set_position(x, y)
         self.width_spin.setValue(w)
         self.height_spin.setValue(h)
+        if not self._synced:
+            self._sync_siblings(row, rect)
+            self._synced = True
+            self._apply_button_states()
         self._maybe_extend_for_fft()
-        self._refresh_camera_overlays(preview, row.camera.currentText())
+        self._refresh_all_overlays()
 
     def _on_rect_moved(
         self, row: _ChannelRow, preview: PygfxPreview, rect: tuple[int, int, int, int]
@@ -308,6 +386,12 @@ class SpectralChannelConfigWidget(QWidget):
             else []
         )
         preview.set_roi_overlays(rois)
+
+    def _refresh_all_overlays(self) -> None:
+        """Refresh ROI overlays on every camera referenced by the configured rows."""
+        for camera_label in {row.camera.currentText() for row in self._rows}:
+            if (preview := self._preview_for_camera(camera_label)) is not None:
+                self._refresh_camera_overlays(preview, camera_label)
 
     def _save(self) -> None:
         settings = SettingsV1.instance()

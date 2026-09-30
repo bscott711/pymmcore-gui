@@ -15,13 +15,14 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from pymmcore_plus import CMMCorePlus
-from pymmcore_plus.mda.handlers import handler_for_path
 
+from pymmcore_gui._async_writer import DEFAULT_BACKLOG_BUDGET_BYTES, AsyncWriter
 from pymmcore_gui._multi_camera_handler import (
     _KNOWN_SUFFIXES,
     _sanitize,
     without_cam_index,
 )
+from pymmcore_gui._vendored.mda_handlers import handler_for_path
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -72,6 +73,32 @@ def channel_output_path(
     stem = _strip_known_suffix(str(base))
     suffix = _FORMAT_SUFFIX.get(writer_format, _FORMAT_SUFFIX["ome-zarr"])
     return f"{stem}_{_sanitize(channel.name)}{suffix}"
+
+
+def active_channels_for_event(
+    event: useq.MDAEvent,
+    channels: list[SpectralChannelConfig],
+    laser_group: str,
+    all_lasers_preset: str,
+) -> list[SpectralChannelConfig]:
+    """Return the configured *channels* that are "lit" for *event*.
+
+    Determined from the laser preset active for this event
+    (``event.channel.config``), matched against each channel's configured
+    ``laser_preset``. ``all_lasers_preset`` (or a missing/foreign channel
+    group) activates every configured channel.
+
+    Standalone so other frame consumers (e.g. the Argus real-time streamer)
+    can determine exactly which regions :class:`SpectralChannelHandler` would
+    save for a given event, without duplicating -- and risking drifting from
+    -- this logic.
+    """
+    ch = event.channel
+    in_group = ch is not None and ch.group == laser_group
+    preset = ch.config if (ch is not None and in_group) else None
+    if preset is None or preset == all_lasers_preset:
+        return list(channels)
+    return [c for c in channels if c.laser_preset == preset]
 
 
 def channels_for_sequence(
@@ -162,6 +189,8 @@ class SpectralChannelHandler:
         *,
         writer_format: str = "ome-zarr",
         mmcore: CMMCorePlus | None = None,
+        zarr_compression: bool = False,
+        backlog_budget_bytes: int = DEFAULT_BACKLOG_BUDGET_BYTES,
     ) -> None:
         self._output = output
         self._channels = list(channels)
@@ -169,6 +198,8 @@ class SpectralChannelHandler:
         self._all_lasers_preset = all_lasers_preset
         self._writer_format = writer_format
         self._mmc = mmcore or CMMCorePlus.instance()
+        self._zarr_compression = zarr_compression
+        self._backlog_budget_bytes = backlog_budget_bytes
         # channel name -> writer
         self._writers: dict[str, Any] = {}
         self._started: set[str] = set()
@@ -187,23 +218,21 @@ class SpectralChannelHandler:
     ) -> list[SpectralChannelConfig]:
         """Return the configured channels that are "lit" for *event*.
 
-        Determined from the laser preset active for this event
-        (``event.channel.config``), matched against each channel's configured
-        ``laser_preset``. ``AllLasers`` (or a missing/foreign channel group)
-        activates every configured channel.
+        See :func:`active_channels_for_event`.
         """
-        ch = event.channel
-        in_group = ch is not None and ch.group == self._laser_group
-        preset = ch.config if (ch is not None and in_group) else None
-        if preset is None or preset == self._all_lasers_preset:
-            return list(self._channels)
-        return [c for c in self._channels if c.laser_preset == preset]
+        return active_channels_for_event(
+            event, self._channels, self._laser_group, self._all_lasers_preset
+        )
 
     def _get_writer(self, channel: SpectralChannelConfig) -> Any:
         """Return (creating + starting if needed) the writer for *channel*."""
         if channel.name not in self._writers:
             path = channel_output_path(self._output, channel, self._writer_format)
-            self._writers[channel.name] = handler_for_path(path)
+            self._writers[channel.name] = AsyncWriter(
+                handler_for_path(path, zarr_compression=self._zarr_compression),
+                name=_sanitize(channel.name),
+                backlog_budget_bytes=self._backlog_budget_bytes,
+            )
         writer = self._writers[channel.name]
         if channel.name not in self._started:
             self._call_sequence_started(writer)

@@ -12,10 +12,30 @@ from typing import TYPE_CHECKING, Literal, cast
 from superqt.utils import WorkerBase
 
 from pymmcore_gui import __version__
-from pymmcore_gui._main_window import ICON, MicroManagerGUI
-from pymmcore_gui._qt.QtCore import QTimer, Signal
-from pymmcore_gui._qt.QtGui import QIcon
-from pymmcore_gui._qt.QtWidgets import QApplication, QCheckBox, QMessageBox, QWidget
+from pymmcore_gui._main_window import ICON, RESOURCES, MicroManagerGUI
+from pymmcore_gui._qt.QtCore import (
+    QCoreApplication,
+    QPointF,
+    QRect,
+    Qt,
+    QTimer,
+    Signal,
+)
+from pymmcore_gui._qt.QtGui import (
+    QColor,
+    QFont,
+    QFontMetricsF,
+    QIcon,
+    QPainter,
+    QPixmap,
+)
+from pymmcore_gui._qt.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QMessageBox,
+    QSplashScreen,
+    QWidget,
+)
 from pymmcore_gui._settings import Settings
 
 from . import _sentry
@@ -36,6 +56,40 @@ APP_ID = f"{ORG_DOMAIN}.{ORG_NAME}.{APP_NAME}.{APP_VERSION}"
 TESTING = bool(os.getenv("PYTEST_VERSION"))
 IS_FROZEN = getattr(sys, "frozen", False)
 _QAPP: MMQApplication | None = None
+
+
+def _isolate_process_logfile() -> None:
+    """Point this process's pymmcore-plus logger at its own logfile.
+
+    ``pymmcore_plus`` configures a single shared ``RotatingFileHandler`` at
+    import time (see ``pymmcore_plus._logger``). Any *other* process that
+    also imports pymmcore_plus without overriding ``PYMM_LOG_FILE`` --
+    another pymmcore-gui instance, a leftover process, a Jupyter kernel --
+    opens its own handle on that exact file. On Windows, when this
+    process's handler tries to rotate on rollover, the rename fails with a
+    ``PermissionError`` if any of those other handles are still open.
+    Giving this process its own PID-suffixed logfile removes it from that
+    contention entirely (mirrors the same fix applied to camera worker
+    subprocesses in ``asi_z_stack.worker_pool``).
+    """
+    from pymmcore_plus import configure_logging
+    from pymmcore_plus._logger import current_logfile
+    from pymmcore_plus._logger import logger as _pymmcore_plus_logger
+
+    current = current_logfile(_pymmcore_plus_logger)
+    if current is None:
+        return  # file logging disabled (e.g. PYMM_LOG_FILE=0, or under pytest)
+    # Detach *and* close every existing handler ourselves first: configure_logging()
+    # removes old handlers by iterating `logger.handlers` while calling
+    # `removeHandler()` on that same live list, which skips every other handler
+    # once there's more than one -- leaving a stale, already-closed handler
+    # attached that would error (or silently reopen the shared file) on the
+    # next log call. Clearing the list ourselves first makes that loop a no-op.
+    for handler in list(_pymmcore_plus_logger.handlers):
+        _pymmcore_plus_logger.removeHandler(handler)
+        handler.close()
+    unique = current.with_name(f"{current.stem}-pid{os.getpid()}{current.suffix}")
+    configure_logging(file=unique)
 
 
 def _set_osx_app_name(app_title: str) -> None:
@@ -119,6 +173,8 @@ def create_mmgui(
         False, the event loop will not be started, and the caller is responsible for
         starting it with `QApplication.instance().exec()`.
     """
+    _isolate_process_logfile()
+
     global _QAPP
     # Note: in practice this should almost never be None,
     # but in the case of testing, it's conceivable that it could be.
@@ -133,8 +189,49 @@ def create_mmgui(
             stacklevel=2,
         )
 
+    # Everything below this point -- building the main window, loading a
+    # hardware config -- runs synchronously on this thread *before* app.exec()
+    # starts, so there's no event loop yet to paint anything. Without a
+    # splash, that shows up as a blank/unresponsive process for however long
+    # config loading takes. Skipped under pytest: popping a real window
+    # during the test suite is noise, not signal. See TESTING/_show_splash.
+    splash = None if TESTING else _show_splash(app)
+
+    def _set_status(msg: str) -> None:
+        if splash is not None:
+            splash.set_status(msg)
+            app.processEvents()
+
+    _set_status("Building interface...")
     win = MicroManagerGUI(mmcore=mmcore)
-    QTimer.singleShot(0, lambda: win.restore_state(show=True))
+
+    def _show_main_window() -> None:
+        win.restore_state(show=True)
+        if splash is not None:
+            splash.finish(win)
+
+    # Don't show the window until the session's ASI/PLogic circular-buffer
+    # grow (if any) has actually finished. It runs on a background thread
+    # (see ensure_circular_buffer_capacity_async), but that background call
+    # is a long-running pymmcore-plus/C call that doesn't release the GIL --
+    # so showing the window while it's still in flight just trades a
+    # frozen splash for a frozen, now-*visible* main window (spinning
+    # beach ball). Keeping it behind the splash until bufferReady fires
+    # means the window only ever appears once it's actually interactive.
+    # bufferReady can fire again later (e.g. a config reload from the
+    # menu); only react to the first one, at startup.
+    _startup_shown = False
+
+    def _on_startup_ready() -> None:
+        nonlocal _startup_shown
+        if _startup_shown:
+            return
+        _startup_shown = True
+        with suppress(RuntimeError):
+            win.bufferReady.disconnect(_on_startup_ready)
+        QTimer.singleShot(0, _show_main_window)
+
+    win.bufferReady.connect(_on_startup_ready)
 
     def _on_about_to_quit() -> None:
         # Safety net for exit paths that bypass MicroManagerGUI.closeEvent
@@ -143,7 +240,9 @@ def create_mmgui(
         with suppress(Exception):
             from pymmcore_gui._mmcore_shutdown import shutdown_mmcore
 
-            shutdown_mmcore(win.mmcore)
+            shutdown_mmcore(
+                win.mmcore, camera_worker_service=win._camera_worker_service
+            )
 
     app.aboutToQuit.connect(_on_about_to_quit)
 
@@ -152,21 +251,41 @@ def create_mmgui(
         QTimer.singleShot(int(float(quit_s) * 1000), win.close)
 
     # if False was passed, don't load any config at all
+    config_loaded = False
     if mm_config is not False:
         # if a string was passed, load that config
         if mm_config:
             # if mm_config is a string, load that config
+            _set_status("Loading configuration...")
             win.mmcore.loadSystemConfiguration(mm_config)
+            config_loaded = True
         # otherwise, fall back to auto-loading / cli-based
         elif config := _decide_configuration(mm_config, win):
             try:
+                _set_status("Loading configuration...")
                 win.mmcore.loadSystemConfiguration(config)
+                config_loaded = True
             except Exception as e:  # pragma: no cover
                 warnings.warn(
                     f"Failed to load system configuration: {e}",
                     RuntimeWarning,
                     stacklevel=2,
                 )
+
+    if config_loaded:
+        # loadSystemConfiguration() above already fired MicroManagerGUI.
+        # _on_system_config_loaded synchronously, which kicks off the
+        # background buffer grow (if one is needed) before returning here.
+        # If none was needed, bufferReady already fired synchronously and
+        # _startup_shown is already True -- don't show a misleading message.
+        if not _startup_shown:
+            _set_status("Allocating memory...")
+    else:
+        # No config was loaded at all (mm_config=False, none chosen, or the
+        # load failed) -- systemConfigurationLoaded never fired, so nothing
+        # will ever call _on_startup_ready. Show the window now instead of
+        # waiting forever.
+        _on_startup_ready()
 
     if install_sys_excepthook:
         _install_excepthook()
@@ -179,6 +298,137 @@ def create_mmgui(
     if exec_app:
         app.exec()
     return win
+
+
+# Geometry measured from logo.png (1024x1024). The opaque white card sits at
+# x/y 101-922 with a soft drop shadow trailing to y=937, and everything outside
+# that is transparent padding -- hence the crop, which is the art's real alpha
+# bounding box. The yellow base graphic ends at y=827, leaving a band of plain
+# white card from y=828 to y=922 with nothing in it.
+_CARD_CROP = QRect(95, 101, 834, 837)
+_BAND_TOP_SRC, _BAND_BOT_SRC = 828, 922
+# 256px of card yields a ~29px band -- enough for 11pt with clearance above the
+# yellow base and below for descenders. Smaller sizes crowd both.
+_CARD_ART_WIDTH = 256
+_CARD_MARGIN = 8
+_STATUS_INK = "#1f3b52"
+
+
+class _SplashScreen(QSplashScreen):
+    """Splash screen that paints its status text inside the logo card itself.
+
+    ``QSplashScreen.showMessage()`` can only draw flat, single-color text, and
+    the color it used to be given was white -- which landed on the logo's white
+    card and vanished. Adding a colored strip or a full background behind the
+    text fixes legibility but reads as a box bolted onto the artwork. Instead
+    the text goes in the empty white margin the card art already has beneath
+    the microscope, in a dark ink: nothing is added to the splash at all, so it
+    stays just the app icon floating, and the text can never collide with
+    whatever happens to be on the desktop behind it.
+
+    Painting it requires overriding :meth:`drawContents`, which Qt calls on
+    every repaint after blitting the pixmap.
+    """
+
+    def __init__(self, pixmap: QPixmap, font: QFont, baseline: float) -> None:
+        super().__init__(pixmap)
+        self._font = font
+        self._baseline = baseline
+
+    def set_status(self, message: str) -> None:
+        """Show ``message`` in the card's text band and repaint.
+
+        Parameters
+        ----------
+        message : str
+            The status text to display.
+        """
+        # showMessage()'s alignment and color arguments are inert here --
+        # drawContents() ignores them -- but it is still what stores the
+        # message and triggers the repaint.
+        self.showMessage(message)
+
+    def drawContents(self, painter: QPainter) -> None:
+        """Paint the current status message centered in the card's white band.
+
+        Parameters
+        ----------
+        painter : QPainter
+            Painter supplied by Qt, already clipped to the splash.
+        """
+        if not (message := self.message()):
+            return
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setFont(self._font)
+        painter.setPen(QColor(_STATUS_INK))
+        advance = QFontMetricsF(self._font).horizontalAdvance(message)
+        painter.drawText(
+            QPointF((self.width() - advance) / 2.0, self._baseline), message
+        )
+
+
+def _show_splash(app: QCoreApplication) -> _SplashScreen:
+    """Show a splash screen immediately, before the main window is built.
+
+    Loading a real hardware config -- especially one that grows the ASI/
+    PLogic circular buffer, see :func:`~pymmcore_gui.asi_z_stack.
+    asi_controller.ensure_circular_buffer_capacity_async` -- can take several
+    seconds, and that work currently happens before the Qt event loop even
+    starts. A splash gives the user something responsive to look at during
+    that gap instead of a blank, seemingly-frozen window. Closed via
+    ``QSplashScreen.finish(win)`` once the main window is shown.
+
+    Parameters
+    ----------
+    app : QCoreApplication
+        The running application, used to pump events so the splash paints
+        before the (synchronous) startup work begins.
+    """
+    art = (
+        QPixmap(str(RESOURCES / "logo.png"))
+        .copy(_CARD_CROP)
+        .scaledToWidth(_CARD_ART_WIDTH, Qt.TransformationMode.SmoothTransformation)
+    )
+
+    pixmap = QPixmap(art.width() + 2 * _CARD_MARGIN, art.height() + 2 * _CARD_MARGIN)
+    # QSplashScreen sets WA_TranslucentBackground when its pixmap has an alpha
+    # channel, so filling with transparent is what makes the card actually
+    # float rather than sit on a window-colored rectangle. QPixmap(w, h) is
+    # uninitialized memory -- the fill is required, not cosmetic.
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.drawPixmap(_CARD_MARGIN, _CARD_MARGIN, art)
+    painter.end()
+
+    # Build the font only now: QFont created before a QApplication exists
+    # silently falls back to another family, which shifts every metric below.
+    font = QFont(QApplication.font())
+    font.setPointSizeF(11.0)
+    font.setWeight(QFont.Weight.Medium)
+    font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 101.0)
+
+    scale = _CARD_ART_WIDTH / _CARD_CROP.width()
+    band_top = (_BAND_TOP_SRC - _CARD_CROP.y()) * scale
+    band_bottom = (_BAND_BOT_SRC - _CARD_CROP.y()) * scale
+    metrics = QFontMetricsF(font)
+    # Center the visual block (cap top..descender bottom) in the band. Centering
+    # on cap height alone pushes descenders onto the card's rounded edge.
+    baseline = (
+        _CARD_MARGIN
+        + (band_top + band_bottom) / 2.0
+        + (metrics.capHeight() - metrics.descent()) / 2.0
+    )
+
+    splash = _SplashScreen(pixmap, font, baseline)
+    # Deliberately no WindowStaysOnTopHint: this used to force the splash
+    # above every other window on the machine for the whole loading time,
+    # with no way to bring anything else forward. Without it, the splash
+    # still shows on top initially, but clicking another window covers it
+    # like a normal window.
+    splash.set_status("Starting pymmcore-gui...")
+    splash.show()
+    app.processEvents()
+    return splash
 
 
 def _close_splash_screen() -> None:  # pragma: no cover
@@ -246,6 +496,12 @@ def _install_excepthook() -> None:
         return
     sys._original_excepthook_ = sys.excepthook  # type: ignore
     sys.excepthook = ndv_excepthook
+
+    # Also cover worker threads -- otherwise a thread that dies on an unhandled
+    # exception (e.g. the MDA save relay) only prints to an unseen stderr.
+    from pymmcore_gui._exceptions import install_threading_excepthook
+
+    install_threading_excepthook()
 
 
 def rich_print_exception(

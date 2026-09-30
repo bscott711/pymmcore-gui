@@ -1,31 +1,159 @@
 from __future__ import annotations
 
 import warnings
+from contextlib import suppress
 from typing import TYPE_CHECKING, cast
 from weakref import WeakSet, WeakValueDictionary
 
 import ndv
+import numpy as np
 import useq
-from pymmcore_plus.mda.handlers import TensorStoreHandler
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QWidget
 from PyQt6Ads import CDockWidget
 
-from pymmcore_gui._multi_camera_handler import without_cam_index
+from pymmcore_gui._multi_camera_handler import physical_camera_labels, without_cam_index
+from pymmcore_gui._numpy_display_store import NumpyDisplayStore
 from pymmcore_gui._settings import SettingsV1
+from pymmcore_gui.asi_z_stack.camera_worker_service import CameraWorkerService
 from pymmcore_gui.widgets.image_preview._pygfx_preview import PygfxPreview
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
+    from typing import Any, TypeGuard
 
-    import numpy as np
-    from ndv.models._array_display_model import (
-        IndexMap,  # pyright: ignore[reportPrivateImportUsage]
-    )
     from pymmcore_plus import CMMCorePlus
-    from pymmcore_plus.mda import SupportsFrameReady
     from pymmcore_plus.metadata import FrameMetaV1, SummaryMetaV1
     from useq import MDASequence
+
+
+class _LabeledArrayWrapper(ndv.DataWrapper):
+    """Expose a ``NumpyDisplayStore``'s array with its real t/p/z/c/y/x axis labels.
+
+    ndv's built-in fallback wrapper for a plain array (or zarr array) exposes
+    bare integer dim positions (0, 1, 2, ...), which silently breaks
+    ``_update_mda_viewer``'s ``current_index.update(event.index.items())``
+    calls below: ``event.index`` is keyed by string axis names ("t"/"z"/etc),
+    and ndv drops any ``current_index`` key that doesn't resolve against the
+    wrapper's ``dims`` (see ``ndv.models._resolve._norm_current_index``'s
+    ``except (IndexError, KeyError): continue``) -- so those "jump to latest"
+    updates were silent no-ops, and the display only ever advanced when a
+    user manually dragged a slider (which uses the view's own,
+    correctly-integer-keyed index, giving the impression that frames only
+    "arrive" once you scrub). This mirrors what ndv's own
+    ``TensorstoreWrapper`` did for a tensorstore store (reading real string
+    dim labels from the store's domain), just for our zarr-backed
+    ``NumpyDisplayStore``.
+
+    Also bounds ``"t"``/``"z"`` sliders to data that's actually been
+    collected (``coords``), and translates the handler's rolling-window
+    storage positions transparently on read (``isel``) -- see
+    ``NumpyDisplayStore``'s module docstring for why the store only retains a
+    bounded window of recent timepoints. Neither of these needs an offset/
+    non-zero-based ``coords`` range (which ``_norm_current_index`` mishandles,
+    see above): ``useq.MDAEvent.index["t"]`` is a permanent, monotonic,
+    0-based counter that's never renumbered as older timepoints are evicted,
+    so ``coords["t"]`` can just report ``range(0, max_t_seen + 1)`` forever.
+    """
+
+    def __init__(self, handler: NumpyDisplayStore) -> None:
+        array = handler.array
+        if array is None:  # pragma: no cover -- only constructed after frameReady
+            raise ValueError("NumpyDisplayStore has no data yet")
+        self._dims_ = handler.dims
+        self._handler = handler
+        # currently-viewed t/p, kept in sync via _ndv_viewers's selection
+        # listener -- used only to decide whether the "z" bound below should
+        # reflect the (possibly still-filling) newest volume or the full
+        # declared range of an older, guaranteed-complete one.
+        self._selected_t: int | None = None
+        self._selected_p: int = 0
+        # last-reported bounds, so dims_changed is only emitted when the
+        # valid range has actually changed (avoids redundant slider rebuilds).
+        self._last_t_bound = 0
+        self._last_z_bound: int | None = None
+        super().__init__(array)
+
+    @classmethod
+    def supports(cls, obj: Any) -> TypeGuard[Any]:
+        # Only ever constructed explicitly (see _update_mda_viewer) -- never
+        # auto-detected by DataWrapper.create(), so this must never claim
+        # ownership of some other, unrelated bare array elsewhere in the app.
+        return False
+
+    @property
+    def dims(self) -> tuple[str, ...]:
+        return self._dims_
+
+    @property
+    def coords(self) -> Mapping[Hashable, Sequence]:
+        array = self._handler.array
+        assert array is not None  # guaranteed by __init__ / handler lifecycle
+        coords: dict[Hashable, Sequence] = {
+            label: range(size)
+            for label, size in zip(self._dims_, array.shape, strict=False)
+        }
+        if "t" in coords:
+            # collected-data bound, not the (possibly much larger) declared
+            # domain -- always 0-based since t is never renumbered.
+            coords["t"] = range(self._handler.max_t_seen + 1)
+        if "z" in coords and self._selected_t == self._handler.max_t_seen:
+            z_filled = self._handler.z_progress_for(
+                self._handler.max_t_seen, self._selected_p
+            )
+            if z_filled is not None:
+                coords["z"] = range(z_filled)
+        return coords
+
+    def isel(self, index: Mapping[int, int | slice]) -> np.ndarray:
+        by_label = {
+            self._dims_[k]: index.get(k, slice(None)) for k in range(len(self._dims_))
+        }
+        t_val = by_label.get("t")
+        if isinstance(t_val, slice):
+            t_val = t_val.start
+        evicted = t_val is not None and self._handler.is_evicted(t_val)
+
+        storage = self._handler.to_storage_index(by_label)
+        idx = tuple(storage[label] for label in self._dims_)
+        array = self._handler.array
+        assert array is not None
+        result = self._asarray(array[idx])
+        # An evicted t still maps to a *resident* storage slot (whatever
+        # timepoint currently occupies it after wraparound) -- reading it is
+        # safe but the data is stale/wrong, so zero it out. Reusing the real
+        # read's shape here (rather than hand-computing it) keeps this
+        # correct-by-construction for every visible-axes combination ndv can
+        # request.
+        return np.zeros_like(result) if evicted else result
+
+    def set_selection(self, *, t: int | None = None, p: int | None = None) -> None:
+        """Record the currently-selected t/p (see the manager's selection listener)."""
+        changed = (t is not None and t != self._selected_t) or (
+            p is not None and p != self._selected_p
+        )
+        if t is not None:
+            self._selected_t = t
+        if p is not None:
+            self._selected_p = p
+        if changed:
+            self._maybe_emit_dims_changed()
+
+    def notify_frame_written(self) -> None:
+        """Re-check whether the collected-data bounds changed; called after writes."""
+        self._maybe_emit_dims_changed()
+
+    def _maybe_emit_dims_changed(self) -> None:
+        new_t_bound = self._handler.max_t_seen + 1
+        new_z_bound = (
+            self._handler.z_progress_for(self._handler.max_t_seen, self._selected_p)
+            if self._selected_t == self._handler.max_t_seen
+            else None
+        )
+        if new_t_bound != self._last_t_bound or new_z_bound != self._last_z_bound:
+            self._last_t_bound = new_t_bound
+            self._last_z_bound = new_z_bound
+            self.dims_changed.emit()
 
 
 # NOTE: we make this a QObject mostly so that the lifetime of this object is tied to
@@ -43,7 +171,7 @@ class NDVViewersManager(QObject):
     """
 
     mdaViewerCreated = pyqtSignal(ndv.ArrayViewer, useq.MDASequence, str)
-    previewViewerCreated = pyqtSignal(CDockWidget)
+    previewViewerCreated = pyqtSignal(CDockWidget, str)
     viewerDestroyed = pyqtSignal(str)
 
     def __init__(self, parent: QWidget, mmcore: CMMCorePlus):
@@ -56,15 +184,33 @@ class NDVViewersManager(QObject):
         # currently active viewer
         self._active_mda_viewer: ndv.ArrayViewer | None = None
 
-        # We differentiate between handlers that were created by someone else, and
-        # gathered using mda.get_output_handlers(), vs handlers that were created by us.
-        # because we need to call frameReady/sequenceFinished manually on the latter.
-        self._handler: SupportsFrameReady | None = None
-        self._own_handler: TensorStoreHandler | None = None
+        # Private, in-RAM display-only store for the single-camera case --
+        # always created fresh per sequence (see _on_sequence_started),
+        # independent of whatever the MDA's real output/save handler is
+        # doing. We call frameReady/sequenceFinished on it manually.
+        self._own_handler: NumpyDisplayStore | None = None
 
         # CONNECTIONS ---------------------------------------------------------
 
         self._is_mda_running = False
+
+        # {viewer: latest event} for a coalesced, at-most-one-in-flight
+        # QTimer.singleShot per viewer -- see _update_mda_viewer.
+        self._pending_viewer_updates: dict[ndv.ArrayViewer, useq.MDAEvent] = {}
+
+        # {viewer: locked z index} for viewers in "locked slice" playback mode
+        # (see set_viewer_z_locked / _update_mda_viewer). Absent from this dict
+        # means "live" mode -- the default, always-jump-to-latest behavior.
+        self._locked_z_axis: dict[ndv.ArrayViewer, int] = {}
+        # {viewer: current_index.item_changed listener} for locked viewers, so
+        # set_viewer_z_locked(locked=False) / _cleanup can disconnect them.
+        self._z_lock_listeners: dict[ndv.ArrayViewer, Callable[..., None]] = {}
+
+        # {viewer: current_index.item_changed listener} that keeps each
+        # viewer's _LabeledArrayWrapper informed of the currently-selected
+        # t/p (see _LabeledArrayWrapper.set_selection), for the whole
+        # lifetime of the viewer -- disconnected in _cleanup.
+        self._selection_listeners: dict[ndv.ArrayViewer, Callable[..., None]] = {}
 
         # Per-camera preview dock widgets, keyed by physical camera label.
         # e.g. {"Camera-1": <CDockWidget>, "Camera-2": <CDockWidget>}
@@ -78,14 +224,21 @@ class NDVViewersManager(QObject):
         # Per-camera MDA display handlers/viewers, keyed by physical camera label.
         # Populated only for multi-camera acquisitions; the single-camera path
         # continues to use ``_own_handler`` / ``_active_mda_viewer`` below.
-        self._mda_camera_handlers: dict[str, TensorStoreHandler] = {}
+        self._mda_camera_handlers: dict[str, NumpyDisplayStore] = {}
         self._mda_camera_viewers: dict[str, ndv.ArrayViewer] = {}
+
+        # Camera worker service (persistent dual-PVCAM worker processes) --
+        # see _sync_worker_service_connection for why this is re-evaluated
+        # on every config load rather than connected once here.
+        self._connected_worker_service: CameraWorkerService | None = None
 
         ev = self._mmc.events
         ev.imageSnapped.connect(self._on_image_snapped)
         ev.sequenceAcquisitionStarted.connect(self._on_streaming_started)
         ev.continuousSequenceAcquisitionStarted.connect(self._on_streaming_started)
         ev.propertyChanged.connect(self._on_property_changed)
+        ev.systemConfigurationLoaded.connect(self._sync_worker_service_connection)
+        self._sync_worker_service_connection()
 
         mda_ev = self._mmc.mda.events
         mda_ev.sequenceStarted.connect(self._on_sequence_started)
@@ -101,23 +254,15 @@ class NDVViewersManager(QObject):
     def _get_physical_camera_labels(self) -> list[str]:
         """Return the list of physical camera labels behind the active camera device.
 
-        For a ``Multi Camera`` device this reads the ``Physical Camera N``
-        properties.  For a plain camera device returns a single-element list.
+        Delegates to the shared ``_multi_camera_handler.physical_camera_labels``,
+        which falls back to ``CameraWorkerService``'s static label list when a
+        persistent worker service is active (Camera-1/Camera-2 are then never
+        loaded on ``self._mmc`` at all) -- one fix point instead of this
+        method independently re-deriving the same thing from
+        ``getNumberOfCameraChannels``/``getPhysicalCameraDevice``, which would
+        return empty/stale results once the cameras are worker-owned.
         """
-        cam = self._mmc.getCameraDevice()
-        n = self._mmc.getNumberOfCameraChannels()
-        if n <= 1:
-            return [cam]
-        # Resolve each channel via the same helper the preview fetch uses
-        # (getPhysicalCameraDevice -> "Physical Camera N" property) so the dock
-        # keys and the frame-dict keys are guaranteed identical.
-        labels: list[str] = []
-        for i in range(n):
-            try:
-                labels.append(self._mmc.getPhysicalCameraDevice(i) or f"Camera-ch{i}")
-            except Exception:
-                labels.append(f"Camera-ch{i}")
-        return labels
+        return physical_camera_labels(self._mmc)
 
     def _create_camera_preview(self, camera_label: str) -> PygfxPreview:
         """Create a new PygfxPreview dock for *camera_label* and emit the signal."""
@@ -130,12 +275,56 @@ class NDVViewersManager(QObject):
         dw.setWidget(preview)
         dw.setFeature(dw.DockWidgetFeature.DockWidgetFloatable, False)
         self._camera_previews[camera_label] = dw
-        self._apply_roi_overlays(preview, camera_label)
-        self.previewViewerCreated.emit(dw)
+        rois = self._apply_roi_overlays(preview, camera_label)
+        # Default the view -- including future resets from append() recreating
+        # the texture (e.g. the first real frame after the placeholder) -- to
+        # the union of this camera's defined spectral ROIs (its new "100%")
+        # instead of the full sensor. The user can still pan/zoom further in.
+        preview.set_default_zoom_rect(self._roi_union_rect(rois))
+        self.previewViewerCreated.emit(dw, camera_label)
         return preview
 
-    def _apply_roi_overlays(self, preview: PygfxPreview, camera_label: str) -> None:
-        """Draw this camera's configured splitter ROIs on *preview*, if any."""
+    @staticmethod
+    def _roi_union_rect(
+        rois: list[tuple[str, tuple[int, int, int, int]]],
+    ) -> tuple[int, int, int, int] | None:
+        """Return the ``(x, y, w, h)`` union bbox of *rois*, or None if empty."""
+        if not rois:
+            return None
+        xs0 = [r[0] for _, r in rois]
+        ys0 = [r[1] for _, r in rois]
+        xs1 = [r[0] + r[2] for _, r in rois]
+        ys1 = [r[1] + r[3] for _, r in rois]
+        x0, y0 = min(xs0), min(ys0)
+        return x0, y0, max(xs1) - x0, max(ys1) - y0
+
+    def create_default_camera_previews(self) -> None:
+        """Proactively create a preview dock for every configured physical camera.
+
+        Called once at startup (see ``MicroManagerGUI._ensure_camera_previews``)
+        so the user doesn't have to Snap before the camera panes exist. This
+        also has the side effect of paying the one-time GPU/wgpu
+        initialization that the first ``PygfxPreview`` (or ``ndv.ArrayViewer``)
+        triggers during this deliberate startup pause, instead of blocking the
+        event loop mid-Acquire on the first MDA of a session -- both use the
+        same underlying ``pygfx`` renderer singleton.
+
+        No-op if no camera device is configured yet (e.g. no config loaded).
+        """
+        if not self._mmc.getCameraDevice():
+            return
+        for label in self._get_physical_camera_labels():
+            self._get_or_create_camera_preview(label)
+
+    def _apply_roi_overlays(
+        self, preview: PygfxPreview, camera_label: str
+    ) -> list[tuple[str, tuple[int, int, int, int]]]:
+        """Draw this camera's configured splitter ROIs on *preview*, if any.
+
+        Returns the ``(name, rect)`` pairs drawn, so callers that need the
+        raw rectangles (e.g. to compute a zoom target) don't have to
+        re-derive them from settings.
+        """
         spectral = SettingsV1.instance().spectral
         rois = [
             (c.name, c.rect)
@@ -143,15 +332,22 @@ class NDVViewersManager(QObject):
             if c.is_ready and c.camera == camera_label and c.rect is not None
         ]
         preview.set_roi_overlays(rois)
+        return rois
 
     def refresh_roi_overlays(self) -> None:
         """Re-apply spectral-channel ROI overlays to every open camera preview.
 
         Called after the spectral-channel config UI saves changes, so already
-        open live/snap panes reflect the new rectangles immediately.
+        open live/snap panes reflect the new rectangles immediately. Also
+        updates each preview's stored zoom-to-ROI default so it stays correct
+        across future texture resets, but doesn't force an immediate re-frame
+        -- an already-open preview may have been manually panned/zoomed since
+        it was created, and this shouldn't yank that away.
         """
         for label, dw in self._camera_previews.items():
-            self._apply_roi_overlays(cast("PygfxPreview", dw.widget()), label)
+            preview = cast("PygfxPreview", dw.widget())
+            rois = self._apply_roi_overlays(preview, label)
+            preview.set_default_zoom_rect(self._roi_union_rect(rois), apply=False)
 
     def get_or_create_camera_preview(self, camera_label: str) -> PygfxPreview:
         """Return (creating and showing if needed) the preview for *camera_label*."""
@@ -209,8 +405,60 @@ class NDVViewersManager(QObject):
         return _on_frames
 
     # ------------------------------------------------------------------
+    # Camera worker service (persistent dual-PVCAM worker processes)
+    # ------------------------------------------------------------------
+
+    def _sync_worker_service_connection(self) -> None:
+        """(Re)connect to the active ``CameraWorkerService``, if any.
+
+        Re-evaluated on every ``systemConfigurationLoaded`` rather than
+        connected once, since the active service instance can change (or
+        disappear/reappear) across a config reload -- see
+        ``CameraWorkerService.prepare_for_reload``.
+        """
+        svc = CameraWorkerService.get_active()
+        if svc is self._connected_worker_service:
+            return
+        if self._connected_worker_service is not None:
+            with suppress(RuntimeError, TypeError):
+                self._connected_worker_service.frameReady.disconnect(
+                    self._on_worker_frame
+                )
+        if svc is not None:
+            svc.frameReady.connect(self._on_worker_frame)
+        self._connected_worker_service = svc
+
+    def _on_worker_frame(
+        self,
+        camera_label: str,
+        slice_idx: int,
+        frame: np.ndarray,
+        camera_metadata: dict[str, Any],
+        images_remaining: int,
+    ) -> None:
+        """Display one Live or Snap frame delivered by a persistent camera worker.
+
+        Frames already arrive tagged with their physical camera at the
+        source (``FrameMsg.camera_label``), so -- unlike
+        ``_on_streaming_started``'s ``_multicam_frame_callback`` demuxing
+        below, which exists only to split one shared circular buffer --
+        this can dispatch straight to the right dock via a plain lookup.
+        """
+        if self._is_mda_running:
+            return
+        preview, _ = self._get_or_create_camera_preview(camera_label)
+        preview.append(frame)
+
+    # ------------------------------------------------------------------
     # Streaming / Snap handlers
     # ------------------------------------------------------------------
+    #
+    # NOTE: the two handlers below react to mmc's own sequence-acquisition/
+    # imageSnapped events, which never fire once Live/Snap route through a
+    # persistent CameraWorkerService (see core_actions.py) -- they stay
+    # fully functional, unmodified, for demo/single-camera/non-ASI rigs,
+    # and are simply dormant (never invoked) for the worker-owned rig,
+    # where _on_worker_frame above handles frame delivery instead.
 
     def _on_streaming_started(self) -> None:
         if self._is_mda_running:
@@ -319,20 +567,98 @@ class NDVViewersManager(QObject):
 
     def _cleanup(self, obj: QObject | None = None) -> None:
         self._active_mda_viewer = None
-        self._handler = None
         self._own_handler = None
+        self._pending_viewer_updates.clear()
+        for viewer, listener in self._z_lock_listeners.items():
+            with suppress(Exception):  # viewer may already be gone/destroyed
+                viewer.display_model.current_index.item_changed.disconnect(listener)
+        self._z_lock_listeners.clear()
+        self._locked_z_axis.clear()
+        for viewer, listener in self._selection_listeners.items():
+            with suppress(Exception):  # viewer may already be gone/destroyed
+                viewer.display_model.current_index.item_changed.disconnect(listener)
+        self._selection_listeners.clear()
+
+    def _make_z_lock_listener(self, viewer: ndv.ArrayViewer) -> Callable[..., None]:
+        """Return a listener that keeps ``_locked_z_axis[viewer]`` in sync.
+
+        Connected to ``current_index.item_changed`` while *viewer* is locked,
+        so that manually dragging to a new slice re-locks to it (rather than
+        the slice originally captured at lock time). Safe against the
+        manager's own programmatic writes in ``_update_mda_viewer``: those
+        only ever set "z" to the value already recorded in
+        ``_locked_z_axis`` (frames at any other z are dropped before that
+        call), so this listener re-recording the same value is a no-op.
+        """
+
+        def _on_item_changed(key: str, new_value: object, old_value: object) -> None:
+            if key == "z" and viewer in self._locked_z_axis:
+                self._locked_z_axis[viewer] = cast("int", new_value)
+
+        return _on_item_changed
+
+    def _make_selection_listener(
+        self, wrapper: _LabeledArrayWrapper
+    ) -> Callable[..., None]:
+        """Return a listener that keeps *wrapper*'s selected t/p in sync.
+
+        Connected to ``current_index.item_changed`` for the viewer's whole
+        lifetime (both programmatic "jump to latest" updates and manual
+        slider drags go through this), so ``_LabeledArrayWrapper.coords``'s
+        z-bound stays correct for whichever t/p is currently being viewed.
+        """
+
+        def _on_item_changed(key: str, new_value: object, old_value: object) -> None:
+            if key == "t":
+                wrapper.set_selection(t=cast("int", new_value))
+            elif key == "p":
+                wrapper.set_selection(p=cast("int", new_value))
+
+        return _on_item_changed
+
+    def set_viewer_z_locked(self, viewer: ndv.ArrayViewer, locked: bool) -> None:
+        """Toggle "locked slice" playback mode for a live-MDA *viewer*.
+
+        In the default "live" mode, the viewer jumps to show every newly
+        acquired frame. In "locked" mode, it captures whichever z index the
+        viewer is showing right now and stops jumping around -- it only
+        updates when a new frame arrives at that same z index (see
+        ``_update_mda_viewer``), so watching one plane over time isn't
+        interrupted by frames from other z planes. Manually dragging to a
+        different slice while locked re-locks to that new slice for
+        subsequent frames. A no-op if the sequence has no z axis. Unlocking
+        (or re-locking) returns to normal behavior.
+        """
+        if locked:
+            current_z = dict(viewer.display_model.current_index).get("z")
+            if current_z is not None:
+                self._locked_z_axis[viewer] = cast("int", current_z)
+                listener = self._make_z_lock_listener(viewer)
+                self._z_lock_listeners[viewer] = listener
+                viewer.display_model.current_index.item_changed.connect(listener)
+        else:
+            self._locked_z_axis.pop(viewer, None)
+            if viewer in self._z_lock_listeners:
+                listener = self._z_lock_listeners.pop(viewer)
+                viewer.display_model.current_index.item_changed.disconnect(listener)
 
     def _on_sequence_started(
         self, sequence: useq.MDASequence, meta: SummaryMetaV1
     ) -> None:
         """Called when a new MDA sequence has been started.
 
-        We grab the first handler in the list of output handlers, or create a new
-        TensorStoreHandler if none exist. Then we create a new ndv viewer and show it.
+        Every camera gets its own private, in-RAM ``NumpyDisplayStore``
+        purely for display, regardless of whatever the MDA's real output/save
+        handler is doing (pymmcore-plus 0.18 routes a str/Path output through
+        a sink that isn't discoverable via the now-deprecated
+        ``mda.get_output_handlers()``, so there's no reliable way to reuse the
+        real save handler as a display source here). This intentionally does
+        NOT use tensorstore -- see ``NumpyDisplayStore`` docstring for why.
+        Then we create a new ndv viewer and show it.
         """
         self._is_mda_running = True
 
-        self._own_handler = self._handler = None
+        self._own_handler = None
         self._mda_camera_handlers.clear()
         self._mda_camera_viewers.clear()
 
@@ -343,7 +669,7 @@ class NDVViewersManager(QObject):
             # camera its own in-memory display handler + viewer (independent of any
             # save handler), routing frames by ``meta["camera_device"]``.
             for label in labels:
-                handler = TensorStoreHandler(driver="zarr", kvstore="memory://")
+                handler = NumpyDisplayStore()
                 handler.reset(sequence)
                 self._mda_camera_handlers[label] = handler
                 self._mda_camera_viewers[label] = self._create_ndv_viewer(
@@ -352,13 +678,8 @@ class NDVViewersManager(QObject):
             self._active_mda_viewer = None
             return
 
-        if handlers := self._mmc.mda.get_output_handlers():
-            # someone else has created a handler for this sequence
-            self._handler = handlers[0]
-        else:
-            # if it does not exist, create a new TensorStoreHandler
-            self._own_handler = TensorStoreHandler(driver="zarr", kvstore="memory://")
-            self._own_handler.reset(sequence)
+        self._own_handler = NumpyDisplayStore()
+        self._own_handler.reset(sequence)
 
         # since the handler is empty at this point, create a ndv viewer with no data
         self._active_mda_viewer = self._create_ndv_viewer(sequence)
@@ -388,43 +709,73 @@ class NDVViewersManager(QObject):
         if (viewer := self._active_mda_viewer) is None:
             return  # pragma: no cover
 
-        self._update_mda_viewer(viewer, self._handler or self._own_handler, event)
+        self._update_mda_viewer(viewer, self._own_handler, event)
 
     def _update_mda_viewer(
         self,
         viewer: ndv.ArrayViewer,
-        handler: SupportsFrameReady | None,
+        handler: NumpyDisplayStore | None,
         event: useq.MDAEvent,
     ) -> None:
-        """Point the viewer at the handler store, or update its current index."""
+        """Point the viewer at the handler array, or update its current index."""
+        if handler is None:
+            return  # pragma: no cover
+
         # if the viewer does not yet have data, it's likely the very first frame
-        # so update the viewer's data source to the underlying handlers store
+        # so update the viewer's data source to the underlying handler's array,
+        # wrapped so its axes carry the real t/p/z/c labels event.index uses
+        # (see _LabeledArrayWrapper docstring for why this can't just be a
+        # bare `viewer.data = handler.array`).
         if viewer.data_wrapper is None:
-            if isinstance(handler, TensorStoreHandler):
-                # TODO: temporary. maybe create the DataWrapper for the handlers
-                viewer.data = handler.store
-            else:
-                warnings.warn(
-                    f"don't know how to show data of type {type(handler)}",
-                    stacklevel=2,
-                )
-        # otherwise update the sliders to the most recently acquired frame
-        else:
-            # Add a small delay to make sure the data are available in the handler
-            # This is a bit of a hack to get around the data handlers can write data
-            # asynchronously, so the data may not be available immediately to the viewer
-            # after the handler's frameReady method is called.
-            current_index = viewer.display_model.current_index
+            wrapper = _LabeledArrayWrapper(handler)
+            # seed the initial selection from this (first) event, rather than
+            # waiting for the item_changed listener below to fire, so the
+            # very first coords computation already reflects the right t/p.
+            wrapper.set_selection(
+                t=cast("int", event.index.get("t", 0)),
+                p=cast("int", event.index.get("p", 0)),
+            )
+            viewer.data = wrapper
+            listener = self._make_selection_listener(wrapper)
+            self._selection_listeners[viewer] = listener
+            viewer.display_model.current_index.item_changed.connect(listener)
+            return
 
-            def _update(_idx: IndexMap = current_index) -> None:
-                try:
-                    _idx.update(event.index.items())
-                except Exception:  # pragma: no cover
-                    # this happens if the viewer has been closed in the meantime
-                    # usually it's a RuntimeError, but could be an EmitLoopError
-                    pass
+        # Otherwise, move the viewer's slider to the most recently acquired
+        # frame. At real acquisition frame rates, scheduling a brand-new
+        # QTimer.singleShot per frame (as before) piles up callbacks on the Qt
+        # event loop faster than they can run -- only the *latest* event
+        # actually matters (each update just moves the slider to "wherever we
+        # are now"), so coalesce: at most one deferred update in flight per
+        # viewer, always reflecting the latest event. The 10ms delay (kept
+        # from the original implementation) works around data handlers
+        # writing asynchronously, so the frame may not be available to the
+        # viewer immediately after the handler's frameReady method is called.
+        already_pending = viewer in self._pending_viewer_updates
+        self._pending_viewer_updates[viewer] = event
+        if already_pending:
+            return  # already scheduled -- it will pick up this latest event
 
-            QTimer.singleShot(10, _update)
+        def _update(v: ndv.ArrayViewer = viewer) -> None:
+            latest = self._pending_viewer_updates.pop(v, None)
+            if latest is None:
+                return  # pragma: no cover
+            # Re-check the collected-data bounds regardless of whether this
+            # particular viewer's z-lock (below) ends up skipping the visible
+            # update -- new data has been written either way.
+            if isinstance(wrapper := v.data_wrapper, _LabeledArrayWrapper):
+                wrapper.notify_frame_written()
+            locked_z = self._locked_z_axis.get(v)
+            if locked_z is not None and latest.index.get("z") != locked_z:
+                return  # locked to a different z-slice -- skip this frame
+            try:
+                v.display_model.current_index.update(latest.index.items())
+            except Exception:  # pragma: no cover
+                # this happens if the viewer has been closed in the meantime
+                # usually it's a RuntimeError, but could be an EmitLoopError
+                pass
+
+        QTimer.singleShot(10, _update)
 
     def _on_sequence_finished(self, sequence: useq.MDASequence) -> None:
         """Called when a sequence has finished."""

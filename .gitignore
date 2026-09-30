@@ -132,3 +132,6 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 .vscode/
+
+# CRISP stability output
+/CRISPTest

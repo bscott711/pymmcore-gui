@@ -1,0 +1,213 @@
+"""Unit tests for worker_pool.py's pure helpers.
+
+``CameraWorkerPool``/``CameraWorkerHandle`` need a real subprocess and
+shared memory, so they're left to bench/integration verification
+(consistent with this package's existing convention -- see
+``test_asi_zstack_camera_worker.py``). ``_worker_stderr_file`` takes only a
+camera label and reads the current logfile path, so it's directly
+unit-testable with a mocked logfile.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import pymmcore_gui.asi_z_stack.worker_pool as worker_pool_mod
+from pymmcore_gui.asi_z_stack.worker_pool import _worker_stderr_file
+
+if TYPE_CHECKING:
+    import pytest
+
+
+def test_worker_stderr_file_is_sibling_of_main_logfile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same directory/stem as the main process's own pymmcore-plus logfile."""
+    main_log = Path("/logs/pymmcore-plus-pid1234.log")
+    monkeypatch.setattr(worker_pool_mod, "current_logfile", lambda _logger: main_log)
+
+    result = _worker_stderr_file("Camera-1")
+
+    assert result == str(Path("/logs/pymmcore-plus-pid1234-worker-Camera-1-stderr.log"))
+
+
+def test_worker_stderr_file_sanitizes_unsafe_characters_in_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard: a camera label isn't necessarily filesystem-safe."""
+    main_log = Path("/logs/pymmcore-plus-pid1234.log")
+    monkeypatch.setattr(worker_pool_mod, "current_logfile", lambda _logger: main_log)
+
+    result = _worker_stderr_file("Camera:1/weird")
+
+    assert "/" not in Path(result).name
+    assert ":" not in Path(result).name
+
+
+def test_worker_stderr_file_empty_when_no_main_logfile_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No sensible sibling location exists -- caller must leave stderr inherited."""
+    monkeypatch.setattr(worker_pool_mod, "current_logfile", lambda _logger: None)
+
+    assert _worker_stderr_file("Camera-1") == ""
+
+
+def test_iter_frames_times_out_when_worker_only_reports_stalls() -> None:
+    """Rig hang 2026-09-23: a stalled worker's repeated StalledMsg reset the
+    stall guard forever, so the MDA hung with no error and no way to cancel."""
+    import threading
+    import time
+    from multiprocessing import Pipe
+    from types import SimpleNamespace
+
+    import pytest
+
+    from pymmcore_gui.asi_z_stack.worker_messages import StalledMsg
+    from pymmcore_gui.asi_z_stack.worker_pool import (
+        CameraWorkerHandle,
+        CameraWorkerPool,
+    )
+
+    parent, child = Pipe(duplex=True)
+    never_ready, _keep_open = Pipe(duplex=False)
+    handle = CameraWorkerHandle(
+        "Camera-1",
+        None,  # type: ignore[arg-type]
+        height=1,
+        width=1,
+        dtype="uint16",
+        n_slots=1,
+    )
+    handle.conn = parent
+    handle.process = SimpleNamespace(sentinel=never_ready, exitcode=None)  # type: ignore[assignment]
+
+    stop = threading.Event()
+
+    def _spam_stalls() -> None:
+        while not stop.is_set():
+            child.send(StalledMsg("Camera-1", 50, 6.0))
+            time.sleep(0.05)
+
+    spammer = threading.Thread(target=_spam_stalls, daemon=True)
+    spammer.start()
+    try:
+        start = time.monotonic()
+        with pytest.raises(TimeoutError, match="no frame"):
+            list(CameraWorkerPool([handle]).iter_frames(stall_timeout_s=0.5))
+        assert time.monotonic() - start < 3.0
+    finally:
+        stop.set()
+        spammer.join(timeout=1)
+
+
+def test_set_properties_round_trip_and_error() -> None:
+    import threading
+    from multiprocessing import Pipe
+
+    import pytest
+
+    from pymmcore_gui.asi_z_stack.worker_messages import (
+        PropertiesSetMsg,
+        SetPropertiesCmd,
+    )
+    from pymmcore_gui.asi_z_stack.worker_pool import CameraWorkerHandle
+
+    parent, child = Pipe(duplex=True)
+    handle = CameraWorkerHandle(
+        "Camera-1",
+        None,  # type: ignore[arg-type]
+        height=1,
+        width=1,
+        dtype="uint16",
+        n_slots=1,
+    )
+    handle.conn = parent
+    received: list[SetPropertiesCmd] = []
+
+    def _reply(error: str | None) -> None:
+        received.append(child.recv())
+        child.send(PropertiesSetMsg("Camera-1", error=error))
+
+    t = threading.Thread(target=_reply, args=(None,))
+    t.start()
+    handle.set_properties((("Port", "Sensitivity"),), timeout=2.0)
+    t.join()
+    assert received == [SetPropertiesCmd("Camera-1", (("Port", "Sensitivity"),))]
+
+    t = threading.Thread(target=_reply, args=("Invalid property value",))
+    t.start()
+    with pytest.raises(RuntimeError, match="Invalid property value"):
+        handle.set_properties((("Port", "Bogus"),), timeout=2.0)
+    t.join()
+
+
+def _pipe_handle(label: str):  # type: ignore[no-untyped-def]
+    from multiprocessing import Pipe
+    from types import SimpleNamespace
+
+    from pymmcore_gui.asi_z_stack.worker_pool import CameraWorkerHandle
+
+    parent, child = Pipe(duplex=True)
+    never_ready, keep_open = Pipe(duplex=False)
+    handle = CameraWorkerHandle(
+        label,
+        None,  # type: ignore[arg-type]
+        height=1,
+        width=1,
+        dtype="uint16",
+        n_slots=1,
+    )
+    handle.conn = parent
+    handle.process = SimpleNamespace(sentinel=never_ready, exitcode=None)  # type: ignore[assignment]
+    return handle, child, keep_open
+
+
+def test_stop_and_drain_discards_leftovers_up_to_token() -> None:
+    """Snap's early break used to leave frames + a StoppedMsg queued, which the
+    persistent pool's next iter_frames read as its own."""
+    import threading
+
+    from pymmcore_gui.asi_z_stack.worker_messages import (
+        FrameMsg,
+        SlotFreeCmd,
+        StopCmd,
+        StoppedMsg,
+    )
+    from pymmcore_gui.asi_z_stack.worker_pool import CameraWorkerPool
+
+    handle, child, _keep = _pipe_handle("Camera-1")
+    seen: list[object] = []
+
+    def _worker() -> None:
+        # Leftovers from the interrupted cycle, then the natural end.
+        child.send(FrameMsg("Camera-1", 0, 1, 2))
+        child.send(StoppedMsg("Camera-1", 2))
+        # stop_and_drain sends its StopCmd before reading anything.
+        cmd = child.recv()
+        seen.append(cmd)
+        child.send(StoppedMsg("Camera-1", 0, cmd.token))
+
+    t = threading.Thread(target=_worker)
+    t.start()
+    CameraWorkerPool([handle]).stop_and_drain(timeout=2.0)
+    t.join()
+
+    assert isinstance(seen[0], StopCmd)
+    assert seen[0].token
+    assert handle.conn is not None
+    assert not handle.conn.poll(0.1)  # nothing left for the next command
+    # The leftover frame's slot was handed back.
+    assert child.recv() == SlotFreeCmd(0)
+
+
+def test_stop_and_drain_times_out_without_raising() -> None:
+    import time
+
+    from pymmcore_gui.asi_z_stack.worker_pool import CameraWorkerPool
+
+    handle, _child, _keep = _pipe_handle("Camera-1")
+    start = time.monotonic()
+    CameraWorkerPool([handle]).stop_and_drain(timeout=0.3)
+    assert time.monotonic() - start < 2.0

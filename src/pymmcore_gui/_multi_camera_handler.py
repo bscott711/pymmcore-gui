@@ -21,7 +21,9 @@ from inspect import signature
 from typing import TYPE_CHECKING, Any
 
 from pymmcore_plus import CMMCorePlus
-from pymmcore_plus.mda.handlers import handler_for_path
+
+from pymmcore_gui._async_writer import DEFAULT_BACKLOG_BUDGET_BYTES, AsyncWriter
+from pymmcore_gui._vendored.mda_handlers import handler_for_path
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -90,7 +92,21 @@ def physical_camera_labels(mmcore: CMMCorePlus) -> list[str]:
     For a ``Multi Camera`` device this reads the ``Physical Camera N``
     properties (one label per channel). For a plain camera device returns a
     single-element list containing the active camera device.
+
+    When a :class:`~pymmcore_gui.asi_z_stack.camera_worker_service.
+    CameraWorkerService` is active for this session, *mmcore* itself never
+    has Camera-1/Camera-2 loaded (they live permanently in worker
+    processes) -- resolve from the service's own static label list instead.
+    This one fallback is what lets every other camera-label consumer in the
+    app (``MultiCameraHandler``, the MDA widget, the spectral-channel/camera-
+    alignment widgets, ``NDVViewersManager``, Argus streaming) keep working
+    unmodified once the service is active.
     """
+    from pymmcore_gui.asi_z_stack.camera_worker_service import CameraWorkerService
+
+    if (svc := CameraWorkerService.get_active()) is not None:
+        return list(svc.camera_labels)
+
     n = mmcore.getNumberOfCameraChannels()
     if n <= 1:
         return [mmcore.getCameraDevice()]
@@ -101,10 +117,17 @@ class MultiCameraHandler:
     """Route MDA frames to one writer per physical camera, keyed by camera label."""
 
     def __init__(
-        self, output: str | Path, *, mmcore: CMMCorePlus | None = None
+        self,
+        output: str | Path,
+        *,
+        mmcore: CMMCorePlus | None = None,
+        zarr_compression: bool = False,
+        backlog_budget_bytes: int = DEFAULT_BACKLOG_BUDGET_BYTES,
     ) -> None:
         self._output = output
         self._mmc = mmcore or CMMCorePlus.instance()
+        self._zarr_compression = zarr_compression
+        self._backlog_budget_bytes = backlog_budget_bytes
         # camera label -> writer
         self._writers: dict[str, Any] = {}
         self._started: set[str] = set()
@@ -123,7 +146,11 @@ class MultiCameraHandler:
         """Return (creating + starting if needed) the writer for *label*."""
         if label not in self._writers:
             path = per_camera_path(self._output, label)
-            self._writers[label] = handler_for_path(path)
+            self._writers[label] = AsyncWriter(
+                handler_for_path(path, zarr_compression=self._zarr_compression),
+                name=_sanitize(label),
+                backlog_budget_bytes=self._backlog_budget_bytes,
+            )
         writer = self._writers[label]
         if label not in self._started:
             self._call_sequence_started(writer)

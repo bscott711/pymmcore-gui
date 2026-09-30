@@ -30,7 +30,7 @@ USER_DATA_DIR = Path(user_data_dir(appname=APP_NAME))
 USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
 SETTINGS_FILE_NAME = USER_DATA_DIR / "pmm_settings.json"
 TESTING = "PYTEST_VERSION" in os.environ
-_GLOBAL_SETTINGS: "None | SettingsV1" = None
+_GLOBAL_SETTINGS: "SettingsV1 | None" = None
 
 
 class BaseMMSettings(BaseSettings):
@@ -193,6 +193,13 @@ class SpectralChannelConfig(BaseModel):
     """Physical camera device label, e.g. ``"Camera-1"``."""
     laser_preset: str
     """The single-laser config preset this region maps to, e.g. ``"488nm"``."""
+    position: Literal["top", "bottom"] = "top"
+    """Which half of the image splitter's sensor this region occupies.
+
+    Used only to auto-populate sibling regions when the first region on any
+    camera is drawn (see :class:`~pymmcore_gui.widgets._spectral_channel_config.
+    SpectralChannelConfigWidget`) -- it is not otherwise consulted for saving.
+    """
     rect: tuple[int, int, int, int] | None = None
     """``(x, y, w, h)`` in full-sensor pixel coordinates. ``None`` until drawn."""
 
@@ -204,15 +211,23 @@ class SpectralChannelConfig(BaseModel):
 
 def _default_spectral_channels() -> list[SpectralChannelConfig]:
     return [
-        SpectralChannelConfig(name="GFP_488", camera="Camera-1", laser_preset="488nm"),
         SpectralChannelConfig(
-            name="CalceinViolet_405", camera="Camera-1", laser_preset="405nm"
+            name="GFP_488", camera="Camera-1", laser_preset="488nm", position="top"
         ),
         SpectralChannelConfig(
-            name="mScarlet_561", camera="Camera-2", laser_preset="561nm"
+            name="CalceinViolet_405",
+            camera="Camera-1",
+            laser_preset="405nm",
+            position="bottom",
         ),
         SpectralChannelConfig(
-            name="CF647_638", camera="Camera-2", laser_preset="638nm"
+            name="mScarlet_561", camera="Camera-2", laser_preset="561nm", position="top"
+        ),
+        SpectralChannelConfig(
+            name="CF647_638",
+            camera="Camera-2",
+            laser_preset="638nm",
+            position="bottom",
         ),
     ]
 
@@ -229,6 +244,173 @@ class SpectralChannelSettingsV1(BaseMMSettings):
     )
 
 
+class ArgusStreamSettingsV1(BaseMMSettings):
+    """Real-time frame-streaming-to-Argus feature configuration.
+
+    See ``pymmcore_gui._argus_stream`` for the streaming client this
+    configures, and ``opym_local/src/opym/stream/`` (Argus side, canonical)
+    for the wire protocol and receiver these fields feed. v1 only supports
+    single-position MDA sequences (Argus's ``(T, C)`` grid has no position
+    axis). Multi-camera sequences are supported *only* when spectral-channel
+    cropping (see :class:`SpectralChannelSettingsV1`) resolves each camera's
+    regions into distinct channel identities -- an uncropped multi-camera
+    acquisition is skipped, same as multi-position (see
+    ``_argus_stream._session.ArgusStreamSession``).
+    """
+
+    enabled: bool = False
+    """Master on/off switch for the whole feature."""
+    ssh_host: str = "Argus"
+    """``Host`` alias from the user's ``~/.ssh/config`` to tunnel through."""
+    direct_endpoint: str = ""
+    """Argus's direct 10 GbE endpoint, e.g. ``tcp://137.216.250.14:5556``.
+
+    Empty: stream through the SSH tunnel only. Set: each run connects here
+    first and falls back to the tunnel if Argus doesn't answer within a few
+    seconds. The tunnel moved ~33 MB/s; this link runs at 10 GbE. It is plain
+    TCP, accepted by Argus only from this PC's IP (``opym-receive``'s
+    ``OPYM_STREAM_ALLOW_IPS``) and allowed through the site firewall only
+    from here.
+    """
+    compress_over_tunnel: bool = True
+    """Compress frames (blosc: lz4 + bitshuffle, ~2.5x on camera data) when
+    streaming through the SSH tunnel, if Argus accepts them. The tunnel moves
+    ~33 MB/s, so this is ~2.5x the frames per second; the direct link is
+    faster than one thread can compress, so frames always go to it raw.
+    """
+    local_port: int = 5555
+    """Local end of the SSH port-forward that the ZMQ DEALER connects to.
+
+    With several ``stream_links``, link k's forward listens on
+    ``local_port + k``.
+    """
+    stream_links: int = 4
+    """Parallel connections each run streams over.
+
+    Through the tunnel, each link is its own SSH forward (and ssh process).
+    One SSH connection is capped by sshd's fixed 2 MB window per round trip,
+    however fast the network is; measured from the rig on 2026-09-26: 1 link
+    63 MB/s, 2: 128, 4: 255, 8: 514. 4 links carry ~600 MB/s of camera data
+    after compression. Only used once Argus advertises "links"; otherwise
+    link 0 carries everything. Measure with
+    ``python -m pymmcore_gui._argus_stream.linkbench``. Read at app launch.
+    """
+    ssh_processes: int = 0
+    """How many ``ssh`` processes carry the links; 0 means one per link.
+
+    Separate processes are separate TCP connections (and encrypt in
+    parallel); several links in one process share its connection.
+    """
+    remote_port: int = 5555
+    """Port ``opym-receive`` binds to on ``127.0.0.1`` on the Argus side.
+
+    Matches ``opym.stream.receiver.DEFAULT_BIND_ADDR`` (``tcp://127.0.0.1:5555``).
+    """
+    buffer_budget_mb: int = 4096
+    """RAM budget for buffered-but-unacked volumes before raising an alarm.
+
+    Sized generously (several volumes deep) since the policy on exceeding it
+    is to warn, not to drop data -- see ``_argus_stream._session``.
+    """
+    buffer_hard_cap_mb: int = 0
+    """RAM the stream may hold unsent, across runs, before it gives up.
+
+    Past it (Argus unreachable for too long), the current run stops
+    streaming: its unsent volumes are dropped, Argus is told not to keep
+    the partial copy, and the run goes to Argus by Globus instead.
+    Acquisition and the local save are never affected. 0 means a quarter of
+    this PC's RAM.
+    """
+    gpfs_scratch_root: str = ""
+    """GPFS root the local save directory structure is mirrored under.
+
+    Each run's actual ``raw_root`` is this root plus the MDA save widget's
+    own ``save_dir``, drive letter stripped -- e.g. a local save to
+    ``S:/20260922-SVO-YG_0.1umBead_PSF/...`` streams to
+    ``<gpfs_scratch_root>/20260922-SVO-YG_0.1umBead_PSF/...``, matching
+    what a Globus transfer of the same local tree would have produced.
+    Each channel's raw store is then named
+    ``<base_name>_<channel_name>.ome.zarr`` directly under THAT (see
+    ``opym.stream.rawmirror.store_path_for_channel`` on the Argus side),
+    not nested under a further ``base_name`` subdirectory. Streaming
+    refuses to start if this is unset.
+    """
+    output_format: Literal["both", "ome-zarr", "tiff"] = "both"
+    """Format the processed (deskewed/deconvolved) result is kept in on Argus.
+
+    ``"tiff"``: per-frame OME-TIFFs, which ChimeraX opens directly.
+    ``"ome-zarr"``: one pyramidal OME-Zarr per run (napari); the TIFF frames
+    are removed once the zarr copy is verified. ``"both"``: keep both, at
+    roughly twice the disk. PetaKit5D's MIPs are kept in every mode.
+    """
+
+
+class MdaWriterSettingsV1(BaseMMSettings):
+    """Local MDA save-writer tuning.
+
+    See ``pymmcore_gui._async_writer`` and
+    ``pymmcore_gui._vendored.mda_handlers._ome_zarr_writer``.
+    """
+
+    zarr_compression: bool = False
+    """Compress OME-Zarr chunks (blosc/lz4).
+
+    Off by default: for fast multi-camera / SPIM acquisitions the compress
+    step is the write-throughput bottleneck and raw camera frames compress
+    poorly. Turn on only if disk space matters more than acquisition-keep-up.
+    """
+    backlog_budget_mb: int = 32768
+    """Per-writer cap on frame bytes buffered in RAM waiting to be written.
+
+    Each per-camera / per-channel writer drains its own queue on its own
+    thread; if the disk can't keep up and a writer's backlog would exceed
+    this, further frames for that writer are dropped (with a visible alarm)
+    rather than growing until the process runs out of memory. A healthy run
+    never approaches this -- the backlog stays near zero.
+    """
+
+
+class FocusOffsetSettingsV1(BaseMMSettings):
+    """Per-excitation-wavelength focus (Z) offset configuration.
+
+    Corrects axial chromatic aberration on the ASI SPIM rig: CRISP holds one
+    physical plane, but each excitation wavelength focuses slightly
+    differently. When enabled, a small per-wavelength Z offset is applied at
+    the per-volume channel switch by shifting the CRISP lock setpoint (see
+    ``pymmcore_gui.asi_z_stack.engine.ASISPIMEngine``); the offset travels
+    into the sequence as ``useq.Channel.z_offset`` (see
+    ``pymmcore_gui.widgets._mda_widget``).
+
+    Offsets are stored **absolute** -- each measured against one calibration
+    datum -- and ``locked_preset`` picks the runtime zero, so re-locking CRISP
+    on a different channel never needs the offsets re-measured.
+    """
+
+    enabled: bool = False
+    """Master on/off switch for the whole feature."""
+    laser_config_group: str = "Lasers"
+    """MM config group whose presets name the excitation wavelengths."""
+    all_lasers_preset: str = "AllLasers"
+    """Simultaneous-multi-wavelength preset -- never given an offset."""
+    crisp_label: str = "CRISPAFocus:P:34"
+    """CRISP AutoFocus device servoing the focus piezo. Empty => auto-discover."""
+    counts_per_um: float | None = None
+    """Signed CRISP lock-offset counts per micron of focus shift, from the
+    bench probe (``crisp_focus_offset_tuning.probe_lock_offset_response``).
+    ``None`` falls back to the device's own
+    ``|Calibration Gain| / Calibration Range(um)`` sensitivity."""
+    locked_preset: str = ""
+    """Which wavelength CRISP is currently focused/locked on -- the runtime
+    zero that gets no net move. Empty => use the running sequence's first
+    channel."""
+    apply_live: bool = False
+    """Auto-apply the active channel's offset during ordinary live preview
+    (opt-in; off by default -- otherwise it silently fights the CRISPy panel)."""
+    offsets: dict[str, float] = Field(default_factory=dict)
+    """Per-preset focus offset in microns, absolute vs the calibration datum,
+    keyed by laser-preset name (e.g. ``{"561nm": 0.35}``)."""
+
+
 class SettingsV1(BaseMMSettings):
     """Global settings for the PyMMCore GUI."""
 
@@ -242,6 +424,9 @@ class SettingsV1(BaseMMSettings):
     spectral: SpectralChannelSettingsV1 = Field(
         default_factory=SpectralChannelSettingsV1
     )
+    argus_stream: ArgusStreamSettingsV1 = Field(default_factory=ArgusStreamSettingsV1)
+    mda_writer: MdaWriterSettingsV1 = Field(default_factory=MdaWriterSettingsV1)
+    focus: FocusOffsetSettingsV1 = Field(default_factory=FocusOffsetSettingsV1)
 
     send_error_reports: bool | None = None
     """Whether to send error reports to the developers, None means undecided."""

@@ -65,3 +65,32 @@ def test_user_settings(tmp_path: Path) -> None:
         with patch("pymmcore_gui._settings.TESTING", False):
             _settings.reset_to_defaults()
         assert not fake_settings.exists()
+
+
+def test_focus_offset_settings_roundtrip() -> None:
+    s = SettingsV1()
+    assert s.focus.enabled is False
+    assert s.focus.offsets == {}
+    assert s.focus.locked_preset == ""
+
+    s.focus.enabled = True
+    s.focus.locked_preset = "488nm"
+    s.focus.counts_per_um = 558.5
+    s.focus.apply_live = True
+    s.focus.offsets = {"488nm": 0.0, "561nm": 0.35}
+
+    s2 = SettingsV1.model_validate_json(s.model_dump_json())
+    assert s2.focus.enabled is True
+    assert s2.focus.locked_preset == "488nm"
+    assert s2.focus.counts_per_um == 558.5
+    assert s2.focus.apply_live is True
+    assert s2.focus.offsets == {"488nm": 0.0, "561nm": 0.35}
+
+
+def test_focus_offset_bad_offsets_entry_degrades_gracefully() -> None:
+    # A single unparseable offset drops only `offsets` (back to {}), leaving
+    # the rest of the `focus` section intact -- not the whole section.
+    data = {"focus": {"enabled": True, "offsets": {"561nm": "banana"}}}
+    with pytest.warns(RuntimeWarning, match="Could not validate key 'offsets'"):
+        cleaned = _settings._good_data_only(SettingsV1, data)
+    assert cleaned == {"focus": {"enabled": True}}

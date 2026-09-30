@@ -2,6 +2,7 @@
 import logging
 import time
 from collections.abc import Iterable, Iterator
+from typing import TYPE_CHECKING
 
 import numpy as np
 from pymmcore_plus import CMMCorePlus
@@ -14,18 +15,19 @@ from pymmcore_plus.metadata import (
 from useq import MDAEvent, MDASequence
 
 from .asi_controller import (
+    close_all_lasers,
     configure_plogic_for_dual_nrt_pulses,
     log_plogic_trigger_chain_state,
+    set_laser_outputs,
     set_plogic_evaluation_clock,
 )
-from .camera_handoff import (
-    CameraHandoffSnapshot,
-    release_cameras_for_workers,
-    reload_cameras_after_handoff,
-)
-from .camera_worker import CameraWorkerConfig
+from .camera_worker_service import CameraWorkerService
 from .common import AcquisitionSettings, HardwareConstants
-from .worker_pool import CameraWorkerHandle, CameraWorkerPool, WorkerDiedError
+from .worker_pool import CameraWorkerPool, WorkerDiedError
+from .z_scan import compute_galvo_scan
+
+if TYPE_CHECKING:
+    from .camera_handoff import CameraHandoffSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -74,65 +76,175 @@ class _ASITriggerEngineBase(MDAEngine):
         self._original_autoshutter = True
         self._snapshot: CameraHandoffSnapshot | None = None
         self._worker_pool: CameraWorkerPool | None = None
+        self._piezo_pos_at_setup: float | None = None
+        # Plan positions of the galvo sweep, in slice order; used to give each
+        # frame its real z_pos. Empty when nothing scans (stationary engine).
+        self._z_positions: tuple[float, ...] = ()
+
+    def _set_event_z(self, event: MDAEvent) -> None:
+        """No-op: Z-stepping here is done entirely by the galvo hardware trigger.
+
+        ``event_iterator`` below forwards only the z-index-0 sub-event of
+        each collapsed stack, so the inherited ``MDAEngine._set_event_z``
+        would call ``mmcore.setZPosition()`` with that sub-event's resolved
+        position -- the *bottom* of the intended range for the default
+        ``go_up=True`` direction -- physically moving the piezo (this rig's
+        Core-Focus device) by ``-range/2`` before the galvo stack even
+        triggers. Since the galvo's own sweep is positioned relative to
+        wherever the focus device physically sits at trigger time (its
+        ``SingleAxisYOffset(deg)`` is computed from the z-plan against that
+        position in ``setup_sequence`` -- see :mod:`.z_scan`), that stray
+        pre-move shifts the whole optical
+        stack by another ``range/2`` in the same direction -- landing the
+        pre-acquisition focus at the very last slice instead of the middle,
+        and leaving the piezo parked away from where the user left it
+        (nothing restores it afterward). Confirmed bench symptom: a
+        symmetric ``ZRangeAround`` stack put the focused plane at the last
+        slice instead of the middle, and the piezo's position read
+        differently after a run than before it.
+        """
+
+    def setup_single_event(self, event: MDAEvent) -> None:
+        """Set up hardware for one event, replicating the base method minus exposure.
+
+        Copied from ``MDAEngine.setup_single_event`` verbatim, with one
+        deliberate omission: the trailing ``mmcore.setExposure(event.exposure)``
+        block. This engine bakes exposure into the PLogic pulse width at
+        ``setup_sequence`` time instead (see
+        :func:`~pymmcore_gui.asi_z_stack.asi_controller.
+        configure_plogic_for_dual_nrt_pulses`), and each camera worker
+        subprocess owns its own independent ``CMMCorePlus`` (see
+        :meth:`_handoff_to_workers`) -- so ``core.setExposure()`` against the
+        main process's core is never meaningful here, not even for the very
+        first event, before the handoff has run. Left in place, the
+        inherited version's own try/except silently logs "Failed to set
+        exposure. %s" on every event from the 2nd one onward, once every
+        physical camera has been released to a worker and the main-process
+        core has no camera device left for ``setExposure`` to target -- this
+        is the exact spurious warning seen in production logs. Everything
+        else here (XY position, channel switching, properties/ROI/SLM
+        no-ops, the trailing keep-shutter-open block) is kept verbatim for
+        fidelity with the base dispatch, even where it's a no-op for this
+        engine (``_set_event_z`` is already overridden separately -- see its
+        docstring).
+
+        Parameters
+        ----------
+        event : MDAEvent
+            The event to use for the hardware config.
+        """
+        if event.keep_shutter_open:
+            ...
+
+        self._set_event_xy_position(event)
+
+        if event.z_pos is not None:
+            self._set_event_z(event)
+        if event.slm_image is not None:
+            self._set_event_slm_image(event)
+
+        self._set_event_channel(event)
+
+        mmcore = self.mmcore
+        if event.properties is not None:
+            self._set_event_properties(event.properties)
+        if event.roi is not None:
+            self._set_event_roi(event)
+        if (
+            # (if autoshutter wasn't set at the beginning of the sequence
+            # then it never matters...)
+            self._autoshutter_was_set
+            # if we want to leave the shutter open after this event, and
+            # autoshutter is currently enabled...
+            and event.keep_shutter_open
+            and mmcore.getAutoShutter()
+        ):
+            # we have to disable autoshutter and open the shutter
+            mmcore.setAutoShutter(False)
+            mmcore.setShutterOpen(True)
+
+    def _snapshot_piezo_position(self) -> None:
+        """Record the piezo's position so :meth:`_warn_if_piezo_moved` can compare.
+
+        Called at the top of each subclass's ``setup_sequence``, before any
+        hardware is touched.
+        """
+        mmc = self.mmcore
+        if self.hw.piezo_a_label in mmc.getLoadedDevices():
+            self._piezo_pos_at_setup = mmc.getPosition(self.hw.piezo_a_label)
+        else:
+            self._piezo_pos_at_setup = None
+
+    def _warn_if_piezo_moved(self) -> None:
+        """Log a warning if the piezo's position changed since ``setup_sequence``.
+
+        Defensive check for this class of bug: with :meth:`_set_event_z`
+        now a no-op, nothing in this engine should ever move the piezo. If
+        it moves anyway (e.g. an ASI-firmware auto-home side effect of
+        setting the galvo's ``SPIMState`` to ``"Running"``, which is
+        plausible but unconfirmed), this turns a silent focus drift into a
+        visible warning in the run log instead of requiring another round
+        of bench detective work.
+        """
+        mmc = self.mmcore
+        if (
+            self._piezo_pos_at_setup is None
+            or self.hw.piezo_a_label not in mmc.getLoadedDevices()
+        ):
+            return
+        current = mmc.getPosition(self.hw.piezo_a_label)
+        delta = current - self._piezo_pos_at_setup
+        if abs(delta) > 0.05:  # um -- above readback noise, well below a real move
+            logger.warning(
+                f"Piezo ({self.hw.piezo_a_label}) moved {delta:+.3f} um during "
+                f"acquisition: {self._piezo_pos_at_setup:.3f} -> {current:.3f}. "
+                "This engine never commands the piezo -- investigate whether "
+                "the ASI SPIM state machine is auto-homing it."
+            )
 
     def _handoff_to_workers(self) -> None:
-        """Release every physical camera and spawn one worker process per camera.
+        """Acquire the session's persistent camera worker pool for this MDA run.
 
-        Replaces the old ``_arm_cameras`` -- instead of switching each
-        physical camera's ``TriggerMode`` while it stays loaded in the main
-        process (behind the ``Multi Camera`` composite), the main process
-        lets go of every physical camera entirely and hands it to its own
-        worker subprocess (see :mod:`~pymmcore_gui.asi_z_stack.worker_pool`).
-        Each worker owns its camera's ``pvcam64.dll`` in its own address
-        space, so a driver-level crash during concurrent dual-camera
-        acquisition can, at worst, take down one disposable worker instead of
-        the whole app. :meth:`_reclaim_from_workers` undoes this.
+        Camera-1/Camera-2 now live permanently in worker processes owned by
+        :class:`~pymmcore_gui.asi_z_stack.camera_worker_service.
+        CameraWorkerService` (spawned once, at config load -- see
+        ``_main_window.py::_on_system_config_loaded``), not spawned fresh per
+        MDA run. This just claims exclusive use of the already-running pool
+        for the duration of this sequence (stopping Live first if it was
+        running) -- see :meth:`~pymmcore_gui.asi_z_stack.camera_worker_service.
+        CameraWorkerService.acquire_for_mda`. :meth:`_reclaim_from_workers`
+        releases the claim; it does **not** shut the pool down or reload
+        cameras into the main process -- that's the service's job, for the
+        whole session, not this engine's.
 
         Called lazily from :meth:`exec_event` on its first invocation, not
-        from ``setup_sequence`` -- ``MDARunner`` emits ``sequenceStarted``
-        immediately after ``setup_sequence`` returns, and both
-        ``MultiCameraHandler.sequenceStarted`` and
-        ``NDVViewersManager._on_sequence_started`` independently call
-        ``physical_camera_labels(mmc)`` right then to eagerly create one
-        writer/viewer per physical camera, which needs the cameras to still
-        be loaded at that moment. By the time the first ``exec_event`` call
-        happens, ``sequenceStarted`` has already fired, so releasing the
-        cameras here is safe.
+        from ``setup_sequence`` -- kept that way for a minimal diff even
+        though the original reason for deferring it (cameras needing to
+        stay loaded in-process until after ``sequenceStarted``, for
+        ``MultiCameraHandler``/``NDVViewersManager`` to enumerate them) no
+        longer applies: those now resolve camera labels through the service
+        too (see ``_multi_camera_handler.physical_camera_labels``), not
+        through the main-process core.
 
-        Caches ``pixel_size_um`` here (while the cameras are still loaded)
-        because it's needed for per-frame metadata built later in
-        :meth:`exec_event`, once the cameras -- and the Camera-role-dependent
-        core methods that would otherwise supply it -- are gone.
+        Caches ``pixel_size_um`` here via the main-process core --
+        believed camera-role-independent (tied to the active pixel-size
+        config/objective, not a loaded camera device), unlike the other
+        Camera-role-dependent methods this class avoids post-handoff. Not
+        yet bench-verified under the persistent design specifically.
         """
         mmc = self.mmcore
         self._pixel_size_um = mmc.getPixelSizeUm(True)
-        self._snapshot = release_cameras_for_workers(mmc, self.hw)
-
-        def _worker_for(label: str) -> CameraWorkerHandle:
-            snap = self._snapshot
-            assert snap is not None
-            cam = snap.per_camera.get(label)
-            return CameraWorkerHandle(
-                camera_label=label,
-                config=CameraWorkerConfig(
-                    camera_label=label,
-                    adapter_device_name=label,
-                    property_snapshot=cam.property_values if cam else {},
-                    roi=cam.roi if cam else None,
-                    circular_buffer_mb=self.hw.worker_circular_buffer_mb,
-                ),
-                height=snap.image_height,
-                width=snap.image_width,
-                dtype=snap.dtype_str,
-                n_slots=self.hw.frame_ring_slots_per_camera,
+        svc = CameraWorkerService.get_active()
+        if svc is None or svc.geometry is None:
+            raise RuntimeError(
+                "Camera worker service is not active for this session -- "
+                "cannot run a hardware-triggered MDA without it."
             )
-
-        self._worker_pool = CameraWorkerPool(
-            [_worker_for(label) for label in self._snapshot.camera_labels]
-        )
-        self._worker_pool.spawn_all(ready_timeout=self.hw.worker_ready_timeout_s)
+        self._snapshot = svc.geometry
+        self._worker_pool = svc.acquire_for_mda()
         logger.info(
-            f"Camera worker pool ready: {self._snapshot.camera_labels} "
+            f"Acquired persistent camera worker pool for MDA: "
+            f"{self._snapshot.camera_labels} "
             f"({self._snapshot.image_width}x{self._snapshot.image_height} "
             f"{self._snapshot.dtype_str})."
         )
@@ -144,23 +256,23 @@ class _ASITriggerEngineBase(MDAEngine):
         :class:`~pymmcore_plus.mda.MDARunner` calls ``teardown_sequence``
         unconditionally on completion, cancellation, *or* any exception out
         of ``setup_sequence``/``exec_event`` -- this may run against a
-        partial handoff (e.g. the pool spawned but ``setup_sequence`` raised
-        before finishing).
+        partial handoff (e.g. ``_handoff_to_workers`` raised before
+        finishing). Lighter-weight than the old per-MDA version: no
+        ``shutdown_all``/``reload_cameras_after_handoff`` -- the pool and the
+        cameras' worker-process ownership are session-lifetime, owned by
+        ``CameraWorkerService``, not this engine.
         """
         if self._worker_pool is not None:
-            try:
-                self._worker_pool.shutdown_all(
-                    timeout=self.hw.worker_shutdown_timeout_s
-                )
-            except Exception:
-                logger.error("Error shutting down camera worker pool.", exc_info=True)
+            svc = CameraWorkerService.get_active()
+            if svc is not None:
+                try:
+                    svc.release_from_mda()
+                except Exception:
+                    logger.error(
+                        "Error releasing camera worker pool from MDA.", exc_info=True
+                    )
             self._worker_pool = None
-        if self._snapshot is not None:
-            try:
-                reload_cameras_after_handoff(self.mmcore, self.hw, self._snapshot)
-            except Exception:
-                logger.error("Error reloading cameras after handoff.", exc_info=True)
-            self._snapshot = None
+        self._snapshot = None
 
     def _warn_if_circular_buffer_too_small(self, per_camera_images: int) -> None:
         """Log a warning if a worker's circular buffer can't fit one z-stack.
@@ -169,16 +281,22 @@ class _ASITriggerEngineBase(MDAEngine):
         circular buffer (``HardwareConstants.worker_circular_buffer_mb``) --
         unlike the old single shared 30 GB main-process buffer this replaces,
         each worker's buffer only ever needs to hold *one* camera's frames,
-        not ``n_cameras`` worth. Must run against the main process's core
-        *before* :meth:`_handoff_to_workers` releases the cameras -- it needs
-        their live image geometry, which isn't available once they're gone.
-        Mirrors an earlier, hard-won lesson from the old single-buffer
-        design: never resize a circular buffer after a camera is armed for
-        external triggering (that crashed PVCAM's driver,
-        ``pvcam64.dll``, exception ``0xc0000409`` / STATUS_STACK_BUFFER_OVERRUN,
-        even more reliably than the wraparound it was meant to prevent) --
-        so this only warns, it never resizes anything itself. Each worker
-        sizes its own buffer once at startup, before arming -- see
+        not ``n_cameras`` worth. Reads image geometry from
+        :class:`~pymmcore_gui.asi_z_stack.camera_worker_service.
+        CameraWorkerService`'s cached geometry, **not** the main process's
+        core -- under the persistent-worker design the cameras are already
+        released from the main process long before ``setup_sequence`` (which
+        calls this) runs, so ``mmc.getImageWidth()``/etc. would misbehave
+        here if used directly (this is a real bug this class had until the
+        persistent-worker redesign; ``_handoff_to_workers`` used to run
+        *after* this call, not before -- it no longer does). Mirrors an
+        earlier, hard-won lesson from the old single-buffer design: never
+        resize a circular buffer after a camera is armed for external
+        triggering (that crashed PVCAM's driver, ``pvcam64.dll``, exception
+        ``0xc0000409`` / STATUS_STACK_BUFFER_OVERRUN, even more reliably than
+        the wraparound it was meant to prevent) -- so this only warns, it
+        never resizes anything itself. Each worker sizes its own buffer once
+        at startup, before arming -- see
         :func:`~pymmcore_gui.asi_z_stack.camera_worker.run_camera_worker`.
 
         Parameters
@@ -187,10 +305,17 @@ class _ASITriggerEngineBase(MDAEngine):
             The number of frames one camera's z-stack will produce (not
             multiplied by camera count -- each worker only buffers its own).
         """
-        mmc = self.mmcore
-        bytes_per_frame = (
-            mmc.getImageWidth() * mmc.getImageHeight() * mmc.getBytesPerPixel()
-        )
+        svc = CameraWorkerService.get_active()
+        geometry = svc.geometry if svc is not None else None
+        if geometry is not None:
+            bytes_per_frame = (
+                geometry.image_width * geometry.image_height * geometry.bytes_per_pixel
+            )
+        else:
+            mmc = self.mmcore
+            bytes_per_frame = (
+                mmc.getImageWidth() * mmc.getImageHeight() * mmc.getBytesPerPixel()
+            )
         if bytes_per_frame <= 0:
             return
         required_mb = (bytes_per_frame * per_camera_images * 1.5) / (1024 * 1024)
@@ -202,6 +327,79 @@ class _ASITriggerEngineBase(MDAEngine):
                 "HardwareConstants.worker_circular_buffer_mb."
             )
 
+    def _fit_slice_period_to_exposure(self) -> None:
+        """Stretch the galvo card's per-slice period to cover the exposure.
+
+        The card's slice period is max(delay+duration) over its scan/camera/
+        laser phases, and nothing else here sets it -- measured on the rig
+        (2026-09-23) at a fixed ~36 ms (SPIMDelayBeforeLaser 25.75 +
+        SPIMLaserDuration 10) regardless of exposure. With a 100 ms exposure
+        the non-retriggerable PLogic camera pulse swallowed most slice
+        triggers, the cameras got ~50 of 301 frames, and the run stalled.
+        Lasers and cameras are driven by PLogic, not the card's own laser
+        output, so this only lengthens each slice; at 10 ms exposure it
+        leaves the card exactly as it was.
+        """
+        self.mmcore.setProperty(
+            self.hw.galvo_a_label, "SPIMLaserDuration(ms)", f"{self._exposure_ms:.4f}"
+        )
+        delay_before_laser = float(
+            self.mmcore.getProperty(self.hw.galvo_a_label, "SPIMDelayBeforeLaser(ms)")
+        )
+        logger.info(
+            f"Galvo slice period >= {delay_before_laser + self._exposure_ms:.2f} ms "
+            f"(SPIMDelayBeforeLaser {delay_before_laser:.2f} + "
+            f"SPIMLaserDuration {self._exposure_ms:.2f})."
+        )
+
+    def _reset_channel_config_cache(self) -> None:
+        """Force the next per-channel config switch to actually happen.
+
+        Mirrors the stock ``MDAEngine.setup_sequence``'s own
+        ``core._last_config = ("", "")`` reset (added for
+        https://github.com/pymmcore-plus/pymmcore-plus/issues/503) -- which
+        neither ``ASISPIMEngine`` nor ``ASIStationaryTriggerEngine`` ever ran,
+        since both override ``setup_sequence`` completely rather than calling
+        ``super()``. Without it, ``_set_event_channel`` compares the
+        sequence's first channel against whatever ``"Lasers"`` config was
+        last actually applied (e.g. a Live/Snap selection, or the previous
+        MDA's final channel); if they match, it treats the channel as already
+        correct and skips calling ``mmc.setConfig(...)`` for it entirely --
+        silently leaving that channel's whole z-stack running under whatever
+        raw PLogic BNC wiring ``setup_sequence`` happened to leave behind,
+        rather than its own selected laser. Calling this at the top of every
+        ``setup_sequence`` guarantees the first channel always gets a real,
+        unconditional ``setConfig`` call, same as every later channel change.
+        """
+        self.mmcore._last_config = ("", "")
+
+    def _shutter_gated_bncs(self) -> list[int]:
+        """BNC addresses of currently-active, shutter-gated lasers.
+
+        A laser qualifies only if it is both (a) driven by the current
+        ``"Lasers"`` preset and (b) listed in
+        :attr:`~pymmcore_gui.asi_z_stack.common.HardwareConstants.shutter_gated_wavelengths`.
+        Diode lasers firing alongside it -- e.g. the other three wavelengths
+        under the ``all_lasers_preset`` -- are deliberately excluded, so they
+        keep per-frame blanking off PLogic's laser NRT cell while only the
+        shutter-gated wavelength is held open for the whole burst.
+        """
+        if not self.hw.laser_open_full_stack:
+            return []
+        group = self.hw.laser_config_group
+        mmc = self.mmcore
+        if group not in mmc.getAvailableConfigGroups():
+            return []
+        preset = mmc.getCurrentConfig(group)
+        if preset == self.hw.all_lasers_preset:
+            active = set(self.hw.laser_bnc_addr)
+        elif preset in self.hw.laser_bnc_addr:
+            active = {preset}
+        else:
+            return []
+        gated = active.intersection(self.hw.shutter_gated_wavelengths)
+        return [self.hw.laser_bnc_addr[w] for w in gated]
+
     def event_iterator(self, events: Iterable[MDAEvent]) -> Iterator[MDAEvent]:
         """Collapse each hardware z-stack down to a single event.
 
@@ -210,6 +408,17 @@ class _ASITriggerEngineBase(MDAEngine):
         event per z-slice, so forward only the first slice of each stack
         (``z`` index 0, or events with no ``z`` axis) and drop the rest --
         otherwise the stack would be re-triggered once per slice.
+
+        Only **per-volume** channel switching is possible today: a whole
+        z-stack is triggered by a single, uninterrupted hardware burst (see
+        :meth:`exec_event`), with no software checkpoint between slices where
+        a different laser could be selected. This holds regardless of which
+        ``axis_order`` ("...cz" vs "...zc") the MDA sequence uses -- that
+        setting has no effect on this engine's actual trigger timing, only on
+        event bookkeeping order. True per-slice (interleaved) laser switching
+        would need a different PLogic wiring scheme entirely (a hardware
+        mod-N BNC counter clocked per-slice, as ASI's own diSPIM plugin
+        implements) and is not currently implemented.
         """
         for event in events:
             if event.index.get("z", 0) == 0:
@@ -300,6 +509,25 @@ class _ASITriggerEngineBase(MDAEngine):
             self._num_slices, armed_timeout=self.hw.worker_arm_timeout_s
         )
         logger.info(f"{n_cameras} camera(s) armed for {self._num_slices} images each.")
+
+        # Shutter-gated lasers (e.g. 561, a CW laser behind a physical
+        # shutter) can't follow per-frame TTL blanking reliably, so hold them
+        # open for the whole burst instead of pulsing them per slice. The
+        # channel's "Lasers" preset is already applied by this point (via
+        # setup_single_event -> _set_event_channel, before exec_event runs),
+        # so _shutter_gated_bncs() reflects the laser this burst will use.
+        gated_bncs = self._shutter_gated_bncs()
+        if gated_bncs:
+            set_laser_outputs(
+                self.hw.plogic_label,
+                self.hw.tiger_comm_hub_label,
+                gated_bncs,
+                True,
+                self.hw.plogic_always_on_cell,
+            )
+            if self.hw.shutter_open_settle_ms > 0:
+                time.sleep(self.hw.shutter_open_settle_ms / 1000.0)
+
         # See _trigger_spim_state_value's docstring: currently always
         # "Running" on the galvo (its NO_SCAN/SLICE_SCAN_ONLY trigger path)
         # -- the piezo's SPIMState property has no "Running" value at all,
@@ -327,7 +555,18 @@ class _ASITriggerEngineBase(MDAEngine):
                 new_index = {**event.index, "z": slice_idx}
                 if n_cameras > 1:
                     new_index["cam"] = cam_index
-                sub_event = event.model_copy(update={"index": new_index})
+                update: dict[str, object] = {"index": new_index}
+                # The collapsed event carries slice 0's z_pos; shift it to
+                # the plane this slice actually imaged.
+                if (
+                    event.z_pos is not None
+                    and self._z_positions
+                    and slice_idx < len(self._z_positions)
+                ):
+                    update["z_pos"] = event.z_pos + (
+                        self._z_positions[slice_idx] - self._z_positions[0]
+                    )
+                sub_event = event.model_copy(update=update)
 
                 runner_time_ms = (
                     (time.perf_counter() - runner_t0) * 1000.0 if runner_t0 else 0.0
@@ -342,14 +581,39 @@ class _ASITriggerEngineBase(MDAEngine):
                 received = yield img, sub_event, meta
                 if received == "cancel":
                     logger.info("MDA cancelled -- stopping camera workers.")
-                    self._worker_pool.stop_all()
                     return
         except WorkerDiedError:
             logger.error(
                 "A camera worker process died during acquisition.", exc_info=True
             )
-            self._worker_pool.stop_all()
             raise
+        finally:
+            # Guarantees every worker gets a StopCmd on every exit path from
+            # this generator -- normal completion, "cancel", WorkerDiedError,
+            # a TimeoutError from iter_frames's stall guard, a plain
+            # RuntimeError wrapping a worker's ErrorMsg, or this generator
+            # being abandoned mid-iteration by its caller and closed by the
+            # interpreter (GeneratorExit thrown at the yield above) -- the
+            # mechanism behind a production deadlock where an abandoned
+            # generator left a worker blocked forever in
+            # camera_worker._wait_for_free_slot, waiting for a SlotFreeCmd/
+            # StopCmd that would never come. stop_all() is best-effort/
+            # idempotent (worker_pool.py's own conn-closed/OSError guards),
+            # so the extra call this now makes on ordinary per-event
+            # completion (never called there before) is harmless: a StopCmd
+            # against an already-idle worker.
+            if gated_bncs:
+                set_laser_outputs(
+                    self.hw.plogic_label,
+                    self.hw.tiger_comm_hub_label,
+                    gated_bncs,
+                    False,
+                    self.hw.plogic_always_on_cell,
+                )
+            # stop_and_drain, not stop_all: the pool is session-persistent,
+            # so frames left queued by a cancel/error would otherwise be read
+            # by the next Snap/Live/MDA as its own.
+            self._worker_pool.stop_and_drain(timeout=self.hw.worker_shutdown_timeout_s)
 
 
 class ASISPIMEngine(_ASITriggerEngineBase):
@@ -371,23 +635,74 @@ class ASISPIMEngine(_ASITriggerEngineBase):
     def __init__(self, mmc: CMMCorePlus, hw: HardwareConstants):
         super().__init__(mmc, hw)
         self._master_axis_label = hw.galvo_a_label
+        # Galvo SingleAxisYOffset(deg) from before the MDA, restored in
+        # teardown so Live doesn't keep imaging a shifted plane afterwards.
+        self._galvo_offset_before: str | None = None
+
+    def _check_galvo_reach(self, amplitude_deg: float, offset_deg: float) -> None:
+        """Raise if the requested sweep falls outside the galvo's property limits.
+
+        Checked before any hardware is touched, so an unreachable Top/Bottom
+        (or Above/Below) range fails loudly instead of being silently clipped
+        by the card.
+        """
+        mmc = self.mmcore
+        label = self.hw.galvo_a_label
+        slope = self.hw.slice_calibration_slope_um_per_deg
+        if mmc.hasPropertyLimits(label, "SingleAxisYOffset(deg)"):
+            lo = mmc.getPropertyLowerLimit(label, "SingleAxisYOffset(deg)")
+            hi = mmc.getPropertyUpperLimit(label, "SingleAxisYOffset(deg)")
+            half = abs(amplitude_deg) / 2
+            if offset_deg - half < lo or offset_deg + half > hi:
+                raise ValueError(
+                    "Z stack is outside the galvo's reach: it spans "
+                    f"{(offset_deg - half) * slope:+.2f} to "
+                    f"{(offset_deg + half) * slope:+.2f} um from current focus, "
+                    f"but the galvo covers {lo * slope:+.2f} to {hi * slope:+.2f} "
+                    "um. Move focus closer to the range or shrink it."
+                )
+        if mmc.hasPropertyLimits(label, "SingleAxisYAmplitude(deg)"):
+            lo = mmc.getPropertyLowerLimit(label, "SingleAxisYAmplitude(deg)")
+            hi = mmc.getPropertyUpperLimit(label, "SingleAxisYAmplitude(deg)")
+            if not lo <= amplitude_deg <= hi:
+                raise ValueError(
+                    f"Z stack range {amplitude_deg * slope:+.2f} um needs a galvo "
+                    f"amplitude of {amplitude_deg:.4f} deg, outside the card's "
+                    f"[{lo}, {hi}] deg limits."
+                )
 
     def setup_sequence(self, sequence: MDASequence) -> SummaryMetaV1 | None:
         """Prepare hardware and calculate Z-stack parameters."""
-        # 1. Calculate Z-stack parameters
+        # 0. Force the sequence's first channel to get a real hardware
+        # config switch -- see _reset_channel_config_cache's docstring.
+        self._reset_channel_config_cache()
+        self._snapshot_piezo_position()
+
+        # 1. Calculate Z-stack parameters. The piezo never moves, so every
+        # Z Stack mode (Range Around / Above-Below / Top-Bottom) is realized
+        # purely through the galvo sweep's signed amplitude and its offset
+        # from current focus -- see z_scan.py.
         if sequence.z_plan:
-            z_positions = list(sequence.z_plan)
-            self._num_slices = len(z_positions)
-            step_size_um = (
-                abs(z_positions[1] - z_positions[0]) if self._num_slices > 1 else 0.0
+            scan = compute_galvo_scan(
+                sequence.z_plan,
+                current_focus_um=self.mmcore.getZPosition(),
+                slope_um_per_deg=self.hw.slice_calibration_slope_um_per_deg,
             )
-            amplitude_um = (self._num_slices - 1) * step_size_um
-            galvo_amplitude_deg = (
-                amplitude_um / self.hw.slice_calibration_slope_um_per_deg
+            self._num_slices = scan.num_slices
+            self._z_positions = scan.z_positions
+            galvo_amplitude_deg = scan.amplitude_deg
+            galvo_offset_deg = scan.offset_deg
+            self._check_galvo_reach(galvo_amplitude_deg, galvo_offset_deg)
+            logger.info(
+                f"Z plan {type(sequence.z_plan).__name__}: {scan.num_slices} "
+                f"slices, step {scan.step_um:+.3f} um, center "
+                f"{scan.center_offset_um:+.3f} um from current focus."
             )
         else:
             self._num_slices = 1
+            self._z_positions = ()
             galvo_amplitude_deg = 0.0
+            galvo_offset_deg = 0.0
 
         # 2. Determine exposure
         if (
@@ -397,23 +712,23 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         ):
             self._exposure_ms = sequence.channels[0].exposure
         else:
-            self._exposure_ms = self.mmcore.getExposure()
+            svc = CameraWorkerService.get_active()
+            self._exposure_ms = (
+                svc.last_known_exposure_ms
+                if svc is not None
+                else self.mmcore.getExposure()
+            )
 
         # 3. Prepare Hardware
         logger.info("--- SEQUENCE STARTED: Preparing PLogic and Camera ---")
         self._original_autoshutter = self.mmcore.getAutoShutter()
         self.mmcore.setAutoShutter(False)
-        # Circular-buffer sizing needs live image geometry, so it must run
-        # against the main process's core before the cameras are released.
-        # The handoff itself is deliberately NOT done here: MDARunner emits
-        # sequenceStarted right after setup_sequence returns, and both
-        # MultiCameraHandler.sequenceStarted and
-        # NDVViewersManager._on_sequence_started independently call
-        # physical_camera_labels(mmc) at that point to eagerly create one
-        # writer/viewer per physical camera -- which needs the cameras still
-        # loaded. _handoff_to_workers() runs lazily on the first exec_event
-        # call instead, which always happens after sequenceStarted has
-        # already fired.
+        # Circular-buffer sizing reads geometry from CameraWorkerService,
+        # not the main-process core -- see _warn_if_circular_buffer_too_small's
+        # docstring. The pool handoff itself is deliberately NOT done here,
+        # kept lazy in exec_event as before -- see _handoff_to_workers's
+        # docstring for why (a smaller reason now than it used to be, but the
+        # structure is kept for a minimal diff).
         self._warn_if_circular_buffer_too_small(self._num_slices)
 
         settings = AcquisitionSettings(
@@ -424,7 +739,6 @@ class ASISPIMEngine(_ASITriggerEngineBase):
             settings,
             self.hw.plogic_label,
             self.hw.tiger_comm_hub_label,
-            self.hw.plogic_laser_preset_num,
             self.hw.plogic_camera_cell,
             self.hw.pulses_per_ms,
             self.hw.plogic_4khz_clock_addr,
@@ -479,7 +793,14 @@ class ASISPIMEngine(_ASITriggerEngineBase):
             self.hw.galvo_a_label, "SingleAxisXAmplitude(deg)", "0.0"
         )
         self.mmcore.setProperty(self.hw.galvo_a_label, "SingleAxisXOffset(deg)", "0.0")
-        self.mmcore.setProperty(self.hw.galvo_a_label, "SingleAxisYOffset(deg)", "0.0")
+        self._galvo_offset_before = self.mmcore.getProperty(
+            self.hw.galvo_a_label, "SingleAxisYOffset(deg)"
+        )
+        self.mmcore.setProperty(
+            self.hw.galvo_a_label,
+            "SingleAxisYOffset(deg)",
+            f"{galvo_offset_deg:.4f}",
+        )
         self.mmcore.setProperty(self.hw.galvo_a_label, "SPIMNumSlicesPerPiezo", "1")
         self.mmcore.setProperty(
             self.hw.galvo_a_label,
@@ -491,7 +812,8 @@ class ASISPIMEngine(_ASITriggerEngineBase):
             "SPIMDelayBeforeSide(ms)",
             str(self.hw.delay_before_side_ms),
         )
-        # Deliberately not touching ASI's native per-slice camera/laser
+        self._fit_slice_period_to_exposure()
+        # Deliberately not touching ASI's other native per-slice camera/laser
         # trigger properties (SPIMDelayBeforeScan(ms), SPIMDelayBeforeCamera(ms),
         # SPIMCameraDuration(ms), SPIMDelayBeforeLaser(ms), SPIMLaserDuration(ms))
         # -- the microscope-control sibling repo's confirmed-working engine
@@ -509,6 +831,7 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         logger.info(
             f"--- PLogic and Camera ready --- "
             f"(slices={self._num_slices}, amplitude={galvo_amplitude_deg:.4f}deg, "
+            f"offset={galvo_offset_deg:.4f}deg, "
             f"exposure={self._exposure_ms:.1f}ms)"
         )
 
@@ -520,9 +843,25 @@ class ASISPIMEngine(_ASITriggerEngineBase):
     def teardown_sequence(self, sequence: MDASequence) -> None:
         """Clean up hardware state after the sequence finishes."""
         logger.info("--- SEQUENCE FINISHED: Cleaning up hardware ---")
+        self._warn_if_piezo_moved()
         set_plogic_evaluation_clock(self.hw.tiger_comm_hub_label, running=False)
         if self.hw.galvo_a_label in self.mmcore.getLoadedDevices():
             self.mmcore.setProperty(self.hw.galvo_a_label, "SPIMState", "Idle")
+            # Undo this run's sweep-center shift (Above/Below, Top/Bottom) so
+            # Live/Snap image the same plane they did before the MDA.
+            if self._galvo_offset_before is not None:
+                self.mmcore.setProperty(
+                    self.hw.galvo_a_label,
+                    "SingleAxisYOffset(deg)",
+                    self._galvo_offset_before,
+                )
+                self._galvo_offset_before = None
+
+        # Belt-and-suspenders: exec_event's own finally block already closes
+        # any shutter-gated laser it opened after every burst, so this is
+        # only a safety net against a run aborting between volumes.
+        if self.hw.laser_open_full_stack:
+            close_all_lasers()
 
         # Deliberately not closing the global shutter here -- it's
         # session-level infrastructure (opened once via
@@ -590,6 +929,11 @@ class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
 
     def setup_sequence(self, sequence: MDASequence) -> SummaryMetaV1 | None:
         """Prepare hardware; both galvo and piezo stay stationary."""
+        # 0. Force the sequence's first channel to get a real hardware
+        # config switch -- see _reset_channel_config_cache's docstring.
+        self._reset_channel_config_cache()
+        self._snapshot_piezo_position()
+
         # 1. Number of trigger pulses/frames wanted. Neither axis moves, so
         # there's no amplitude/step-size to compute from the z_plan
         # positions -- only their count matters.
@@ -606,7 +950,12 @@ class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
         ):
             self._exposure_ms = sequence.channels[0].exposure
         else:
-            self._exposure_ms = self.mmcore.getExposure()
+            svc = CameraWorkerService.get_active()
+            self._exposure_ms = (
+                svc.last_known_exposure_ms
+                if svc is not None
+                else self.mmcore.getExposure()
+            )
 
         # 3. Prepare hardware
         logger.info(
@@ -614,17 +963,12 @@ class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
         )
         self._original_autoshutter = self.mmcore.getAutoShutter()
         self.mmcore.setAutoShutter(False)
-        # Circular-buffer sizing needs live image geometry, so it must run
-        # against the main process's core before the cameras are released.
-        # The handoff itself is deliberately NOT done here: MDARunner emits
-        # sequenceStarted right after setup_sequence returns, and both
-        # MultiCameraHandler.sequenceStarted and
-        # NDVViewersManager._on_sequence_started independently call
-        # physical_camera_labels(mmc) at that point to eagerly create one
-        # writer/viewer per physical camera -- which needs the cameras still
-        # loaded. _handoff_to_workers() runs lazily on the first exec_event
-        # call instead, which always happens after sequenceStarted has
-        # already fired.
+        # Circular-buffer sizing reads geometry from CameraWorkerService,
+        # not the main-process core -- see _warn_if_circular_buffer_too_small's
+        # docstring. The pool handoff itself is deliberately NOT done here,
+        # kept lazy in exec_event as before -- see _handoff_to_workers's
+        # docstring for why (a smaller reason now than it used to be, but the
+        # structure is kept for a minimal diff).
         self._warn_if_circular_buffer_too_small(self._num_slices)
 
         settings = AcquisitionSettings(
@@ -635,7 +979,6 @@ class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
             settings,
             self.hw.plogic_label,
             self.hw.tiger_comm_hub_label,
-            self.hw.plogic_laser_preset_num,
             self.hw.plogic_camera_cell,
             self.hw.pulses_per_ms,
             self.hw.plogic_4khz_clock_addr,
@@ -690,6 +1033,7 @@ class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
             "SPIMDelayBeforeSide(ms)",
             str(self.hw.delay_before_side_ms),
         )
+        self._fit_slice_period_to_exposure()
 
         # 5. Arm the piezo in parallel, also held stationary. Matches ASI's
         # reference (prepareControllerForAquisition_Side): the piezo is
@@ -728,6 +1072,7 @@ class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
     def teardown_sequence(self, sequence: MDASequence) -> None:
         """Clean up hardware state after the sequence finishes."""
         logger.info("--- SEQUENCE FINISHED: Cleaning up hardware (stationary) ---")
+        self._warn_if_piezo_moved()
         if self.hw.galvo_a_label in self.mmcore.getLoadedDevices():
             self.mmcore.setProperty(self.hw.galvo_a_label, "SPIMState", "Idle")
         if self.hw.piezo_a_label in self.mmcore.getLoadedDevices():

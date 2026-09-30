@@ -14,13 +14,17 @@ rather than the old direct ``core.startSequenceAcquisition``/
 
 from __future__ import annotations
 
+import logging
+import time
 from typing import TYPE_CHECKING, cast
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 import useq
+from useq._mda_event import Channel as EventChannel
 
+from pymmcore_gui.asi_z_stack import engine as engine_module
 from pymmcore_gui.asi_z_stack.camera_handoff import CameraHandoffSnapshot
 from pymmcore_gui.asi_z_stack.common import HardwareConstants
 from pymmcore_gui.asi_z_stack.engine import (
@@ -167,7 +171,7 @@ def test_exec_event_cancel_stops_workers() -> None:
     with pytest.raises(StopIteration):
         gen.send("cancel")
 
-    pool.stop_all.assert_called_once()
+    pool.stop_and_drain.assert_called_once()
 
 
 def test_exec_event_worker_died_stops_survivor_and_reraises() -> None:
@@ -183,7 +187,7 @@ def test_exec_event_worker_died_stops_survivor_and_reraises() -> None:
     with pytest.raises(WorkerDiedError):
         list(engine.exec_event(useq.MDAEvent(index={"t": 0})))
 
-    pool.stop_all.assert_called_once()
+    pool.stop_and_drain.assert_called_once()
 
 
 def test_event_iterator_collapses_z_stack() -> None:
@@ -243,3 +247,539 @@ def test_stationary_engine_triggers_galvo_not_piezo() -> None:
     assert ("PiezoStage:P:34", "SPIMState", "Running") not in [
         call.args for call in core.setProperty.call_args_list
     ]
+
+
+@pytest.mark.parametrize("engine_cls", [ASISPIMEngine, ASIStationaryTriggerEngine])
+def test_setup_event_never_moves_focus_device(
+    engine_cls: type[_ASITriggerEngineBase],
+) -> None:
+    """``setup_event`` must never call ``core.setZPosition`` for these engines.
+
+    Regression test for the actual mis-centered-stack bug: ``event_iterator``
+    collapses a whole z-stack down to its z-index-0 sub-event, and the stock
+    ``MDAEngine.setup_single_event`` calls ``_set_event_z`` (->
+    ``mmcore.setZPosition``) whenever that sub-event's ``z_pos`` is not
+    ``None``. Since z-index 0 resolves to the *bottom* of the range for the
+    default ``go_up=True`` direction, this physically pre-moved the piezo --
+    this rig's Core-Focus device -- by ``-range/2`` before the galvo's own
+    independent ``+/-range/2`` sweep (always centered on wherever the focus
+    device is at trigger time) ran on top of it -- landing the user's actual
+    pre-acquisition focus at the very last slice instead of the middle, and
+    leaving the piezo parked away from where the user left it.
+    ``_ASITriggerEngineBase._set_event_z`` is now a no-op specifically to
+    prevent this; this test exercises the real ``setup_event`` dispatch path
+    (not ``_set_event_z`` directly) so it fails if that dispatch ever changes.
+    """
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=3, engine_cls=engine_cls)
+
+    event = useq.MDAEvent(index={"t": 0, "z": 0}, z_pos=-50.0)
+    engine.setup_event(event)
+
+    core.setZPosition.assert_not_called()
+
+
+@pytest.mark.parametrize("engine_cls", [ASISPIMEngine, ASIStationaryTriggerEngine])
+def test_warn_if_piezo_moved(
+    caplog: pytest.LogCaptureFixture,
+    engine_cls: type[_ASITriggerEngineBase],
+) -> None:
+    """``_warn_if_piezo_moved`` only logs when the piezo's position changed.
+
+    Defensive check for this class of bug: with ``_set_event_z`` now a
+    no-op, nothing in these engines should ever move the piezo. If it moves
+    anyway (e.g. an ASI-firmware auto-home side effect of the galvo's
+    ``SPIMState`` going to ``"Running"``), this should surface as a warning
+    instead of silently trusting the hardware.
+    """
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=3, engine_cls=engine_cls)
+    core.getLoadedDevices.return_value = ["PiezoStage:P:34", "Scanner:AB:33"]
+
+    core.getPosition.return_value = 10.0
+    engine._snapshot_piezo_position()
+    with caplog.at_level(logging.WARNING):
+        engine._warn_if_piezo_moved()
+    assert not caplog.records
+
+    core.getPosition.return_value = 10.0
+    engine._snapshot_piezo_position()
+    core.getPosition.return_value = 15.0
+    with caplog.at_level(logging.WARNING):
+        engine._warn_if_piezo_moved()
+    assert len(caplog.records) == 1
+    assert "10.000" in caplog.records[0].message
+    assert "15.000" in caplog.records[0].message
+
+
+@pytest.mark.parametrize("engine_cls", [ASISPIMEngine, ASIStationaryTriggerEngine])
+def test_setup_event_never_calls_set_exposure(
+    engine_cls: type[_ASITriggerEngineBase],
+) -> None:
+    """``setup_event`` must never call ``core.setExposure``, but still switches channel.
+
+    Regression test for the spurious "Failed to set exposure" warning seen
+    in production logs: the inherited ``MDAEngine.setup_single_event`` calls
+    ``mmcore.setExposure(event.exposure)`` unconditionally whenever
+    ``event.exposure`` is set, which fails on every event once
+    ``_handoff_to_workers`` has released every physical camera -- this
+    engine bakes exposure into the PLogic pulse width instead, so the call
+    is never useful here. ``_ASITriggerEngineBase.setup_single_event`` drops
+    that call but must still perform the real channel-switch
+    (``_set_event_channel`` -> ``core.setConfig``).
+    """
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=3, engine_cls=engine_cls)
+    event = useq.MDAEvent(
+        index={"t": 0, "z": 0},
+        channel=EventChannel(config="488nm", group="Lasers"),
+        exposure=25.0,
+    )
+
+    engine.setup_event(event)
+
+    core.setExposure.assert_not_called()
+    core.setConfig.assert_called_once_with("Lasers", "488nm")
+
+
+def test_exec_event_timeout_stops_workers_and_reraises() -> None:
+    """A ``TimeoutError`` from ``iter_frames`` (stall guard) still stops workers.
+
+    Regression test for a gap in the old explicit stop_all()-on-error
+    handling: only ``WorkerDiedError`` triggered a stop, so a plain
+    ``TimeoutError`` (worker_pool.py's stall guard) or a worker's own
+    ``ErrorMsg``-derived ``RuntimeError`` left the survivor running with no
+    stop signal. ``exec_event`` now calls ``stop_and_drain()`` in a ``finally``
+    block that covers every exit path.
+    """
+    _core, engine, pool = _make_engine(n_cameras=2, n_slices=3)
+    pool.iter_frames.side_effect = TimeoutError(
+        "no message from any camera worker for 5.0s"
+    )
+
+    with pytest.raises(TimeoutError):
+        list(engine.exec_event(useq.MDAEvent(index={"t": 0})))
+
+    pool.stop_and_drain.assert_called_once()
+
+
+def test_exec_event_generator_close_stops_workers() -> None:
+    """Abandoning ``exec_event`` mid-iteration (``GeneratorExit``) still stops workers.
+
+    This is the actual mechanism behind the production deadlock: if
+    ``exec_event``'s generator is closed/garbage-collected before being
+    fully drained (e.g. the runner's own iteration is abandoned by an
+    exception elsewhere), the interpreter throws ``GeneratorExit`` at the
+    generator's current ``yield``. The old code only called ``stop_all()``
+    from the ``"cancel"`` branch and the ``WorkerDiedError`` handler, so an
+    abandoned generator left workers blocked forever in
+    ``camera_worker._wait_for_free_slot``, waiting for a ``SlotFreeCmd``/
+    ``StopCmd`` that would never come. The ``finally`` block now covers
+    this path too.
+    """
+    _core, engine, pool = _make_engine(n_cameras=1, n_slices=3)
+    _queue_frames(pool, [("cam0", 0), ("cam0", 1), ("cam0", 2)])
+
+    gen = cast(
+        "Generator[tuple[np.ndarray, useq.MDAEvent, FrameMetaV1], str | None, None]",
+        engine.exec_event(useq.MDAEvent(index={"t": 0})),
+    )
+    next(gen)
+    gen.close()
+
+    pool.stop_and_drain.assert_called_once()
+
+
+def test_exec_event_normal_completion_also_stops_workers() -> None:
+    """Ordinary, uncancelled completion also calls ``stop_and_drain()`` exactly once.
+
+    New (safe, intentional) side effect of moving ``stop_all()`` into a
+    ``finally`` block: it now fires on every exit path, including normal
+    completion, where it previously never fired at all. Harmless -- workers
+    are already idle by the time ``iter_frames`` naturally exhausts, so the
+    extra ``StopCmd`` lands on an idle worker as a guarded no-op -- but
+    locked in here as a named test so it isn't mistaken for a regression by
+    a future reader.
+    """
+    _core, engine, pool = _make_engine(n_cameras=1, n_slices=2)
+    _queue_frames(pool, [("cam0", 0), ("cam0", 1)])
+
+    list(engine.exec_event(useq.MDAEvent(index={"t": 0})))
+
+    pool.stop_and_drain.assert_called_once()
+
+
+def test_reset_channel_config_cache_clears_last_config() -> None:
+    """``_reset_channel_config_cache`` unconditionally clears the cache.
+
+    Direct unit test of the helper both ``setup_sequence`` overrides call --
+    see :func:`test_setup_sequence_resets_channel_config_cache` for the
+    end-to-end regression test that it's actually wired in.
+    """
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=1)
+    core._last_config = ("Lasers", "488nm")
+
+    engine._reset_channel_config_cache()
+
+    assert core._last_config == ("", "")
+
+
+@pytest.mark.parametrize("engine_cls", [ASISPIMEngine, ASIStationaryTriggerEngine])
+def test_setup_sequence_resets_channel_config_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    engine_cls: type[_ASITriggerEngineBase],
+) -> None:
+    """``setup_sequence`` must invalidate a stale ``core._last_config``.
+
+    Regression test for the wrong-laser bug: both ``ASISPIMEngine`` and
+    ``ASIStationaryTriggerEngine.setup_sequence`` completely override the
+    stock ``MDAEngine.setup_sequence`` (rather than calling ``super()``), so
+    they must replicate its ``core._last_config = ("", "")`` reset
+    themselves. Without it, ``_set_event_channel`` can wrongly treat the
+    sequence's first channel as "already configured" (because it happens to
+    match whatever config was last actually applied, e.g. from Live/Snap or
+    the previous MDA run) and skip calling ``mmc.setConfig(...)`` for it --
+    silently leaving that channel's whole z-stack running under whatever raw
+    PLogic wiring was left over from setup instead of its own selected laser.
+
+    Heavy hardware/network side effects (``configure_plogic_for_dual_nrt_pulses``,
+    ``set_plogic_evaluation_clock``, ``log_plogic_trigger_chain_state``,
+    ``summary_metadata``) are stubbed out -- they talk to PLogic's own
+    process-global ``CMMCorePlus`` singleton (a separate concern, unrelated to
+    the cache-reset behavior under test here) rather than the mocked ``core``.
+    """
+    monkeypatch.setattr(
+        engine_module, "configure_plogic_for_dual_nrt_pulses", MagicMock()
+    )
+    monkeypatch.setattr(engine_module, "set_plogic_evaluation_clock", MagicMock())
+    monkeypatch.setattr(engine_module, "log_plogic_trigger_chain_state", MagicMock())
+    monkeypatch.setattr(engine_module, "summary_metadata", MagicMock(return_value=None))
+
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=3, engine_cls=engine_cls)
+    # Simulate a stale cache left over from a prior Live/Snap selection or MDA
+    # run that happens to match this sequence's first (and only) channel.
+    core._last_config = ("Lasers", "488nm")
+    core.getExposure.return_value = 10.0
+    # Real ints, not MagicMocks -- _warn_if_circular_buffer_too_small does
+    # arithmetic/comparisons on these.
+    core.getImageWidth.return_value = 2
+    core.getImageHeight.return_value = 2
+    core.getBytesPerPixel.return_value = 2
+
+    sequence = useq.MDASequence(
+        channels=(useq.Channel(config="488nm", group="Lasers", exposure=10.0),)
+    )
+    engine.setup_sequence(sequence)
+
+    assert core._last_config == ("", "")
+
+
+# --- Z Stack mode -> galvo sweep offset/amplitude ---
+
+
+def _setup_spim_engine(
+    monkeypatch: pytest.MonkeyPatch, focus_um: float = 0.0
+) -> tuple[MagicMock, ASISPIMEngine]:
+    """ASISPIMEngine with PLogic side effects stubbed and a readable galvo core."""
+    monkeypatch.setattr(
+        engine_module, "configure_plogic_for_dual_nrt_pulses", MagicMock()
+    )
+    monkeypatch.setattr(engine_module, "set_plogic_evaluation_clock", MagicMock())
+    monkeypatch.setattr(engine_module, "summary_metadata", MagicMock(return_value=None))
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=1)
+    core.getExposure.return_value = 10.0
+    core.getImageWidth.return_value = 2
+    core.getImageHeight.return_value = 2
+    core.getBytesPerPixel.return_value = 2
+    core.getZPosition.return_value = focus_um
+    core.getProperty.return_value = "0.1234"
+    core.hasPropertyLimits.return_value = False
+    return core, cast("ASISPIMEngine", engine)
+
+
+def _galvo_value(core: MagicMock, prop: str) -> float:
+    values = [
+        c.args[2]
+        for c in core.setProperty.call_args_list
+        if c.args[:2] == ("Scanner:AB:33", prop)
+    ]
+    return float(values[-1])
+
+
+@pytest.mark.parametrize(
+    ("z_plan", "focus", "offset_um", "amplitude_um"),
+    [
+        (useq.ZRangeAround(range=10, step=1), 0.0, 0.0, 10.0),
+        (useq.ZAboveBelow(above=10, below=0, step=1), 0.0, 5.0, 10.0),
+        (useq.ZAboveBelow(above=0, below=10, step=1), 0.0, -5.0, 10.0),
+        (useq.ZTopBottom(top=110, bottom=100, step=1), 100.0, 5.0, 10.0),
+        (useq.ZRangeAround(range=10, step=1, go_up=False), 0.0, 0.0, -10.0),
+    ],
+)
+def test_setup_sequence_honors_z_stack_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    z_plan: useq.ZPlan,
+    focus: float,
+    offset_um: float,
+    amplitude_um: float,
+) -> None:
+    """Each Z Stack mode sets its own galvo sweep center/direction, not always 0."""
+    core, engine = _setup_spim_engine(monkeypatch, focus_um=focus)
+    engine.setup_sequence(useq.MDASequence(z_plan=z_plan))
+
+    slope = engine.hw.slice_calibration_slope_um_per_deg
+    assert _galvo_value(core, "SingleAxisYOffset(deg)") == pytest.approx(
+        offset_um / slope, abs=1e-4
+    )
+    assert _galvo_value(core, "SingleAxisYAmplitude(deg)") == pytest.approx(
+        amplitude_um / slope, abs=1e-4
+    )
+
+
+def test_teardown_restores_galvo_offset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Live/Snap after an off-center MDA must image the original plane again."""
+    core, engine = _setup_spim_engine(monkeypatch)
+    monkeypatch.setattr(engine_module.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(engine, "_reclaim_from_workers", MagicMock())
+    core.getLoadedDevices.return_value = ["Scanner:AB:33"]
+    seq = useq.MDASequence(z_plan=useq.ZAboveBelow(above=10, below=0, step=1))
+
+    engine.setup_sequence(seq)
+    engine.teardown_sequence(seq)
+
+    assert _galvo_value(core, "SingleAxisYOffset(deg)") == pytest.approx(0.1234)
+
+
+def test_setup_sequence_rejects_unreachable_top_bottom(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Top/Bottom range beyond the galvo's limits fails before any hardware call."""
+    core, engine = _setup_spim_engine(monkeypatch, focus_um=0.0)
+    core.hasPropertyLimits.return_value = True
+    core.getPropertyLowerLimit.return_value = -1.0
+    core.getPropertyUpperLimit.return_value = 1.0
+    seq = useq.MDASequence(z_plan=useq.ZTopBottom(top=500, bottom=490, step=1))
+
+    with pytest.raises(ValueError, match="outside the galvo's reach"):
+        engine.setup_sequence(seq)
+    core.setProperty.assert_not_called()
+
+
+def test_exec_event_sets_per_slice_z_pos() -> None:
+    """Every frame carries the z it imaged, not the collapsed event's slice-0 z."""
+    _core, engine, pool = _make_engine(n_cameras=1, n_slices=3)
+    engine._z_positions = (0.0, 2.0, 4.0)
+    _queue_frames(pool, [("cam0", 0), ("cam0", 1), ("cam0", 2)])
+
+    payloads = list(engine.exec_event(useq.MDAEvent(index={"t": 0}, z_pos=100.0)))
+
+    assert [sub.z_pos for _img, sub, _meta in payloads] == [100.0, 102.0, 104.0]
+
+
+# --- Shutter-gated laser (561): whole-stack-open instead of per-slice blanking ---
+#
+# The 561 line is a CW laser behind a physical mechanical shutter (Oxxius
+# L4C), which can't reliably follow PLogic's per-frame TTL blanking (laser
+# NRT cell 10, fired every slice like the camera). These tests cover holding
+# it open for a whole per-volume burst instead: see
+# ``_ASITriggerEngineBase._shutter_gated_bncs`` and its use in ``exec_event``.
+
+
+def test_shutter_gated_bncs_single_wavelength_preset() -> None:
+    """A single shutter-gated wavelength preset returns its own BNC."""
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=1)
+    core.getAvailableConfigGroups.return_value = ["Lasers"]
+    core.getCurrentConfig.return_value = "561nm"
+
+    assert engine._shutter_gated_bncs() == [40]
+
+
+def test_shutter_gated_bncs_diode_preset_returns_empty() -> None:
+    """A diode-only preset (not shutter-gated) returns no BNCs."""
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=1)
+    core.getAvailableConfigGroups.return_value = ["Lasers"]
+    core.getCurrentConfig.return_value = "488nm"
+
+    assert engine._shutter_gated_bncs() == []
+
+
+def test_shutter_gated_bncs_all_lasers_preset_returns_only_gated() -> None:
+    """The "AllLasers" preset pulls out only the shutter-gated wavelength's BNC.
+
+    Regression coverage for the "all lasers at once" case: cell 10 fires
+    per-slice for every wavelength under this preset, so the diode BNCs
+    (37/38/39) must stay off this list -- only 561's BNC (40) should be
+    re-pointed to the always-on cell, pulling it out of the simultaneous
+    per-slice triggering while the diodes keep blanking normally.
+    """
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=1)
+    core.getAvailableConfigGroups.return_value = ["Lasers"]
+    core.getCurrentConfig.return_value = "AllLasers"
+
+    assert engine._shutter_gated_bncs() == [40]
+
+
+def test_shutter_gated_bncs_flag_off_returns_empty() -> None:
+    """``laser_open_full_stack=False`` disables the feature entirely."""
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=1)
+    engine.hw.laser_open_full_stack = False
+    core.getAvailableConfigGroups.return_value = ["Lasers"]
+    core.getCurrentConfig.return_value = "561nm"
+
+    assert engine._shutter_gated_bncs() == []
+
+
+def test_shutter_gated_bncs_missing_config_group_returns_empty() -> None:
+    """No "Lasers" config group loaded (e.g. a demo config) returns no BNCs."""
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=1)
+    core.getAvailableConfigGroups.return_value = []
+
+    assert engine._shutter_gated_bncs() == []
+
+
+def test_exec_event_opens_then_closes_shutter_gated_laser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shutter-gated channel opens its laser before the burst, closes after.
+
+    The mechanical 561 shutter can't follow per-frame TTL blanking reliably,
+    so ``exec_event`` must hold it open for the whole per-volume burst
+    instead -- via the same ``set_laser_outputs`` primitive snap/live
+    already use to gate lasers -- and close it again only after the last
+    frame has been delivered.
+    """
+    calls: list[tuple[str, tuple[object, ...]]] = []
+    mock_set_laser_outputs = MagicMock(
+        side_effect=lambda *a, **kw: calls.append(("set_laser_outputs", a))
+    )
+    monkeypatch.setattr(engine_module, "set_laser_outputs", mock_set_laser_outputs)
+    monkeypatch.setattr(time, "sleep", MagicMock())
+
+    core, engine, pool = _make_engine(n_cameras=1, n_slices=2)
+    core.getAvailableConfigGroups.return_value = ["Lasers"]
+    core.getCurrentConfig.return_value = "561nm"
+    core.setProperty.side_effect = lambda *a, **kw: calls.append(("setProperty", a))
+    _queue_frames(pool, [("cam0", 0), ("cam0", 1)])
+
+    list(engine.exec_event(useq.MDAEvent(index={"t": 0})))
+
+    laser_calls = [c for c in calls if c[0] == "set_laser_outputs"]
+    assert len(laser_calls) == 2
+    assert laser_calls[0][1][2] == [40]  # bnc_addrs
+    assert laser_calls[0][1][3] is True  # on=True -- opened
+    assert laser_calls[1][1][3] is False  # on=False -- closed
+
+    open_idx = calls.index(laser_calls[0])
+    close_idx = calls.index(laser_calls[1])
+    trigger_idx = calls.index(
+        ("setProperty", (engine._master_axis_label, "SPIMState", "Running"))
+    )
+    assert open_idx < trigger_idx < close_idx
+
+
+def test_exec_event_settle_delay_honored(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The configured shutter settle delay is slept before the burst fires."""
+    monkeypatch.setattr(engine_module, "set_laser_outputs", MagicMock())
+    mock_sleep = MagicMock()
+    monkeypatch.setattr(time, "sleep", mock_sleep)
+
+    core, engine, pool = _make_engine(n_cameras=1, n_slices=1)
+    engine.hw.shutter_open_settle_ms = 25.0
+    core.getAvailableConfigGroups.return_value = ["Lasers"]
+    core.getCurrentConfig.return_value = "561nm"
+    _queue_frames(pool, [("cam0", 0)])
+
+    list(engine.exec_event(useq.MDAEvent(index={"t": 0})))
+
+    mock_sleep.assert_called_once_with(0.025)
+
+
+def test_exec_event_does_not_gate_diode_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A diode-only channel (e.g. 488) never touches ``set_laser_outputs``."""
+    mock_set_laser_outputs = MagicMock()
+    monkeypatch.setattr(engine_module, "set_laser_outputs", mock_set_laser_outputs)
+
+    core, engine, pool = _make_engine(n_cameras=1, n_slices=2)
+    core.getAvailableConfigGroups.return_value = ["Lasers"]
+    core.getCurrentConfig.return_value = "488nm"
+    _queue_frames(pool, [("cam0", 0), ("cam0", 1)])
+
+    list(engine.exec_event(useq.MDAEvent(index={"t": 0})))
+
+    mock_set_laser_outputs.assert_not_called()
+
+
+def test_exec_event_respects_flag_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``laser_open_full_stack=False`` disables the shutter bracket, even for 561."""
+    mock_set_laser_outputs = MagicMock()
+    monkeypatch.setattr(engine_module, "set_laser_outputs", mock_set_laser_outputs)
+
+    core, engine, pool = _make_engine(n_cameras=1, n_slices=2)
+    engine.hw.laser_open_full_stack = False
+    core.getAvailableConfigGroups.return_value = ["Lasers"]
+    core.getCurrentConfig.return_value = "561nm"
+    _queue_frames(pool, [("cam0", 0), ("cam0", 1)])
+
+    list(engine.exec_event(useq.MDAEvent(index={"t": 0})))
+
+    mock_set_laser_outputs.assert_not_called()
+
+
+def test_exec_event_closes_shutter_gated_laser_on_worker_death(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``WorkerDiedError`` still closes the shutter-gated laser via ``finally``.
+
+    Mirrors :func:`test_exec_event_worker_died_stops_survivor_and_reraises`:
+    the shutter must never be left open on an aborted run.
+    """
+    mock_set_laser_outputs = MagicMock()
+    monkeypatch.setattr(engine_module, "set_laser_outputs", mock_set_laser_outputs)
+    monkeypatch.setattr(time, "sleep", MagicMock())
+
+    core, engine, pool = _make_engine(n_cameras=1, n_slices=2)
+    core.getAvailableConfigGroups.return_value = ["Lasers"]
+    core.getCurrentConfig.return_value = "561nm"
+    pool.iter_frames.side_effect = WorkerDiedError("cam0", -1073740791)
+
+    with pytest.raises(WorkerDiedError):
+        list(engine.exec_event(useq.MDAEvent(index={"t": 0})))
+
+    on_values = [call.args[3] for call in mock_set_laser_outputs.call_args_list]
+    assert on_values == [True, False]
+
+
+def test_teardown_sequence_closes_all_lasers_when_flag_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``teardown_sequence``'s safety net closes any shutter-gated laser left open.
+
+    Strictly redundant with ``exec_event``'s own per-burst ``finally`` close,
+    but guards against a run aborting between volumes rather than mid-burst.
+    """
+    monkeypatch.setattr(engine_module, "set_plogic_evaluation_clock", MagicMock())
+    monkeypatch.setattr(time, "sleep", MagicMock())
+    mock_close_all_lasers = MagicMock()
+    monkeypatch.setattr(engine_module, "close_all_lasers", mock_close_all_lasers)
+
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=1)
+
+    engine.teardown_sequence(useq.MDASequence())
+
+    mock_close_all_lasers.assert_called_once()
+
+
+def test_teardown_sequence_skips_close_all_lasers_when_flag_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The teardown safety net is itself gated by ``laser_open_full_stack``."""
+    monkeypatch.setattr(engine_module, "set_plogic_evaluation_clock", MagicMock())
+    monkeypatch.setattr(time, "sleep", MagicMock())
+    mock_close_all_lasers = MagicMock()
+    monkeypatch.setattr(engine_module, "close_all_lasers", mock_close_all_lasers)
+
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=1)
+    engine.hw.laser_open_full_stack = False
+
+    engine.teardown_sequence(useq.MDASequence())
+
+    mock_close_all_lasers.assert_not_called()

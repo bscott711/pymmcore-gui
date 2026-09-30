@@ -22,9 +22,28 @@ from typing import Any
 
 @dataclass(frozen=True)
 class ArmCmd:
-    """Arm the camera for a hardware-triggered sequence of *n_images* frames."""
+    """Arm the camera for a sequence of *n_images* frames.
+
+    ``external_trigger`` selects the camera's trigger mode for this arm:
+    ``True`` (MDA) waits for PLogic's hardware trigger; ``False`` (Snap)
+    free-runs on the camera's internal trigger -- nothing else would ever
+    trigger it outside an MDA.
+    """
 
     n_images: int
+    external_trigger: bool = True
+
+
+@dataclass(frozen=True)
+class ArmLiveCmd:
+    """Arm the camera for unbounded, free-running acquisition (internal trigger).
+
+    Unlike :class:`ArmCmd`, there is no target frame count and no
+    ``stopOnOverflow`` race to dodge (no hardware trigger to race against) --
+    the worker streams frames via ``startContinuousSequenceAcquisition``
+    until a :class:`StopCmd`/:class:`ShutdownCmd` arrives. See
+    :func:`~pymmcore_gui.asi_z_stack.camera_worker._drain_live`.
+    """
 
 
 @dataclass(frozen=True)
@@ -36,12 +55,51 @@ class SlotFreeCmd:
 
 @dataclass(frozen=True)
 class StopCmd:
-    """Stop the current sequence acquisition, if any, and return to idle."""
+    """Stop the current sequence acquisition, if any, and return to idle.
+
+    A nonzero ``token`` asks for a :class:`StoppedMsg` carrying the same token
+    even if the worker was already idle, so the main process can drain the
+    pipe up to that exact reply (see ``CameraWorkerPool.stop_and_drain``).
+    ``0`` keeps the fire-and-forget behavior: no reply when idle.
+    """
+
+    token: int = 0
 
 
 @dataclass(frozen=True)
 class ShutdownCmd:
     """Stop if running, unload the camera device, and exit the worker process."""
+
+
+@dataclass(frozen=True)
+class SetROICmd:
+    """Set this camera's hardware ROI. Only valid while the worker is idle."""
+
+    camera_label: str
+    x: int
+    y: int
+    w: int
+    h: int
+
+
+@dataclass(frozen=True)
+class GetROICmd:
+    """Read this camera's current hardware ROI. Only valid while idle."""
+
+    camera_label: str
+
+
+@dataclass(frozen=True)
+class SetPropertiesCmd:
+    """Set camera properties, in order. Only valid while the worker is idle.
+
+    Used to apply config-group presets that touch a worker-owned camera
+    (e.g. a ``Port`` preset), since the main process no longer has the
+    camera loaded to call ``setConfig`` against.
+    """
+
+    camera_label: str
+    values: tuple[tuple[str, str], ...]
 
 
 # ---------------------------------------------------------------------------
@@ -78,10 +136,15 @@ class FrameMsg:
 
 @dataclass(frozen=True)
 class StoppedMsg:
-    """The worker reached *images_collected* frames or acknowledged a StopCmd."""
+    """The worker reached *images_collected* frames or acknowledged a StopCmd.
+
+    ``token`` echoes the acknowledged :class:`StopCmd`'s token; ``0`` for a
+    natural end of sequence.
+    """
 
     camera_label: str
     images_collected: int
+    token: int = 0
 
 
 @dataclass(frozen=True)
@@ -103,5 +166,47 @@ class ErrorMsg:
     traceback_text: str
 
 
-WorkerToMainMsg = ReadyMsg | ArmedMsg | FrameMsg | StoppedMsg | StalledMsg | ErrorMsg
-MainToWorkerMsg = ArmCmd | SlotFreeCmd | StopCmd | ShutdownCmd
+@dataclass(frozen=True)
+class RoiMsg:
+    """Reply to :class:`SetROICmd`/:class:`GetROICmd`: the ROI now in effect.
+
+    ``error`` is set (and ``x``/``y``/``w``/``h`` are meaningless zeros) if
+    the underlying ``setROI``/``getROI`` call raised.
+    """
+
+    camera_label: str
+    x: int
+    y: int
+    w: int
+    h: int
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class PropertiesSetMsg:
+    """Reply to :class:`SetPropertiesCmd`; ``error`` is set if any set failed."""
+
+    camera_label: str
+    error: str | None = None
+
+
+WorkerToMainMsg = (
+    ReadyMsg
+    | ArmedMsg
+    | FrameMsg
+    | StoppedMsg
+    | StalledMsg
+    | ErrorMsg
+    | RoiMsg
+    | PropertiesSetMsg
+)
+MainToWorkerMsg = (
+    ArmCmd
+    | ArmLiveCmd
+    | SlotFreeCmd
+    | StopCmd
+    | ShutdownCmd
+    | SetROICmd
+    | GetROICmd
+    | SetPropertiesCmd
+)

@@ -43,6 +43,8 @@ class WidgetAction(ActionKey):
     CONFIG_WIZARD = "pymmcore_gui.hardware_config_wizard"
     CRISP = "pymmcore_gui.crisp_widget"
     SPECTRAL_CHANNELS = "pymmcore_gui.spectral_channel_config"
+    CAMERA_ALIGNMENT = "pymmcore_gui.camera_alignment_widget"
+    ARGUS_QC = "pymmcore_gui.argus_qc_widget"
 
 
 # ######################## Functions that create widgets #########################
@@ -98,15 +100,49 @@ def create_mda_widget(parent: QWidget) -> pmmw.MDAWidget:
     return GuiMDAWidget(parent=parent, mmcore=_get_core(parent))
 
 
-def create_camera_roi(parent: QWidget) -> pmmw.CameraRoiWidget:
-    """Create the Camera ROI widget."""
+def create_camera_roi(parent: QWidget) -> QWidget:
+    """Create the Camera ROI widget.
+
+    Camera-1/Camera-2 are never loaded on the main-process core once a
+    persistent :class:`~pymmcore_gui.asi_z_stack.camera_worker_service.
+    CameraWorkerService` is active, so the stock ``pymmcore_widgets.
+    CameraRoiWidget`` (which calls ``mmcore.setROI``/``getROI`` directly)
+    would go permanently inert for them. Swap in a small worker-aware
+    replacement in that case; fall back to the stock widget otherwise
+    (demo/single-camera/non-ASI configs -- unaffected, unchanged).
+    """
+    from pymmcore_gui.asi_z_stack.camera_worker_service import CameraWorkerService
+
+    if (svc := CameraWorkerService.get_active()) is not None:
+        from pymmcore_gui.widgets._worker_camera_roi_widget import (
+            WorkerCameraRoiWidget,
+        )
+
+        return WorkerCameraRoiWidget(parent=parent, service=svc)
+
     from pymmcore_widgets import CameraRoiWidget
 
     return CameraRoiWidget(parent=parent, mmcore=_get_core(parent))
 
 
 def create_config_groups(parent: QWidget) -> pmmw.GroupPresetTableWidget:
-    """Create the Config Groups widget."""
+    """Create the Config Groups widget.
+
+    Worker-aware when a persistent camera worker service is active, so config
+    groups touching Camera-1/Camera-2 stay usable (see
+    ``WorkerGroupPresetTableWidget``), mirroring :func:`create_camera_roi`.
+    """
+    from pymmcore_gui.asi_z_stack.camera_worker_service import CameraWorkerService
+
+    if (svc := CameraWorkerService.get_active()) is not None:
+        from pymmcore_gui.widgets._worker_group_preset_table import (
+            WorkerGroupPresetTableWidget,
+        )
+
+        return WorkerGroupPresetTableWidget(
+            svc, parent=parent, mmcore=_get_core(parent)
+        )
+
     from pymmcore_widgets import GroupPresetTableWidget
 
     return GroupPresetTableWidget(parent=parent, mmcore=_get_core(parent))
@@ -159,6 +195,25 @@ def create_spectral_channel_config(parent: QWidget) -> QWidget:
     )
 
     return SpectralChannelConfigWidget(parent=parent, mmcore=_get_core(parent))
+
+
+def create_camera_alignment_widget(parent: QWidget) -> QWidget:
+    """Create the dual-camera overlay/alignment widget."""
+    from pymmcore_gui.widgets.camera_alignment import CameraAlignmentWidget
+
+    return CameraAlignmentWidget(parent=parent, mmcore=_get_core(parent))
+
+
+def create_argus_qc_widget(parent: QWidget) -> QWidget:
+    """Create the Argus live-QC panel, fed by the main window's stream relay."""
+    from pymmcore_gui.widgets._argus_qc import ArgusQCWidget
+
+    widget = ArgusQCWidget(parent=parent)
+    if win := _get_mm_main_window(parent):
+        for rec in win.argus_qc_history:
+            widget.update_qc(rec)
+        win.argus_qc_received.connect(widget.update_qc)
+    return widget
 
 
 # ######################## WidgetAction Enum #########################
@@ -289,4 +344,20 @@ show_spectral_channels = WidgetActionInfo(
     icon="mdi:grid-large",
     create_widget=create_spectral_channel_config,
     dock_area=DockWidgetArea.LeftDockWidgetArea,
+)
+
+show_argus_qc = WidgetActionInfo(
+    key=WidgetAction.ARGUS_QC,
+    text="Argus QC",
+    icon="mdi:clipboard-check-outline",
+    create_widget=create_argus_qc_widget,
+    dock_area=DockWidgetArea.RightDockWidgetArea,
+)
+
+show_camera_alignment = WidgetActionInfo(
+    key=WidgetAction.CAMERA_ALIGNMENT,
+    text="Camera Alignment",
+    icon="mdi:crosshairs",
+    create_widget=create_camera_alignment_widget,
+    dock_area=DockWidgetArea.RightDockWidgetArea,
 )

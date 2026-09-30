@@ -29,7 +29,6 @@ class HardwareConstants:
     plogic_always_on_cell: int = 12
     plogic_bnc3_addr: int = 35
     pulses_per_ms: float = 4.0
-    plogic_laser_preset_num: int = 30
 
     # Per-laser PLogic BNC outputs used for software snap/live gating.
     # Front-panel BNC n maps to PLogic address 32 + n (so BNC3 = 35, as used by
@@ -46,6 +45,19 @@ class HardwareConstants:
             "561nm": 40,
         }
     )
+
+    # Hold shutter-gated lasers open for the whole per-volume burst instead of
+    # blanking them per slice. A mechanical shutter (e.g. the 561 line, an
+    # Oxxius L4C CW laser behind a physical shutter) cannot follow per-frame
+    # TTL toggling reliably -- opening once per stack actuates it twice total
+    # instead of once per slice. Diode lasers not listed here keep per-frame
+    # blanking (less photobleaching).
+    laser_open_full_stack: bool = True
+    shutter_gated_wavelengths: tuple[str, ...] = ("561nm",)
+    # Delay after opening a shutter-gated laser before the burst starts, so
+    # the mechanical shutter is fully open before the first exposure. Tune on
+    # the bench/oscilloscope for the actual shutter in use.
+    shutter_open_settle_ms: float = 10.0
 
     # Extended parameters for SPIM Z-stack calculations
     slice_calibration_slope_um_per_deg: float = 100.0
@@ -74,8 +86,8 @@ class HardwareConstants:
     # small for a full hardware-triggered z-stack on this rig's Kinetix/PVCAM
     # cameras (~11 MB/frame at 2400x2400x16-bit) -- e.g. 4 cameras at 201
     # slices needs over 13 GB with headroom. Provisioned once at session
-    # startup (see ensure_circular_buffer_capacity in asi_controller.py) so
-    # it's never resized mid-acquisition -- resizing right after arming
+    # startup (see ensure_circular_buffer_capacity_async in asi_controller.py)
+    # so it's never resized mid-acquisition -- resizing right after arming
     # cameras for external triggering crashed PVCAM's driver (see
     # engine.py's _warn_if_circular_buffer_too_small).
     circular_buffer_target_mb: int = 30_000
