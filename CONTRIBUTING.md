@@ -18,7 +18,7 @@ To get started, make sure you have
 [uv installed](https://docs.astral.sh/uv/getting-started/installation/), then run
 
 ```sh
-git clone https://github.com/pymmcore-plus/pymmcore-gui.git
+git clone https://github.com/bscott711/pymmcore-gui.git
 cd pymmcore-gui
 uv sync
 ```
@@ -105,13 +105,27 @@ uv run pytest
 (*or... just `pytest` if you've [activated your virtual
 environment](#activating-the-virtual-environment-optional)*)
 
+## Branches and pull requests
+
+On this fork ([`bscott711/pymmcore-gui`](https://github.com/bscott711/pymmcore-gui)),
+`main` is the base branch: branch from `main` and open pull requests against
+`main` of the fork, never against upstream `pymmcore-plus/pymmcore-gui`. Releases
+are git tags (versions come from the tags via `hatch-vcs`; see
+[CHANGELOG.md](./CHANGELOG.md)).
+
+`feat/mda-ux-perf-fixes` was the fork's working branch until it was landed on
+`main` (#19). It is frozen: it stays in place, but nothing more is committed to it.
+
 ## Deploying to the acquisition PC
 
 The acquisition PC runs from a `git clone` (not a PyInstaller bundle), launched
 by `launch_gui.ps1` from a desktop shortcut. That script pulls before every
-launch (`git pull --ff-only`, logged to `update.log` next to it), so pushing a
-change to whatever branch is checked out there is enough -- no one needs to be
-at that machine's console to deploy. It never blocks launching on a failed
+launch (`git pull --ff-only`, logged to `update.log` next to it), so merging a
+change into the branch checked out there is enough -- no one needs to be
+at that machine's console to deploy. That checkout should track `main`: the
+launcher pulls whichever branch it is on and has no branch of its own, so a
+checkout still on the frozen `feat/mda-ux-perf-fixes` silently stops receiving
+updates (switch it with `git switch main`). It never blocks launching on a failed
 pull (no network, a dirty tree, a diverged branch): it just logs why and
 launches with whatever is already checked out.
 
@@ -129,13 +143,14 @@ git remote set-url origin https://github.com/bscott711/pymmcore-gui.git
 git remote set-url origin Argus:/home/SDSMT.LOCAL/bscott/projects/pymmcore-gui
 ```
 
-and make sure the checked-out branch has an upstream to pull from
-(`git branch --set-upstream-to=origin/<branch>`).
+and make sure the checked-out branch (`main`) has an upstream to pull from
+(`git branch --set-upstream-to=origin/main`).
 
 ## Streaming to Argus over the direct 10 GbE link
 
-By default each acquisition streams to Argus through the SSH tunnel, which
-tops out around 33 MB/s. Once Argus's firewall admits this PC on TCP 5556,
+By default each acquisition streams to Argus through SSH tunnels: one SSH
+connection tops out around 33-63 MB/s, so a run uses `stream_links` of them in
+parallel (4 by default). Once Argus's firewall admits this PC on TCP 5556,
 point the stream straight at Argus in `pmm_settings.json` (in the app's
 user-data directory):
 
@@ -205,7 +220,7 @@ from the following sources, in order of decreasing precedence:
 
 1. Values passed directly to the `Settings()` constructor (highest precedence)
 2. Environment variables starting with `PMM_`
-3. User settings stored in a `USER_DATA_DIR/settings.json` file. (lowest
+3. User settings stored in a `USER_DATA_DIR/pmm_settings.json` file. (lowest
    precedence). `USER_DATA_DIR` is determined in a platform-specific way using
    [`platformdirs.user_data_dir`](https://platformdirs.readthedocs.io/en/latest/api.html#user-data-directory)
    with the appname `pymmcore-gui`.

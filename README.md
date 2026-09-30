@@ -13,6 +13,67 @@ Python tools for device control, image acquisition, and visualization.
 | [🔗 Skip to Installation ...](#-installation)|
 | :--- |
 
+<!-- BEGIN fork-specific section: outside these markers is upstream's README -->
+## 🔀 About this fork
+
+This repository is
+[`bscott711/pymmcore-gui`](https://github.com/bscott711/pymmcore-gui), a fork of
+upstream [`pymmcore-plus/pymmcore-gui`](https://github.com/pymmcore-plus/pymmcore-gui)
+used to run a dual-camera ASI SPIM/OPM rig. It is **not published to PyPI**:
+versions are git tags (see [CHANGELOG.md](./CHANGELOG.md)), and the install
+commands and download links further down this README are upstream's and install
+upstream's build. To run this fork, clone it and follow
+[CONTRIBUTING.md](./CONTRIBUTING.md) (`uv sync`, then `uv run mmgui`).
+
+What the fork adds on top of upstream:
+
+- **Argus streaming**: each acquired MDA volume is also streamed to a receiver
+  on the Argus GPU server for real-time deskew/deconvolution (parallel SSH
+  links, compressed, resumable after drops; optional direct 10 GbE link). It
+  never delays acquisition or the local save.
+- **Replay**: stream a saved run through the real sender to a test receiver,
+  with no microscope.
+- **Live QC**: the receiver's per-timepoint verdicts, in the status bar and in
+  **Plugins > Argus QC**.
+- **Deploy launcher**: `launch_gui.ps1` runs `git pull --ff-only` before each
+  launch of the acquisition PC's GUI.
+- **Multi-ROI / spectral-splitter save** (one file per image-splitter
+  sub-region) and **live laser control** for the ASI SPIM rig.
+
+Streaming is off by default. To turn it on, add this to `pmm_settings.json` in
+the app's user-data directory (see
+[Settings and Configuration](./CONTRIBUTING.md#settings-and-configuration)).
+You need an SSH `Host` alias in your `~/.ssh/config` that logs in without a
+password, and the receiver running on the server:
+
+```json
+{
+  "argus_stream": {
+    "enabled": true,
+    "ssh_host": "<Host alias>",
+    "gpfs_scratch_root": "<root the receiver writes raw data under>"
+  }
+}
+```
+
+Only single-position sequences are streamed; a multi-camera acquisition is
+streamed only with spectral cropping enabled (`"spectral": {"enabled": true}`).
+Anything skipped is still saved locally. Every option is documented on
+`ArgusStreamSettingsV1` in `src/pymmcore_gui/_settings.py`. Tools:
+
+```sh
+# replay a saved run through the real sender
+uv run python -m pymmcore_gui._argus_stream.replay <channel .ome.zarr>
+# measure SSH link throughput to the server
+uv run python -m pymmcore_gui._argus_stream.linkbench
+```
+
+Docs for the fork: [CHANGELOG.md](./CHANGELOG.md), the "Deploying to the
+acquisition PC" and "Streaming to Argus over the direct 10 GbE link" sections
+of [CONTRIBUTING.md](./CONTRIBUTING.md), and the module docstrings in
+`src/pymmcore_gui/_argus_stream/` (the wire protocol is in `_protocol.py`).
+<!-- END fork-specific section -->
+
 ## ✅ Project Status
 
 `pymmcore-gui` has evolved from an experimental prototype into a working
