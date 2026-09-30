@@ -532,6 +532,10 @@ class _FakeReceiver:
         self.features: list[str] | None = None
         # Answer SESSION_END with the final ACK ({"ended": true}).
         self.confirm_end = True
+        # When set, every SESSION_START is turned down with this reason (like
+        # the real receiver when its RAM disk is short) and nothing else is
+        # answered.
+        self.reject_starts: str | None = None
         self._stop = threading.Event()
         self._identity: bytes | None = None
         self._session_id: str | None = None
@@ -551,6 +555,18 @@ class _FakeReceiver:
             self._session_id = session_id
             self.identities.append(identity)
             self.messages.append((msg_type, session_id, header, payload))
+            if self.reject_starts is not None:
+                if msg_type == MSG_SESSION_START:
+                    self.send(
+                        MSG_ACK,
+                        {
+                            "through_frame_index": -1,
+                            "unknown_session": True,
+                            "rejected": self.reject_starts,
+                            "features": self.features or [],
+                        },
+                    )
+                continue
             if not self.auto_ack:
                 continue
             if msg_type == MSG_SESSION_END and self.confirm_end:
@@ -1654,4 +1670,66 @@ def test_a_plain_ack_after_session_end_is_not_its_confirmation(
     fake_receiver.send(MSG_ACK, {"through_frame_index": -1, "unknown_session": True})
     session._all_workers[0].join(timeout=3)
     assert not session._all_workers[0].is_alive()
+    session.shutdown(timeout=1)
+
+
+def test_a_rejected_session_start_is_retried_until_argus_takes_it(
+    fake_receiver: _FakeReceiver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Argus turned SESSION_START down (RAM disk short, 2026-09-28) and
+    answered nothing else: the run keeps asking, and streams once it can."""
+    monkeypatch.setattr(session_mod, "_RECOVERY_RETRY_S", 0.2)
+    monkeypatch.setattr(session_mod, "_RECOVERY_RETRY_MAX_S", 0.4)
+    fake_receiver.features = ["resume"]
+    fake_receiver.reject_starts = "RAM disk short"
+    session = _links_session(fake_receiver.port, links=1)
+    states: list[tuple[StreamState, str]] = []
+    session._on_state_changed = lambda s, d: states.append((s, d))
+    seq = _timelapse(2)
+    session.sequenceStarted(seq, {})  # pyright: ignore[reportArgumentType]
+    _feed_frames(session, seq)
+
+    def starts() -> int:
+        return sum(m[0] == MSG_SESSION_START for m in fake_receiver.messages)
+
+    assert _wait(lambda: starts() >= 4)
+    assert (
+        StreamState.RECONNECTING,
+        "Argus rejected: RAM disk short; retrying",
+    ) in states
+
+    fake_receiver.reject_starts = None  # space is back
+    _wait_for_session_end(fake_receiver)
+    acked = {h["frame_index"] for h, _p in fake_receiver.frame_messages()}
+    assert acked == {0, 1}
+    worker = session._all_workers[0]
+    worker.join(timeout=3)
+    assert not worker.is_alive()
+    assert not worker.paused.is_set()
+    session.shutdown(timeout=1)
+
+
+def test_a_finished_run_argus_never_answers_gives_up(
+    fake_receiver: _FakeReceiver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A finished run must not hold its volumes in RAM until app exit."""
+    monkeypatch.setattr(session_mod, "_FINISH_GIVE_UP_S", 0.5)
+    monkeypatch.setattr(session_mod, "_END_RETRY_S", 0.1)
+    fake_receiver.auto_ack = False
+    session = _links_session(fake_receiver.port, links=1)
+    states: list[StreamState] = []
+    session._on_state_changed = lambda s, _d: states.append(s)
+    seq = _timelapse(2)
+    session.sequenceStarted(seq, {})  # pyright: ignore[reportArgumentType]
+    _feed_frames(session, seq)
+
+    def ended() -> list[dict]:
+        return [h for t, _s, h, _p in fake_receiver.messages if t == MSG_SESSION_END]
+
+    assert _wait(lambda: bool(ended()))
+    assert ended()[0]["reason"] == "paused"
+    assert StreamState.PAUSED in states
+    worker = session._all_workers[0]
+    worker.join(timeout=3)
+    assert not worker.is_alive()
     session.shutdown(timeout=1)

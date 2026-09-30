@@ -145,6 +145,16 @@ _RECONNECT_IVL_MAX_MS = 5000
 _RATE_LOG_S = 30.0
 _END_RETRY_S = 2.0
 _END_TRIES = 5
+# A resync SESSION_START or RESUME that nothing answers is sent again, backing
+# off to the max. Argus rejects a SESSION_START without answering when its
+# RAM disk is short, and the previous run's drain can free that space
+# minutes later (2026-09-28: rejected at 12:03, space back at 12:09, and the
+# run never asked again).
+_RECOVERY_RETRY_S = 5.0
+_RECOVERY_RETRY_MAX_S = 30.0
+# A finished run whose volumes Argus hasn't ACKed for this long gives up
+# (PAUSED, send by Globus) instead of holding them in RAM until app exit.
+_FINISH_GIVE_UP_S = 600.0
 # If the RAM can't be read; the setting's 0 otherwise means a quarter of it.
 _FALLBACK_HARD_CAP_BYTES = 8 * 1024**3
 _DTYPE_BY_BYTES_PER_PIXEL = {1: "uint8", 2: "uint16", 4: "uint32"}
@@ -527,13 +537,16 @@ class _RunWorker(threading.Thread):
     resent on the others at once. The stale-ACK RESUME is only a backstop.
 
     Resume: if Argus answers ``unknown_session`` (the receiver restarted,
-    or timed the session out), SESSION_START is sent again with
-    ``resume_through`` and then everything unACKed.
+    or timed the session out, or turned SESSION_START down), SESSION_START
+    is sent again with ``resume_through`` and then everything unACKed. It
+    is retried with backoff until Argus accepts it.
 
     Pause: if what every run holds unsent passes the hard cap, this run
     stops streaming for good. Its buffer is dropped, SESSION_END "paused"
     tells Argus not to keep its partial copy, and the run goes to Argus by
     Globus instead. Acquisition and local saving never wait on any of this.
+    A finished run that Argus stops ACKing for ``_FINISH_GIVE_UP_S`` pauses
+    the same way.
     """
 
     def __init__(
@@ -679,6 +692,16 @@ class _RunWorker(threading.Thread):
         # awaiting its ACK; that ACK makes everything unACKed go again.
         resume_sent = False
         resync_sent = False
+        # When that RESUME or resync went, and how long until it goes again
+        # if nothing answers (see _RECOVERY_RETRY_S).
+        recovery_sent_at = 0.0
+        recovery_retry_s = _RECOVERY_RETRY_S
+        # Why Argus last turned SESSION_START down, until it takes one.
+        rejected = ""
+        # Last ACK that moved this run forward, and when finish() was seen:
+        # a finished run gives up _FINISH_GIVE_UP_S after the later of them.
+        last_progress = time.monotonic()
+        finished_at: float | None = None
         # Argus clock minus ours, from the SESSION_START -> first ACK round
         # trip; sent with every FRAME once known (see _protocol.py).
         clock_offset: float | None = None
@@ -752,28 +775,43 @@ class _RunWorker(threading.Thread):
                 sent_any = True
             return sent_any
 
+        def send_resync() -> None:
+            """SESSION_START again, from where Argus last ACKed."""
+            nonlocal resync_sent, recovery_sent_at
+            start = dict(self._header)
+            if acked_through >= 0:
+                start["resume_through"] = acked_through
+            if send(pack_message(MSG_SESSION_START, sid, start)):  # type: ignore[arg-type]
+                resync_sent = True
+                recovery_sent_at = time.monotonic()
+                self.stats["resyncs"] += 1
+                logger.warning(
+                    "Argus no longer knows this run's session%s; "
+                    "resuming it after frame %d",
+                    f" (rejected: {rejected})" if rejected else "",
+                    acked_through,
+                )
+
         def on_ack(ack: dict[str, object]) -> None:
             nonlocal acked_through, unacked_bytes, last_ack_time, clock_offset
-            nonlocal resume_sent, resync_sent
+            nonlocal resume_sent, resync_sent, rejected, recovery_retry_s
+            nonlocal last_progress
             features.update(cast("list[str]", ack.get("features") or ()))
             if "slabs" in features:
                 self.slabs_enabled.set()
             if ack.get("unknown_session"):
-                # Argus lost this session (restart, or idle timeout): start
-                # it again where it stood, then resend what's unACKed.
+                # Argus lost this session (restart, or idle timeout) or
+                # turned it down: start it again where it stood, then resend
+                # what's unACKed. A resync already out is retried on a timer.
+                if ack.get("rejected"):
+                    rejected = str(ack["rejected"])
+                resume_sent = False
                 if "resume" in features and not resync_sent:
-                    start = dict(self._header)
-                    if acked_through >= 0:
-                        start["resume_through"] = acked_through
-                    if send(pack_message(MSG_SESSION_START, sid, start)):  # type: ignore[arg-type]
-                        resync_sent = True
-                        self.stats["resyncs"] += 1
-                        logger.warning(
-                            "Argus no longer knows this run's session; "
-                            "resuming it after frame %d",
-                            acked_through,
-                        )
+                    send_resync()
                 return
+            rejected = ""
+            recovery_retry_s = _RECOVERY_RETRY_S
+            last_progress = time.monotonic()
             server_time = ack.get("server_time_s")
             if clock_offset is None and server_time is not None:
                 now = time.time()
@@ -810,7 +848,7 @@ class _RunWorker(threading.Thread):
                 )
                 logger.info("Argus stream: %d links over the %s", n_links, route)
 
-        def pause(total: int) -> None:
+        def pause(total: int, why: str) -> None:
             nonlocal unacked_bytes
             self.paused.set()
             self._finish_reason = "paused"
@@ -827,10 +865,17 @@ class _RunWorker(threading.Thread):
                     break
             logger.error(
                 "Argus stream PAUSED for this run: %d MiB could not be sent "
-                "(cap %d MiB). Acquisition and the local save continue; send "
-                "this run to Argus by Globus.",
+                "(%s). Acquisition and the local save continue; send this "
+                "run to Argus by Globus.",
                 total // 2**20,
-                (self._budget.cap_bytes if self._budget else 0) // 2**20,
+                why,
+            )
+            if self._budget is not None:
+                self._budget.update(self, 0)
+            self._emit(
+                StreamState.PAUSED,
+                "Argus stopped answering; local save is complete, "
+                "send this run by Globus",
             )
 
         try:
@@ -949,6 +994,33 @@ class _RunWorker(threading.Thread):
                 if stale and unacked and not (resume_sent or resync_sent):
                     resume_sent = send(pack_message(MSG_RESUME, sid, {})) is not None
                     self.stats["resumes"] += resume_sent
+                    recovery_sent_at = time.monotonic()
+
+                # Nothing answered the RESUME or resync: send it again.
+                now = time.monotonic()
+                if (resume_sent or resync_sent) and (
+                    now - recovery_sent_at >= recovery_retry_s
+                ):
+                    recovery_retry_s = min(2 * recovery_retry_s, _RECOVERY_RETRY_MAX_S)
+                    if resync_sent:
+                        resync_sent = False
+                        send_resync()
+                    else:
+                        resume_sent = False  # staleness sends the next one
+
+                if self._finish_event.is_set() and finished_at is None:
+                    finished_at = now
+                if (
+                    finished_at is not None
+                    and unacked
+                    and not self.paused.is_set()
+                    and now - max(finished_at, last_progress) > _FINISH_GIVE_UP_S
+                ):
+                    pause(
+                        unacked_bytes,
+                        f"no ACK for {_FINISH_GIVE_UP_S:.0f} s after the run ended",
+                    )
+                    continue
 
                 total = unacked_bytes
                 if self._budget is not None:
@@ -957,13 +1029,7 @@ class _RunWorker(threading.Thread):
                         not self._finish_event.is_set()
                         and total > self._budget.cap_bytes
                     ):
-                        pause(total)
-                        self._budget.update(self, 0)
-                        self._emit(
-                            StreamState.PAUSED,
-                            "link down too long; local save is complete, "
-                            "send this run by Globus",
-                        )
+                        pause(total, f"cap {self._budget.cap_bytes // 2**20} MiB")
                         continue
 
                 label = route if n_links == 1 else f"{route} x{len(up)}/{n_links}"
@@ -974,7 +1040,12 @@ class _RunWorker(threading.Thread):
                         StreamState.BACKLOG_ALARM,
                         f"{unacked_bytes // (1024 * 1024)} MiB unacked",
                     )
-                elif (stale or not up) and unacked:
+                elif rejected and unacked:
+                    self._emit(
+                        StreamState.RECONNECTING,
+                        f"Argus rejected: {rejected}; retrying",
+                    )
+                elif (stale or not up or resync_sent) and unacked:
                     self._emit(StreamState.RECONNECTING, label)
                 elif self._finish_event.is_set():
                     self._emit(StreamState.FINISHING, f"{len(unacked)} volumes unacked")

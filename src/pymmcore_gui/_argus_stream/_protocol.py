@@ -185,6 +185,10 @@ class _AckOptional(TypedDict, total=False):
     # Argus dropped frames it couldn't stage (its RAM disk was below its
     # floor) and has room again: resend everything unACKed now.
     resend: bool
+    # Sent with unknown_session when Argus turned the SESSION_START down
+    # (e.g. its RAM disk is short): why, for the status label. The client
+    # keeps retrying with backoff; space may come back once a drain ends.
+    rejected: str
 
 
 class AckHeader(_AckOptional):
