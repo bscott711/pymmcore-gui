@@ -108,3 +108,9 @@ class HardwareConstants:
     worker_shutdown_timeout_s: float = 10.0
     worker_circular_buffer_mb: int = 4096
     frame_ring_slots_per_camera: int = 8
+    # Caps how many Live frames per second a worker ships to the GUI
+    # preview (see camera_worker.py's _drain_live). The camera itself still
+    # free-runs at full rate -- this only throttles what gets copied out of
+    # the circular buffer and sent over the pipe, so a slow-to-render main
+    # process can't force a FIFO backlog of stale frames. 0 means uncapped.
+    live_max_fps: float = 30.0

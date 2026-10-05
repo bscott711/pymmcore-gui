@@ -385,6 +385,7 @@ class CameraWorkerService(QObject):
                 property_snapshot=cam.property_values if cam else {},
                 roi=cam.roi if cam else None,
                 circular_buffer_mb=self.hw.worker_circular_buffer_mb,
+                live_max_fps=self.hw.live_max_fps,
             ),
             height=snapshot.image_height,
             width=snapshot.image_width,
