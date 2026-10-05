@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from multiprocessing.shared_memory import SharedMemory
 from typing import TYPE_CHECKING
 
+import numpy as np
 from pymmcore_plus import CMMCorePlus
 
 from .asi_controller import (
@@ -68,6 +69,20 @@ _SLOT_WAIT_WARNING_S = 30.0
 # stopOnOverflow).
 _ARM_COUNT_PADDING = 50
 
+# Bounds how many Live FrameMsgs may be outstanding (sent but not yet
+# acknowledged via SlotFreeCmd) at once. The point is to bound pipe-side
+# staleness even if the *main* process stalls (a slow Qt paint event, GIL
+# contention, a modal dialog) -- with a round-trip ack per frame, a stalled
+# main process otherwise lets frames queue up on the worker side exactly
+# like the FIFO circular-buffer backlog _drain_live is meant to avoid.
+# Always kept <= config.n_slots (see _drain_live), so free_slots can never
+# run dry here the way it sometimes does in _drain_sequence.
+_LIVE_MAX_IN_FLIGHT = 2
+
+# How often (seconds of worker wall-clock time) _drain_live logs a one-line
+# sent/skipped throughput summary while Live is running.
+_LIVE_STATUS_REPORT_INTERVAL_S = 10.0
+
 
 @dataclass(frozen=True)
 class CameraWorkerConfig:
@@ -81,6 +96,10 @@ class CameraWorkerConfig:
     shm_name: str = ""
     slot_nbytes: int = 0
     n_slots: int = 8
+    live_max_fps: float = 30.0
+    """Rate cap for :func:`_drain_live` (see
+    :attr:`~pymmcore_gui.asi_z_stack.common.HardwareConstants.live_max_fps`).
+    ``0`` means uncapped."""
     stderr_log_file: str = ""
     """Sibling file this worker's stderr/stdout is redirected to (see
     :func:`~pymmcore_gui.asi_z_stack.worker_pool._worker_stderr_file`).
@@ -396,14 +415,41 @@ def _drain_live(
     shm: SharedMemory,
     config: CameraWorkerConfig,
 ) -> bool:
-    """Pop frames off the camera's circular buffer indefinitely until a stop.
+    """Ship the newest camera frame to the main process, dropping the rest.
 
     Free-running counterpart to :func:`_drain_sequence` for Live streaming:
     no target frame count, no ``_ARM_COUNT_PADDING`` over-arm/software-stop
     dance (there's no hardware trigger jitter to race here -- the camera is
-    simply told to run and told to stop). Kept as a separate function rather
-    than threading an optional ``n_images`` through ``_drain_sequence`` so
-    that function's hard-won, bench-tested bounded-arm logic stays untouched.
+    simply told to run and told to stop).
+
+    Unlike ``_drain_sequence``, this does **not** drain the circular buffer
+    oldest-frame-first with ``popNextImageAndMD``. On this rig's real frame
+    rate (~100 fps at ~11 MB/frame on a Kinetix/PVCAM camera) that FIFO drain
+    could not keep up, so the 4096 MB buffer backed up and the Live preview
+    lagged reality by up to ~4 s (observed on the rig 2026-10-05; matches the
+    buffer's ~370-frame capacity at that rate). A live preview only ever
+    wants to *see* the most recent frame, not work through a backlog -- so
+    this instead grabs the newest frame with ``getLastImageAndMD`` and throws
+    away everything else in the buffer with ``clearCircularBuffer``,
+    mirroring the non-worker preview's own newest-frame logic (see
+    ``_pop_latest_frame_group`` in ``widgets/image_preview/_preview_base.py``).
+
+    Two independent caps bound how fast frames are actually shipped, no
+    matter how fast the camera itself is running:
+
+    - **Rate cap** (``config.live_max_fps``): a frame is fetched and sent
+      only once at least ``1 / live_max_fps`` seconds have elapsed since
+      the last send (``<= 0`` means uncapped). Between sends, the camera's
+      circular buffer is left alone to keep filling -- the next send drops
+      it wholesale, so pixel data is never read unless it's about to be
+      used.
+    - **In-flight cap** (``_LIVE_MAX_IN_FLIGHT``): at most this many
+      ``FrameMsg`` messages may be outstanding (sent but not yet freed via
+      ``SlotFreeCmd``) at once, so a stalled *main* process can't let
+      frames pile up on the pipe/shm side either. This is always kept
+      ``<= config.n_slots``, so (unlike ``_drain_sequence``) a free slot is
+      always available whenever a send is actually due, and the
+      ``_wait_for_free_slot`` blocking-wait dance is never needed here.
 
     Parameters
     ----------
@@ -415,7 +461,8 @@ def _drain_live(
     shm : SharedMemory
         The attached frame ring buffer to write pixel data into.
     config : CameraWorkerConfig
-        Supplies ``camera_label`` and ``slot_nbytes``.
+        Supplies ``camera_label``, ``slot_nbytes``, ``n_slots``, and
+        ``live_max_fps``.
 
     Returns
     -------
@@ -425,10 +472,19 @@ def _drain_live(
         sequence stop (caller returns to waiting for the next arm command).
     """
     label = config.camera_label
+    max_in_flight = min(_LIVE_MAX_IN_FLIGHT, config.n_slots)
     free_slots = list(range(config.n_slots))
     slice_idx = 0
     images_collected = 0
     last_image_time = time.monotonic()
+    last_stall_report = 0.0
+    # -inf so the first iteration is always "due", whatever time.monotonic()
+    # happens to return.
+    last_send_time = -float("inf")
+    min_send_interval = 1.0 / config.live_max_fps if config.live_max_fps > 0 else 0.0
+    sent_since_report = 0
+    skipped_since_report = 0
+    last_report_time = time.monotonic()
 
     while True:
         stop_signal = _drain_incoming(conn, free_slots)
@@ -437,40 +493,69 @@ def _drain_live(
             conn.send(StoppedMsg(label, images_collected, _token(stop_signal)))
             return isinstance(stop_signal, ShutdownCmd)
 
+        now = time.monotonic()
+        if now - last_report_time >= _LIVE_STATUS_REPORT_INTERVAL_S:
+            _log(
+                label,
+                f"live: sent {sent_since_report} frames, skipped "
+                f"{skipped_since_report} in {now - last_report_time:.1f}s",
+            )
+            sent_since_report = 0
+            skipped_since_report = 0
+            last_report_time = now
+
         remaining = mmc.getRemainingImageCount()
         if remaining > 0:
-            if not free_slots:
-                stop_signal = _wait_for_free_slot(conn, free_slots, label)
-                if stop_signal is not None:
-                    _stop_and_clear(mmc, label)
-                    conn.send(StoppedMsg(label, images_collected, _token(stop_signal)))
-                    return isinstance(stop_signal, ShutdownCmd)
+            # A frame is actually available -- reset the stall clock here,
+            # independent of whether the caps below let us send it. If this
+            # only reset on a *send*, the rate cap alone could make a
+            # healthy camera look stalled.
+            last_image_time = now
 
+        in_flight = config.n_slots - len(free_slots)
+        due = min_send_interval <= 0.0 or (now - last_send_time) >= min_send_interval
+        if remaining > 0 and due and in_flight < max_in_flight:
             slot = free_slots.pop(0)
-            img, mm_meta = mmc.popNextImageAndMD()
+            img, mm_meta = mmc.getLastImageAndMD()
             try:
                 camera_metadata = dict(mm_meta.items())
             except Exception:
                 camera_metadata = {}
 
-            data = img.tobytes()
-            offset = slot * config.slot_nbytes
-            shm.buf[offset : offset + len(data)] = data
+            if img.nbytes > config.slot_nbytes:
+                raise ValueError(
+                    f"{label}: frame is {img.nbytes} bytes, exceeds this "
+                    f"worker's {config.slot_nbytes}-byte frame slots"
+                )
+            # Copy pixels straight into the slot (no tobytes() intermediate),
+            # and do it *before* dropping the rest of the buffer below.
+            dst: np.ndarray = np.ndarray(
+                img.shape,
+                dtype=img.dtype,
+                buffer=shm.buf,
+                offset=slot * config.slot_nbytes,
+            )
+            dst[...] = img
+            mmc.clearCircularBuffer()
+
+            skipped = remaining - 1
             conn.send(
                 FrameMsg(
                     camera_label=label,
                     slot_index=slot,
                     slice_idx=slice_idx,
-                    nbytes=len(data),
+                    nbytes=img.nbytes,
                     camera_metadata=camera_metadata,
-                    images_remaining=remaining - 1,
+                    images_remaining=skipped,
                     worker_perf_counter=time.perf_counter(),
                 )
             )
             slice_idx += 1
             images_collected += 1
-            last_image_time = time.monotonic()
-        elif not mmc.isSequenceRunning():
+            last_send_time = now
+            sent_since_report += 1
+            skipped_since_report += skipped
+        elif remaining == 0 and not mmc.isSequenceRunning():
             _stop_and_clear(mmc, label)
             conn.send(
                 ErrorMsg(
@@ -485,8 +570,15 @@ def _drain_live(
             )
             return False
         else:
-            now = time.monotonic()
-            if now - last_image_time > _STALL_TIMEOUT_S:
+            # Either nothing is available yet, or a frame is waiting but
+            # isn't due to be sent (rate cap) or there's no in-flight
+            # headroom -- either way, don't touch the camera; just keep
+            # servicing the pipe and check back shortly.
+            if (
+                now - last_image_time > _STALL_TIMEOUT_S
+                and now - last_stall_report >= 1.0
+            ):
+                last_stall_report = now
                 conn.send(
                     StalledMsg(
                         camera_label=label,
