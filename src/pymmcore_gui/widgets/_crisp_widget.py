@@ -10,11 +10,12 @@ loaded at that moment.  This wrapper re-runs discovery and rebuilds its child
 whenever a new system configuration is loaded, so the panel always reflects the
 current hardware.
 
-It also tells CRISPy how to snap (:func:`CRISPy.imaging.set_snap_provider`), for the
-images its Focus curve can take at each position: the same way the toolbar's Snap
-does (:func:`pymmcore_gui.actions.core_actions.snap_image`), firing the selected
-laser(s) and, on the ASI rig, going through the camera-worker pool, since the main
-process's core has no cameras there.
+It also gives CRISPy two hooks for the images its Focus curve can take at each
+position: how to snap (:func:`CRISPy.imaging.set_snap_provider`), the same way the
+toolbar's Snap does (:func:`pymmcore_gui.actions.core_actions.snap_image`), firing the
+selected laser(s) and, on the ASI rig, going through the camera-worker pool, since the
+main process's core has no cameras there; and how to show them
+(:func:`CRISPy.imaging.set_image_view_factory`), with the Preview windows' own widget.
 """
 
 from __future__ import annotations
@@ -57,6 +58,17 @@ def snap_for_crispy(mmc: CMMCorePlus) -> dict[str, np.ndarray]:
         close_selected_lasers()
 
 
+def crispy_image_view(mmc: CMMCorePlus, camera_label: str) -> QWidget:
+    """The Preview windows' widget for *camera_label*, for CRISPy's Focus curve images.
+
+    In its per-camera (managed) mode, as in the Preview docks: it ignores Snap and Live
+    and shows only what CRISPy hands it with ``append()``.
+    """
+    from pymmcore_gui.widgets.image_preview._pygfx_preview import PygfxPreview
+
+    return PygfxPreview(mmcore=mmc, camera_label=camera_label)
+
+
 class CrispWidget(QWidget):
     """Container that (re)builds the CRISPy panel on system configuration load."""
 
@@ -75,22 +87,29 @@ class CrispWidget(QWidget):
 
         self._mmc.events.systemConfigurationLoaded.connect(self._rebuild)
         self.destroyed.connect(self._disconnect)
-        self._set_snap_provider(partial(snap_for_crispy, self._mmc))
+        self._set_crispy_hooks(
+            partial(snap_for_crispy, self._mmc), partial(crispy_image_view, self._mmc)
+        )
 
         self._rebuild()
 
     @staticmethod
-    def _set_snap_provider(provider: object) -> None:
-        # Older CRISPy versions have no imaging module; their Focus curve can't snap.
+    def _set_crispy_hooks(snap: object, view: object) -> None:
+        # Older CRISPy versions lack one or both hooks; skip what isn't there.
         with suppress(ImportError):
-            from CRISPy.imaging import set_snap_provider
+            from CRISPy import imaging
 
-            set_snap_provider(provider)  # type: ignore[arg-type]
+            for name, hook in (
+                ("set_snap_provider", snap),
+                ("set_image_view_factory", view),
+            ):
+                if (setter := getattr(imaging, name, None)) is not None:
+                    setter(hook)
 
     def _disconnect(self, _obj: QObject | None = None) -> None:
         with suppress(Exception):
             self._mmc.events.systemConfigurationLoaded.disconnect(self._rebuild)
-        self._set_snap_provider(None)
+        self._set_crispy_hooks(None, None)
 
     def _rebuild(self) -> None:
         """Discard the current panel and rebuild it from the active configuration."""

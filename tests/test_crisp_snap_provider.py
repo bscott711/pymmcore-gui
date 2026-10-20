@@ -69,13 +69,53 @@ def test_the_lasers_go_off_when_the_snap_fails(
     assert lasers == ["on", "off"]
 
 
-def test_the_widget_registers_and_clears_the_provider(
+def test_the_widget_registers_and_clears_both_hooks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from CRISPy import imaging
+
+    seen: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        imaging, "set_snap_provider", lambda h: seen.append(("snap", h))
+    )
+    monkeypatch.setattr(
+        imaging, "set_image_view_factory", lambda h: seen.append(("view", h))
+    )
+    _crisp_widget.CrispWidget._set_crispy_hooks("snapper", "viewer")
+    _crisp_widget.CrispWidget._set_crispy_hooks(None, None)
+    assert seen == [
+        ("snap", "snapper"),
+        ("view", "viewer"),
+        ("snap", None),
+        ("view", None),
+    ]
+
+
+def test_an_older_crispy_without_the_view_hook_is_fine(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from CRISPy import imaging
 
     seen: list[object] = []
     monkeypatch.setattr(imaging, "set_snap_provider", seen.append)
-    _crisp_widget.CrispWidget._set_snap_provider("provider")
-    _crisp_widget.CrispWidget._set_snap_provider(None)
-    assert seen == ["provider", None]
+    monkeypatch.delattr(imaging, "set_image_view_factory")
+    _crisp_widget.CrispWidget._set_crispy_hooks("snapper", "viewer")
+    assert seen == ["snapper"]
+
+
+def test_the_view_is_the_preview_windows_widget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pymmcore_gui.widgets.image_preview import _pygfx_preview
+
+    made: list[dict] = []
+
+    class FakePreview:
+        def __init__(self, **kwargs: object) -> None:
+            made.append(kwargs)
+
+    monkeypatch.setattr(_pygfx_preview, "PygfxPreview", FakePreview)
+    mmc = MagicMock()
+    view = _crisp_widget.crispy_image_view(mmc, "Camera-2")
+    assert isinstance(view, FakePreview)
+    assert made == [{"mmcore": mmc, "camera_label": "Camera-2"}]  # per-camera mode
