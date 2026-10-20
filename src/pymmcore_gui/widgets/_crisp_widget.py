@@ -9,18 +9,52 @@ the action is toggled), a bare call would freeze whatever devices happened to be
 loaded at that moment.  This wrapper re-runs discovery and rebuilds its child
 whenever a new system configuration is loaded, so the panel always reflects the
 current hardware.
+
+It also tells CRISPy how to snap (:func:`CRISPy.imaging.set_snap_provider`), for the
+images its Focus curve can take at each position: the same way the toolbar's Snap
+does (:func:`pymmcore_gui.actions.core_actions.snap_image`), firing the selected
+laser(s) and, on the ASI rig, going through the camera-worker pool, since the main
+process's core has no cameras there.
 """
 
 from __future__ import annotations
 
 from contextlib import suppress
+from functools import partial
 from typing import TYPE_CHECKING
 
 from pymmcore_plus import CMMCorePlus
 from PyQt6.QtWidgets import QVBoxLayout, QWidget
 
 if TYPE_CHECKING:
+    import numpy as np
     from PyQt6.QtCore import QObject
+
+
+def snap_for_crispy(mmc: CMMCorePlus) -> dict[str, np.ndarray]:
+    """Snap one image per camera the way the toolbar's Snap does, for CRISPy.
+
+    Called by CRISPy on the GUI thread.
+    """
+    from CRISPy.imaging import core_snap
+
+    from pymmcore_gui.asi_z_stack.asi_controller import (
+        close_selected_lasers,
+        open_selected_lasers,
+    )
+    from pymmcore_gui.asi_z_stack.camera_worker_service import CameraWorkerService
+
+    svc = CameraWorkerService.get_active()
+    if svc is None and mmc.isSequenceRunning():
+        mmc.stopSequenceAcquisition()
+    open_selected_lasers()
+    try:
+        if svc is not None:
+            # Camera-1/Camera-2 live in worker processes; svc.snap() stops Live.
+            return svc.snap()
+        return core_snap(mmc)
+    finally:
+        close_selected_lasers()
 
 
 class CrispWidget(QWidget):
@@ -41,12 +75,22 @@ class CrispWidget(QWidget):
 
         self._mmc.events.systemConfigurationLoaded.connect(self._rebuild)
         self.destroyed.connect(self._disconnect)
+        self._set_snap_provider(partial(snap_for_crispy, self._mmc))
 
         self._rebuild()
+
+    @staticmethod
+    def _set_snap_provider(provider: object) -> None:
+        # Older CRISPy versions have no imaging module; their Focus curve can't snap.
+        with suppress(ImportError):
+            from CRISPy.imaging import set_snap_provider
+
+            set_snap_provider(provider)  # type: ignore[arg-type]
 
     def _disconnect(self, _obj: QObject | None = None) -> None:
         with suppress(Exception):
             self._mmc.events.systemConfigurationLoaded.disconnect(self._rebuild)
+        self._set_snap_provider(None)
 
     def _rebuild(self) -> None:
         """Discard the current panel and rebuild it from the active configuration."""
