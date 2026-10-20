@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import suppress
 from itertools import chain
 
 from pymmcore_plus import CMMCorePlus, DeviceType
@@ -14,6 +15,19 @@ from pymmcore_gui._qt.QtWidgets import (
 )
 
 STAGE_DEVICES = {DeviceType.Stage, DeviceType.XYStage}
+
+
+def is_piezo(mmc: CMMCorePlus, label: str) -> bool:
+    """Whether *label* is a piezo stage (by its device name or description).
+
+    A piezo keeps its 0 at the center of its travel, so its stage widget gets no
+    "Zero" (set origin) control. ASI Tiger piezos are ``PiezoStage:<axis>:<card>``,
+    "ASI Piezo Stage".
+    """
+    with suppress(Exception):
+        text = f"{mmc.getDeviceName(label)} {mmc.getDeviceDescription(label)}"
+        return "piezo" in text.lower()
+    return False
 
 
 class _Group(QGroupBox):
@@ -54,6 +68,9 @@ class StagesControlWidget(QWidget):
         for idx, stage_dev in enumerate(stages):
             bx = _Group(stage_dev, self)
             stage = StageWidget(device=stage_dev, parent=bx, mmcore=self._mmc)
+            # Older pymmcore-widgets have no origin controls to hide.
+            if (enable_origin := getattr(stage, "enable_set_origin", None)) is not None:
+                enable_origin(not is_piezo(self._mmc, stage_dev))
             if (lay := bx.layout()) is not None:
                 lay.addWidget(stage)
             self._layout.addWidget(bx, idx // 2, idx % 2)
