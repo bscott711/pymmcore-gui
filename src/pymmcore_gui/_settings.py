@@ -188,7 +188,7 @@ class SpectralChannelConfig(BaseModel):
     # laser isn't in the MDA" override for power users capturing extra regions.
 
     name: str
-    """Per-file label, e.g. ``"GFP_488"``."""
+    """Per-file label, e.g. ``"mNG_488nm"``."""
     camera: str
     """Physical camera device label, e.g. ``"Camera-1"``."""
     laser_preset: str
@@ -212,19 +212,19 @@ class SpectralChannelConfig(BaseModel):
 def _default_spectral_channels() -> list[SpectralChannelConfig]:
     return [
         SpectralChannelConfig(
-            name="GFP_488", camera="Camera-1", laser_preset="488nm", position="top"
+            name="mNG_488nm", camera="Camera-1", laser_preset="488nm", position="top"
         ),
         SpectralChannelConfig(
-            name="CalceinViolet_405",
+            name="Electra_405nm",
             camera="Camera-1",
             laser_preset="405nm",
             position="bottom",
         ),
         SpectralChannelConfig(
-            name="mScarlet_561", camera="Camera-2", laser_preset="561nm", position="top"
+            name="mScarlet_561nm", camera="Camera-2", laser_preset="561nm", position="top"
         ),
         SpectralChannelConfig(
-            name="CF647_638",
+            name="CF647_638nm",
             camera="Camera-2",
             laser_preset="638nm",
             position="bottom",

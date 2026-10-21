@@ -14,6 +14,7 @@ from pymmcore_gui._qt.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -48,7 +49,17 @@ class _ChannelRow(QGroupBox):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(config.name, parent)
-        self.channel_name = config.name
+        # The file/channel name is "<label><suffix>" (e.g. "mNG" + "_488"): the
+        # label is user-editable, the wavelength suffix is kept as-is.
+        label, sep, tail = config.name.rpartition("_")
+        if not sep:
+            label, tail = config.name, ""
+        if tail.isdigit():  # legacy "GFP_488" -> "GFP_488nm"
+            tail += "nm"
+        self._name_suffix = f"_{tail}" if tail else ""
+        self.name_edit = QLineEdit(label)
+        self.name_edit.setPlaceholderText("e.g. mNG")
+        self.name_edit.textChanged.connect(lambda _t: self.setTitle(self.channel_name))
 
         self.camera = QComboBox()
         self.camera.addItems(cameras)
@@ -73,7 +84,12 @@ class _ChannelRow(QGroupBox):
         self.draw_button = QPushButton("Draw on Live View...")
         self.move_button = QPushButton("Move on Live View...")
 
+        name_row = QHBoxLayout()
+        name_row.addWidget(self.name_edit, 1)
+        name_row.addWidget(QLabel(self._name_suffix))
+
         form = QFormLayout(self)
+        form.addRow("Channel name", name_row)
         form.addRow("Camera", self.camera)
         form.addRow("Position", self.position_combo)
         form.addRow("Laser preset", self.laser_preset)
@@ -100,6 +116,12 @@ class _ChannelRow(QGroupBox):
         self.laser_preset.setCurrentText(config.laser_preset)
         x, y = (config.rect[0], config.rect[1]) if config.rect else (0, 0)
         self.set_position(x, y)
+
+    @property
+    def channel_name(self) -> str:
+        """Full channel name used in file names: edited label + wavelength suffix."""
+        label = self.name_edit.text().strip() or "channel"
+        return f"{label}{self._name_suffix}"
 
     def set_position(self, x: int, y: int) -> None:
         self.x_spin.setValue(x)
