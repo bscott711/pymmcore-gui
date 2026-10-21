@@ -29,8 +29,8 @@ from .camera_worker_service import CameraWorkerService
 from .common import AcquisitionSettings, HardwareConstants
 from .spim_timing import (
     SliceTiming,
-    compute_slice_timing,
     readout_ms_from_camera_timing,
+    timing_from_settings,
 )
 from .worker_pool import CameraWorkerPool, WorkerDiedError
 from .z_scan import compute_galvo_scan
@@ -225,6 +225,10 @@ class _ASITriggerEngineBase(MDAEngine):
 
     def _after_arm(self) -> None:
         """Hook between arming the cameras and triggering the volume."""
+
+    def _trigger_timing_summary(self) -> str:
+        """One line on the slice timing this run triggers with (for errors)."""
+        return ""
 
     def _crisp_state(self) -> str | None:
         """Return CRISP's ``CRISP State``, or ``None`` if CRISP isn't loaded."""
@@ -779,6 +783,17 @@ class _ASITriggerEngineBase(MDAEngine):
                     self._finish_volume_record(record)
                 except Exception:
                     logger.debug("Could not log volume state.", exc_info=True)
+        except TimeoutError as err:
+            if any(frames_per_camera.values()):
+                raise
+            # Not one frame from any camera: no trigger ever reached them.
+            # Say what this run drove the galvo/PLogic with, so the log alone
+            # tells which timing to check on the scope.
+            raise TimeoutError(
+                f"{err}. No camera got a single frame, so no trigger reached "
+                "them -- check PLogic BNC1 on the scope during a run. "
+                f"{self._trigger_timing_summary()}"
+            ) from err
         except WorkerDiedError:
             logger.error(
                 "A camera worker process died during acquisition.", exc_info=True
@@ -911,16 +926,11 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         return cfg.fallback_readout_ms
 
     def _timing_for(self, exposure_ms: float, laser_held_on: bool) -> SliceTiming:
-        cfg = self._timing_cfg
-        assert cfg is not None
-        return compute_slice_timing(
-            cfg.mode,
+        assert self._timing_cfg is not None
+        return timing_from_settings(
+            self._timing_cfg,
             exposure_ms,
             self._readout_ms,
-            cfg.galvo_settle_ms,
-            margin_ms=cfg.margin_ms,
-            trigger_pulse_ms=cfg.trigger_pulse_ms,
-            volume_start_settle_ms=cfg.volume_start_settle_ms,
             laser_held_on=laser_held_on,
         )
 
@@ -1039,6 +1049,12 @@ class ASISPIMEngine(_ASITriggerEngineBase):
             "expose_out_mode": None if held_on else "All Rows",
             "exposure_ms": exposure,
         }
+
+    def _trigger_timing_summary(self) -> str:
+        timing = self._applied_timing
+        if timing is None:
+            return ""
+        return f"Slice timing used: {timing.describe(self._num_slices)}."
 
     def _after_arm(self) -> None:
         """Re-time the galvo if the armed cameras report a different readout.

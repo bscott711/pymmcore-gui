@@ -32,6 +32,7 @@ from pymmcore_gui.asi_z_stack.engine import (
     ASIStationaryTriggerEngine,
     _ASITriggerEngineBase,
 )
+from pymmcore_gui.asi_z_stack.spim_timing import compute_slice_timing
 from pymmcore_gui.asi_z_stack.worker_pool import WorkerDiedError
 
 if TYPE_CHECKING:
@@ -358,6 +359,36 @@ def test_exec_event_timeout_stops_workers_and_reraises() -> None:
         list(engine.exec_event(useq.MDAEvent(index={"t": 0})))
 
     pool.stop_and_drain.assert_called_once()
+
+
+def test_exec_event_zero_frame_stall_names_the_timing() -> None:
+    """No frame from any camera: the error says what timing triggered it."""
+    _core, engine, pool = _make_engine(n_cameras=2, n_slices=3)
+    assert isinstance(engine, ASISPIMEngine)
+    engine._applied_timing = compute_slice_timing("all_rows", 10.0, 4.04, 0.25)
+    pool.iter_frames.side_effect = TimeoutError("no frame for 5.0s")
+
+    with pytest.raises(TimeoutError) as info:
+        list(engine.exec_event(useq.MDAEvent(index={"t": 0})))
+
+    message = str(info.value)
+    assert message.startswith("no frame for 5.0s")
+    assert "no trigger reached them" in message
+    assert "PLogic BNC1" in message
+    assert "all_rows: settle 0.25" in message
+
+
+def test_exec_event_partial_stall_keeps_original_error() -> None:
+    _core, engine, pool = _make_engine(n_cameras=1, n_slices=3)
+
+    def frames() -> Generator[tuple[str, int, np.ndarray, dict, int], None, None]:
+        yield "cam0", 0, np.zeros((2, 2), dtype=np.uint16), {}, 2
+        raise TimeoutError("no frame for 5.0s")
+
+    pool.iter_frames.return_value = frames()
+
+    with pytest.raises(TimeoutError, match=r"^no frame for 5\.0s$"):
+        list(engine.exec_event(useq.MDAEvent(index={"t": 0})))
 
 
 def test_exec_event_generator_close_stops_workers() -> None:
@@ -1022,3 +1053,20 @@ def test_legacy_mode_keeps_original_arming(
     # default settings: 25.75 ms settle + 10 ms hold = the original 35.75 ms
     assert _galvo_value(core, "SPIMDelayBeforeLaser(ms)") == 25.75
     assert _galvo_value(core, "SPIMLaserDuration(ms)") == 10.0
+
+
+def test_legacy_mode_ignores_all_rows_settle(
+    monkeypatch: pytest.MonkeyPatch, settings: object
+) -> None:
+    """A settle tuned for All Rows must not leak into the known-good legacy run."""
+    timing = settings.spim_timing  # type: ignore[attr-defined]
+    timing.galvo_settle_ms = 0.25
+    timing.volume_start_settle_ms = 3.0
+    timing.margin_ms = 0.0
+    core, engine = _setup_spim_engine(monkeypatch)
+    engine.setup_sequence(useq.MDASequence(channels=["488nm"]))
+
+    assert _galvo_value(core, "SPIMDelayBeforeCamera(ms)") == 25.75
+    assert _galvo_value(core, "SPIMDelayBeforeLaser(ms)") == 25.75
+    assert _galvo_value(core, "SPIMLaserDuration(ms)") == 10.0
+    assert _galvo_value(core, "SPIMDelayBeforeSide(ms)") == 0.0

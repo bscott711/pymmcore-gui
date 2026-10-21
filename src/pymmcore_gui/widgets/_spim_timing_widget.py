@@ -4,7 +4,9 @@ Edits :class:`~pymmcore_gui._settings.SpimTimingSettingsV1`, which
 :class:`~pymmcore_gui.asi_z_stack.engine.ASISPIMEngine` reads at the start of
 every MDA, and shows what that timing works out to -- slice period, volume
 time, how much light each sensor row gets -- using the same model the engine
-uses (:mod:`~pymmcore_gui.asi_z_stack.spim_timing`).
+uses (:mod:`~pymmcore_gui.asi_z_stack.spim_timing`). Every edit applies to
+the settings at once (there is no Save step), so what the panel shows is
+what the next MDA runs.
 """
 
 from __future__ import annotations
@@ -13,7 +15,7 @@ from typing import TYPE_CHECKING
 
 from pymmcore_plus import CMMCorePlus
 
-from pymmcore_gui._qt.QtCore import QPointF, QRectF, Qt
+from pymmcore_gui._qt.QtCore import QPointF, QRectF, Qt, QTimer
 from pymmcore_gui._qt.QtGui import QColor, QPainter, QPen, QPolygonF
 from pymmcore_gui._qt.QtWidgets import (
     QCheckBox,
@@ -30,9 +32,10 @@ from pymmcore_gui._qt.QtWidgets import (
 )
 from pymmcore_gui._settings import SettingsV1
 from pymmcore_gui.asi_z_stack.spim_timing import (
+    LEGACY_SETTLE_MS,
     SliceTiming,
-    compute_slice_timing,
     readout_ms_from_camera_timing,
+    timing_from_settings,
 )
 
 if TYPE_CHECKING:
@@ -42,6 +45,9 @@ _MODES = {
     "all_rows": "All Rows (pseudo-global, matches Live)",
     "legacy": "Legacy (shared camera/laser pulse)",
 }
+
+#: Delay before writing edits to disk; they apply in memory immediately.
+_FLUSH_DELAY_MS = 500
 
 
 def _spin(lo: float, hi: float, step: float, suffix: str = " ms") -> QDoubleSpinBox:
@@ -161,8 +167,15 @@ class SpimTimingWidget(QWidget):
         readout_row.addWidget(self.readout)
         readout_row.addWidget(self.readout_auto)
 
+        self.legacy_note = QLabel(
+            f"Legacy always runs the original timing ({LEGACY_SETTLE_MS:g} ms "
+            "settle); the fields below apply to All Rows only."
+        )
+        self.legacy_note.setWordWrap(True)
+
         form = QFormLayout()
         form.addRow("Mode", self.mode)
+        form.addRow(self.legacy_note)
         form.addRow("Galvo settle", self.settle)
         form.addRow("Volume-start settle", self.volume_settle)
         form.addRow("Camera readout", readout_row)
@@ -170,8 +183,8 @@ class SpimTimingWidget(QWidget):
         form.addRow("Camera trigger pulse", self.trigger)
         for label, spin in self.bnc.items():
             form.addRow(f"{label} Expose Out -> PLogic BNC", spin)
-        settings_box = QGroupBox("Timing (used by the next MDA)")
-        settings_box.setLayout(form)
+        self.settings_box = QGroupBox("Timing (applies to the next MDA)")
+        self.settings_box.setLayout(form)
 
         self.preview_exposure = _spin(0.1, 10_000, 1)
         self.preview_exposure.setValue(self._live_exposure())
@@ -193,8 +206,6 @@ class SpimTimingWidget(QWidget):
         preview_layout.addWidget(self.strip)
         preview_layout.addWidget(self.summary)
 
-        self.save_button = QPushButton("Save")
-        self.save_button.clicked.connect(self._save)
         refresh = QPushButton("Read camera readout")
         refresh.setToolTip(
             "Use the readout time the cameras reported on their last arm"
@@ -203,13 +214,20 @@ class SpimTimingWidget(QWidget):
         buttons = QHBoxLayout()
         buttons.addWidget(refresh)
         buttons.addStretch()
-        buttons.addWidget(self.save_button)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(settings_box)
+        layout.addWidget(self.settings_box)
         layout.addWidget(preview_box)
         layout.addLayout(buttons)
         layout.addStretch()
+
+        # Edits apply to the in-memory settings (what the engine reads) at
+        # once; the disk write is debounced so spinning a box doesn't start
+        # one write per step.
+        self._flush_timer = QTimer(self)
+        self._flush_timer.setSingleShot(True)
+        self._flush_timer.setInterval(_FLUSH_DELAY_MS)
+        self._flush_timer.timeout.connect(lambda: SettingsV1.instance().flush())
 
         for box in (
             self.settle,
@@ -217,11 +235,13 @@ class SpimTimingWidget(QWidget):
             self.readout,
             self.margin,
             self.trigger,
-            self.preview_exposure,
         ):
-            box.valueChanged.connect(self._update_preview)
+            box.valueChanged.connect(self._apply)
+        for spin in self.bnc.values():
+            spin.valueChanged.connect(self._apply)
+        self.mode.currentIndexChanged.connect(self._apply)
+        self.preview_exposure.valueChanged.connect(self._update_preview)
         self.preview_slices.valueChanged.connect(self._update_preview)
-        self.mode.currentIndexChanged.connect(self._update_preview)
         self.readout_auto.toggled.connect(self._on_auto_toggled)
 
         mda = self._mmc.mda.events
@@ -265,31 +285,31 @@ class SpimTimingWidget(QWidget):
         self.readout.setEnabled(not auto)
         if auto:
             self._refresh_readout()
-        self._update_preview()
+        self._apply()
 
     def _refresh_readout(self) -> None:
         if (measured := self._camera_readout_ms()) is not None:
             self.readout.setValue(measured)
 
     def _set_editable(self, editable: bool) -> None:
-        self.save_button.setEnabled(editable)
+        self.settings_box.setEnabled(editable)
 
     def timing(self) -> SliceTiming:
-        """The slice timing the current fields work out to (preview exposure)."""
-        return compute_slice_timing(
-            self.mode.currentData(),
+        """The slice timing the next MDA runs at the preview exposure."""
+        return timing_from_settings(
+            SettingsV1.instance().spim_timing,
             self.preview_exposure.value(),
             self.readout.value(),
-            self.settle.value(),
-            margin_ms=self.margin.value(),
-            trigger_pulse_ms=self.trigger.value(),
-            volume_start_settle_ms=self.volume_settle.value(),
         )
 
     def _update_preview(self) -> None:
+        legacy = self.mode.currentData() == "legacy"
+        self.legacy_note.setVisible(legacy)
+        for box in (self.settle, self.volume_settle, self.margin, self.trigger):
+            box.setEnabled(not legacy)
         timing = self.timing()
         self.strip.set_timing(timing)
-        text = timing.describe(self.preview_slices.value())
+        text = "Next MDA uses " + timing.describe(self.preview_slices.value())
         if self.readout_auto.isChecked() and self._camera_readout_ms() is None:
             text += (
                 "\nCameras haven't reported a readout yet (Snap or Live once); "
@@ -302,9 +322,9 @@ class SpimTimingWidget(QWidget):
             )
         self.summary.setText(text)
 
-    def _save(self) -> None:
-        settings = SettingsV1.instance()
-        cfg = settings.spim_timing
+    def _apply(self) -> None:
+        """Write the fields to the settings the next MDA reads."""
+        cfg = SettingsV1.instance().spim_timing
         cfg.mode = self.mode.currentData()
         cfg.galvo_settle_ms = self.settle.value()
         cfg.volume_start_settle_ms = self.volume_settle.value()
@@ -314,4 +334,5 @@ class SpimTimingWidget(QWidget):
         cfg.margin_ms = self.margin.value()
         cfg.trigger_pulse_ms = self.trigger.value()
         cfg.expose_out_bnc = {label: spin.value() for label, spin in self.bnc.items()}
-        settings.flush()
+        self._flush_timer.start()
+        self._update_preview()

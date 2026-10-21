@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import pytest
 
+from pymmcore_gui._settings import SpimTimingSettingsV1
 from pymmcore_gui.asi_z_stack.spim_timing import (
+    LEGACY_SETTLE_MS,
     ceil_tick,
     compute_slice_timing,
     readout_ms_from_camera_timing,
+    timing_from_settings,
 )
 
 
@@ -87,3 +90,18 @@ def test_readout_from_camera_timing(
     timing: dict[str, str], expected: float | None
 ) -> None:
     assert readout_ms_from_camera_timing(timing) == expected
+
+
+def test_timing_from_settings_pins_legacy_to_original() -> None:
+    cfg = SpimTimingSettingsV1(
+        mode="legacy", galvo_settle_ms=0.25, volume_start_settle_ms=3.0, margin_ms=0
+    )
+    t = timing_from_settings(cfg, 10.0, 4.04)
+    assert t.settle_ms == LEGACY_SETTLE_MS
+    assert t.volume_start_settle_ms == 0.0
+    assert t.slice_period_ms == 35.75
+
+    cfg.mode = "all_rows"
+    t = timing_from_settings(cfg, 10.0, 4.04)
+    assert t.settle_ms == 0.25
+    assert t.volume_start_settle_ms == 3.0

@@ -29,7 +29,9 @@ Two illumination schemes:
     E-long PLogic pulse. Rows that start late in the rolling readout get
     less light -- MDA frames come out dimmer than Live, with a top-to-bottom
     falloff. ``hold = max(E, S + E - settle)``, which reproduces the
-    original timing (35.75 ms at E = 10 ms, settle = 25.75 ms).
+    original timing (35.75 ms at E = 10 ms, settle = 25.75 ms). Run from the
+    settings (:func:`timing_from_settings`), legacy always uses the original
+    settle -- it is the known-good fallback, not a tunable mode.
 
 All times are in ms and rounded up to the galvo card's 0.25 ms clock.
 """
@@ -38,12 +40,20 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from pymmcore_gui._settings import SpimTimingSettingsV1
 
 TimingMode = Literal["all_rows", "legacy"]
 
 #: The galvo card's and PLogic's clock period.
 TICK_MS = 0.25
+
+#: Galvo settle the rig ran with before advanced timing existed (the card's
+#: stored ``SPIMDelayBeforeLaser``). Legacy mode always uses it, whatever the
+#: All Rows settle is set to.
+LEGACY_SETTLE_MS = 25.75
 
 
 def ceil_tick(ms: float) -> float:
@@ -202,6 +212,51 @@ def compute_slice_timing(
         hold_ms=ceil_tick(hold),
         camera_pulse_ms=ceil_tick(pulse),
         volume_start_settle_ms=ceil_tick(volume_start_settle_ms),
+        laser_held_on=laser_held_on,
+    )
+
+
+def timing_from_settings(
+    cfg: SpimTimingSettingsV1,
+    exposure_ms: float,
+    readout_ms: float,
+    *,
+    laser_held_on: bool = False,
+) -> SliceTiming:
+    """The slice timing an MDA runs with under *cfg*.
+
+    All Rows uses the configured settle, volume-start settle, margin and
+    trigger pulse. Legacy ignores them and reproduces the original timing
+    (:data:`LEGACY_SETTLE_MS`, no volume-start settle), so switching back to
+    legacy always restores the known-good acquisition.
+
+    Parameters
+    ----------
+    cfg : SpimTimingSettingsV1
+        The SPIM timing settings.
+    exposure_ms : float
+        E, the channel's exposure.
+    readout_ms : float
+        S, the camera's rolling readout time.
+    laser_held_on : bool
+        The channel's laser can't be pulsed.
+    """
+    if cfg.mode == "legacy":
+        return compute_slice_timing(
+            "legacy",
+            exposure_ms,
+            readout_ms,
+            LEGACY_SETTLE_MS,
+            laser_held_on=laser_held_on,
+        )
+    return compute_slice_timing(
+        cfg.mode,
+        exposure_ms,
+        readout_ms,
+        cfg.galvo_settle_ms,
+        margin_ms=cfg.margin_ms,
+        trigger_pulse_ms=cfg.trigger_pulse_ms,
+        volume_start_settle_ms=cfg.volume_start_settle_ms,
         laser_held_on=laser_held_on,
     )
 

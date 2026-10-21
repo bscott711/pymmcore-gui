@@ -10,13 +10,13 @@ if TYPE_CHECKING:
     from pytestqt.qtbot import QtBot
 
 
-def test_widget_previews_and_saves_timing(mmcore: CMMCorePlus, qtbot: QtBot) -> None:
+def test_widget_previews_and_applies_timing(mmcore: CMMCorePlus, qtbot: QtBot) -> None:
     widget = SpimTimingWidget(mmcore=mmcore)
     qtbot.addWidget(widget)
 
     # defaults reproduce the original timing
     assert widget.timing().slice_period_ms == 35.75
-    assert "legacy" in widget.summary.text()
+    assert "Next MDA uses legacy" in widget.summary.text()
 
     widget.mode.setCurrentIndex(widget.mode.findData("all_rows"))
     widget.readout_auto.setChecked(False)
@@ -27,17 +27,36 @@ def test_widget_previews_and_saves_timing(mmcore: CMMCorePlus, qtbot: QtBot) -> 
     assert widget.timing().slice_period_ms == 22.5
     assert "Expose Out cabled" in widget.summary.text()
 
-    widget._save()
+    # no Save step: every edit is already what the next MDA reads
     cfg = SettingsV1.instance().spim_timing
     assert cfg.mode == "all_rows"
     assert cfg.galvo_settle_ms == 2.0
     assert cfg.readout_ms_override == 6.0
 
 
-def test_widget_locks_save_during_mda(mmcore: CMMCorePlus, qtbot: QtBot) -> None:
+def test_switching_to_legacy_applies_immediately(
+    mmcore: CMMCorePlus, qtbot: QtBot
+) -> None:
+    cfg = SettingsV1.instance().spim_timing
+    cfg.mode = "all_rows"
+    cfg.galvo_settle_ms = 0.25
+    widget = SpimTimingWidget(mmcore=mmcore)
+    qtbot.addWidget(widget)
+    assert not widget.legacy_note.isVisibleTo(widget)
+
+    widget.mode.setCurrentIndex(widget.mode.findData("legacy"))
+
+    assert cfg.mode == "legacy"
+    # legacy ignores the All Rows settle: the original 35.75 ms slice
+    assert widget.timing().slice_period_ms == 35.75
+    assert widget.legacy_note.isVisibleTo(widget)
+    assert not widget.settle.isEnabled()
+
+
+def test_widget_locks_edits_during_mda(mmcore: CMMCorePlus, qtbot: QtBot) -> None:
     widget = SpimTimingWidget(mmcore=mmcore)
     qtbot.addWidget(widget)
     mmcore.mda.events.sequenceStarted.emit(None, {})
-    assert not widget.save_button.isEnabled()
+    assert not widget.settings_box.isEnabled()
     mmcore.mda.events.sequenceFinished.emit(None)
-    assert widget.save_button.isEnabled()
+    assert widget.settings_box.isEnabled()
