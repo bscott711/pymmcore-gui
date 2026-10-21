@@ -211,3 +211,19 @@ def test_stop_and_drain_times_out_without_raising() -> None:
     start = time.monotonic()
     CameraWorkerPool([handle]).stop_and_drain(timeout=0.3)
     assert time.monotonic() - start < 2.0
+
+
+def test_arm_all_records_camera_timing() -> None:
+    """ArmedMsg.timing lands on the handle and in pool.camera_timing()."""
+    from pymmcore_gui.asi_z_stack.worker_messages import ArmCmd, ArmedMsg
+    from pymmcore_gui.asi_z_stack.worker_pool import CameraWorkerPool
+
+    handle, child, _keep = _pipe_handle("Camera-1")
+    pool = CameraWorkerPool([handle])
+    timing = {"Timing-ReadoutTimeNs": "6400000", "TriggerMode": "Edge Trigger"}
+    child.send(ArmedMsg("Camera-1", timing))
+
+    pool.arm_all(81, armed_timeout=2.0)
+
+    assert isinstance(child.recv(), ArmCmd)
+    assert pool.camera_timing() == {"Camera-1": timing}

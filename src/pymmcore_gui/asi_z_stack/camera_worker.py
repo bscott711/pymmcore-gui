@@ -277,6 +277,44 @@ def _internal_trigger_mode(
     return None
 
 
+#: Substrings of camera property names worth reporting in ArmedMsg.timing.
+_TIMING_PROP_KEYS = ("Timing", "Trigger", "Expose", "Port", "Readout", "Clear")
+
+
+def _read_camera_timing(mmc: CMMCorePlus, label: str) -> dict[str, str]:
+    """Read *label*'s timing-related properties (see ``ArmedMsg.timing``).
+
+    Must run after the acquisition is set up -- before that PVCAM refuses the
+    ``Timing-*`` reads (``PL_ERR_ACQUISITION_SETUP_REQUIRED``). Unreadable
+    properties are skipped, never raised.
+    """
+    timing: dict[str, str] = {}
+    for prop in mmc.getDevicePropertyNames(label):
+        if prop != "Exposure" and not any(k in prop for k in _TIMING_PROP_KEYS):
+            continue
+        try:
+            timing[prop] = str(mmc.getProperty(label, prop))
+        except Exception:
+            continue
+    try:
+        x, y, w, h = mmc.getROI(label)
+        timing["ROI"] = f"{x},{y},{w},{h}"
+    except Exception:
+        pass
+    return timing
+
+
+def _report_timing(
+    mmc: CMMCorePlus, label: str, last: dict[str, str]
+) -> dict[str, str]:
+    """Read the camera timing, log it to stderr when it changed, return it."""
+    timing = _read_camera_timing(mmc, label)
+    if timing != last:
+        summary = ", ".join(f"{k}={v}" for k, v in sorted(timing.items()))
+        _log(label, f"camera timing: {summary}")
+    return timing
+
+
 def _stop_and_clear(mmc: CMMCorePlus, label: str) -> None:
     """Stop the camera's sequence (if running) and drop any buffered frames.
 
@@ -644,6 +682,7 @@ def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
         return
 
     conn.send(ReadyMsg(label))
+    last_timing: dict[str, str] = {}
 
     try:
         while True:
@@ -662,7 +701,8 @@ def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
                     )
                     armed_count = cmd.n_images + _ARM_COUNT_PADDING
                     mmc.startSequenceAcquisition(label, armed_count, 0, True)
-                    conn.send(ArmedMsg(label))
+                    last_timing = _report_timing(mmc, label, last_timing)
+                    conn.send(ArmedMsg(label, last_timing))
                     shutdown_requested = _drain_sequence(
                         mmc, conn, shm, config, cmd.n_images
                     )
@@ -683,7 +723,8 @@ def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
                 try:
                     _set_trigger_mode(mmc, label, internal_mode)
                     mmc.startContinuousSequenceAcquisition(0)
-                    conn.send(ArmedMsg(label))
+                    last_timing = _report_timing(mmc, label, last_timing)
+                    conn.send(ArmedMsg(label, last_timing))
                     shutdown_requested = _drain_live(mmc, conn, shm, config)
                 except Exception:
                     _log(label, f"live arm/drain failed:\n{traceback.format_exc()}")

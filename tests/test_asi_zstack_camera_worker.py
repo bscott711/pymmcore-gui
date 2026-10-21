@@ -519,3 +519,37 @@ def test_drain_live_shutdown_cmd_returns_true(shm: SharedMemory) -> None:
     )
 
     assert shutdown is True
+
+
+def test_read_camera_timing_keeps_timing_props_and_skips_failures() -> None:
+    from pymmcore_gui.asi_z_stack.camera_worker import _read_camera_timing
+
+    core = MagicMock()
+    core.getDevicePropertyNames.return_value = [
+        "Timing-ReadoutTimeNs",
+        "Timing-ClearingTimeNs",
+        "TriggerMode",
+        "ExposeOutMode",
+        "Exposure",
+        "PortName",
+        "Gain",
+    ]
+    values = {
+        "Timing-ReadoutTimeNs": "13500000",
+        "TriggerMode": "Edge Trigger",
+        "ExposeOutMode": "All Rows",
+        "Exposure": "10.0",
+        "PortName": "Sensitivity",
+    }
+
+    def _get(label: str, prop: str) -> str:
+        if prop not in values:
+            raise RuntimeError("PL_ERR_ACQUISITION_SETUP_REQUIRED")
+        return values[prop]
+
+    core.getProperty.side_effect = _get
+    core.getROI.return_value = (485, 644, 1458, 1143)
+
+    timing = _read_camera_timing(core, "Camera-1")
+
+    assert timing == {**values, "ROI": "485,644,1458,1143"}

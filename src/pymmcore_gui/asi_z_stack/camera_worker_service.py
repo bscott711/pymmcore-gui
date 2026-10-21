@@ -249,6 +249,16 @@ class CameraWorkerService(QObject):
         """Config groups moved off the main-process core at :meth:`begin_release`."""
         return self._worker_config_groups
 
+    def camera_timing(self) -> dict[str, dict[str, str]]:
+        """Each camera's timing properties from its most recent arm.
+
+        Empty per camera until it has been armed once (Snap, Live or MDA) --
+        PVCAM only reports readout/clearing times after an acquisition setup.
+        """
+        with self._lock:
+            pool = self._pool
+        return pool.camera_timing() if pool is not None else {}
+
     # ------------------------------------------------------------------
     # Startup (see _main_window.py::_on_system_config_loaded)
     # ------------------------------------------------------------------

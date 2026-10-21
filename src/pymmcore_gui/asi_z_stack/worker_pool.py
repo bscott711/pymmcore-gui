@@ -166,6 +166,9 @@ class CameraWorkerHandle:
         self.process: BaseProcess | None = None
         self.conn: Connection | None = None
         self.shm: SharedMemory | None = None
+        # Camera timing reported by the most recent ArmedMsg (see
+        # worker_messages.ArmedMsg.timing); empty until the first arm.
+        self.last_timing: dict[str, str] = {}
 
     def spawn(self, ctx: SpawnContext) -> None:
         """Create this worker's shared memory and pipe, then start its process.
@@ -367,6 +370,10 @@ class CameraWorkerPool:
             assert worker.conn is not None
             worker.conn.send(ArmLiveCmd())
         self._wait_for_all(ArmedMsg, armed_timeout)
+
+    def camera_timing(self) -> dict[str, dict[str, str]]:
+        """Each camera's timing from its most recent arm (see ``ArmedMsg``)."""
+        return {w.camera_label: dict(w.last_timing) for w in self.workers}
 
     def _worker_for(self, camera_label: str) -> CameraWorkerHandle:
         for worker in self.workers:
@@ -620,4 +627,6 @@ class CameraWorkerPool:
                         f"{msg.traceback_text}"
                     )
                 if isinstance(msg, expected):
+                    if isinstance(msg, ArmedMsg):
+                        worker.last_timing = dict(msg.timing)
                     pending.pop(worker.camera_label, None)

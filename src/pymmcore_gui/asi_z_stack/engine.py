@@ -2,7 +2,8 @@
 import logging
 import time
 from collections.abc import Iterable, Iterator
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from pymmcore_plus import CMMCorePlus
@@ -30,6 +31,34 @@ if TYPE_CHECKING:
     from .camera_handoff import CameraHandoffSnapshot
 
 logger = logging.getLogger(__name__)
+
+#: ``CRISP State`` values meaning the servo is actively holding focus.
+_CRISP_LOCKED_STATES = frozenset({"Lock", "In Focus"})
+
+
+@dataclass
+class _VolumeRecord:
+    """Focus/position state around one hardware-triggered volume.
+
+    Collected per timepoint so drift across a timelapse can be attributed:
+    CRISP moving the piezo, the stage, or neither (the galvo is the only
+    thing this engine moves).
+    """
+
+    index: dict[str, int]
+    piezo_before: float | None
+    crisp_state: str | None
+    xy: tuple[float, float] | None
+    galvo_offset_deg: str | None
+    piezo_after: float | None = None
+    frames: dict[str, int] = field(default_factory=dict)
+
+
+def _try_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class _ASITriggerEngineBase(MDAEngine):
@@ -80,6 +109,8 @@ class _ASITriggerEngineBase(MDAEngine):
         # Plan positions of the galvo sweep, in slice order; used to give each
         # frame its real z_pos. Empty when nothing scans (stationary engine).
         self._z_positions: tuple[float, ...] = ()
+        # One record per triggered volume this run (see _VolumeRecord).
+        self._volume_records: list[_VolumeRecord] = []
 
     def _set_event_z(self, event: MDAEvent) -> None:
         """No-op: Z-stepping here is done entirely by the galvo hardware trigger.
@@ -170,21 +201,30 @@ class _ASITriggerEngineBase(MDAEngine):
         hardware is touched.
         """
         mmc = self.mmcore
+        self._volume_records = []
         if self.hw.piezo_a_label in mmc.getLoadedDevices():
             self._piezo_pos_at_setup = mmc.getPosition(self.hw.piezo_a_label)
         else:
             self._piezo_pos_at_setup = None
 
+    def _crisp_state(self) -> str | None:
+        """Return CRISP's ``CRISP State``, or ``None`` if CRISP isn't loaded."""
+        mmc = self.mmcore
+        if self.hw.crisp_label not in mmc.getLoadedDevices():
+            return None
+        try:
+            return str(mmc.getProperty(self.hw.crisp_label, "CRISP State"))
+        except Exception:
+            return None
+
     def _warn_if_piezo_moved(self) -> None:
         """Log a warning if the piezo's position changed since ``setup_sequence``.
 
-        Defensive check for this class of bug: with :meth:`_set_event_z`
-        now a no-op, nothing in this engine should ever move the piezo. If
-        it moves anyway (e.g. an ASI-firmware auto-home side effect of
-        setting the galvo's ``SPIMState`` to ``"Running"``, which is
-        plausible but unconfirmed), this turns a silent focus drift into a
-        visible warning in the run log instead of requiring another round
-        of bench detective work.
+        Nothing in this engine ever moves the piezo (see :meth:`_set_event_z`),
+        so a change means something else did. On this rig that is almost
+        always CRISP holding focus -- the message says so when CRISP is
+        locked, and otherwise points at the remaining suspects (joystick
+        wheel creep, an ASI SPIM auto-home side effect).
         """
         mmc = self.mmcore
         if (
@@ -195,12 +235,117 @@ class _ASITriggerEngineBase(MDAEngine):
         current = mmc.getPosition(self.hw.piezo_a_label)
         delta = current - self._piezo_pos_at_setup
         if abs(delta) > 0.05:  # um -- above readback noise, well below a real move
+            state = self._crisp_state()
+            if state in _CRISP_LOCKED_STATES:
+                cause = (
+                    f"CRISP is locked ({state!r}), so this is CRISP moving the "
+                    "objective -- in this OPM that shifts the imaged volume "
+                    "relative to the sample unless the sample moved with it."
+                )
+            else:
+                cause = (
+                    "CRISP is not locked; this engine never commands the piezo "
+                    "-- check the joystick wheel and whether the ASI SPIM state "
+                    "machine is auto-homing it."
+                )
             logger.warning(
                 f"Piezo ({self.hw.piezo_a_label}) moved {delta:+.3f} um during "
                 f"acquisition: {self._piezo_pos_at_setup:.3f} -> {current:.3f}. "
-                "This engine never commands the piezo -- investigate whether "
-                "the ASI SPIM state machine is auto-homing it."
+                + cause
             )
+
+    def _log_galvo_spim_properties(self, label: str, tag: str) -> None:
+        """Log every SPIM/single-axis property *label* currently holds.
+
+        The galvo card's per-slice timing (``SPIMDelayBeforeCamera`` and
+        friends) persists on the card between sessions; logging it makes the
+        timing a run actually used visible instead of assumed.
+        """
+        mmc = self.mmcore
+        if label not in mmc.getLoadedDevices():
+            return
+        for prop in mmc.getDevicePropertyNames(label):
+            if "SPIM" in prop or "SingleAxis" in prop:
+                logger.info(f"  [{tag}] {prop} = {mmc.getProperty(label, prop)}")
+
+    def _read_volume_state(self, event: MDAEvent) -> _VolumeRecord:
+        """Snapshot piezo, CRISP, XY and galvo offset just before a volume."""
+        mmc = self.mmcore
+        loaded = mmc.getLoadedDevices()
+        piezo = None
+        if self.hw.piezo_a_label in loaded:
+            piezo = _try_float(mmc.getPosition(self.hw.piezo_a_label))
+        xy: tuple[float, float] | None = None
+        try:
+            if mmc.getXYStageDevice():
+                x, y = mmc.getXYPosition()
+                xy = (float(x), float(y))
+        except Exception:
+            xy = None
+        offset = None
+        if self.hw.galvo_a_label in loaded:
+            offset = str(
+                mmc.getProperty(self.hw.galvo_a_label, "SingleAxisYOffset(deg)")
+            )
+        return _VolumeRecord(
+            index=dict(event.index),
+            piezo_before=piezo,
+            crisp_state=self._crisp_state(),
+            xy=xy,
+            galvo_offset_deg=offset,
+        )
+
+    def _finish_volume_record(self, record: _VolumeRecord) -> None:
+        """Read the piezo after a volume and log one line for the timepoint."""
+        mmc = self.mmcore
+        if self.hw.piezo_a_label in mmc.getLoadedDevices():
+            record.piezo_after = _try_float(mmc.getPosition(self.hw.piezo_a_label))
+        self._volume_records.append(record)
+
+        parts = [f"Volume {record.index}:"]
+        if record.piezo_before is not None and record.piezo_after is not None:
+            during = record.piezo_after - record.piezo_before
+            parts.append(
+                f"piezo {record.piezo_before:.3f} -> {record.piezo_after:.3f} um "
+                f"({during:+.3f} during volume"
+            )
+            if self._piezo_pos_at_setup is not None:
+                since = record.piezo_after - self._piezo_pos_at_setup
+                parts[-1] += f", {since:+.3f} since run start"
+            parts[-1] += ")"
+        parts.append(f"CRISP={record.crisp_state}")
+        if record.xy is not None:
+            parts.append(f"XY=({record.xy[0]:.2f}, {record.xy[1]:.2f})")
+        parts.append(f"galvo offset={record.galvo_offset_deg} deg")
+        frames = ", ".join(f"{k}={v}" for k, v in record.frames.items())
+        parts.append(f"frames: {frames or 'none'} (expected {self._num_slices} each)")
+        logger.info(" ".join(parts))
+        short = [k for k, v in record.frames.items() if v != self._num_slices]
+        if short:
+            logger.warning(
+                f"Volume {record.index}: {short} delivered a frame count other "
+                f"than {self._num_slices}; z labels for that volume may be "
+                "shifted."
+            )
+
+    def _log_drift_summary(self) -> None:
+        """Summarize piezo motion across this run's volumes (see _VolumeRecord)."""
+        pairs = [
+            (r.piezo_before, r.piezo_after)
+            for r in self._volume_records
+            if r.piezo_before is not None and r.piezo_after is not None
+        ]
+        if len(pairs) < 2:
+            return
+        within = [after - before for before, after in pairs]
+        firsts = [before for before, _ in pairs]
+        last = pairs[-1][1]
+        logger.info(
+            f"Drift summary over {len(pairs)} volumes: piezo start "
+            f"{firsts[0]:.3f} -> last {last:.3f} um (net {last - firsts[0]:+.3f} "
+            f"um; range {min(firsts):.3f}..{max(firsts):.3f}); largest move "
+            f"within one volume {max(within, key=abs):+.3f} um."
+        )
 
     def _handoff_to_workers(self) -> None:
         """Acquire the session's persistent camera worker pool for this MDA run.
@@ -509,6 +654,11 @@ class _ASITriggerEngineBase(MDAEngine):
             self._num_slices, armed_timeout=self.hw.worker_arm_timeout_s
         )
         logger.info(f"{n_cameras} camera(s) armed for {self._num_slices} images each.")
+        if not self._volume_records:  # once per run: what the cameras armed with
+            for label, timing in self._worker_pool.camera_timing().items():
+                if isinstance(timing, dict) and timing:
+                    summary = ", ".join(f"{k}={v}" for k, v in sorted(timing.items()))
+                    logger.info(f"{label} timing: {summary}")
 
         # Shutter-gated lasers (e.g. 561, a CW laser behind a physical
         # shutter) can't follow per-frame TTL blanking reliably, so hold them
@@ -536,6 +686,19 @@ class _ASITriggerEngineBase(MDAEngine):
         # that hardware signal, not software call order, is what actually
         # synchronizes the two cameras' exposures.
         mmc = self.mmcore
+        # Per-timepoint focus/position record (logged after the volume), so
+        # drift across a timelapse can be attributed. Never allowed to break
+        # an acquisition.
+        record: _VolumeRecord | None
+        try:
+            record = self._read_volume_state(event)
+        except Exception:
+            logger.debug("Could not read pre-volume state.", exc_info=True)
+            record = None
+        frames_per_camera: dict[str, int] = dict.fromkeys(
+            self._snapshot.camera_labels, 0
+        )
+
         mmc.setProperty(
             self._master_axis_label, "SPIMState", self._trigger_spim_state_value
         )
@@ -552,6 +715,9 @@ class _ASITriggerEngineBase(MDAEngine):
                 images_remaining,
             ) in self._worker_pool.iter_frames(stall_timeout_s=5.0):
                 cam_index = self._snapshot.camera_labels.index(camera_label)
+                frames_per_camera[camera_label] = (
+                    frames_per_camera.get(camera_label, 0) + 1
+                )
                 new_index = {**event.index, "z": slice_idx}
                 if n_cameras > 1:
                     new_index["cam"] = cam_index
@@ -582,6 +748,12 @@ class _ASITriggerEngineBase(MDAEngine):
                 if received == "cancel":
                     logger.info("MDA cancelled -- stopping camera workers.")
                     return
+            if record is not None:
+                record.frames = frames_per_camera
+                try:
+                    self._finish_volume_record(record)
+                except Exception:
+                    logger.debug("Could not log volume state.", exc_info=True)
         except WorkerDiedError:
             logger.error(
                 "A camera worker process died during acquisition.", exc_info=True
@@ -796,6 +968,9 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         self._galvo_offset_before = self.mmcore.getProperty(
             self.hw.galvo_a_label, "SingleAxisYOffset(deg)"
         )
+        logger.info(
+            f"Pre-MDA (Live) galvo SingleAxisYOffset = {self._galvo_offset_before} deg."
+        )
         self.mmcore.setProperty(
             self.hw.galvo_a_label,
             "SingleAxisYOffset(deg)",
@@ -827,6 +1002,9 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         # SPIM scan is driven entirely through the SPIMState/SingleAxis*
         # device-adapter properties set above.
         set_plogic_evaluation_clock(self.hw.tiger_comm_hub_label, running=True)
+        # Everything the galvo card will actually use this run, including the
+        # card-persisted per-slice delays nothing here sets.
+        self._log_galvo_spim_properties(self.hw.galvo_a_label, "galvo")
 
         logger.info(
             f"--- PLogic and Camera ready --- "
@@ -844,6 +1022,7 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         """Clean up hardware state after the sequence finishes."""
         logger.info("--- SEQUENCE FINISHED: Cleaning up hardware ---")
         self._warn_if_piezo_moved()
+        self._log_drift_summary()
         set_plogic_evaluation_clock(self.hw.tiger_comm_hub_label, running=False)
         if self.hw.galvo_a_label in self.mmcore.getLoadedDevices():
             self.mmcore.setProperty(self.hw.galvo_a_label, "SPIMState", "Idle")
@@ -1049,14 +1228,8 @@ class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
 
         # Diagnostic: dump both axes' live SPIM/scan state so the run log
         # shows exactly what each card accepted.
-        for label, tag in (
-            (self.hw.galvo_a_label, "galvo"),
-            (self.hw.piezo_a_label, "piezo"),
-        ):
-            for prop in self.mmcore.getDevicePropertyNames(label):
-                if "SPIM" in prop or "SingleAxis" in prop:
-                    value = self.mmcore.getProperty(label, prop)
-                    logger.info(f"  [{tag}] {prop} = {value}")
+        self._log_galvo_spim_properties(self.hw.galvo_a_label, "galvo")
+        self._log_galvo_spim_properties(self.hw.piezo_a_label, "piezo")
 
         log_plogic_trigger_chain_state(
             self.hw.plogic_label, self.hw.tiger_comm_hub_label
@@ -1073,6 +1246,7 @@ class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
         """Clean up hardware state after the sequence finishes."""
         logger.info("--- SEQUENCE FINISHED: Cleaning up hardware (stationary) ---")
         self._warn_if_piezo_moved()
+        self._log_drift_summary()
         if self.hw.galvo_a_label in self.mmcore.getLoadedDevices():
             self.mmcore.setProperty(self.hw.galvo_a_label, "SPIMState", "Idle")
         if self.hw.piezo_a_label in self.mmcore.getLoadedDevices():

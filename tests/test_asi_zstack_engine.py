@@ -783,3 +783,133 @@ def test_teardown_sequence_skips_close_all_lasers_when_flag_off(
     engine.teardown_sequence(useq.MDASequence())
 
     mock_close_all_lasers.assert_not_called()
+
+
+def test_warn_if_piezo_moved_names_crisp_when_locked(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """With CRISP locked the warning attributes the move to CRISP, not SPIM homing."""
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=3)
+    core.getLoadedDevices.return_value = ["PiezoStage:P:34", "CRISPAFocus:P:34"]
+    core.getProperty.side_effect = lambda dev, prop: (
+        "In Focus" if prop == "CRISP State" else "0"
+    )
+
+    core.getPosition.return_value = 10.0
+    engine._snapshot_piezo_position()
+    core.getPosition.return_value = 12.5
+    with caplog.at_level(logging.WARNING):
+        engine._warn_if_piezo_moved()
+
+    assert len(caplog.records) == 1
+    assert "+2.500" in caplog.records[0].message
+    assert "CRISP is locked" in caplog.records[0].message
+
+
+def test_exec_event_logs_one_line_per_volume(caplog: pytest.LogCaptureFixture) -> None:
+    """Each volume logs piezo before/after, CRISP state, XY, offset and frames."""
+    core, engine, pool = _make_engine(n_cameras=2, n_slices=2)
+    core.getLoadedDevices.return_value = [
+        "PiezoStage:P:34",
+        "CRISPAFocus:P:34",
+        "Scanner:AB:33",
+    ]
+    core.getXYStageDevice.return_value = "XY"
+    core.getXYPosition.return_value = (-3218.0, 2482.3)
+    core.getProperty.side_effect = lambda dev, prop: {
+        "CRISP State": "In Focus",
+        "SingleAxisYOffset(deg)": "0.2000",
+    }.get(prop, "Running")
+    engine._piezo_pos_at_setup = -69.4
+    core.getPosition.side_effect = [-69.4, -69.6]  # before, after the volume
+    _queue_frames(pool, [("cam0", 0), ("cam1", 0), ("cam0", 1), ("cam1", 1)])
+
+    with caplog.at_level(logging.INFO):
+        list(engine.exec_event(useq.MDAEvent(index={"t": 3})))
+
+    lines = [r.message for r in caplog.records if r.message.startswith("Volume")]
+    assert len(lines) == 1
+    line = lines[0]
+    assert "{'t': 3}" in line
+    assert "-69.400 -> -69.600 um" in line
+    assert "-0.200 during volume" in line
+    assert "CRISP=In Focus" in line
+    assert "XY=(-3218.00, 2482.30)" in line
+    assert "galvo offset=0.2000 deg" in line
+    assert "cam0=2, cam1=2" in line
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_exec_event_warns_on_short_frame_count(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A camera delivering fewer frames than slices is flagged (z labels shift)."""
+    core, engine, pool = _make_engine(n_cameras=2, n_slices=2)
+    core.getLoadedDevices.return_value = []
+    core.getXYStageDevice.return_value = ""
+    _queue_frames(pool, [("cam0", 0), ("cam1", 0), ("cam0", 1)])
+
+    with caplog.at_level(logging.INFO):
+        list(engine.exec_event(useq.MDAEvent(index={"t": 0})))
+
+    warnings_ = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings_) == 1
+    assert "['cam1']" in warnings_[0]
+
+
+def test_drift_summary_spans_all_volumes(caplog: pytest.LogCaptureFixture) -> None:
+    core, engine, pool = _make_engine(n_cameras=1, n_slices=1)
+    core.getLoadedDevices.return_value = ["PiezoStage:P:34"]
+    core.getXYStageDevice.return_value = ""
+    engine._piezo_pos_at_setup = 0.0
+    core.getPosition.side_effect = [0.0, 0.1, 1.0, 1.3, 2.0, 2.05]
+    for t in range(3):
+        _queue_frames(pool, [("cam0", 0)])
+        list(engine.exec_event(useq.MDAEvent(index={"t": t})))
+
+    with caplog.at_level(logging.INFO):
+        engine._log_drift_summary()
+
+    summary = caplog.records[-1].message
+    assert "over 3 volumes" in summary
+    assert "net +2.050 um" in summary
+    assert "largest move within one volume +0.300 um" in summary
+
+
+def test_setup_sequence_logs_galvo_spim_properties(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The card-persisted per-slice delays are logged, not assumed."""
+    for name in (
+        "configure_plogic_for_dual_nrt_pulses",
+        "set_plogic_evaluation_clock",
+        "summary_metadata",
+    ):
+        monkeypatch.setattr(engine_module, name, MagicMock())
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=1)
+    core.getLoadedDevices.return_value = ["Scanner:AB:33"]
+    core.getDevicePropertyNames.return_value = [
+        "SPIMDelayBeforeCamera(ms)",
+        "SingleAxisYOffset(deg)",
+        "Description",
+    ]
+    core.getProperty.side_effect = lambda dev, prop: {
+        "SPIMDelayBeforeCamera(ms)": "0.25",
+        "SPIMDelayBeforeLaser(ms)": "25.75",
+        "SingleAxisYOffset(deg)": "0.0",
+    }.get(prop, "x")
+    core.hasPropertyLimits.return_value = False
+    core.getImageWidth.return_value = 2
+    core.getImageHeight.return_value = 2
+    core.getBytesPerPixel.return_value = 2
+    core.getExposure.return_value = 10.0
+
+    with caplog.at_level(logging.INFO):
+        engine.setup_sequence(useq.MDASequence(channels=["405nm"]))
+
+    messages = [r.message for r in caplog.records]
+    assert "  [galvo] SPIMDelayBeforeCamera(ms) = 0.25" in messages
+    assert not any("Description" in m for m in messages)
+    assert any(
+        "Pre-MDA (Live) galvo SingleAxisYOffset = 0.0 deg" in m for m in messages
+    )

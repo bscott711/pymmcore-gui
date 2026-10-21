@@ -116,9 +116,16 @@ class ReadyMsg:
 
 @dataclass(frozen=True)
 class ArmedMsg:
-    """The worker's camera has accepted ``startSequenceAcquisition``."""
+    """The worker's camera has accepted ``startSequenceAcquisition``.
+
+    ``timing`` carries the camera's timing-related properties (PVCAM's
+    ``Timing-*`` readout/clearing/trigger delays, trigger and expose-out
+    modes, port, ROI) as read right after arming -- PVCAM only reports
+    them once an acquisition is set up.
+    """
 
     camera_label: str
+    timing: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

@@ -20,6 +20,13 @@ from pymmcore_gui._multi_camera_handler import physical_camera_labels
 from ._logging import configure_asi_logging
 from .asi_controller import _HW, _send_tiger_command, mmc, set_camera_trigger_mode
 
+# Offline image checks, re-exported for console use alongside the bench tools.
+from .image_analysis import (  # noqa: F401
+    phase_shift,
+    row_profile_ratio,
+    volume_drift,
+)
+
 logger = logging.getLogger(__name__)
 
 # This module is meant to be run interactively (see the module docstring
