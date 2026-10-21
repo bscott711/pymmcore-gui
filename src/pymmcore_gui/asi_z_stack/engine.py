@@ -15,8 +15,11 @@ from pymmcore_plus.metadata import (
 )
 from useq import MDAEvent, MDASequence
 
+from pymmcore_gui._settings import SpimTimingSettingsV1
+
 from .asi_controller import (
     close_all_lasers,
+    configure_plogic_for_all_rows,
     configure_plogic_for_dual_nrt_pulses,
     log_plogic_trigger_chain_state,
     set_laser_outputs,
@@ -24,6 +27,11 @@ from .asi_controller import (
 )
 from .camera_worker_service import CameraWorkerService
 from .common import AcquisitionSettings, HardwareConstants
+from .spim_timing import (
+    SliceTiming,
+    compute_slice_timing,
+    readout_ms_from_camera_timing,
+)
 from .worker_pool import CameraWorkerPool, WorkerDiedError
 from .z_scan import compute_galvo_scan
 
@@ -206,6 +214,17 @@ class _ASITriggerEngineBase(MDAEngine):
             self._piezo_pos_at_setup = mmc.getPosition(self.hw.piezo_a_label)
         else:
             self._piezo_pos_at_setup = None
+
+    def _prepare_volume(self, event: MDAEvent) -> dict[str, Any]:
+        """Per-volume hardware prep before arming; returns extra ``arm_all`` options.
+
+        Runs after ``setup_event`` (so the channel's laser preset is already
+        applied). The base engine needs nothing; see ASISPIMEngine.
+        """
+        return {}
+
+    def _after_arm(self) -> None:
+        """Hook between arming the cameras and triggering the volume."""
 
     def _crisp_state(self) -> str | None:
         """Return CRISP's ``CRISP State``, or ``None`` if CRISP isn't loaded."""
@@ -654,10 +673,12 @@ class _ASITriggerEngineBase(MDAEngine):
         assert self._worker_pool is not None and self._snapshot is not None
         n_cameras = self._snapshot.n_cameras
 
+        arm_options = self._prepare_volume(event)
         self._worker_pool.arm_all(
-            self._num_slices, armed_timeout=self.hw.worker_arm_timeout_s
+            self._num_slices, armed_timeout=self.hw.worker_arm_timeout_s, **arm_options
         )
         logger.info(f"{n_cameras} camera(s) armed for {self._num_slices} images each.")
+        self._after_arm()
         if not self._volume_records:  # once per run: what the cameras armed with
             for label, timing in self._worker_pool.camera_timing().items():
                 if isinstance(timing, dict) and timing:
@@ -814,8 +835,16 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         # Galvo SingleAxisYOffset(deg) from before the MDA, restored in
         # teardown so Live doesn't keep imaging a shifted plane afterwards.
         self._galvo_offset_before: str | None = None
+        # Advanced slice timing for the current run (see spim_timing.py), a
+        # copy of SettingsV1.spim_timing taken at setup_sequence; None until
+        # then (and for engines driven without setup, e.g. in tests).
+        self._timing_cfg: SpimTimingSettingsV1 | None = None
+        self._readout_ms = 0.0
+        self._applied_timing: SliceTiming | None = None
 
-    def _check_galvo_reach(self, amplitude_deg: float, offset_deg: float) -> None:
+    def _check_galvo_reach(
+        self, amplitude_deg: float, offset_deg: float, live_offset_deg: float = 0.0
+    ) -> None:
         """Raise if the requested sweep falls outside the galvo's property limits.
 
         Checked before any hardware is touched, so an unreachable Top/Bottom
@@ -830,12 +859,14 @@ class ASISPIMEngine(_ASITriggerEngineBase):
             hi = mmc.getPropertyUpperLimit(label, "SingleAxisYOffset(deg)")
             half = abs(amplitude_deg) / 2
             if offset_deg - half < lo or offset_deg + half > hi:
+                rel = offset_deg - live_offset_deg
                 raise ValueError(
                     "Z stack is outside the galvo's reach: it spans "
-                    f"{(offset_deg - half) * slope:+.2f} to "
-                    f"{(offset_deg + half) * slope:+.2f} um from current focus, "
-                    f"but the galvo covers {lo * slope:+.2f} to {hi * slope:+.2f} "
-                    "um. Move focus closer to the range or shrink it."
+                    f"{(rel - half) * slope:+.2f} to "
+                    f"{(rel + half) * slope:+.2f} um from the Live plane, "
+                    f"but the galvo covers {(lo - live_offset_deg) * slope:+.2f} to "
+                    f"{(hi - live_offset_deg) * slope:+.2f} um. Move focus closer "
+                    "to the range or shrink it."
                 )
         if mmc.hasPropertyLimits(label, "SingleAxisYAmplitude(deg)"):
             lo = mmc.getPropertyLowerLimit(label, "SingleAxisYAmplitude(deg)")
@@ -847,38 +878,245 @@ class ASISPIMEngine(_ASITriggerEngineBase):
                     f"[{lo}, {hi}] deg limits."
                 )
 
+    # ------------------------------------------------------------------
+    # Advanced slice timing (see spim_timing.py)
+    # ------------------------------------------------------------------
+
+    def _reported_readout_ms(self) -> float | None:
+        """Largest rolling readout time the cameras reported on their last arm."""
+        pool = self._worker_pool
+        if pool is not None:
+            timings = pool.camera_timing()
+        elif (svc := CameraWorkerService.get_active()) is not None:
+            timings = svc.camera_timing()
+        else:
+            return None
+        values = [
+            r
+            for t in timings.values()
+            if isinstance(t, dict) and (r := readout_ms_from_camera_timing(t))
+        ]
+        return max(values) if values else None
+
+    def _resolve_readout_ms(self, cfg: SpimTimingSettingsV1) -> float:
+        """Readout time to plan with: override, camera-reported, or fallback."""
+        if cfg.readout_ms_override is not None:
+            return cfg.readout_ms_override
+        if (reported := self._reported_readout_ms()) is not None:
+            return reported
+        logger.warning(
+            "Cameras haven't reported a readout time yet (Snap or Live once to "
+            f"measure it); planning with {cfg.fallback_readout_ms:g} ms."
+        )
+        return cfg.fallback_readout_ms
+
+    def _timing_for(self, exposure_ms: float, laser_held_on: bool) -> SliceTiming:
+        cfg = self._timing_cfg
+        assert cfg is not None
+        return compute_slice_timing(
+            cfg.mode,
+            exposure_ms,
+            self._readout_ms,
+            cfg.galvo_settle_ms,
+            margin_ms=cfg.margin_ms,
+            trigger_pulse_ms=cfg.trigger_pulse_ms,
+            volume_start_settle_ms=cfg.volume_start_settle_ms,
+            laser_held_on=laser_held_on,
+        )
+
+    def _expose_out_addrs(self) -> list[int]:
+        """PLogic addresses of the Expose Out BNCs of this run's cameras."""
+        cfg = self._timing_cfg
+        assert cfg is not None
+        svc = CameraWorkerService.get_active()
+        labels = svc.camera_labels if svc is not None else tuple(cfg.expose_out_bnc)
+        missing = [label for label in labels if label not in cfg.expose_out_bnc]
+        if missing:
+            raise RuntimeError(
+                f"All Rows mode: no Expose Out BNC configured for {missing} "
+                "(SPIM Timing settings)."
+            )
+        return [32 + cfg.expose_out_bnc[label] for label in labels]
+
+    def _apply_plogic_timing(self, timing: SliceTiming) -> None:
+        """Program PLogic's camera/laser cells for *timing*'s mode."""
+        previous = self._applied_timing
+        if timing.mode == "all_rows":
+            # Laser gating comes from the cameras, so exposure changes need
+            # no reprogramming -- only a mode change does.
+            if previous is None or previous.mode != "all_rows":
+                configure_plogic_for_all_rows(
+                    self.hw.plogic_label,
+                    self.hw.tiger_comm_hub_label,
+                    self.hw.plogic_camera_cell,
+                    self.hw.plogic_laser_on_cell,
+                    self.hw.pulses_per_ms,
+                    self.hw.plogic_4khz_clock_addr,
+                    self.hw.plogic_trigger_ttl_addr,
+                    timing.camera_pulse_ms,
+                    self._expose_out_addrs(),
+                )
+            return
+        if (
+            previous is None
+            or previous.mode != "legacy"
+            or previous.camera_pulse_ms != timing.camera_pulse_ms
+        ):
+            configure_plogic_for_dual_nrt_pulses(
+                AcquisitionSettings(
+                    camera_exposure_ms=timing.camera_pulse_ms,
+                    laser_trig_duration_ms=timing.camera_pulse_ms,
+                ),
+                self.hw.plogic_label,
+                self.hw.tiger_comm_hub_label,
+                self.hw.plogic_camera_cell,
+                self.hw.pulses_per_ms,
+                self.hw.plogic_4khz_clock_addr,
+                self.hw.plogic_trigger_ttl_addr,
+                self.hw.plogic_laser_on_cell,
+            )
+
+    def _set_galvo_timing(self, timing: SliceTiming) -> None:
+        """Write *timing*'s per-slice delays to the galvo card, logging changes.
+
+        Both the camera and laser delays get the settle, so the slice TTL
+        PLogic triggers from (backplane address 41) fires ``settle`` after
+        each step whichever of the card's lines it carries; the laser
+        duration sets the hold (slice period = settle + hold).
+        """
+        mmc = self.mmcore
+        label = self.hw.galvo_a_label
+        values: list[tuple[str, float]] = [
+            ("SPIMDelayBeforeCamera(ms)", timing.settle_ms),
+            ("SPIMDelayBeforeLaser(ms)", timing.settle_ms),
+            ("SPIMCameraDuration(ms)", min(1.0, timing.hold_ms)),
+            ("SPIMLaserDuration(ms)", timing.hold_ms),
+            ("SPIMDelayBeforeScan(ms)", 0.0),
+            ("SPIMNumScansPerSlice", 1),
+            ("SPIMDelayBeforeSide(ms)", timing.volume_start_settle_ms),
+        ]
+        changes: list[str] = []
+        for prop, value in values:
+            if not mmc.hasProperty(label, prop):
+                logger.warning(f"Galvo {label} has no {prop}; left as is.")
+                continue
+            before = mmc.getProperty(label, prop)
+            try:
+                same = abs(float(before) - value) < 1e-6
+            except (TypeError, ValueError):
+                same = False
+            if not same:
+                text = (
+                    str(int(value)) if prop == "SPIMNumScansPerSlice" else f"{value:g}"
+                )
+                mmc.setProperty(label, prop, text)
+                changes.append(f"{prop} {before} -> {text}")
+        if changes:
+            logger.info("Galvo timing: " + "; ".join(changes))
+
+    def _apply_timing(self, timing: SliceTiming) -> None:
+        self._apply_plogic_timing(timing)
+        self._set_galvo_timing(timing)
+        self._applied_timing = timing
+        logger.info(f"Slice timing: {timing.describe(self._num_slices)}")
+
+    def _prepare_volume(self, event: MDAEvent) -> dict[str, Any]:
+        """Fit the slice timing to this volume's channel, return arm options."""
+        if self._timing_cfg is None:
+            return {}
+        exposure = float(event.exposure) if event.exposure else self._exposure_ms
+        held_on = bool(self._shutter_gated_bncs())
+        timing = self._timing_for(exposure, held_on)
+        if timing != self._applied_timing:
+            self._apply_timing(timing)
+        self._exposure_ms = exposure
+        if timing.mode != "all_rows":
+            return {}
+        return {
+            "trigger_mode": "Edge Trigger",
+            # A held-on laser can't be gated: the camera uses its normal
+            # rolling exposure instead (None restores the camera's own mode).
+            "expose_out_mode": None if held_on else "All Rows",
+            "exposure_ms": exposure,
+        }
+
+    def _after_arm(self) -> None:
+        """Re-time the galvo if the armed cameras report a different readout.
+
+        The readout planned with in setup comes from the last Snap/Live arm;
+        the cameras' readout in this run's own trigger/ROI setup is the one
+        that matters, and it's known only now -- before the volume triggers.
+        """
+        cfg = self._timing_cfg
+        timing = self._applied_timing
+        if cfg is None or timing is None or cfg.readout_ms_override is not None:
+            return
+        reported = self._reported_readout_ms()
+        if reported is None or abs(reported - self._readout_ms) <= 0.05:
+            return
+        logger.warning(
+            f"Cameras report a {reported:.3f} ms readout, but this run was timed "
+            f"for {self._readout_ms:.3f} ms; re-timing before triggering."
+        )
+        self._readout_ms = reported
+        self._apply_timing(self._timing_for(timing.exposure_ms, timing.laser_held_on))
+
     def setup_sequence(self, sequence: MDASequence) -> SummaryMetaV1 | None:
         """Prepare hardware and calculate Z-stack parameters."""
+        from pymmcore_gui._settings import SettingsV1
+
         # 0. Force the sequence's first channel to get a real hardware
         # config switch -- see _reset_channel_config_cache's docstring.
         self._reset_channel_config_cache()
         self._snapshot_piezo_position()
 
+        # The galvo offset Live sits at defines the Live plane; every z-plan
+        # is placed relative to it (see z_scan.py).
+        self._galvo_offset_before = self.mmcore.getProperty(
+            self.hw.galvo_a_label, "SingleAxisYOffset(deg)"
+        )
+        try:
+            live_offset_deg = float(self._galvo_offset_before)
+        except (TypeError, ValueError):
+            live_offset_deg = 0.0
+        logger.info(
+            f"Pre-MDA (Live) galvo SingleAxisYOffset = {self._galvo_offset_before} deg."
+        )
+
         # 1. Calculate Z-stack parameters. The piezo never moves, so every
         # Z Stack mode (Range Around / Above-Below / Top-Bottom) is realized
         # purely through the galvo sweep's signed amplitude and its offset
-        # from current focus -- see z_scan.py.
+        # from the Live plane -- see z_scan.py.
         if sequence.z_plan:
+            current_focus = self.mmcore.getZPosition()
             scan = compute_galvo_scan(
                 sequence.z_plan,
-                current_focus_um=self.mmcore.getZPosition(),
+                current_focus_um=current_focus,
                 slope_um_per_deg=self.hw.slice_calibration_slope_um_per_deg,
+                live_offset_deg=live_offset_deg,
             )
             self._num_slices = scan.num_slices
             self._z_positions = scan.z_positions
             galvo_amplitude_deg = scan.amplitude_deg
             galvo_offset_deg = scan.offset_deg
-            self._check_galvo_reach(galvo_amplitude_deg, galvo_offset_deg)
+            self._check_galvo_reach(
+                galvo_amplitude_deg, galvo_offset_deg, live_offset_deg
+            )
+            direction = "up" if getattr(sequence.z_plan, "go_up", True) else "down"
+            note = (
+                ""
+                if sequence.z_plan.is_relative
+                else f"; absolute plan, placed against the piezo at {current_focus:.3f}"
+            )
             logger.info(
-                f"Z plan {type(sequence.z_plan).__name__}: {scan.num_slices} "
-                f"slices, step {scan.step_um:+.3f} um, center "
-                f"{scan.center_offset_um:+.3f} um from current focus."
+                f"Z plan {type(sequence.z_plan).__name__} ({direction}): "
+                f"{scan.describe()}{note}."
             )
         else:
             self._num_slices = 1
             self._z_positions = ()
             galvo_amplitude_deg = 0.0
-            galvo_offset_deg = 0.0
+            galvo_offset_deg = live_offset_deg
 
         # 2. Determine exposure
         if (
@@ -907,20 +1145,16 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         # structure is kept for a minimal diff).
         self._warn_if_circular_buffer_too_small(self._num_slices)
 
-        settings = AcquisitionSettings(
-            camera_exposure_ms=self._exposure_ms,
-            laser_trig_duration_ms=self._exposure_ms,
+        # Advanced slice timing: a snapshot of the settings for this run, so
+        # edits mid-run apply to the next MDA only.
+        self._timing_cfg = SettingsV1.instance().spim_timing.model_copy(deep=True)
+        self._readout_ms = self._resolve_readout_ms(self._timing_cfg)
+        self._applied_timing = None
+        first = sequence.channels[0].config if sequence.channels else ""
+        timing = self._timing_for(
+            self._exposure_ms, first in self.hw.shutter_gated_wavelengths
         )
-        configure_plogic_for_dual_nrt_pulses(
-            settings,
-            self.hw.plogic_label,
-            self.hw.tiger_comm_hub_label,
-            self.hw.plogic_camera_cell,
-            self.hw.pulses_per_ms,
-            self.hw.plogic_4khz_clock_addr,
-            self.hw.plogic_trigger_ttl_addr,
-            self.hw.plogic_laser_on_cell,
-        )
+        self._apply_plogic_timing(timing)
 
         # Deliberately not calling open_global_shutter() here -- it's
         # session-level (opened once via ensure_global_shutter_open), not
@@ -969,12 +1203,6 @@ class ASISPIMEngine(_ASITriggerEngineBase):
             self.hw.galvo_a_label, "SingleAxisXAmplitude(deg)", "0.0"
         )
         self.mmcore.setProperty(self.hw.galvo_a_label, "SingleAxisXOffset(deg)", "0.0")
-        self._galvo_offset_before = self.mmcore.getProperty(
-            self.hw.galvo_a_label, "SingleAxisYOffset(deg)"
-        )
-        logger.info(
-            f"Pre-MDA (Live) galvo SingleAxisYOffset = {self._galvo_offset_before} deg."
-        )
         self.mmcore.setProperty(
             self.hw.galvo_a_label,
             "SingleAxisYOffset(deg)",
@@ -986,19 +1214,13 @@ class ASISPIMEngine(_ASITriggerEngineBase):
             "SPIMDelayBeforeRepeat(ms)",
             str(self.hw.delay_before_repeat_ms),
         )
-        self.mmcore.setProperty(
-            self.hw.galvo_a_label,
-            "SPIMDelayBeforeSide(ms)",
-            str(self.hw.delay_before_side_ms),
-        )
-        self._fit_slice_period_to_exposure()
-        # Deliberately not touching ASI's other native per-slice camera/laser
-        # trigger properties (SPIMDelayBeforeScan(ms), SPIMDelayBeforeCamera(ms),
-        # SPIMCameraDuration(ms), SPIMDelayBeforeLaser(ms), SPIMLaserDuration(ms))
-        # -- the microscope-control sibling repo's confirmed-working engine
-        # never touches them either, driving the camera and laser entirely
-        # through PLogic's dual-NRT cells. Whatever is currently persisted
-        # on the card for those SPIM properties is left alone.
+        # Per-slice delays, the hold that sets the slice period, and the
+        # volume-start settle (SPIMDelayBeforeSide) all come from the advanced
+        # timing settings -- see _set_galvo_timing. They used to be left at
+        # whatever the card had stored, which nothing here ever read.
+        self._set_galvo_timing(timing)
+        self._applied_timing = timing
+        logger.info(f"Slice timing: {timing.describe(self._num_slices)}")
         #
         # No raw "TTL X=/Y=" command is sent to the scanner anywhere in
         # this engine -- confirmed against a captured log of the sibling
@@ -1006,8 +1228,7 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         # SPIM scan is driven entirely through the SPIMState/SingleAxis*
         # device-adapter properties set above.
         set_plogic_evaluation_clock(self.hw.tiger_comm_hub_label, running=True)
-        # Everything the galvo card will actually use this run, including the
-        # card-persisted per-slice delays nothing here sets.
+        # Everything the galvo card will actually use this run.
         self._log_galvo_spim_properties(self.hw.galvo_a_label, "galvo")
 
         logger.info(

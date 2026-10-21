@@ -13,6 +13,11 @@ it sweeps*:
 - ``ZTopBottom`` (and other absolute plans): absolute focus-device
   coordinates, so the center is measured against the focus position at
   acquisition time.
+
+"Current focus" is the plane Live shows: the piezo where it is *and* the
+galvo at the offset Live sits at. The sweep is therefore placed relative to
+that pre-MDA galvo offset, not to galvo zero, so slice *i* images the Live
+plane + ``z[i] - reference`` in every mode.
 """
 
 from __future__ import annotations
@@ -45,7 +50,11 @@ class GalvoScan:
     amplitude_deg : float
         Signed ``SingleAxisYAmplitude(deg)``; its sign sets sweep direction.
     offset_deg : float
-        ``SingleAxisYOffset(deg)`` placing the sweep center.
+        ``SingleAxisYOffset(deg)`` placing the sweep center (absolute galvo
+        position, including the Live offset).
+    reference_um : float
+        Plan coordinate of the Live plane: ``0`` for relative plans, the
+        focus position for absolute ones.
     """
 
     z_positions: tuple[float, ...]
@@ -53,6 +62,7 @@ class GalvoScan:
     center_offset_um: float
     amplitude_deg: float
     offset_deg: float
+    reference_um: float = 0.0
 
     @property
     def num_slices(self) -> int:
@@ -64,9 +74,34 @@ class GalvoScan:
         """Signed distance from the first to the last slice."""
         return self.z_positions[-1] - self.z_positions[0]
 
+    def live_plane_slice(self) -> str:
+        """Where the Live plane falls in the stack, for the run log."""
+        rel = [z - self.reference_um for z in self.z_positions]
+        for i, r in enumerate(rel):
+            if abs(r) <= _STEP_TOLERANCE_UM:
+                return f"slice {i}"
+        for i, (a, b) in enumerate(itertools.pairwise(rel)):
+            if min(a, b) < 0 < max(a, b):
+                return f"between slices {i} and {i + 1}"
+        return "outside the stack"
+
+    def describe(self) -> str:
+        """Planes relative to the Live plane, for the run log."""
+        # "+ 0.0" turns useq's -0.0 into 0.0 so it doesn't print as "-0.000"
+        first = self.z_positions[0] - self.reference_um + 0.0
+        last = self.z_positions[-1] - self.reference_um + 0.0
+        return (
+            f"{self.num_slices} slices, step {self.step_um:+.3f} um, planes "
+            f"{first:+.3f} .. {last:+.3f} um from the Live plane; Live plane = "
+            f"{self.live_plane_slice()}"
+        )
+
 
 def compute_galvo_scan(
-    z_plan: ZPlan, current_focus_um: float, slope_um_per_deg: float
+    z_plan: ZPlan,
+    current_focus_um: float,
+    slope_um_per_deg: float,
+    live_offset_deg: float = 0.0,
 ) -> GalvoScan:
     """Compute galvo amplitude/offset that reproduce ``z_plan`` exactly.
 
@@ -80,6 +115,9 @@ def compute_galvo_scan(
         plans such as ``ZTopBottom``.
     slope_um_per_deg : float
         Galvo slice calibration (microns of z per degree of galvo).
+    live_offset_deg : float
+        The galvo ``SingleAxisYOffset(deg)`` Live sits at before the MDA; the
+        sweep is placed relative to it.
 
     Raises
     ------
@@ -101,11 +139,13 @@ def compute_galvo_scan(
             )
 
     midpoint = (z[0] + z[-1]) / 2
-    center_offset_um = midpoint if z_plan.is_relative else midpoint - current_focus_um
+    reference = 0.0 if z_plan.is_relative else current_focus_um
+    center_offset_um = midpoint - reference
     return GalvoScan(
         z_positions=z,
         step_um=step,
         center_offset_um=center_offset_um,
         amplitude_deg=(z[-1] - z[0]) / slope_um_per_deg,
-        offset_deg=center_offset_um / slope_um_per_deg,
+        offset_deg=live_offset_deg + center_offset_um / slope_um_per_deg,
+        reference_um=reference,
     )

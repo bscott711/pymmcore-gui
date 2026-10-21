@@ -520,13 +520,17 @@ def test_setup_sequence_honors_z_stack_mode(
     offset_um: float,
     amplitude_um: float,
 ) -> None:
-    """Each Z Stack mode sets its own galvo sweep center/direction, not always 0."""
+    """Each Z Stack mode sets its own galvo sweep center/direction, not always 0.
+
+    The sweep is placed relative to the galvo offset Live sits at (0.1234 deg
+    here), so slice i images the Live plane + z[i] in every mode.
+    """
     core, engine = _setup_spim_engine(monkeypatch, focus_um=focus)
     engine.setup_sequence(useq.MDASequence(z_plan=z_plan))
 
     slope = engine.hw.slice_calibration_slope_um_per_deg
     assert _galvo_value(core, "SingleAxisYOffset(deg)") == pytest.approx(
-        offset_um / slope, abs=1e-4
+        0.1234 + offset_um / slope, abs=1e-4
     )
     assert _galvo_value(core, "SingleAxisYAmplitude(deg)") == pytest.approx(
         amplitude_um / slope, abs=1e-4
@@ -913,3 +917,108 @@ def test_setup_sequence_logs_galvo_spim_properties(
     assert any(
         "Pre-MDA (Live) galvo SingleAxisYOffset = 0.0 deg" in m for m in messages
     )
+
+
+# --- Advanced slice timing / All Rows mode ---
+
+
+def _all_rows_engine(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: object,
+    readout_override: float | None = 6.0,
+) -> tuple[MagicMock, ASISPIMEngine, MagicMock]:
+    timing = settings.spim_timing  # type: ignore[attr-defined]
+    timing.mode = "all_rows"
+    timing.galvo_settle_ms = 2.0
+    timing.readout_ms_override = readout_override
+    all_rows = MagicMock()
+    monkeypatch.setattr(engine_module, "configure_plogic_for_all_rows", all_rows)
+    core, engine = _setup_spim_engine(monkeypatch)
+    engine.setup_sequence(
+        useq.MDASequence(
+            channels=(useq.Channel(config="488nm", group="Lasers", exposure=10.0),)
+        )
+    )
+    return core, engine, all_rows
+
+
+def test_all_rows_setup_programs_plogic_and_galvo(
+    monkeypatch: pytest.MonkeyPatch, settings: object
+) -> None:
+    core, _engine, all_rows = _all_rows_engine(monkeypatch, settings)
+
+    all_rows.assert_called_once()
+    args = all_rows.call_args.args
+    assert args[-2] == 1.0  # Edge Trigger pulse
+    assert args[-1] == [36, 34]  # Expose Out: Camera-1 on BNC4, Camera-2 on BNC2
+    engine_module.configure_plogic_for_dual_nrt_pulses.assert_not_called()  # type: ignore[attr-defined]
+    # S=6, E=10, s=2: hold = max(S+E, 2S+E-s) + 0.5 = 20.5, period 22.5 ms
+    assert _galvo_value(core, "SPIMDelayBeforeCamera(ms)") == 2.0
+    assert _galvo_value(core, "SPIMDelayBeforeLaser(ms)") == 2.0
+    assert _galvo_value(core, "SPIMLaserDuration(ms)") == 20.5
+    assert _galvo_value(core, "SPIMNumScansPerSlice") == 1
+    assert _galvo_value(core, "SPIMDelayBeforeSide(ms)") == 0.0
+
+
+def test_all_rows_volume_arms_edge_trigger_and_retimes_per_channel(
+    monkeypatch: pytest.MonkeyPatch, settings: object
+) -> None:
+    core, engine, all_rows = _all_rows_engine(monkeypatch, settings)
+    event = useq.MDAEvent(
+        index={"t": 0}, channel={"config": "561nm", "group": "Lasers"}, exposure=20.0
+    )
+
+    options = engine._prepare_volume(event)
+
+    assert options == {
+        "trigger_mode": "Edge Trigger",
+        "expose_out_mode": "All Rows",
+        "exposure_ms": 20.0,
+    }
+    # E=20: hold = max(26, 12 + 20 - 2) + 0.5
+    assert _galvo_value(core, "SPIMLaserDuration(ms)") == 30.5
+    all_rows.assert_called_once()  # camera-gated: no PLogic change per exposure
+
+
+def test_all_rows_held_on_laser_keeps_rolling_exposure(
+    monkeypatch: pytest.MonkeyPatch, settings: object
+) -> None:
+    core, engine, _all_rows = _all_rows_engine(monkeypatch, settings)
+    monkeypatch.setattr(engine, "_shutter_gated_bncs", lambda: [40])
+
+    options = engine._prepare_volume(useq.MDAEvent(exposure=10.0))
+
+    assert options["expose_out_mode"] is None  # camera's normal mode
+    assert _galvo_value(core, "SPIMLaserDuration(ms)") == 16.5  # S + E + margin
+
+
+def test_all_rows_after_arm_retimes_to_reported_readout(
+    monkeypatch: pytest.MonkeyPatch, settings: object
+) -> None:
+    core, engine, _all_rows = _all_rows_engine(
+        monkeypatch, settings, readout_override=None
+    )
+    assert engine._readout_ms == 13.5  # fallback: nothing reported yet
+    pool = cast("MagicMock", engine._worker_pool)
+    pool.camera_timing.return_value = {
+        "cam0": {"Timing-ReadoutTimeNs": "8000000"},
+        "cam1": {"Timing-ReadoutTimeNs": "7000000"},
+    }
+
+    engine._after_arm()
+
+    assert engine._readout_ms == 8.0  # slowest camera wins
+    # S=8, E=10, s=2: hold = max(18, 24) + 0.5
+    assert _galvo_value(core, "SPIMLaserDuration(ms)") == 24.5
+
+
+def test_legacy_mode_keeps_original_arming(
+    monkeypatch: pytest.MonkeyPatch, settings: object
+) -> None:
+    core, engine = _setup_spim_engine(monkeypatch)
+    engine.setup_sequence(useq.MDASequence(channels=["488nm"]))
+
+    assert engine._prepare_volume(useq.MDAEvent(exposure=10.0)) == {}
+    # default settings: 25.75 ms settle + 10 ms hold = the original 35.75 ms
+    assert _galvo_value(core, "SPIMDelayBeforeLaser(ms)") == 25.75
+    assert _galvo_value(core, "SPIMLaserDuration(ms)") == 10.0

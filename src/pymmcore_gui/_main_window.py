@@ -201,6 +201,7 @@ class MicroManagerGUI(QMainWindow):
         Menu.PLUGINS: [
             WidgetAction.CRISP,
             WidgetAction.SPECTRAL_CHANNELS,
+            WidgetAction.SPIM_TIMING,
             WidgetAction.CAMERA_ALIGNMENT,
             WidgetAction.ARGUS_QC,
         ],
@@ -579,11 +580,16 @@ class MicroManagerGUI(QMainWindow):
         from pymmcore_gui.asi_z_stack.asi_controller import (
             ensure_beam_enabled,
             ensure_circular_buffer_capacity_async,
+            ensure_expose_out_inputs,
             ensure_global_shutter_open,
         )
 
         ensure_global_shutter_open()
         ensure_beam_enabled()
+        # Cameras' Expose Out may be cabled into these BNCs (All Rows mode);
+        # make them inputs before anything could drive them as outputs.
+        bncs = Settings.instance().spim_timing.expose_out_bnc.values()
+        ensure_expose_out_inputs([32 + n for n in bncs])
 
         # Live stays disabled until BOTH the circular-buffer grow (if any)
         # and the persistent camera worker pool (if this config needs one)

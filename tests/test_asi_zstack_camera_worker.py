@@ -553,3 +553,55 @@ def test_read_camera_timing_keeps_timing_props_and_skips_failures() -> None:
     timing = _read_camera_timing(core, "Camera-1")
 
     assert timing == {**values, "ROI": "485,644,1458,1143"}
+
+
+def test_set_expose_out_matches_case_insensitively_and_skips_noop() -> None:
+    from pymmcore_gui.asi_z_stack.camera_worker import (
+        _expose_out_property,
+        _set_expose_out,
+    )
+
+    core = MagicMock()
+    core.getDevicePropertyNames.return_value = ["Exposure", "ExposeOutMode", "Port"]
+    core.getAllowedPropertyValues.return_value = ("First Row", "All Rows", "Any Row")
+    core.getProperty.return_value = "First Row"
+
+    prop = _expose_out_property(core, "Camera-1")
+    assert prop == "ExposeOutMode"
+    _set_expose_out(core, "Camera-1", prop, "all rows")
+    core.setProperty.assert_called_once_with("Camera-1", "ExposeOutMode", "All Rows")
+
+    core.setProperty.reset_mock()
+    core.getProperty.return_value = "All Rows"
+    _set_expose_out(core, "Camera-1", prop, "All Rows")
+    core.setProperty.assert_not_called()
+
+
+def test_set_expose_out_refuses_unknown_mode() -> None:
+    from pymmcore_gui.asi_z_stack.camera_worker import _set_expose_out
+
+    core = MagicMock()
+    core.getAllowedPropertyValues.return_value = ("First Row",)
+    with pytest.raises(RuntimeError, match="no 'All Rows' mode"):
+        _set_expose_out(core, "Camera-1", "ExposeOutMode", "All Rows")
+    with pytest.raises(RuntimeError, match="no expose-out mode property"):
+        _set_expose_out(core, "Camera-1", None, "All Rows")
+
+
+def test_require_trigger_mode_and_set_exposure() -> None:
+    from pymmcore_gui.asi_z_stack.camera_worker import (
+        _require_trigger_mode,
+        _set_exposure,
+    )
+
+    core = MagicMock()
+    core.getAllowedPropertyValues.return_value = ("Internal Trigger", "Edge Trigger")
+    assert _require_trigger_mode(core, "Camera-1", "Edge Trigger") == "Edge Trigger"
+    with pytest.raises(RuntimeError, match="no 'Level Overlap'"):
+        _require_trigger_mode(core, "Camera-1", "Level Overlap")
+
+    core.getExposure.return_value = 10.0
+    _set_exposure(core, "Camera-1", 10.0)
+    core.setExposure.assert_not_called()
+    _set_exposure(core, "Camera-1", 20.0)
+    core.setExposure.assert_called_once_with("Camera-1", 20.0)

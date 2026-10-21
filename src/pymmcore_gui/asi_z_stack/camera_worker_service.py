@@ -516,7 +516,12 @@ class CameraWorkerService(QObject):
             raise RuntimeError(
                 f"Camera worker service is not ready for Live (state={state.name})."
             )
-        pool.arm_live_all(armed_timeout=self.hw.worker_arm_timeout_s)
+        # Explicit exposure: an MDA may have left the cameras at a channel's
+        # exposure (All Rows mode sets it per channel).
+        pool.arm_live_all(
+            armed_timeout=self.hw.worker_arm_timeout_s,
+            exposure_ms=self.last_known_exposure_ms,
+        )
         with self._lock:
             self._state = CameraWorkerServiceState.LIVE
             self._live_thread = threading.Thread(
@@ -631,7 +636,10 @@ class CameraWorkerService(QObject):
         # Internal trigger: outside an MDA nothing fires the external one, so
         # an externally-triggered Snap just times out with zero frames.
         pool.arm_all(
-            1, armed_timeout=self.hw.worker_arm_timeout_s, external_trigger=False
+            1,
+            armed_timeout=self.hw.worker_arm_timeout_s,
+            external_trigger=False,
+            exposure_ms=self.last_known_exposure_ms,
         )
         try:
             for camera_label, slice_idx, img, meta, remaining in pool.iter_frames(

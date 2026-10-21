@@ -417,6 +417,41 @@ class FocusOffsetSettingsV1(BaseMMSettings):
     keyed by laser-preset name (e.g. ``{"561nm": 0.35}``)."""
 
 
+class SpimTimingSettingsV1(BaseMMSettings):
+    """Advanced per-slice timing for the ASI galvo SPIM MDA.
+
+    See ``pymmcore_gui.asi_z_stack.spim_timing`` for the timing model; the
+    engine writes these to the galvo card and PLogic for every MDA.
+    """
+
+    mode: Literal["legacy", "all_rows"] = "legacy"
+    """``"all_rows"``: Kinetix pseudo-global All Rows mode, lasers gated by
+    each camera's Expose Out (needs Expose Out cabled into PLogic) -- every
+    row gets the full exposure, matching Live. ``"legacy"``: camera and laser
+    share one PLogic pulse (later-read rows get less light)."""
+    galvo_settle_ms: float = 25.75
+    """Galvo settle between each slice step and the camera trigger (written to
+    both ``SPIMDelayBeforeCamera`` and ``SPIMDelayBeforeLaser``)."""
+    volume_start_settle_ms: float = 0.0
+    """Extra settle before each volume's first slice, for the galvo's jump
+    back to the start of the sweep (``SPIMDelayBeforeSide``)."""
+    readout_ms_override: float | None = None
+    """Camera rolling readout time in ms; ``None`` uses the value the cameras
+    report (PVCAM ``Timing-ReadoutTimeNs``, maximum over cameras)."""
+    fallback_readout_ms: float = 13.5
+    """Readout time assumed when the cameras haven't reported one yet (e.g.
+    the first MDA of a session before any Snap/Live) and no override is set."""
+    margin_ms: float = 0.5
+    """Extra galvo hold after the light ends (All Rows only)."""
+    trigger_pulse_ms: float = 1.0
+    """Camera Edge Trigger pulse width in All Rows mode."""
+    expose_out_bnc: dict[str, int] = Field(
+        default_factory=lambda: {"Camera-1": 4, "Camera-2": 2}
+    )
+    """PLogic front-panel BNC each camera's Expose Out 1 is cabled into (the
+    rig's cabling, 2026-10-21: Camera-1 -> BNC4, Camera-2 -> BNC2)."""
+
+
 class SnapshotSettingsV1(BaseMMSettings):
     """Where the Save Image action writes Snap/Live frames."""
 
@@ -441,6 +476,7 @@ class SettingsV1(BaseMMSettings):
     mda_writer: MdaWriterSettingsV1 = Field(default_factory=MdaWriterSettingsV1)
     focus: FocusOffsetSettingsV1 = Field(default_factory=FocusOffsetSettingsV1)
     snapshot: SnapshotSettingsV1 = Field(default_factory=SnapshotSettingsV1)
+    spim_timing: SpimTimingSettingsV1 = Field(default_factory=SpimTimingSettingsV1)
 
     send_error_reports: bool | None = None
     """Whether to send error reports to the developers, None means undecided."""

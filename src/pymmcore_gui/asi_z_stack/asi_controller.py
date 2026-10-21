@@ -13,7 +13,7 @@ from .common import HardwareConstants
 # Direct import - this fixes the Pylance error
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
     from .common import AcquisitionSettings
 
@@ -306,6 +306,152 @@ def configure_plogic_for_dual_nrt_pulses(
             set_property(tiger_comm_hub_label, hub_prop, "Yes")
 
 
+#: PLogic front-panel BNC I/O type codes (``CCA Y`` at a BNC address), per
+#: ASI's Tiger PLogic docs: 0 input, 1 open-drain output, 2 push-pull output
+#: (the front-panel default).
+_PLOGIC_IO_INPUT = 0
+#: PLogic cell type codes (``CCA Y`` at a cell address): two-input AND and
+#: non-retriggerable one-shot.
+_PLOGIC_CELL_AND2 = 5
+_PLOGIC_CELL_ONE_SHOT_NRT = 14
+#: PLogic address that always reads logic high.
+_PLOGIC_HIGH = 64
+
+
+def configure_expose_out_inputs(
+    plogic_label: str, tiger_comm_hub_label: str, bnc_addrs: Sequence[int]
+) -> None:
+    """Make the PLogic BNCs carrying the cameras' Expose Out signals inputs.
+
+    Front-panel BNCs default to push-pull outputs, so a camera output cabled
+    into one would be driven against it; set them to inputs before anything
+    reads them (and once per session, see :func:`ensure_expose_out_inputs`).
+
+    Parameters
+    ----------
+    plogic_label : str
+        PLogic device label (e.g. ``"PLogic:E:36"``).
+    tiger_comm_hub_label : str
+        Tiger comm hub device label.
+    bnc_addrs : Sequence[int]
+        PLogic addresses of the input BNCs (front-panel BNC n = 32 + n).
+    """
+    if not bnc_addrs:
+        return
+    prefix = plogic_label.split(":")[-1]
+    hub_prop = "OnlySendSerialCommandOnChange"
+    original_hub_setting = get_property(tiger_comm_hub_label, hub_prop)
+    try:
+        if original_hub_setting == "Yes":
+            set_property(tiger_comm_hub_label, hub_prop, "No")
+        for addr in bnc_addrs:
+            _send_tiger_command(f"M E={addr}", tiger_comm_hub_label)
+            _send_tiger_command(
+                f"{prefix}CCA Y={_PLOGIC_IO_INPUT}", tiger_comm_hub_label
+            )
+        _send_tiger_command(f"{prefix}SS Z", tiger_comm_hub_label)
+        logger.info(f"PLogic BNC addresses {list(bnc_addrs)} set as inputs.")
+    finally:
+        if original_hub_setting == "Yes":
+            set_property(tiger_comm_hub_label, hub_prop, "Yes")
+
+
+def configure_plogic_for_all_rows(
+    plogic_label: str,
+    tiger_comm_hub_label: str,
+    plogic_camera_cell: int,
+    plogic_laser_on_cell: int,
+    pulses_per_ms: float,
+    plogic_4khz_clock_addr: int,
+    plogic_trigger_ttl_addr: int,
+    trigger_pulse_ms: float,
+    expose_out_addrs: Sequence[int],
+) -> None:
+    """Program PLogic for the cameras' pseudo-global "All Rows" mode.
+
+    - Camera: cell ``plogic_camera_cell`` is a short non-retriggerable
+      one-shot fired by the galvo's slice TTL, routed to BNC1 -- an Edge
+      Trigger that starts each frame (the camera's own exposure sets how
+      long all rows integrate).
+    - Laser: cell ``plogic_laser_on_cell`` ("laser on", which the ``Lasers``
+      presets route to the selected laser's BNC) becomes the AND of the
+      cameras' Expose Out inputs, so light falls only while every row of
+      every camera is integrating. With one camera the second AND input is
+      tied high.
+
+    Parameters
+    ----------
+    plogic_label : str
+        PLogic device label.
+    tiger_comm_hub_label : str
+        Tiger comm hub device label.
+    plogic_camera_cell : int
+        Cell that drives the camera trigger (BNC1).
+    plogic_laser_on_cell : int
+        Cell the laser presets take "laser on" from.
+    pulses_per_ms : float
+        PLogic clock ticks per millisecond.
+    plogic_4khz_clock_addr : int
+        Clock input address for the one-shot.
+    plogic_trigger_ttl_addr : int
+        Backplane address of the galvo's per-slice TTL.
+    trigger_pulse_ms : float
+        Camera trigger pulse width.
+    expose_out_addrs : Sequence[int]
+        PLogic addresses of the BNCs carrying each camera's Expose Out (one
+        or two).
+    """
+    if not 1 <= len(expose_out_addrs) <= 2:
+        raise ValueError(
+            f"All Rows gating needs 1 or 2 Expose Out inputs, got {expose_out_addrs}"
+        )
+    configure_expose_out_inputs(plogic_label, tiger_comm_hub_label, expose_out_addrs)
+
+    prefix = plogic_label.split(":")[-1]
+    hub_prop = "OnlySendSerialCommandOnChange"
+    original_hub_setting = get_property(tiger_comm_hub_label, hub_prop)
+
+    def _send(cmd: str) -> None:
+        _send_tiger_command(cmd, tiger_comm_hub_label)
+
+    first = expose_out_addrs[0]
+    second = expose_out_addrs[1] if len(expose_out_addrs) > 1 else _PLOGIC_HIGH
+    try:
+        if original_hub_setting == "Yes":
+            set_property(tiger_comm_hub_label, hub_prop, "No")
+
+        # 1. Camera Edge Trigger: short NRT one-shot off the slice TTL. Y and
+        # Z bundled into one command (see configure_plogic_for_dual_nrt_pulses).
+        _send(f"M E={plogic_camera_cell}")
+        cycles = max(1, round(trigger_pulse_ms * pulses_per_ms))
+        _send(f"{prefix}CCA Y={_PLOGIC_CELL_ONE_SHOT_NRT} Z={cycles}")
+        _send(f"{prefix}CCB X={plogic_trigger_ttl_addr} Y={plogic_4khz_clock_addr} Z=0")
+
+        # 2. Laser on = AND of the cameras' Expose Out (All Rows) signals.
+        _send(f"M E={plogic_laser_on_cell}")
+        _send(f"{prefix}CCA Y={_PLOGIC_CELL_AND2} Z=0")
+        _send(f"{prefix}CCB X={first} Y={second}")
+
+        # 3. Camera trigger cell -> BNC1 (address 33).
+        _send("M E=33")
+        _send(f"{prefix}CCA Z={plogic_camera_cell}")
+
+        _send(f"{prefix}SS Z")
+        logger.info(
+            f"PLogic configured for All Rows: camera trigger {trigger_pulse_ms:g} ms "
+            f"on BNC1, laser on = AND({first}, {second})."
+        )
+    finally:
+        if original_hub_setting == "Yes":
+            set_property(tiger_comm_hub_label, hub_prop, "Yes")
+
+
+def read_plogic_front_panel(plogic_label: str, tiger_comm_hub_label: str) -> str | None:
+    """Read the front-panel BNC levels (``RDADC X?``; LSB = BNC1)."""
+    prefix = plogic_label.split(":")[-1]
+    return _send_tiger_command(f"{prefix}RDADC X?", tiger_comm_hub_label)
+
+
 def read_plogic_trigger_chain_state(
     plogic_label: str, tiger_comm_hub_label: str
 ) -> dict[str, str | None]:
@@ -435,6 +581,23 @@ def ensure_global_shutter_open() -> None:
         _HW.plogic_always_on_cell,
         _HW.plogic_bnc3_addr,
     )
+
+
+def ensure_expose_out_inputs(bnc_addrs: Sequence[int]) -> None:
+    """Set the Expose Out BNCs as PLogic inputs once per session.
+
+    No-op without the ASI PLogic hardware. See
+    :func:`configure_expose_out_inputs` for why this matters even when All
+    Rows mode isn't in use.
+
+    Parameters
+    ----------
+    bnc_addrs : Sequence[int]
+        PLogic addresses of the Expose Out input BNCs.
+    """
+    if not _plogic_available():
+        return
+    configure_expose_out_inputs(_HW.plogic_label, _HW.tiger_comm_hub_label, bnc_addrs)
 
 
 def ensure_beam_enabled() -> None:

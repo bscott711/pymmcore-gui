@@ -339,6 +339,9 @@ class CameraWorkerPool:
         armed_timeout: float = 10.0,
         *,
         external_trigger: bool = True,
+        trigger_mode: str | None = None,
+        expose_out_mode: str | None = None,
+        exposure_ms: float | None = None,
     ) -> None:
         """Arm every worker for *n_images* frames and wait for all acks.
 
@@ -354,13 +357,29 @@ class CameraWorkerPool:
         external_trigger : bool
             ``True`` (MDA) to wait for the hardware trigger; ``False`` (Snap)
             to free-run on the camera's internal trigger.
+        trigger_mode : str | None
+            An exact ``TriggerMode`` to use instead of the worker's default
+            (see :class:`~pymmcore_gui.asi_z_stack.worker_messages.ArmCmd`).
+        expose_out_mode : str | None
+            Expose-out mode for this arm; ``None`` restores the camera's own.
+        exposure_ms : float | None
+            Camera exposure to set before arming; ``None`` leaves it.
         """
+        cmd = ArmCmd(
+            n_images,
+            external_trigger=external_trigger,
+            trigger_mode=trigger_mode,
+            expose_out_mode=expose_out_mode,
+            exposure_ms=exposure_ms,
+        )
         for worker in self.workers:
             assert worker.conn is not None
-            worker.conn.send(ArmCmd(n_images, external_trigger=external_trigger))
+            worker.conn.send(cmd)
         self._wait_for_all(ArmedMsg, armed_timeout)
 
-    def arm_live_all(self, armed_timeout: float = 10.0) -> None:
+    def arm_live_all(
+        self, armed_timeout: float = 10.0, *, exposure_ms: float | None = None
+    ) -> None:
         """Arm every worker for unbounded, free-running acquisition.
 
         Live counterpart to :meth:`arm_all` -- no target frame count, since
@@ -373,10 +392,12 @@ class CameraWorkerPool:
         armed_timeout : float
             Seconds to wait for every worker's
             :class:`~pymmcore_gui.asi_z_stack.worker_messages.ArmedMsg`.
+        exposure_ms : float | None
+            Camera exposure to set before arming; ``None`` leaves it.
         """
         for worker in self.workers:
             assert worker.conn is not None
-            worker.conn.send(ArmLiveCmd())
+            worker.conn.send(ArmLiveCmd(exposure_ms=exposure_ms))
         self._wait_for_all(ArmedMsg, armed_timeout)
 
     def camera_timing(self) -> dict[str, dict[str, str]]:

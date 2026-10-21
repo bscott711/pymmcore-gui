@@ -253,6 +253,54 @@ def _set_trigger_mode(mmc: CMMCorePlus, label: str, mode: str | None) -> None:
     _log(label, f"TriggerMode -> {mode!r} ({(time.perf_counter() - t0) * 1e3:.0f} ms)")
 
 
+def _expose_out_property(mmc: CMMCorePlus, label: str) -> str | None:
+    """Name of *label*'s expose-out mode property (PVCAM), if it has one."""
+    for prop in mmc.getDevicePropertyNames(label):
+        lowered = prop.lower().replace(" ", "")
+        if "exposeout" in lowered and "mode" in lowered:
+            return prop
+    return None
+
+
+def _set_expose_out(
+    mmc: CMMCorePlus, label: str, prop: str | None, mode: str | None
+) -> None:
+    """Switch *label*'s expose-out mode to *mode* (matched case-insensitively).
+
+    Raises if the camera has no expose-out property or doesn't offer *mode*,
+    so an acquisition that depends on it fails loudly instead of running
+    with the wrong illumination timing.
+    """
+    if mode is None:
+        return
+    if prop is None:
+        raise RuntimeError(f"{label} has no expose-out mode property")
+    allowed = list(mmc.getAllowedPropertyValues(label, prop))
+    match = next((v for v in allowed if v.lower() == mode.lower()), None)
+    if match is None:
+        raise RuntimeError(f"{label} {prop} has no {mode!r} mode (allowed: {allowed})")
+    if mmc.getProperty(label, prop) != match:
+        mmc.setProperty(label, prop, match)
+        _log(label, f"{prop} -> {match!r}")
+
+
+def _set_exposure(mmc: CMMCorePlus, label: str, exposure_ms: float | None) -> None:
+    """Set *label*'s exposure if *exposure_ms* is given and differs."""
+    if exposure_ms is None:
+        return
+    if abs(mmc.getExposure(label) - exposure_ms) > 1e-6:
+        mmc.setExposure(label, exposure_ms)
+        _log(label, f"Exposure -> {exposure_ms:g} ms")
+
+
+def _require_trigger_mode(mmc: CMMCorePlus, label: str, mode: str) -> str:
+    """Return *mode* if *label* allows it as a ``TriggerMode``, else raise."""
+    allowed = list(mmc.getAllowedPropertyValues(label, "TriggerMode"))
+    if mode not in allowed:
+        raise RuntimeError(f"{label} has no {mode!r} trigger mode (allowed: {allowed})")
+    return mode
+
+
 def _internal_trigger_mode(
     mmc: CMMCorePlus, label: str, snapshot_mode: str | None
 ) -> str | None:
@@ -686,6 +734,10 @@ def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
             label,
             f"trigger modes: internal={internal_mode!r} external={external_mode!r}",
         )
+        expose_out_prop = _expose_out_property(mmc, label)
+        normal_expose_out = (
+            mmc.getProperty(label, expose_out_prop) if expose_out_prop else None
+        )
         shm = SharedMemory(name=config.shm_name, create=False)
     except Exception:
         _log(label, f"startup failed:\n{traceback.format_exc()}")
@@ -712,11 +764,19 @@ def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
             if isinstance(cmd, ArmCmd):
                 shutdown_requested = False
                 try:
-                    _set_trigger_mode(
+                    mode: str | None
+                    if cmd.trigger_mode is not None:
+                        mode = _require_trigger_mode(mmc, label, cmd.trigger_mode)
+                    else:
+                        mode = external_mode if cmd.external_trigger else internal_mode
+                    _set_trigger_mode(mmc, label, mode)
+                    _set_expose_out(
                         mmc,
                         label,
-                        external_mode if cmd.external_trigger else internal_mode,
+                        expose_out_prop,
+                        cmd.expose_out_mode or normal_expose_out,
                     )
+                    _set_exposure(mmc, label, cmd.exposure_ms)
                     armed_count = cmd.n_images + _ARM_COUNT_PADDING
                     mmc.startSequenceAcquisition(label, armed_count, 0, True)
                     last_timing = _report_timing(mmc, label, last_timing)
@@ -740,6 +800,8 @@ def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
                 shutdown_requested = False
                 try:
                     _set_trigger_mode(mmc, label, internal_mode)
+                    _set_expose_out(mmc, label, expose_out_prop, normal_expose_out)
+                    _set_exposure(mmc, label, cmd.exposure_ms)
                     mmc.startContinuousSequenceAcquisition(0)
                     last_timing = _report_timing(mmc, label, last_timing)
                     conn.send(ArmedMsg(label, last_timing))

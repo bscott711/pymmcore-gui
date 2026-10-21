@@ -43,6 +43,7 @@ class WidgetAction(ActionKey):
     CONFIG_WIZARD = "pymmcore_gui.hardware_config_wizard"
     CRISP = "pymmcore_gui.crisp_widget"
     SPECTRAL_CHANNELS = "pymmcore_gui.spectral_channel_config"
+    SPIM_TIMING = "pymmcore_gui.spim_timing_widget"
     CAMERA_ALIGNMENT = "pymmcore_gui.camera_alignment_widget"
     ARGUS_QC = "pymmcore_gui.argus_qc_widget"
 
@@ -197,6 +198,15 @@ def create_spectral_channel_config(parent: QWidget) -> QWidget:
     return SpectralChannelConfigWidget(parent=parent, mmcore=_get_core(parent))
 
 
+def create_spim_timing_widget(parent: QWidget) -> QWidget:
+    """Create the ASI galvo SPIM advanced slice-timing widget."""
+    from pymmcore_gui.widgets._spim_timing_widget import SpimTimingWidget
+
+    # PySide6-typed widget (pymmcore_gui._qt) vs this module's PyQt6 QWidget;
+    # the bindings are duck-type compatible at runtime.
+    return SpimTimingWidget(parent=parent, mmcore=_get_core(parent))  # type: ignore[return-value]
+
+
 def create_camera_alignment_widget(parent: QWidget) -> QWidget:
     """Create the dual-camera overlay/alignment widget."""
     from pymmcore_gui.widgets.camera_alignment import CameraAlignmentWidget
@@ -343,6 +353,14 @@ show_spectral_channels = WidgetActionInfo(
     text="Spectral Channels",
     icon="mdi:grid-large",
     create_widget=create_spectral_channel_config,
+    dock_area=DockWidgetArea.LeftDockWidgetArea,
+)
+
+show_spim_timing = WidgetActionInfo(
+    key=WidgetAction.SPIM_TIMING,
+    text="SPIM Timing",
+    icon="mdi:timer-cog-outline",
+    create_widget=create_spim_timing_widget,
     dock_area=DockWidgetArea.LeftDockWidgetArea,
 )
 
