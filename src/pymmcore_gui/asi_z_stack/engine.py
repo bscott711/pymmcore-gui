@@ -387,11 +387,13 @@ class _ASITriggerEngineBase(MDAEngine):
             )
         self._snapshot = svc.geometry
         self._worker_pool = svc.acquire_for_mda()
+        sizes = ", ".join(
+            "{}={}x{}".format(label, *svc.frame_size(label))
+            for label in self._snapshot.camera_labels
+        )
         logger.info(
             f"Acquired persistent camera worker pool for MDA: "
-            f"{self._snapshot.camera_labels} "
-            f"({self._snapshot.image_width}x{self._snapshot.image_height} "
-            f"{self._snapshot.dtype_str})."
+            f"{self._snapshot.camera_labels} ({sizes} {self._snapshot.dtype_str})."
         )
 
     def _reclaim_from_workers(self) -> None:
@@ -452,9 +454,11 @@ class _ASITriggerEngineBase(MDAEngine):
         """
         svc = CameraWorkerService.get_active()
         geometry = svc.geometry if svc is not None else None
-        if geometry is not None:
-            bytes_per_frame = (
-                geometry.image_width * geometry.image_height * geometry.bytes_per_pixel
+        if svc is not None and geometry is not None:
+            # Current (possibly cropped) frame size, not the spawn snapshot's.
+            bytes_per_frame = geometry.bytes_per_pixel * max(
+                w * h
+                for w, h in (svc.frame_size(label) for label in geometry.camera_labels)
             )
         else:
             mmc = self.mmcore

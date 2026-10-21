@@ -20,8 +20,10 @@ from pymmcore_gui._settings import SettingsV1
 from pymmcore_gui._spectral_channel_handler import (
     SpectralChannelHandler,
     _strip_known_suffix,
+    camera_roi,
     channel_output_path,
     channels_for_sequence,
+    regions_outside_roi,
 )
 from pymmcore_gui._vendored.mda_handlers import handler_for_path
 
@@ -94,6 +96,17 @@ class GuiMDAWidget(MDAWidget):
             backlog_budget_bytes = writer_cfg.backlog_budget_mb * 1024**2
             save = self._spectral_channels_to_save(sequence)
             if save:
+                rois = {c.camera: camera_roi(self._mmc, c.camera) for c in save}
+                if outside := regions_outside_roi(save, rois):
+                    QMessageBox.critical(
+                        self,
+                        "Spectral regions outside the camera ROI",
+                        "These spectral regions are not inside their camera's "
+                        f"current ROI, so they can't be saved: {', '.join(outside)}."
+                        "\n\nWiden the camera ROI (or turn on 'Crop cameras to "
+                        "regions' in Spectral Channels) and start the MDA again.",
+                    )
+                    return
                 meta = sequence.metadata.get(PYMMCW_METADATA_KEY, {})
                 output = SpectralChannelHandler(
                     output,

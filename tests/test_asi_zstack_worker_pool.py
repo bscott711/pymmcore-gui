@@ -227,3 +227,36 @@ def test_arm_all_records_camera_timing() -> None:
 
     assert isinstance(child.recv(), ArmCmd)
     assert pool.camera_timing() == {"Camera-1": timing}
+
+
+def test_read_frame_uses_message_shape_for_cropped_frames() -> None:
+    from multiprocessing.shared_memory import SharedMemory
+
+    import numpy as np
+    import pytest
+
+    from pymmcore_gui.asi_z_stack.worker_pool import CameraWorkerHandle
+
+    handle = CameraWorkerHandle(
+        "Camera-1",
+        None,  # type: ignore[arg-type]
+        height=8,
+        width=10,
+        dtype="uint16",
+        n_slots=2,
+    )
+    shm = SharedMemory(create=True, size=handle.slot_nbytes * 2)
+    handle.shm = shm
+    try:
+        cropped = np.arange(4 * 6, dtype=np.uint16).reshape(4, 6)
+        offset = handle.slot_nbytes  # slot 1
+        shm.buf[offset : offset + cropped.nbytes] = cropped.tobytes()
+
+        out = handle.read_frame(1, cropped.nbytes, height=4, width=6)
+        np.testing.assert_array_equal(out, cropped)
+
+        with pytest.raises(ValueError, match="expected"):
+            handle.read_frame(1, cropped.nbytes, height=5, width=6)
+    finally:
+        shm.close()
+        shm.unlink()

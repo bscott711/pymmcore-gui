@@ -17,6 +17,7 @@ from pymmcore_gui._multi_camera_handler import physical_camera_labels, without_c
 from pymmcore_gui._numpy_display_store import NumpyDisplayStore
 from pymmcore_gui._settings import SettingsV1
 from pymmcore_gui._snapshot_save import LatestFrame
+from pymmcore_gui._spectral_channel_handler import roi_origin
 from pymmcore_gui.asi_z_stack.camera_worker_service import (
     CameraWorkerService,
     CameraWorkerServiceState,
@@ -335,8 +336,11 @@ class NDVViewersManager(QObject):
         re-derive them from settings.
         """
         spectral = SettingsV1.instance().spectral
+        # Regions are stored in full-sensor coordinates; a cropped camera's
+        # frames (and so its preview) start at its ROI origin.
+        ox, oy = roi_origin(self._mmc, camera_label)
         rois = [
-            (c.name, c.rect)
+            (c.name, (c.rect[0] - ox, c.rect[1] - oy, c.rect[2], c.rect[3]))
             for c in spectral.channels
             if c.is_ready and c.camera == camera_label and c.rect is not None
         ]
@@ -464,9 +468,24 @@ class NDVViewersManager(QObject):
                 self._connected_worker_service.frameReady.disconnect(
                     self._on_worker_frame
                 )
+            with suppress(RuntimeError, TypeError):
+                self._connected_worker_service.roiChanged.disconnect(
+                    self._on_camera_roi_changed
+                )
         if svc is not None:
             svc.frameReady.connect(self._on_worker_frame)
+            svc.roiChanged.connect(self._on_camera_roi_changed)
         self._connected_worker_service = svc
+
+    def _on_camera_roi_changed(self, camera_label: str) -> None:
+        """Re-place overlays (and the default zoom) after a camera's ROI changed."""
+        if (dw := self._camera_previews.get(camera_label)) is None:
+            return
+        preview = cast("PygfxPreview", dw.widget())
+        rois = self._apply_roi_overlays(preview, camera_label)
+        # The next frame has a new shape, which re-applies this default view.
+        preview.set_default_zoom_rect(self._roi_union_rect(rois), apply=False)
+        self._latest_frames.pop(camera_label, None)
 
     def _on_worker_frame(
         self,

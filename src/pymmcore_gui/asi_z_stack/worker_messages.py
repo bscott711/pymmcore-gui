@@ -130,7 +130,12 @@ class ArmedMsg:
 
 @dataclass(frozen=True)
 class FrameMsg:
-    """One frame is ready to read from the worker's shared-memory ring buffer."""
+    """One frame is ready to read from the worker's shared-memory ring buffer.
+
+    ``height``/``width`` give the frame's own shape, which follows the
+    camera's current ROI rather than the full-sensor slot size; ``0`` means
+    "the slot's full-sensor shape".
+    """
 
     camera_label: str
     slot_index: int
@@ -139,6 +144,8 @@ class FrameMsg:
     camera_metadata: dict[str, Any] = field(default_factory=dict)
     images_remaining: int = 0
     worker_perf_counter: float = 0.0
+    height: int = 0
+    width: int = 0
 
 
 @dataclass(frozen=True)

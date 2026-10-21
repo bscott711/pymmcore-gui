@@ -237,6 +237,12 @@ class SpectralChannelSettingsV1(BaseMMSettings):
 
     enabled: bool = False
     """Master on/off switch for the whole feature."""
+    crop_camera_roi: bool = False
+    """Crop each camera's hardware ROI to the bounding box of its regions.
+
+    Shorter rolling readout (faster slices) and less data per frame; the
+    regions stay in full-sensor coordinates (see ``pymmcore_gui._camera_crop``).
+    """
     laser_config_group: str = "Lasers"
     all_lasers_preset: str = "AllLasers"
     channels: list[SpectralChannelConfig] = Field(

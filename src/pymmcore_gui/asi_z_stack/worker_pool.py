@@ -211,7 +211,9 @@ class CameraWorkerHandle:
         self.process = process
         child_conn.close()
 
-    def read_frame(self, slot_index: int, nbytes: int) -> np.ndarray:
+    def read_frame(
+        self, slot_index: int, nbytes: int, height: int = 0, width: int = 0
+    ) -> np.ndarray:
         """Copy one frame out of shared memory slot *slot_index*.
 
         Parameters
@@ -219,9 +221,13 @@ class CameraWorkerHandle:
         slot_index : int
             Which ring-buffer slot the worker wrote the frame into.
         nbytes : int
-            The exact byte length the worker wrote (for a truncated/short
-            final row this can be less than ``slot_nbytes``, though normally
-            they match).
+            The exact byte length the worker wrote.
+        height : int
+            The frame's height (from ``FrameMsg``). With a cropped camera ROI
+            this is smaller than the full-sensor slot; ``0`` means the slot's
+            own full-sensor shape.
+        width : int
+            The frame's width; see *height*.
 
         Returns
         -------
@@ -229,17 +235,19 @@ class CameraWorkerHandle:
             An owned copy (safe to use after the slot is recycled).
         """
         assert self.shm is not None
-        offset = slot_index * self.slot_nbytes
-        expected = self.height * self.width * np.dtype(self.dtype).itemsize
-        if nbytes != expected:
+        if not (height and width):
+            height, width = self.height, self.width
+        expected = height * width * np.dtype(self.dtype).itemsize
+        if nbytes != expected or nbytes > self.slot_nbytes:
             raise ValueError(
-                f"{self.camera_label} frame is {nbytes} bytes, expected {expected}"
+                f"{self.camera_label} frame is {nbytes} bytes, expected {expected} "
+                f"for {width}x{height} (slot holds {self.slot_nbytes})"
             )
         arr: np.ndarray = np.ndarray(
-            (self.height, self.width),
+            (height, width),
             dtype=self.dtype,
             buffer=self.shm.buf,
-            offset=offset,
+            offset=slot_index * self.slot_nbytes,
         )
         return arr.copy()
 
@@ -460,7 +468,9 @@ class CameraWorkerPool:
                 worker = conn_map[obj]
                 msg = worker.conn.recv()  # type: ignore[union-attr]
                 if isinstance(msg, FrameMsg):
-                    img = worker.read_frame(msg.slot_index, msg.nbytes)
+                    img = worker.read_frame(
+                        msg.slot_index, msg.nbytes, msg.height, msg.width
+                    )
                     worker.conn.send(SlotFreeCmd(msg.slot_index))  # type: ignore[union-attr]
                     frames_seen[worker.camera_label] += 1
                     last_frame_time = time.monotonic()

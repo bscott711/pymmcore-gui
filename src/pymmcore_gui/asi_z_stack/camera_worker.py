@@ -277,6 +277,13 @@ def _internal_trigger_mode(
     return None
 
 
+def _frame_shape(img: np.ndarray) -> tuple[int, int]:
+    """``(height, width)`` of a mono frame, or ``(0, 0)`` (slot shape) otherwise."""
+    if img.ndim == 2:
+        return int(img.shape[0]), int(img.shape[1])
+    return 0, 0
+
+
 #: Substrings of camera property names worth reporting in ArmedMsg.timing.
 _TIMING_PROP_KEYS = ("Timing", "Trigger", "Expose", "Port", "Readout", "Clear")
 
@@ -393,8 +400,14 @@ def _drain_sequence(
                 camera_metadata = {}
 
             data = img.tobytes()
+            if len(data) > config.slot_nbytes:
+                raise ValueError(
+                    f"{label}: frame is {len(data)} bytes, exceeds this "
+                    f"worker's {config.slot_nbytes}-byte frame slots"
+                )
             offset = slot * config.slot_nbytes
             shm.buf[offset : offset + len(data)] = data
+            height, width = _frame_shape(img)
             conn.send(
                 FrameMsg(
                     camera_label=label,
@@ -404,6 +417,8 @@ def _drain_sequence(
                     camera_metadata=camera_metadata,
                     images_remaining=remaining - 1,
                     worker_perf_counter=time.perf_counter(),
+                    height=height,
+                    width=width,
                 )
             )
             slice_idx += 1
@@ -577,6 +592,7 @@ def _drain_live(
             mmc.clearCircularBuffer()
 
             skipped = remaining - 1
+            height, width = _frame_shape(img)
             conn.send(
                 FrameMsg(
                     camera_label=label,
@@ -586,6 +602,8 @@ def _drain_live(
                     camera_metadata=camera_metadata,
                     images_remaining=skipped,
                     worker_perf_counter=time.perf_counter(),
+                    height=height,
+                    width=width,
                 )
             )
             slice_idx += 1

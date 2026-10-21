@@ -292,3 +292,36 @@ def test_exposure_widget_uses_core_without_service(
     # Under a QApplication, core events are Qt signals delivered via the loop.
     core.setExposure(7.0)
     qtbot.waitUntil(lambda: wdg.spin.value() == pytest.approx(7.0), timeout=2000)
+
+
+class _RoiPool(_FakePool):
+    """Fake pool whose camera rounds the requested ROI width up to a multiple of 4."""
+
+    def set_roi(
+        self, camera_label: str, x: int, y: int, w: int, h: int, timeout: float = 5.0
+    ) -> tuple[int, int, int, int]:
+        return x, y, (w + 3) // 4 * 4, h
+
+
+def test_set_roi_tracks_crop_and_emits(core: CMMCorePlus, qtbot: QtBot) -> None:
+    svc = _service(core, _RoiPool())
+    assert svc.roi("Camera-1") == (0, 0, 16, 16)  # full frame until cropped
+
+    with qtbot.waitSignal(svc.roiChanged) as blocker:
+        applied = svc.set_roi("Camera-1", 2, 3, 9, 5)
+
+    assert blocker.args == ["Camera-1"]
+    assert applied == (2, 3, 12, 5)  # what the camera actually applied
+    assert svc.roi("Camera-1") == (2, 3, 12, 5)
+    assert svc.frame_size("Camera-1") == (12, 5)
+    assert svc.roi("Camera-2") == (0, 0, 16, 16)
+    # the respawn snapshot keeps the crop
+    assert svc.geometry is not None
+    assert svc.geometry.per_camera["Camera-1"].roi == (2, 3, 12, 5)
+
+
+def test_set_roi_refused_while_live(core: CMMCorePlus) -> None:
+    svc = _service(core, _RoiPool())
+    svc._state = CameraWorkerServiceState.LIVE
+    with pytest.raises(RuntimeError, match="stop Live/MDA"):
+        svc.set_roi("Camera-1", 0, 0, 4, 4)

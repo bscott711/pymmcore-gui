@@ -22,7 +22,7 @@ from pymmcore_gui._qt.QtWidgets import (
     QWidget,
 )
 from pymmcore_gui._settings import SettingsV1, SpectralChannelConfig
-from pymmcore_gui._spectral_channel_handler import next_fft_friendly
+from pymmcore_gui._spectral_channel_handler import next_fft_friendly, roi_origin
 
 if TYPE_CHECKING:
     from pymmcore_gui._main_window import MicroManagerGUI
@@ -147,6 +147,13 @@ class SpectralChannelConfigWidget(QWidget):
 
         self.master_enabled = QCheckBox("Enable spectral-channel cropping")
         self.master_enabled.setChecked(spectral.enabled)
+        self.crop_camera = QCheckBox("Crop cameras to regions (faster readout)")
+        self.crop_camera.setToolTip(
+            "Read only the bounding box of each camera's regions: shorter "
+            "rolling readout (faster slices) and less data per frame. Applied "
+            "on Save and restored at startup."
+        )
+        self.crop_camera.setChecked(spectral.crop_camera_roi)
 
         # Shared size — every region must be identical for deconvolution.
         self.width_spin = QSpinBox()
@@ -198,6 +205,7 @@ class SpectralChannelConfigWidget(QWidget):
 
         layout = QVBoxLayout(self)
         layout.addWidget(self.master_enabled)
+        layout.addWidget(self.crop_camera)
         layout.addWidget(size_box)
         layout.addWidget(scroll)
         layout.addWidget(save_button)
@@ -282,6 +290,15 @@ class SpectralChannelConfigWidget(QWidget):
     def _preview_for(self, row: _ChannelRow) -> PygfxPreview | None:
         return self._preview_for_camera(row.camera.currentText())
 
+    def _origin(self, camera_label: str) -> tuple[int, int]:
+        """Top-left of *camera_label*'s ROI on the sensor.
+
+        Regions are stored in full-sensor coordinates while a cropped
+        camera's preview shows only its ROI, so drawing/moving/overlaying
+        converts between the two with this offset.
+        """
+        return roi_origin(self._mmc, camera_label)
+
     def _apply_button_states(self) -> None:
         """Sync every row's draw/move buttons to the pristine/synced state.
 
@@ -307,7 +324,12 @@ class SpectralChannelConfigWidget(QWidget):
 
     def _draw(self, row: _ChannelRow) -> None:
         if (preview := self._preview_for(row)) is not None:
-            preview.begin_roi_draw(lambda rect: self._on_rect_drawn(row, preview, rect))
+            ox, oy = self._origin(row.camera.currentText())
+            preview.begin_roi_draw(
+                lambda r: self._on_rect_drawn(
+                    row, preview, (r[0] + ox, r[1] + oy, r[2], r[3])
+                )
+            )
 
     def _move(self, row: _ChannelRow) -> None:
         if not self._synced:
@@ -315,8 +337,12 @@ class SpectralChannelConfigWidget(QWidget):
         w, h = self._size
         if (preview := self._preview_for(row)) is not None:
             x, y = row.position
+            ox, oy = self._origin(row.camera.currentText())
             preview.begin_roi_move(
-                (x, y, w, h), lambda rect: self._on_rect_moved(row, preview, rect)
+                (x - ox, y - oy, w, h),
+                lambda r: self._on_rect_moved(
+                    row, preview, (r[0] + ox, r[1] + oy, r[2], r[3])
+                ),
             )
 
     def _sync_siblings(
@@ -376,9 +402,13 @@ class SpectralChannelConfigWidget(QWidget):
     ) -> None:
         """Live-preview all this camera's (unsaved) regions on *preview*."""
         w, h = self._size
+        ox, oy = self._origin(camera_label)
         rois = (
             [
-                (row.channel_name, (row.x_spin.value(), row.y_spin.value(), w, h))
+                (
+                    row.channel_name,
+                    (row.x_spin.value() - ox, row.y_spin.value() - oy, w, h),
+                )
                 for row in self._rows
                 if row.camera.currentText() == camera_label
             ]
@@ -395,8 +425,24 @@ class SpectralChannelConfigWidget(QWidget):
 
     def _save(self) -> None:
         settings = SettingsV1.instance()
+        crop_before = settings.spectral.enabled and settings.spectral.crop_camera_roi
+        rects_before = [c.rect for c in settings.spectral.channels]
         settings.spectral.enabled = self.master_enabled.isChecked()
+        settings.spectral.crop_camera_roi = self.crop_camera.isChecked()
         settings.spectral.channels = [row.to_config(self._size) for row in self._rows]
         settings.flush()
+        crop_now = settings.spectral.enabled and settings.spectral.crop_camera_roi
+        rects_now = [c.rect for c in settings.spectral.channels]
+        if crop_now != crop_before or (crop_now and rects_now != rects_before):
+            self._apply_crop()
         if (win := self._main_window()) is not None:
             win.viewers_manager.refresh_roi_overlays()
+
+    def _apply_crop(self) -> None:
+        """Apply (or undo) the camera crop to match the saved settings."""
+        from pymmcore_gui._camera_crop import apply_camera_crop
+
+        try:
+            apply_camera_crop(self._mmc, SettingsV1.instance().spectral)
+        except Exception as exc:
+            QMessageBox.warning(self, "Could not change the camera ROI", str(exc))

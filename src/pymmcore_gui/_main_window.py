@@ -598,6 +598,7 @@ class MicroManagerGUI(QMainWindow):
         def _on_camera_service_ready() -> None:
             with suppress(RuntimeError):
                 live_action.setEnabled(has_camera(self._mmc))
+            self._reapply_camera_crop()
             self.bufferReady.emit()
 
         def _on_buffer_ready() -> None:
@@ -606,6 +607,25 @@ class MicroManagerGUI(QMainWindow):
         ensure_circular_buffer_capacity_async(on_done=_on_buffer_ready)
 
         self._register_mda_engine()
+
+    def _reapply_camera_crop(self) -> None:
+        """Restore the saved "crop cameras to spectral regions" ROI at startup.
+
+        Cameras come up full frame after every config load; the crop is a
+        persisted preference (``SpectralChannelSettingsV1.crop_camera_roi``).
+        """
+        from pymmcore_gui._camera_crop import apply_camera_crop
+        from pymmcore_gui.asi_z_stack.camera_worker_service import CameraWorkerService
+
+        spectral = Settings.instance().spectral
+        if not (spectral.enabled and spectral.crop_camera_roi):
+            return
+        if CameraWorkerService.get_active() is None:
+            return
+        try:
+            apply_camera_crop(self._mmc, spectral)
+        except Exception:
+            logger.exception("Could not crop cameras to the spectral regions.")
 
     def _register_mda_engine(self) -> None:
         """Select the MDA engine to match the loaded configuration.
