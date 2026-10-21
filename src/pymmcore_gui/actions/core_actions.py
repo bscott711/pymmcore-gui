@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import suppress
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ._action_info import ActionInfo, ActionKey
@@ -19,6 +20,8 @@ class CoreAction(ActionKey):
 
     SNAP = "pymmcore_gui.snap_image"
     TOGGLE_LIVE = "pymmcore_gui.toggle_live"
+    SAVE_IMAGE = "pymmcore_gui.save_image"
+    SAVE_IMAGE_AS = "pymmcore_gui.save_image_as"
     LOAD_DEMO = "pymmcore_gui.load_demo_config"
     LOAD_CONFIG = "pymmcore_gui.load_config"
     SAVE_CONFIG = "pymmcore_gui.save_config"
@@ -102,6 +105,56 @@ def toggle_live(action: QCoreAction, checked: bool) -> None:
     else:
         open_selected_lasers()
         mmc.startContinuousSequenceAcquisition(0)
+
+
+def _save_latest_frames(action: QCoreAction, *, ask_for_folder: bool) -> None:
+    """Save each camera's newest Snap/Live frame (see ``_snapshot_save``)."""
+    from qtpy.QtWidgets import QFileDialog
+
+    from pymmcore_gui._settings import SettingsV1
+    from pymmcore_gui._snapshot_save import collect_scope_state, save_frames
+
+    window = action.parent()
+    viewers = getattr(window, "viewers_manager", None)
+    notify = getattr(window, "nm", None)
+    frames = viewers.latest_frames() if viewers is not None else []
+    if not frames:
+        if notify is not None:
+            notify.show_warning_message(
+                "Nothing to save yet -- Snap or start Live first."
+            )
+        return
+
+    settings = SettingsV1.instance()
+    folder = settings.snapshot.save_dir
+    if ask_for_folder or folder is None:
+        chosen = QFileDialog.getExistingDirectory(
+            None, "Folder for saved images", str(folder or "")
+        )
+        if not chosen:
+            return
+        settings.snapshot.save_dir = folder = Path(chosen)
+        settings.flush()
+
+    try:
+        paths = save_frames(frames, folder, collect_scope_state(action.mmc))
+    except OSError as exc:
+        if notify is not None:
+            notify.show_error_message(f"Could not save image: {exc}")
+        return
+    if notify is not None:
+        names = ", ".join(p.name for p in paths)
+        notify.show_info_message(f"Saved {len(paths)} image(s) to {folder}: {names}")
+
+
+def save_image(action: QCoreAction, checked: bool) -> None:
+    """Save the newest Snap/Live frame of every camera to the save folder."""
+    _save_latest_frames(action, ask_for_folder=False)
+
+
+def save_image_as(action: QCoreAction, checked: bool) -> None:
+    """Choose a folder, then save the newest Snap/Live frame of every camera."""
+    _save_latest_frames(action, ask_for_folder=True)
 
 
 def _init_snap_image(action: QCoreAction) -> None:
@@ -247,6 +300,23 @@ toggle_live_action = ActionInfo(
     checkable=True,
     on_triggered=toggle_live,
     on_created=_init_toggle_live,
+)
+
+save_image_action = ActionInfo(
+    key=CoreAction.SAVE_IMAGE,
+    text="Save Image",
+    shortcut="Ctrl+S",
+    icon="mdi:content-save-outline",
+    tooltip="Save the newest Snap/Live frame of each camera (OME-TIFF + JSON)",
+    on_triggered=save_image,
+)
+
+save_image_as_action = ActionInfo(
+    key=CoreAction.SAVE_IMAGE_AS,
+    text="Save Image To...",
+    icon="mdi:content-save-move-outline",
+    tooltip="Choose a folder, then save the newest Snap/Live frame of each camera",
+    on_triggered=save_image_as,
 )
 
 load_demo_action = ActionInfo(

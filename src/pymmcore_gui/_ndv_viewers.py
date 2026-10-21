@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import warnings
 from contextlib import suppress
+from datetime import datetime
 from typing import TYPE_CHECKING, cast
 from weakref import WeakSet, WeakValueDictionary
 
@@ -15,12 +16,16 @@ from PyQt6Ads import CDockWidget
 from pymmcore_gui._multi_camera_handler import physical_camera_labels, without_cam_index
 from pymmcore_gui._numpy_display_store import NumpyDisplayStore
 from pymmcore_gui._settings import SettingsV1
-from pymmcore_gui.asi_z_stack.camera_worker_service import CameraWorkerService
+from pymmcore_gui._snapshot_save import LatestFrame
+from pymmcore_gui.asi_z_stack.camera_worker_service import (
+    CameraWorkerService,
+    CameraWorkerServiceState,
+)
 from pymmcore_gui.widgets.image_preview._pygfx_preview import PygfxPreview
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
-    from typing import Any, TypeGuard
+    from typing import Any, Literal, TypeGuard
 
     from pymmcore_plus import CMMCorePlus
     from pymmcore_plus.metadata import FrameMetaV1, SummaryMetaV1
@@ -216,6 +221,10 @@ class NDVViewersManager(QObject):
         # e.g. {"Camera-1": <CDockWidget>, "Camera-2": <CDockWidget>}
         self._camera_previews: dict[str, CDockWidget] = {}
 
+        # Newest Snap/Live frame per physical camera, kept so it can be saved
+        # (see latest_frames / the Save Image action).
+        self._latest_frames: dict[str, LatestFrame] = {}
+
         # Primary "streaming driver" preview — the first camera's PygfxPreview owns
         # the Qt timer that polls the circular buffer.  Other cameras' previews
         # receive frames via a callback set on this widget.
@@ -368,6 +377,35 @@ class NDVViewersManager(QObject):
             return cast("PygfxPreview", dw.widget()), False
         return self._create_camera_preview(camera_label), True
 
+    def latest_frames(self) -> list[LatestFrame]:
+        """Return the newest Snap/Live frame of each camera, in camera order.
+
+        Frames from the single-camera streaming path (which appends inside the
+        preview's own timer, with no hook here) are read back from the
+        preview's texture instead.
+        """
+        frames = dict(self._latest_frames)
+        for label, dw in self._camera_previews.items():
+            if label in frames:
+                continue
+            data = cast("PygfxPreview", dw.widget()).data
+            # A 1x1 texture is the placeholder shown before any frame arrives.
+            if data is not None and data.size > 1:
+                frames[label] = LatestFrame(label, data, "live", datetime.now())
+        order = {label: i for i, label in enumerate(self._get_physical_camera_labels())}
+        return sorted(frames.values(), key=lambda f: order.get(f.camera_label, 99))
+
+    def _remember_frame(
+        self,
+        camera_label: str,
+        frame: np.ndarray,
+        source: Literal["snap", "live"],
+        camera_metadata: dict[str, Any] | None = None,
+    ) -> None:
+        self._latest_frames[camera_label] = LatestFrame(
+            camera_label, frame, source, datetime.now(), dict(camera_metadata or {})
+        )
+
     def _dispatch_snap_to_previews(self, images: dict[int, np.ndarray]) -> None:
         """Send each snapped camera image to its dedicated preview widget."""
         labels = self._get_physical_camera_labels()
@@ -375,6 +413,7 @@ class NDVViewersManager(QObject):
             label = labels[ch_idx] if ch_idx < len(labels) else f"Camera-ch{ch_idx}"
             preview, _ = self._get_or_create_camera_preview(label)
             preview.append(img)
+            self._remember_frame(label, img, "snap")
 
     def _make_multicam_streaming_callback(
         self, labels: list[str]
@@ -401,6 +440,7 @@ class NDVViewersManager(QObject):
                 else:
                     preview = cast("PygfxPreview", dw.widget())
                 preview.append(frame)
+                self._remember_frame(label, frame, "live")
 
         return _on_frames
 
@@ -448,6 +488,11 @@ class NDVViewersManager(QObject):
             return
         preview, _ = self._get_or_create_camera_preview(camera_label)
         preview.append(frame)
+        svc = self._connected_worker_service
+        live = svc is not None and svc.state is CameraWorkerServiceState.LIVE
+        self._remember_frame(
+            camera_label, frame, "live" if live else "snap", camera_metadata
+        )
 
     # ------------------------------------------------------------------
     # Streaming / Snap handlers
@@ -520,7 +565,9 @@ class NDVViewersManager(QObject):
             label = self._mmc.getCameraDevice()
             preview, _ = self._get_or_create_camera_preview(label)
             try:
-                preview.append(self._mmc.getImage())
+                img = self._mmc.getImage()
+                preview.append(img)
+                self._remember_frame(label, img, "snap")
             except Exception as exc:  # pragma: no cover
                 warnings.warn(
                     f"Failed to get image: {exc}", RuntimeWarning, stacklevel=2

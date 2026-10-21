@@ -411,6 +411,13 @@ class FocusOffsetSettingsV1(BaseMMSettings):
     keyed by laser-preset name (e.g. ``{"561nm": 0.35}``)."""
 
 
+class SnapshotSettingsV1(BaseMMSettings):
+    """Where the Save Image action writes Snap/Live frames."""
+
+    save_dir: Path | None = None
+    """Destination folder; ``None`` means ask on the next save."""
+
+
 class SettingsV1(BaseMMSettings):
     """Global settings for the PyMMCore GUI."""
 
@@ -427,6 +434,7 @@ class SettingsV1(BaseMMSettings):
     argus_stream: ArgusStreamSettingsV1 = Field(default_factory=ArgusStreamSettingsV1)
     mda_writer: MdaWriterSettingsV1 = Field(default_factory=MdaWriterSettingsV1)
     focus: FocusOffsetSettingsV1 = Field(default_factory=FocusOffsetSettingsV1)
+    snapshot: SnapshotSettingsV1 = Field(default_factory=SnapshotSettingsV1)
 
     send_error_reports: bool | None = None
     """Whether to send error reports to the developers, None means undecided."""
