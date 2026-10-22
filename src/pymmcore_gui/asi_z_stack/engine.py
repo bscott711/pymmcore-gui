@@ -44,6 +44,17 @@ logger = logging.getLogger(__name__)
 #: ``CRISP State`` values meaning the servo is actively holding focus.
 _CRISP_LOCKED_STATES = frozenset({"Lock", "In Focus"})
 
+#: The galvo card's per-slice timing the proven legacy setup ran with (the
+#: rig's stored values, confirmed by the user 2026-10-21). Legacy restores
+#: any that differ; SPIMCameraDuration/SPIMLaserDuration follow the exposure
+#: (see _fit_slice_period_to_exposure).
+_LEGACY_CARD_TIMING: dict[str, float] = {
+    "SPIMDelayBeforeCamera(ms)": LEGACY_SETTLE_MS,
+    "SPIMDelayBeforeLaser(ms)": LEGACY_SETTLE_MS,
+    "SPIMDelayBeforeScan(ms)": 0.0,
+    "SPIMNumScansPerSlice": 1,
+}
+
 #: Galvo per-slice properties only All Rows mode writes. The proven legacy
 #: setup never touches them (it relies on the values stored on the card), so
 #: an All Rows run snapshots them and restores them in teardown.
@@ -1076,31 +1087,31 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         if restored:
             logger.info("Galvo timing restored after All Rows: " + "; ".join(restored))
 
-    def _restore_legacy_delay_before_laser(self) -> None:
-        """Make sure the card has the proven 25.75 ms slice settle for legacy.
+    def _restore_legacy_card_timing(self) -> None:
+        """Make sure the galvo card holds the proven legacy per-slice timing.
 
-        The legacy setup never wrote ``SPIMDelayBeforeLaser``; it relied on the
-        value stored on the card (25.75 ms, logged on every run since
-        2026-09-23). An All Rows run from before teardown restored the card
-        could have left a different value, so legacy writes the known-good one
-        back -- a no-op on a card that still has it.
+        The legacy setup never wrote these; it relied on the values stored on
+        the card (see :data:`_LEGACY_CARD_TIMING`). An All Rows run from before
+        teardown restored the card could have left different ones, so legacy
+        writes the known-good values back -- a no-op on a card that has them.
         """
         mmc = self.mmcore
         label = self.hw.galvo_a_label
-        prop = "SPIMDelayBeforeLaser(ms)"
-        if not mmc.hasProperty(label, prop):
-            return
-        current = mmc.getProperty(label, prop)
-        try:
-            if abs(float(current) - LEGACY_SETTLE_MS) < 1e-6:
-                return
-        except (TypeError, ValueError):
-            pass
-        logger.warning(
-            f"Galvo {prop} was {current}, not the proven {LEGACY_SETTLE_MS}; "
-            "restoring it for legacy timing."
-        )
-        mmc.setProperty(label, prop, f"{LEGACY_SETTLE_MS:.4f}")
+        for prop, value in _LEGACY_CARD_TIMING.items():
+            if not mmc.hasProperty(label, prop):
+                continue
+            current = mmc.getProperty(label, prop)
+            try:
+                if abs(float(current) - value) < 1e-6:
+                    continue
+            except (TypeError, ValueError):
+                pass
+            text = str(int(value)) if prop == "SPIMNumScansPerSlice" else f"{value:.4f}"
+            logger.warning(
+                f"Galvo {prop} was {current}, not the proven {text}; restoring it "
+                "for legacy timing."
+            )
+            mmc.setProperty(label, prop, text)
 
     def _apply_timing(self, timing: SliceTiming) -> None:
         self._apply_plogic_timing(timing)
@@ -1349,7 +1360,7 @@ class ASISPIMEngine(_ASITriggerEngineBase):
                 "SPIMDelayBeforeSide(ms)",
                 str(self.hw.delay_before_side_ms),
             )
-            self._restore_legacy_delay_before_laser()
+            self._restore_legacy_card_timing()
             self._fit_slice_period_to_exposure()
         self._applied_timing = timing
         logger.info(f"Slice timing: {timing.describe(self._num_slices)}")

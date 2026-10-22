@@ -1066,24 +1066,15 @@ def test_legacy_mode_ignores_all_rows_settle(
     core, engine = _setup_spim_engine(monkeypatch)
     engine.setup_sequence(useq.MDASequence(channels=["488nm"]))
 
-    # exactly the proven legacy writes: side delay, slice settle, hold, and
-    # the camera pulse = exposure (Level Trigger)
+    # exactly the proven legacy card timing: 25.75 ms camera/laser delays,
+    # no scan delay, one scan per slice, camera/laser pulses = exposure
     assert _galvo_value(core, "SPIMDelayBeforeSide(ms)") == 0.0
+    assert _galvo_value(core, "SPIMDelayBeforeCamera(ms)") == 25.75
     assert _galvo_value(core, "SPIMDelayBeforeLaser(ms)") == 25.75
+    assert _galvo_value(core, "SPIMDelayBeforeScan(ms)") == 0.0
+    assert _galvo_value(core, "SPIMNumScansPerSlice") == 1
     assert _galvo_value(core, "SPIMLaserDuration(ms)") == 10.0
     assert _galvo_value(core, "SPIMCameraDuration(ms)") == 10.0
-    # ... and nothing the proven setup left to the card
-    written = {
-        c.args[1]
-        for c in core.setProperty.call_args_list
-        if c.args[0] == "Scanner:AB:33"
-    }
-    for prop in (
-        "SPIMDelayBeforeCamera(ms)",
-        "SPIMDelayBeforeScan(ms)",
-        "SPIMNumScansPerSlice",
-    ):
-        assert prop not in written
     # legacy PLogic: the proven E-long one-shots, never the All Rows cells
     engine_module.configure_plogic_for_dual_nrt_pulses.assert_called_once()  # type: ignore[attr-defined]
     settings_arg = engine_module.configure_plogic_for_dual_nrt_pulses.call_args.args[0]  # type: ignore[attr-defined]
