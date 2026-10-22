@@ -79,8 +79,8 @@ def test_z_lock_skips_non_matching_frames(mmcore: CMMCorePlus, qtbot: QtBot) -> 
     assert locked_z is not None
     assert locked_z == first.index.get("z")
 
-    manager.set_viewer_z_locked(viewer, True)
-    assert manager._locked_z_axis[viewer] == locked_z
+    manager.set_viewer_slice_locked(viewer, True)
+    assert manager._locked_axes[viewer]["z"] == locked_z
 
     other_z_event = next(e for e in events if e.index.get("z") != locked_z)
     handler.frameReady(frame, other_z_event, {})  # pyright: ignore
@@ -105,8 +105,8 @@ def test_z_lock_skips_non_matching_frames(mmcore: CMMCorePlus, qtbot: QtBot) -> 
     )
 
     # unlocking resumes normal "jump to latest" behavior
-    manager.set_viewer_z_locked(viewer, False)
-    assert viewer not in manager._locked_z_axis
+    manager.set_viewer_slice_locked(viewer, False)
+    assert viewer not in manager._locked_axes
     manager._update_mda_viewer(viewer, handler, other_z_event)
     qtbot.wait(50)
     assert dict(viewer.display_model.current_index).get("z") == other_z_event.index.get(
@@ -145,13 +145,13 @@ def test_z_lock_tracks_manual_slice_drag(mmcore: CMMCorePlus, qtbot: QtBot) -> N
     assert original_z is not None
     assert dict(viewer.display_model.current_index).get("t") == first.index.get("t")
 
-    manager.set_viewer_z_locked(viewer, True)
-    assert manager._locked_z_axis[viewer] == original_z
+    manager.set_viewer_slice_locked(viewer, True)
+    assert manager._locked_axes[viewer]["z"] == original_z
 
     # simulate the user manually dragging the z slider to a different slice
     new_z = next(z for z in (e.index.get("z") for e in events) if z != original_z)
     viewer.display_model.current_index["z"] = new_z
-    assert manager._locked_z_axis[viewer] == new_z
+    assert manager._locked_axes[viewer]["z"] == new_z
 
     # a subsequent frame at the *original* z is now skipped -- it no longer
     # matches the (updated) lock
@@ -180,10 +180,155 @@ def test_z_lock_tracks_manual_slice_drag(mmcore: CMMCorePlus, qtbot: QtBot) -> N
     )
 
     # unlocking disconnects the listener -- further manual drags no longer
-    # touch _locked_z_axis
-    manager.set_viewer_z_locked(viewer, False)
+    # touch _locked_axes
+    manager.set_viewer_slice_locked(viewer, False)
     viewer.display_model.current_index["z"] = original_z
-    assert viewer not in manager._locked_z_axis
+    assert viewer not in manager._locked_axes
+
+
+def test_lock_holds_channel_and_slice(mmcore: CMMCorePlus, qtbot: QtBot) -> None:
+    """Locking pins both z and channel; only frames at that (z, c) advance t."""
+    from ndv.models import ChannelMode
+
+    manager = NDVViewersManager(QWidget(), mmcore)
+    seq = MDASequence(
+        axis_order="tpcz",  # pyright: ignore
+        channels=["DAPI", "FITC"],  # pyright: ignore
+        z_plan=useq.ZRangeAround(range=2, step=1),  # 3 z slices
+        time_plan=useq.TIntervalLoops(interval=0, loops=3),  # pyright: ignore
+    )
+    events = list(seq)
+    handler = NumpyDisplayStore()
+    handler.reset(seq)
+    frame = np.zeros((4, 4), dtype="uint8")
+    viewer = ndv.ArrayViewer()
+    viewer.display_model.channel_mode = ChannelMode.GRAYSCALE
+
+    def feed(event: useq.MDAEvent) -> None:
+        handler.frameReady(frame, event, {})  # pyright: ignore
+        manager._update_mda_viewer(viewer, handler, event)
+
+    def current() -> dict:
+        return {str(k): v for k, v in viewer.display_model.current_index.items()}
+
+    def at(t: int, c: int, z: int) -> useq.MDAEvent:
+        return next(
+            e
+            for e in events
+            if (e.index.get("t"), e.index.get("c"), e.index.get("z")) == (t, c, z)
+        )
+
+    # play t=0 up to (c=1, z=1), then lock there.
+    for e in events[: events.index(at(0, 1, 1)) + 1]:
+        feed(e)
+        qtbot.wait(15)
+    qtbot.waitUntil(lambda: current().get("c") == 1 and current().get("z") == 1)
+    manager.set_viewer_slice_locked(viewer, True)
+    assert manager._locked_axes[viewer] == {"z": 1, "c": 1}
+
+    # all of t=1 except the locked plane: the view must not move at all,
+    # neither to the other channel at the same z nor to other slices.
+    for e in (e for e in events if e.index.get("t") == 1):
+        if e is at(1, 1, 1):
+            continue
+        feed(e)
+        qtbot.wait(15)
+    qtbot.wait(50)
+    assert current() == {"t": 0, "c": 1, "z": 1}
+
+    # the locked plane at a new timepoint advances t only.
+    feed(at(1, 1, 1))
+    qtbot.waitUntil(lambda: current().get("t") == 1)
+    assert current() == {"t": 1, "c": 1, "z": 1}
+
+    # dragging the channel slider re-locks to that channel.
+    viewer.display_model.current_index["c"] = 0
+    assert manager._locked_axes[viewer] == {"z": 1, "c": 0}
+    feed(at(2, 1, 1))
+    qtbot.wait(50)
+    assert current()["t"] == 1
+    feed(at(2, 0, 1))
+    qtbot.waitUntil(lambda: current().get("t") == 2)
+    assert current() == {"t": 2, "c": 0, "z": 1}
+
+
+def test_lock_ignores_channel_in_composite_mode(
+    mmcore: CMMCorePlus, qtbot: QtBot
+) -> None:
+    """Composite mode draws every channel, so only z gates the locked update."""
+    from ndv.models import ChannelMode
+
+    manager = NDVViewersManager(QWidget(), mmcore)
+    seq = MDASequence(
+        axis_order="tpcz",  # pyright: ignore
+        channels=["DAPI", "FITC"],  # pyright: ignore
+        z_plan=useq.ZRangeAround(range=2, step=1),
+        time_plan=useq.TIntervalLoops(interval=0, loops=2),  # pyright: ignore
+    )
+    events = list(seq)
+    handler = NumpyDisplayStore()
+    handler.reset(seq)
+    frame = np.zeros((4, 4), dtype="uint8")
+    viewer = ndv.ArrayViewer()
+    viewer.display_model.channel_mode = ChannelMode.COMPOSITE
+
+    def current() -> dict:
+        return {str(k): v for k, v in viewer.display_model.current_index.items()}
+
+    first, second = events[0], events[1]  # (t0, c0, z0), (t0, c0, z1)
+    for e in (first, second):
+        handler.frameReady(frame, e, {})  # pyright: ignore
+        manager._update_mda_viewer(viewer, handler, e)
+        qtbot.wait(30)
+    qtbot.waitUntil(lambda: current().get("z") == 1)
+    manager.set_viewer_slice_locked(viewer, True)
+
+    # the *other* channel at the locked z, next timepoint: shown in composite,
+    # without moving the (locked) channel index.
+    other_c = next(
+        e
+        for e in events
+        if (e.index.get("t"), e.index.get("c"), e.index.get("z")) == (1, 1, 1)
+    )
+    handler.frameReady(frame, other_c, {})  # pyright: ignore
+    manager._update_mda_viewer(viewer, handler, other_c)
+    qtbot.waitUntil(lambda: current().get("t") == 1)
+    assert current() == {"t": 1, "c": 0, "z": 1}
+
+
+def test_z_slider_keeps_full_range_while_volume_fills(
+    mmcore: CMMCorePlus, qtbot: QtBot
+) -> None:
+    """Regression: z must not be bounded to the slices written so far.
+
+    Bounding it made the newest frame always the slider's maximum, so in live
+    mode the z handle sat pinned at the end of the stack while the volume
+    filled, instead of tracking the slice being acquired.
+    """
+    manager = NDVViewersManager(QWidget(), mmcore)
+    seq = MDASequence(
+        z_plan=useq.ZRangeAround(range=4, step=1),  # 5 z slices
+        time_plan=useq.TIntervalLoops(interval=0, loops=2),  # pyright: ignore
+    )
+    events = list(seq)
+    handler = NumpyDisplayStore()
+    handler.reset(seq)
+    frame = np.zeros((4, 4), dtype="uint8")
+    viewer = ndv.ArrayViewer()
+
+    for e in events[:7]:  # all of t=0, then the first 2 slices of t=1
+        handler.frameReady(frame, e, {})  # pyright: ignore
+        manager._update_mda_viewer(viewer, handler, e)
+        qtbot.wait(15)
+    qtbot.waitUntil(
+        lambda: dict(viewer.display_model.current_index).get("z") == 1
+        and dict(viewer.display_model.current_index).get("t") == 1
+    )
+    assert viewer.data_wrapper is not None
+    assert dict(viewer.data_wrapper.coords)["z"] == range(5)
+    sliders = viewer._view._qwidget.dims_sliders._sliders  # type: ignore[attr-defined]
+    assert sliders["z"].maximum() == 4
+    assert sliders["z"].value() == 1
 
 
 def test_live_frames_actually_resolve_not_just_the_raw_model(
@@ -344,43 +489,47 @@ def test_to_storage_index_modulo_wraparound() -> None:
     assert store.to_storage_index({"y": slice(None)}) == {"y": slice(None)}
 
 
-def test_z_progress_for_newest_volume_only() -> None:
-    """``z_progress_for`` tracks only the currently-filling volume.
+def test_is_unwritten_tracks_newest_volume_per_channel() -> None:
+    """``is_unwritten`` flags only not-yet-written planes of the newest volume.
 
-    Older, already-complete volumes must report ``None`` (meaning "use the
-    full declared z range"), never a stale partial count.
+    Tracked per channel, so channel-interleaved (z outer) and stack-per-channel
+    (c outer) orders both work; older, complete volumes are never flagged.
     """
     frame = np.zeros((4, 4), dtype="uint16")
     store = NumpyDisplayStore()
     seq = MDASequence(
+        axis_order="tpzc",  # pyright: ignore
+        channels=["DAPI", "FITC"],  # pyright: ignore
         time_plan=useq.TIntervalLoops(interval=0, loops=2),  # pyright: ignore
         z_plan=useq.ZRangeAround(range=2, step=1),  # 3 z slices
     )
     store.reset(seq)
     events = list(seq)
-    t0_events = [e for e in events if e.index.get("t") == 0]
-    assert len(t0_events) == 3
 
-    store.frameReady(frame, t0_events[0], {})  # pyright: ignore
-    assert store.z_progress_for(0, 0) == 1
-    store.frameReady(frame, t0_events[1], {})  # pyright: ignore
-    assert store.z_progress_for(0, 0) == 2
+    # (t0, z0, c0) written, (t0, z0, c1) not yet.
+    store.frameReady(frame, events[0], {})  # pyright: ignore
+    assert not store.is_unwritten(0, 0, 0, 0)
+    assert store.is_unwritten(0, 0, 1, 0)
+    assert store.is_unwritten(0, 0, 0, 1)
+
+    store.frameReady(frame, events[1], {})  # pyright: ignore
+    assert not store.is_unwritten(0, 0, 1, 0)
 
     # a frame for a new t implies the previous (t, p) is now complete.
-    t1_events = [e for e in events if e.index.get("t") == 1]
-    store.frameReady(frame, t1_events[0], {})  # pyright: ignore
-    assert store.z_progress_for(0, 0) is None  # old volume -- use full range
-    assert store.z_progress_for(1, 0) == 1  # new volume -- in progress
+    t1 = next(e for e in events if e.index.get("t") == 1)
+    store.frameReady(frame, t1, {})  # pyright: ignore
+    assert not store.is_unwritten(0, 0, 1, 2)  # old volume -- complete
+    assert store.is_unwritten(1, 0, 0, 1)  # new volume -- in progress
 
 
 def test_labeled_wrapper_bounds_and_evicted_reads() -> None:
     """``_LabeledArrayWrapper.coords``/``isel`` reflect collected data, not the domain.
 
     Covers: "t" always reports ``range(0, max_t_seen+1)`` (never the larger
-    declared total); "z" is bounded only while viewing the still-filling
-    newest volume, and reports the full range for any older (complete)
-    volume; reading an evicted "t" returns zeros of the correct shape/dtype
-    without raising, rather than stale or wrong data.
+    declared total); "z" always reports the full declared range; reading an
+    evicted "t", or a not-yet-written plane of the filling volume whose
+    storage slot still holds an older timepoint, returns zeros of the correct
+    shape/dtype without raising, rather than stale or wrong data.
     """
     from pymmcore_gui._ndv_viewers import _LabeledArrayWrapper
 
@@ -397,16 +546,10 @@ def test_labeled_wrapper_bounds_and_evicted_reads() -> None:
     t0_events = [e for e in events if e.index.get("t") == 0]
     store.frameReady(frame, t0_events[0], {})  # pyright: ignore
     wrapper = _LabeledArrayWrapper(store)
-    wrapper.set_selection(t=0, p=0)
 
     coords = dict(wrapper.coords)
     assert coords["t"] == range(1)  # only t=0 collected so far
-    assert coords["z"] == range(1)  # only 1 of 3 z slices written for t=0
-
-    # finish t=0's volume -- z bound should now show the full declared range.
-    for e in t0_events[1:]:
-        store.frameReady(frame, e, {})  # pyright: ignore
-    assert dict(wrapper.coords)["z"] == range(3)
+    assert coords["z"] == range(3)  # full range, though only 1 slice written
 
     # advance well past the window (window=3, so t=0 gets evicted).
     for e in events:
@@ -428,6 +571,22 @@ def test_labeled_wrapper_bounds_and_evicted_reads() -> None:
     # isel on a still-resident, non-evicted t returns the real (non-zero) data.
     result = wrapper.isel({t_pos: 5, z_pos: 0})
     assert np.all(result == 1)
+
+    # t=6 starts filling the slot t=3 used (window=3): its first slice is
+    # real, the rest still hold t=3's planes and must read as zeros -- for a
+    # pinned z and for the whole z axis (3D view) alike.
+    t6 = MDASequence(
+        time_plan=useq.TIntervalLoops(interval=0, loops=7),  # pyright: ignore
+        z_plan=useq.ZRangeAround(range=2, step=1),
+    )
+    t6_first = next(e for e in t6 if e.index.get("t") == 6)
+    store.frameReady(np.full((4, 4), 2, dtype="uint16"), t6_first, {})  # pyright: ignore
+    assert np.all(wrapper.isel({t_pos: 6, z_pos: 0}) == 2)
+    assert np.all(wrapper.isel({t_pos: 6, z_pos: 1}) == 0)
+    volume = wrapper.isel({t_pos: 6})
+    assert volume.shape == (3, 4, 4)
+    assert np.all(volume[0] == 2)
+    assert np.all(volume[1:] == 0)
 
 
 def test_live_preview_creates_no_tensorstore(

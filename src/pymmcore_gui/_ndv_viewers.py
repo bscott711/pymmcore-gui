@@ -51,15 +51,22 @@ class _LabeledArrayWrapper(ndv.DataWrapper):
     dim labels from the store's domain), just for our zarr-backed
     ``NumpyDisplayStore``.
 
-    Also bounds ``"t"``/``"z"`` sliders to data that's actually been
+    Also bounds the ``"t"`` slider to timepoints that have actually been
     collected (``coords``), and translates the handler's rolling-window
     storage positions transparently on read (``isel``) -- see
     ``NumpyDisplayStore``'s module docstring for why the store only retains a
-    bounded window of recent timepoints. Neither of these needs an offset/
+    bounded window of recent timepoints. This doesn't need an offset/
     non-zero-based ``coords`` range (which ``_norm_current_index`` mishandles,
     see above): ``useq.MDAEvent.index["t"]`` is a permanent, monotonic,
     0-based counter that's never renumbered as older timepoints are evicted,
     so ``coords["t"]`` can just report ``range(0, max_t_seen + 1)`` forever.
+
+    ``"z"`` deliberately keeps its full declared range. Bounding it to the
+    slices written so far for the filling volume made the newest frame
+    always the slider's maximum, so in live mode the handle sat pinned at
+    the end of the stack while the range grew underneath it. Planes not yet
+    written in that volume are blanked on read instead (see
+    ``NumpyDisplayStore.is_unwritten``).
     """
 
     def __init__(self, handler: NumpyDisplayStore) -> None:
@@ -68,16 +75,9 @@ class _LabeledArrayWrapper(ndv.DataWrapper):
             raise ValueError("NumpyDisplayStore has no data yet")
         self._dims_ = handler.dims
         self._handler = handler
-        # currently-viewed t/p, kept in sync via _ndv_viewers's selection
-        # listener -- used only to decide whether the "z" bound below should
-        # reflect the (possibly still-filling) newest volume or the full
-        # declared range of an older, guaranteed-complete one.
-        self._selected_t: int | None = None
-        self._selected_p: int = 0
-        # last-reported bounds, so dims_changed is only emitted when the
+        # last-reported "t" bound, so dims_changed is only emitted when the
         # valid range has actually changed (avoids redundant slider rebuilds).
         self._last_t_bound = 0
-        self._last_z_bound: int | None = None
         super().__init__(array)
 
     @classmethod
@@ -103,12 +103,6 @@ class _LabeledArrayWrapper(ndv.DataWrapper):
             # collected-data bound, not the (possibly much larger) declared
             # domain -- always 0-based since t is never renumbered.
             coords["t"] = range(self._handler.max_t_seen + 1)
-        if "z" in coords and self._selected_t == self._handler.max_t_seen:
-            z_filled = self._handler.z_progress_for(
-                self._handler.max_t_seen, self._selected_p
-            )
-            if z_filled is not None:
-                coords["z"] = range(z_filled)
         return coords
 
     def isel(self, index: Mapping[int, int | slice]) -> np.ndarray:
@@ -131,34 +125,55 @@ class _LabeledArrayWrapper(ndv.DataWrapper):
         # read's shape here (rather than hand-computing it) keeps this
         # correct-by-construction for every visible-axes combination ndv can
         # request.
-        return np.zeros_like(result) if evicted else result
+        if evicted:
+            return np.zeros_like(result)
+        if isinstance(t_val, int):
+            return self._blank_unwritten(result, by_label, t_val)
+        return result
 
-    def set_selection(self, *, t: int | None = None, p: int | None = None) -> None:
-        """Record the currently-selected t/p (see the manager's selection listener)."""
-        changed = (t is not None and t != self._selected_t) or (
-            p is not None and p != self._selected_p
-        )
-        if t is not None:
-            self._selected_t = t
-        if p is not None:
-            self._selected_p = p
-        if changed:
-            self._maybe_emit_dims_changed()
+    def _blank_unwritten(
+        self, result: np.ndarray, by_label: Mapping[str, int | slice], t: int
+    ) -> np.ndarray:
+        """Zero any not-yet-written (c, z) planes of the filling volume in *result*.
+
+        *result* holds one axis per slice-indexed label of *by_label* (in dims
+        order, integer-indexed labels dropped), so a plane is addressed by
+        the positions of "c"/"z" among those axes, when they're sliced.
+        """
+        p = by_label.get("p", 0)
+        if not isinstance(p, int):
+            return result
+        kept = [label for label in self._dims_ if isinstance(by_label[label], slice)]
+        shape = dict(zip(self._dims_, self._handler.array.shape, strict=False))  # type: ignore[union-attr]
+
+        def _planes(label: str) -> list[tuple[int, int | None]]:
+            # [(logical value, axis position in result or None if pinned)]
+            idx = by_label.get(label, 0)
+            if isinstance(idx, int):
+                return [(idx, None)]
+            values = range(*idx.indices(shape[label]))
+            return [(v, i) for i, v in enumerate(values)]
+
+        out = result
+        for c, c_pos in _planes("c"):
+            for z, z_pos in _planes("z"):
+                if not self._handler.is_unwritten(t, p, c, z):
+                    continue
+                if out is result:
+                    out = np.array(result, copy=True)
+                sel: list[int | slice] = [slice(None)] * out.ndim
+                if c_pos is not None:
+                    sel[kept.index("c")] = c_pos
+                if z_pos is not None:
+                    sel[kept.index("z")] = z_pos
+                out[tuple(sel)] = 0
+        return out
 
     def notify_frame_written(self) -> None:
         """Re-check whether the collected-data bounds changed; called after writes."""
-        self._maybe_emit_dims_changed()
-
-    def _maybe_emit_dims_changed(self) -> None:
         new_t_bound = self._handler.max_t_seen + 1
-        new_z_bound = (
-            self._handler.z_progress_for(self._handler.max_t_seen, self._selected_p)
-            if self._selected_t == self._handler.max_t_seen
-            else None
-        )
-        if new_t_bound != self._last_t_bound or new_z_bound != self._last_z_bound:
+        if new_t_bound != self._last_t_bound:
             self._last_t_bound = new_t_bound
-            self._last_z_bound = new_z_bound
             self.dims_changed.emit()
 
 
@@ -204,19 +219,14 @@ class NDVViewersManager(QObject):
         # QTimer.singleShot per viewer -- see _update_mda_viewer.
         self._pending_viewer_updates: dict[ndv.ArrayViewer, useq.MDAEvent] = {}
 
-        # {viewer: locked z index} for viewers in "locked slice" playback mode
-        # (see set_viewer_z_locked / _update_mda_viewer). Absent from this dict
-        # means "live" mode -- the default, always-jump-to-latest behavior.
-        self._locked_z_axis: dict[ndv.ArrayViewer, int] = {}
+        # {viewer: {"z": locked z, "c": locked c}} for viewers in "locked
+        # slice" playback mode (see set_viewer_slice_locked /
+        # _update_mda_viewer). Absent from this dict means "live" mode -- the
+        # default, always-jump-to-latest behavior.
+        self._locked_axes: dict[ndv.ArrayViewer, dict[str, int]] = {}
         # {viewer: current_index.item_changed listener} for locked viewers, so
-        # set_viewer_z_locked(locked=False) / _cleanup can disconnect them.
-        self._z_lock_listeners: dict[ndv.ArrayViewer, Callable[..., None]] = {}
-
-        # {viewer: current_index.item_changed listener} that keeps each
-        # viewer's _LabeledArrayWrapper informed of the currently-selected
-        # t/p (see _LabeledArrayWrapper.set_selection), for the whole
-        # lifetime of the viewer -- disconnected in _cleanup.
-        self._selection_listeners: dict[ndv.ArrayViewer, Callable[..., None]] = {}
+        # set_viewer_slice_locked(locked=False) / _cleanup can disconnect them.
+        self._lock_listeners: dict[ndv.ArrayViewer, Callable[..., None]] = {}
 
         # Per-camera preview dock widgets, keyed by physical camera label.
         # e.g. {"Camera-1": <CDockWidget>, "Camera-2": <CDockWidget>}
@@ -635,77 +645,59 @@ class NDVViewersManager(QObject):
         self._active_mda_viewer = None
         self._own_handler = None
         self._pending_viewer_updates.clear()
-        for viewer, listener in self._z_lock_listeners.items():
+        for viewer, listener in self._lock_listeners.items():
             with suppress(Exception):  # viewer may already be gone/destroyed
                 viewer.display_model.current_index.item_changed.disconnect(listener)
-        self._z_lock_listeners.clear()
-        self._locked_z_axis.clear()
-        for viewer, listener in self._selection_listeners.items():
-            with suppress(Exception):  # viewer may already be gone/destroyed
-                viewer.display_model.current_index.item_changed.disconnect(listener)
-        self._selection_listeners.clear()
+        self._lock_listeners.clear()
+        self._locked_axes.clear()
 
-    def _make_z_lock_listener(self, viewer: ndv.ArrayViewer) -> Callable[..., None]:
-        """Return a listener that keeps ``_locked_z_axis[viewer]`` in sync.
+    def _make_lock_listener(self, viewer: ndv.ArrayViewer) -> Callable[..., None]:
+        """Return a listener that keeps ``_locked_axes[viewer]`` in sync.
 
         Connected to ``current_index.item_changed`` while *viewer* is locked,
-        so that manually dragging to a new slice re-locks to it (rather than
-        the slice originally captured at lock time). Safe against the
-        manager's own programmatic writes in ``_update_mda_viewer``: those
-        only ever set "z" to the value already recorded in
-        ``_locked_z_axis`` (frames at any other z are dropped before that
-        call), so this listener re-recording the same value is a no-op.
+        so that manually dragging to a new slice or channel re-locks to it
+        (rather than the one originally captured at lock time). The
+        manager's own programmatic writes in ``_update_mda_viewer`` never
+        touch a locked axis, so they can't move the lock.
         """
 
         def _on_item_changed(key: str, new_value: object, old_value: object) -> None:
-            if key == "z" and viewer in self._locked_z_axis:
-                self._locked_z_axis[viewer] = cast("int", new_value)
+            locked = self._locked_axes.get(viewer)
+            if locked is not None and key in locked:
+                locked[key] = cast("int", new_value)
 
         return _on_item_changed
 
-    def _make_selection_listener(
-        self, wrapper: _LabeledArrayWrapper
-    ) -> Callable[..., None]:
-        """Return a listener that keeps *wrapper*'s selected t/p in sync.
-
-        Connected to ``current_index.item_changed`` for the viewer's whole
-        lifetime (both programmatic "jump to latest" updates and manual
-        slider drags go through this), so ``_LabeledArrayWrapper.coords``'s
-        z-bound stays correct for whichever t/p is currently being viewed.
-        """
-
-        def _on_item_changed(key: str, new_value: object, old_value: object) -> None:
-            if key == "t":
-                wrapper.set_selection(t=cast("int", new_value))
-            elif key == "p":
-                wrapper.set_selection(p=cast("int", new_value))
-
-        return _on_item_changed
-
-    def set_viewer_z_locked(self, viewer: ndv.ArrayViewer, locked: bool) -> None:
+    def set_viewer_slice_locked(self, viewer: ndv.ArrayViewer, locked: bool) -> None:
         """Toggle "locked slice" playback mode for a live-MDA *viewer*.
 
         In the default "live" mode, the viewer jumps to show every newly
-        acquired frame. In "locked" mode, it captures whichever z index the
-        viewer is showing right now and stops jumping around -- it only
-        updates when a new frame arrives at that same z index (see
-        ``_update_mda_viewer``), so watching one plane over time isn't
-        interrupted by frames from other z planes. Manually dragging to a
-        different slice while locked re-locks to that new slice for
-        subsequent frames. A no-op if the sequence has no z axis. Unlocking
-        (or re-locking) returns to normal behavior.
+        acquired frame. In "locked" mode, it captures whichever z slice and
+        channel the viewer is showing right now and stops jumping around --
+        it only updates (to the newer timepoint/position) when a new frame
+        arrives at that same z and channel (see ``_update_mda_viewer``), so
+        watching one plane over time isn't interrupted by frames from other
+        planes or channels. In a multichannel (composite) display mode every
+        channel is drawn anyway, so only z gates the update there. Manually
+        dragging to a different slice or channel while locked re-locks to
+        it. A no-op if the sequence has neither a z nor a channel axis.
         """
         if locked:
-            current_z = dict(viewer.display_model.current_index).get("z")
-            if current_z is not None:
-                self._locked_z_axis[viewer] = cast("int", current_z)
-                listener = self._make_z_lock_listener(viewer)
-                self._z_lock_listeners[viewer] = listener
+            current = dict(viewer.display_model.current_index)
+            axes = {
+                key: val
+                for key in ("z", "c")
+                if isinstance(val := current.get(key), int)
+            }
+            if axes:
+                self._locked_axes[viewer] = axes
+                listener = self._make_lock_listener(viewer)
+                self._lock_listeners[viewer] = listener
                 viewer.display_model.current_index.item_changed.connect(listener)
         else:
-            self._locked_z_axis.pop(viewer, None)
-            if viewer in self._z_lock_listeners:
-                listener = self._z_lock_listeners.pop(viewer)
+            self._locked_axes.pop(viewer, None)
+            if viewer in self._lock_listeners:
+                listener = self._lock_listeners.pop(viewer)
                 viewer.display_model.current_index.item_changed.disconnect(listener)
 
     def _on_sequence_started(
@@ -793,18 +785,7 @@ class NDVViewersManager(QObject):
         # (see _LabeledArrayWrapper docstring for why this can't just be a
         # bare `viewer.data = handler.array`).
         if viewer.data_wrapper is None:
-            wrapper = _LabeledArrayWrapper(handler)
-            # seed the initial selection from this (first) event, rather than
-            # waiting for the item_changed listener below to fire, so the
-            # very first coords computation already reflects the right t/p.
-            wrapper.set_selection(
-                t=cast("int", event.index.get("t", 0)),
-                p=cast("int", event.index.get("p", 0)),
-            )
-            viewer.data = wrapper
-            listener = self._make_selection_listener(wrapper)
-            self._selection_listeners[viewer] = listener
-            viewer.display_model.current_index.item_changed.connect(listener)
+            viewer.data = _LabeledArrayWrapper(handler)
             return
 
         # Otherwise, move the viewer's slider to the most recently acquired
@@ -827,15 +808,24 @@ class NDVViewersManager(QObject):
             if latest is None:
                 return  # pragma: no cover
             # Re-check the collected-data bounds regardless of whether this
-            # particular viewer's z-lock (below) ends up skipping the visible
+            # particular viewer's lock (below) ends up skipping the visible
             # update -- new data has been written either way.
             if isinstance(wrapper := v.data_wrapper, _LabeledArrayWrapper):
                 wrapper.notify_frame_written()
-            locked_z = self._locked_z_axis.get(v)
-            if locked_z is not None and latest.index.get("z") != locked_z:
-                return  # locked to a different z-slice -- skip this frame
+            index = dict(latest.index)
+            if (locked := self._locked_axes.get(v)) is not None:
+                # composite/multichannel modes draw every channel at once,
+                # so only the locked z decides whether this frame is shown.
+                multichannel = v.display_model.channel_mode.is_multichannel()
+                for key, val in locked.items():
+                    if key == "c" and multichannel:
+                        continue
+                    if index.get(key) != val:
+                        return  # a different slice/channel -- skip this frame
+                # never move a locked axis: only advance t/p etc.
+                index = {k: val for k, val in index.items() if k not in locked}
             try:
-                v.display_model.current_index.update(latest.index.items())
+                v.display_model.current_index.update(index.items())
             except Exception:  # pragma: no cover
                 # this happens if the viewer has been closed in the meantime
                 # usually it's a RuntimeError, but could be an EmitLoopError

@@ -868,11 +868,11 @@ class MicroManagerGUI(QMainWindow):
         title = f"MDA {sha}" + (f" — {camera_label}" if camera_label else "")
         q_viewer.setWindowTitle(title)
 
-        # Small header row with a "Lock current slice" toggle -- lets the
-        # user pin whichever z-index is currently displayed, so the view
-        # stops jumping to every new frame and only updates when a new
-        # frame arrives at that same z (see NDVViewersManager.set_viewer_z_locked
-        # / _update_mda_viewer). A no-op for sequences with no z axis.
+        # Small header row with a "Lock slice & channel" toggle -- lets the
+        # user pin whichever z slice and channel are currently displayed, so
+        # the view stops jumping to every new frame and only updates when a
+        # new frame arrives at that same z and channel (see
+        # NDVViewersManager.set_viewer_slice_locked / _update_mda_viewer).
         container = QWidget(self)
         container_layout = QVBoxLayout(container)
         container_layout.setContentsMargins(0, 0, 0, 0)
@@ -880,9 +880,13 @@ class MicroManagerGUI(QMainWindow):
         lock_row = QWidget(container)
         lock_layout = QHBoxLayout(lock_row)
         lock_layout.setContentsMargins(4, 2, 4, 2)
-        lock_checkbox = QCheckBox("Lock current slice", lock_row)
+        lock_checkbox = QCheckBox("Lock slice && channel", lock_row)
+        lock_checkbox.setToolTip(
+            "Stay on the displayed z slice and channel, updating only when a "
+            "new frame arrives for them. Drag the sliders to re-lock elsewhere."
+        )
         lock_checkbox.toggled.connect(
-            lambda checked, v=ndv_viewer: self._viewers_manager.set_viewer_z_locked(
+            lambda checked, v=ndv_viewer: self._viewers_manager.set_viewer_slice_locked(
                 v, checked
             )
         )
