@@ -568,18 +568,59 @@ def test_setup_sequence_honors_z_stack_mode(
     )
 
 
-def test_teardown_restores_galvo_offset(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Live/Snap after an off-center MDA must image the original plane again."""
+def test_teardown_restores_galvo_sweep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Live/Snap after an MDA must see the galvo exactly as before it.
+
+    Not just the sweep center: the amplitude was left at the run's 0.3 deg on
+    the bench after the user had set it to 0.
+    """
     core, engine = _setup_spim_engine(monkeypatch)
     monkeypatch.setattr(engine_module.time, "sleep", lambda _s: None)
     monkeypatch.setattr(engine, "_reclaim_from_workers", MagicMock())
     core.getLoadedDevices.return_value = ["Scanner:AB:33"]
+    live = {
+        "SingleAxisYOffset(deg)": "0.1234",
+        "SingleAxisYAmplitude(deg)": "0.0000",
+        "SingleAxisXOffset(deg)": "0.0100",
+        "SingleAxisXAmplitude(deg)": "0.0200",
+    }
+    core.getProperty.side_effect = lambda dev, prop: live.get(prop, "0.1234")
     seq = useq.MDASequence(z_plan=useq.ZAboveBelow(above=10, below=0, step=1))
 
     engine.setup_sequence(seq)
+    assert _galvo_value(core, "SingleAxisYAmplitude(deg)") != 0.0
     engine.teardown_sequence(seq)
 
+    for prop, value in live.items():
+        assert _galvo_value(core, prop) == pytest.approx(float(value))
+
+
+def test_stationary_teardown_restores_galvo_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "configure_plogic_for_dual_nrt_pulses",
+        "log_plogic_trigger_chain_state",
+        "summary_metadata",
+    ):
+        monkeypatch.setattr(engine_module, name, MagicMock())
+    monkeypatch.setattr(engine_module.time, "sleep", lambda _s: None)
+    core, engine, _pool = _make_engine(
+        n_cameras=1, n_slices=1, engine_cls=ASIStationaryTriggerEngine
+    )
+    monkeypatch.setattr(engine, "_reclaim_from_workers", MagicMock())
+    core.getLoadedDevices.return_value = ["Scanner:AB:33"]
+    core.getProperty.return_value = "0.1234"
+    core.getExposure.return_value = 10.0
+    core.getImageWidth.return_value = 2
+    core.getImageHeight.return_value = 2
+    core.getBytesPerPixel.return_value = 2
+
+    engine.setup_sequence(useq.MDASequence())
+    engine.teardown_sequence(useq.MDASequence())
+
     assert _galvo_value(core, "SingleAxisYOffset(deg)") == pytest.approx(0.1234)
+    assert _galvo_value(core, "SingleAxisYAmplitude(deg)") == pytest.approx(0.1234)
 
 
 def test_setup_sequence_rejects_unreachable_top_bottom(

@@ -73,6 +73,16 @@ _ALL_ROWS_GALVO_PROPS = (
     "SPIMDelayBeforeSide(ms)",
 )
 
+#: Galvo single-axis sweep properties every run overwrites. Live/Snap image
+#: through the same galvo, so a run snapshots them all and teardown puts them
+#: back -- the card ends up exactly as the user left it in Device Properties.
+_GALVO_SCAN_PROPS = (
+    "SingleAxisYOffset(deg)",
+    "SingleAxisYAmplitude(deg)",
+    "SingleAxisXOffset(deg)",
+    "SingleAxisXAmplitude(deg)",
+)
+
 
 @dataclass
 class _VolumeRecord:
@@ -149,6 +159,9 @@ class _ASITriggerEngineBase(MDAEngine):
         self._z_positions: tuple[float, ...] = ()
         # One record per triggered volume this run (see _VolumeRecord).
         self._volume_records: list[_VolumeRecord] = []
+        # Galvo sweep settings from before the MDA (see _GALVO_SCAN_PROPS),
+        # restored in teardown so Live images the same plane it did before.
+        self._galvo_scan_before: dict[str, str] | None = None
 
     def _set_event_z(self, event: MDAEvent) -> None:
         """No-op: Z-stepping here is done entirely by the galvo hardware trigger.
@@ -244,6 +257,31 @@ class _ASITriggerEngineBase(MDAEngine):
             self._piezo_pos_at_setup = mmc.getPosition(self.hw.piezo_a_label)
         else:
             self._piezo_pos_at_setup = None
+
+    def _snapshot_galvo_scan(self) -> dict[str, str]:
+        """Record the galvo's sweep settings before ``setup_sequence`` rewrites them."""
+        mmc = self.mmcore
+        label = self.hw.galvo_a_label
+        self._galvo_scan_before = {
+            prop: mmc.getProperty(label, prop)
+            for prop in _GALVO_SCAN_PROPS
+            if mmc.hasProperty(label, prop)
+        }
+        return self._galvo_scan_before
+
+    def _restore_galvo_scan(self) -> None:
+        """Put back the galvo sweep settings Live had before the MDA (teardown)."""
+        before = self._galvo_scan_before
+        self._galvo_scan_before = None
+        if not before:
+            return
+        label = self.hw.galvo_a_label
+        for prop, value in before.items():
+            self.mmcore.setProperty(label, prop, value)
+        logger.info(
+            "Restored pre-MDA galvo "
+            + ", ".join(f"{prop}={value}" for prop, value in before.items())
+        )
 
     def _prepare_volume(self, event: MDAEvent) -> dict[str, Any]:
         """Per-volume hardware prep before arming; returns extra ``arm_all`` options.
@@ -886,9 +924,6 @@ class ASISPIMEngine(_ASITriggerEngineBase):
     def __init__(self, mmc: CMMCorePlus, hw: HardwareConstants):
         super().__init__(mmc, hw)
         self._master_axis_label = hw.galvo_a_label
-        # Galvo SingleAxisYOffset(deg) from before the MDA, restored in
-        # teardown so Live doesn't keep imaging a shifted plane afterwards.
-        self._galvo_offset_before: str | None = None
         # Advanced slice timing for the current run (see spim_timing.py), a
         # copy of SettingsV1.spim_timing taken at setup_sequence; None until
         # then (and for engines driven without setup, e.g. in tests).
@@ -1207,15 +1242,13 @@ class ASISPIMEngine(_ASITriggerEngineBase):
 
         # The galvo offset Live sits at defines the Live plane; every z-plan
         # is placed relative to it (see z_scan.py).
-        self._galvo_offset_before = self.mmcore.getProperty(
-            self.hw.galvo_a_label, "SingleAxisYOffset(deg)"
-        )
-        try:
-            live_offset_deg = float(self._galvo_offset_before)
-        except (TypeError, ValueError):
-            live_offset_deg = 0.0
+        before = self._snapshot_galvo_scan()
+        live_offset = before.get("SingleAxisYOffset(deg)")
+        live_amplitude = before.get("SingleAxisYAmplitude(deg)")
+        live_offset_deg = _try_float(live_offset) or 0.0
         logger.info(
-            f"Pre-MDA (Live) galvo SingleAxisYOffset = {self._galvo_offset_before} deg."
+            f"Pre-MDA (Live) galvo SingleAxisYOffset = {live_offset} deg, "
+            f"SingleAxisYAmplitude = {live_amplitude} deg."
         )
 
         # 1. Calculate Z-stack parameters. The piezo never moves, so every
@@ -1415,15 +1448,9 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         set_plogic_evaluation_clock(self.hw.tiger_comm_hub_label, running=False)
         if self.hw.galvo_a_label in self.mmcore.getLoadedDevices():
             self.mmcore.setProperty(self.hw.galvo_a_label, "SPIMState", "Idle")
-            # Undo this run's sweep-center shift (Above/Below, Top/Bottom) so
-            # Live/Snap image the same plane they did before the MDA.
-            if self._galvo_offset_before is not None:
-                self.mmcore.setProperty(
-                    self.hw.galvo_a_label,
-                    "SingleAxisYOffset(deg)",
-                    self._galvo_offset_before,
-                )
-                self._galvo_offset_before = None
+            # Undo this run's sweep (amplitude and center shift) so Live/Snap
+            # image the same plane they did before the MDA.
+            self._restore_galvo_scan()
             self._restore_galvo_timing()
 
         # Belt-and-suspenders: exec_event's own finally block already closes
@@ -1502,6 +1529,7 @@ class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
         # config switch -- see _reset_channel_config_cache's docstring.
         self._reset_channel_config_cache()
         self._snapshot_piezo_position()
+        self._snapshot_galvo_scan()
 
         # 1. Number of trigger pulses/frames wanted. Neither axis moves, so
         # there's no amplitude/step-size to compute from the z_plan
@@ -1639,6 +1667,7 @@ class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
         self._log_drift_summary()
         if self.hw.galvo_a_label in self.mmcore.getLoadedDevices():
             self.mmcore.setProperty(self.hw.galvo_a_label, "SPIMState", "Idle")
+            self._restore_galvo_scan()
         if self.hw.piezo_a_label in self.mmcore.getLoadedDevices():
             self.mmcore.setProperty(self.hw.piezo_a_label, "SPIMState", "Idle")
 
