@@ -525,10 +525,19 @@ class _ASITriggerEngineBase(MDAEngine):
         Lasers and cameras are driven by PLogic, not the card's own laser
         output, so this only lengthens each slice; at 10 ms exposure it
         leaves the card exactly as it was.
+
+        ``SPIMCameraDuration`` is set to the exposure too: with the cameras in
+        Level Trigger the rig has always run with the card's camera pulse
+        equal to the exposure (per the user, 2026-10-21).
         """
+        exposure = f"{self._exposure_ms:.4f}"
         self.mmcore.setProperty(
-            self.hw.galvo_a_label, "SPIMLaserDuration(ms)", f"{self._exposure_ms:.4f}"
+            self.hw.galvo_a_label, "SPIMLaserDuration(ms)", exposure
         )
+        if self.mmcore.hasProperty(self.hw.galvo_a_label, "SPIMCameraDuration(ms)"):
+            self.mmcore.setProperty(
+                self.hw.galvo_a_label, "SPIMCameraDuration(ms)", exposure
+            )
         delay_before_laser = float(
             self.mmcore.getProperty(self.hw.galvo_a_label, "SPIMDelayBeforeLaser(ms)")
         )

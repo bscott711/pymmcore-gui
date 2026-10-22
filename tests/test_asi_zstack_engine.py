@@ -1066,10 +1066,12 @@ def test_legacy_mode_ignores_all_rows_settle(
     core, engine = _setup_spim_engine(monkeypatch)
     engine.setup_sequence(useq.MDASequence(channels=["488nm"]))
 
-    # exactly the proven legacy writes: side delay, slice settle, hold
+    # exactly the proven legacy writes: side delay, slice settle, hold, and
+    # the camera pulse = exposure (Level Trigger)
     assert _galvo_value(core, "SPIMDelayBeforeSide(ms)") == 0.0
     assert _galvo_value(core, "SPIMDelayBeforeLaser(ms)") == 25.75
     assert _galvo_value(core, "SPIMLaserDuration(ms)") == 10.0
+    assert _galvo_value(core, "SPIMCameraDuration(ms)") == 10.0
     # ... and nothing the proven setup left to the card
     written = {
         c.args[1]
@@ -1078,7 +1080,6 @@ def test_legacy_mode_ignores_all_rows_settle(
     }
     for prop in (
         "SPIMDelayBeforeCamera(ms)",
-        "SPIMCameraDuration(ms)",
         "SPIMDelayBeforeScan(ms)",
         "SPIMNumScansPerSlice",
     ):
