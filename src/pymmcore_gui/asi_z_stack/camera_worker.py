@@ -294,11 +294,21 @@ def _set_exposure(mmc: CMMCorePlus, label: str, exposure_ms: float | None) -> No
 
 
 def _require_trigger_mode(mmc: CMMCorePlus, label: str, mode: str) -> str:
-    """Return *mode* if *label* allows it as a ``TriggerMode``, else raise."""
+    """Return the camera's own name for trigger *mode*, or raise.
+
+    Matched ignoring case, spaces, hyphens and underscores, so e.g. "Level
+    Trigger Overlap" finds the adapter's spelling of it. Raises (listing what
+    the camera offers) rather than silently arming in the wrong mode.
+    """
+
+    def _norm(text: str) -> str:
+        return "".join(c for c in text.lower() if c.isalnum())
+
     allowed = list(mmc.getAllowedPropertyValues(label, "TriggerMode"))
-    if mode not in allowed:
+    match = next((v for v in allowed if _norm(v) == _norm(mode)), None)
+    if match is None:
         raise RuntimeError(f"{label} has no {mode!r} trigger mode (allowed: {allowed})")
-    return mode
+    return match
 
 
 def _internal_trigger_mode(

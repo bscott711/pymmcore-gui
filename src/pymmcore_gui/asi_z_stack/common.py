@@ -30,6 +30,8 @@ class HardwareConstants:
     plogic_laser_on_cell: int = 10
     plogic_camera_cell: int = 11
     plogic_always_on_cell: int = 12
+    # Free cell (per ASI's diSPIM cell map) used as the All Rows laser delay.
+    plogic_laser_delay_cell: int = 9
     plogic_bnc3_addr: int = 35
     pulses_per_ms: float = 4.0
 

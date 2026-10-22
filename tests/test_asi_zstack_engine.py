@@ -957,76 +957,98 @@ def _all_rows_engine(
     monkeypatch: pytest.MonkeyPatch,
     settings: object,
     readout_override: float | None = 6.0,
+    overlap: bool = False,
 ) -> tuple[MagicMock, ASISPIMEngine, MagicMock]:
     timing = settings.spim_timing  # type: ignore[attr-defined]
     timing.mode = "all_rows"
     timing.galvo_settle_ms = 2.0
     timing.readout_ms_override = readout_override
-    all_rows = MagicMock()
-    monkeypatch.setattr(engine_module, "configure_plogic_for_all_rows", all_rows)
+    timing.level_trigger_overlap = overlap
+    delayed = MagicMock()
+    monkeypatch.setattr(engine_module, "configure_plogic_for_delayed_laser", delayed)
+    monkeypatch.setattr(
+        engine_module, "describe_plogic_cell", MagicMock(return_value={})
+    )
     core, engine = _setup_spim_engine(monkeypatch)
     engine.setup_sequence(
         useq.MDASequence(
             channels=(useq.Channel(config="488nm", group="Lasers", exposure=10.0),)
         )
     )
-    return core, engine, all_rows
+    return core, engine, delayed
 
 
-def test_all_rows_setup_programs_plogic_and_galvo(
+def _cells(delayed: MagicMock) -> tuple[float, float, float]:
+    """(camera pulse, laser delay, laser pulse) of the last PLogic programming."""
+    args = delayed.call_args.args
+    return args[-3], args[-2], args[-1]
+
+
+def test_all_rows_setup_programs_delayed_laser_and_galvo(
     monkeypatch: pytest.MonkeyPatch, settings: object
 ) -> None:
-    core, _engine, all_rows = _all_rows_engine(monkeypatch, settings)
+    core, _engine, delayed = _all_rows_engine(monkeypatch, settings)
 
-    all_rows.assert_called_once()
-    args = all_rows.call_args.args
-    assert args[-2] == 1.0  # Edge Trigger pulse
-    assert args[-1] == [36, 34]  # Expose Out: Camera-1 on BNC4, Camera-2 on BNC2
+    delayed.assert_called_once()
+    args = delayed.call_args.args
+    assert args[2:5] == (11, 10, 9)  # camera cell, laser cell, delay cell
+    # S=6, E=10, margin 0.5: laser 6.5 ms after the trigger for 10 ms, inside
+    # a 17 ms camera pulse
+    assert _cells(delayed) == (17.0, 6.5, 10.0)
     engine_module.configure_plogic_for_dual_nrt_pulses.assert_not_called()  # type: ignore[attr-defined]
-    # S=6, E=10, s=2: hold = max(S+E, 2S+E-s) + 0.5 = 20.5, period 22.5 ms
+    # plain Level Trigger, s=2: hold = max(C, C + S - s) = 21, period 23 ms
     assert _galvo_value(core, "SPIMDelayBeforeCamera(ms)") == 2.0
     assert _galvo_value(core, "SPIMDelayBeforeLaser(ms)") == 2.0
-    assert _galvo_value(core, "SPIMLaserDuration(ms)") == 20.5
+    assert _galvo_value(core, "SPIMCameraDuration(ms)") == 21.0
+    assert _galvo_value(core, "SPIMLaserDuration(ms)") == 21.0
     assert _galvo_value(core, "SPIMNumScansPerSlice") == 1
     assert _galvo_value(core, "SPIMDelayBeforeSide(ms)") == 0.0
 
 
-def test_all_rows_volume_arms_edge_trigger_and_retimes_per_channel(
+def test_all_rows_keeps_level_trigger_and_retimes_per_channel(
     monkeypatch: pytest.MonkeyPatch, settings: object
 ) -> None:
-    core, engine, all_rows = _all_rows_engine(monkeypatch, settings)
+    core, engine, delayed = _all_rows_engine(monkeypatch, settings)
     event = useq.MDAEvent(
         index={"t": 0}, channel={"config": "561nm", "group": "Lasers"}, exposure=20.0
     )
 
     options = engine._prepare_volume(event)
 
-    assert options == {
-        "trigger_mode": "Edge Trigger",
-        "expose_out_mode": "All Rows",
-        "exposure_ms": 20.0,
-    }
-    # E=20: hold = max(26, 12 + 20 - 2) + 0.5
-    assert _galvo_value(core, "SPIMLaserDuration(ms)") == 30.5
-    all_rows.assert_called_once()  # camera-gated: no PLogic change per exposure
+    assert options == {}  # cameras arm exactly as in legacy (Level Trigger)
+    assert _cells(delayed) == (27.0, 6.5, 20.0)  # reprogrammed for E = 20
+    assert _galvo_value(core, "SPIMLaserDuration(ms)") == 31.0
 
 
-def test_all_rows_held_on_laser_keeps_rolling_exposure(
+def test_all_rows_overlap_arms_level_trigger_overlap(
     monkeypatch: pytest.MonkeyPatch, settings: object
 ) -> None:
-    core, engine, _all_rows = _all_rows_engine(monkeypatch, settings)
+    core, engine, _delayed = _all_rows_engine(monkeypatch, settings, overlap=True)
+
+    options = engine._prepare_volume(useq.MDAEvent(exposure=10.0))
+
+    assert options == {"trigger_mode": "Level Trigger Overlap"}
+    # galvo steps as soon as the camera pulse (and the laser in it) ends
+    assert _galvo_value(core, "SPIMLaserDuration(ms)") == 17.0
+
+
+def test_all_rows_held_on_laser_uses_plain_level_trigger(
+    monkeypatch: pytest.MonkeyPatch, settings: object
+) -> None:
+    core, engine, delayed = _all_rows_engine(monkeypatch, settings, overlap=True)
     monkeypatch.setattr(engine, "_shutter_gated_bncs", lambda: [40])
 
     options = engine._prepare_volume(useq.MDAEvent(exposure=10.0))
 
-    assert options["expose_out_mode"] is None  # camera's normal mode
+    assert options == {}  # constant light: no overlap
+    assert _cells(delayed)[0] == 10.0  # camera pulse = E
     assert _galvo_value(core, "SPIMLaserDuration(ms)") == 16.5  # S + E + margin
 
 
 def test_all_rows_after_arm_retimes_to_reported_readout(
     monkeypatch: pytest.MonkeyPatch, settings: object
 ) -> None:
-    core, engine, _all_rows = _all_rows_engine(
+    core, engine, delayed = _all_rows_engine(
         monkeypatch, settings, readout_override=None
     )
     assert engine._readout_ms == 13.5  # fallback: nothing reported yet
@@ -1039,8 +1061,9 @@ def test_all_rows_after_arm_retimes_to_reported_readout(
     engine._after_arm()
 
     assert engine._readout_ms == 8.0  # slowest camera wins
-    # S=8, E=10, s=2: hold = max(18, 24) + 0.5
-    assert _galvo_value(core, "SPIMLaserDuration(ms)") == 24.5
+    assert _cells(delayed) == (19.0, 8.5, 10.0)
+    # S=8, s=2: hold = max(19, 19 + 8 - 2)
+    assert _galvo_value(core, "SPIMLaserDuration(ms)") == 25.0
 
 
 def test_legacy_mode_keeps_original_arming(

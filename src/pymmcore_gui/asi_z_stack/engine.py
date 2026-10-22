@@ -19,8 +19,9 @@ from pymmcore_gui._settings import SpimTimingSettingsV1
 
 from .asi_controller import (
     close_all_lasers,
-    configure_plogic_for_all_rows,
+    configure_plogic_for_delayed_laser,
     configure_plogic_for_dual_nrt_pulses,
+    describe_plogic_cell,
     log_plogic_trigger_chain_state,
     set_laser_outputs,
     set_plogic_evaluation_clock,
@@ -54,6 +55,10 @@ _LEGACY_CARD_TIMING: dict[str, float] = {
     "SPIMDelayBeforeScan(ms)": 0.0,
     "SPIMNumScansPerSlice": 1,
 }
+
+#: Camera trigger mode for All Rows with overlapped readout (Kinetix "Level
+#: Trigger Overlap"; matched loosely against the camera's own names).
+LEVEL_TRIGGER_OVERLAP = "Level Trigger Overlap"
 
 #: Galvo per-slice properties only All Rows mode writes. The proven legacy
 #: setup never touches them (it relies on the values stored on the card), so
@@ -971,37 +976,38 @@ class ASISPIMEngine(_ASITriggerEngineBase):
             laser_held_on=laser_held_on,
         )
 
-    def _expose_out_addrs(self) -> list[int]:
-        """PLogic addresses of the Expose Out BNCs of this run's cameras."""
-        cfg = self._timing_cfg
-        assert cfg is not None
-        svc = CameraWorkerService.get_active()
-        labels = svc.camera_labels if svc is not None else tuple(cfg.expose_out_bnc)
-        missing = [label for label in labels if label not in cfg.expose_out_bnc]
-        if missing:
-            raise RuntimeError(
-                f"All Rows mode: no Expose Out BNC configured for {missing} "
-                "(SPIM Timing settings)."
-            )
-        return [32 + cfg.expose_out_bnc[label] for label in labels]
-
     def _apply_plogic_timing(self, timing: SliceTiming) -> None:
         """Program PLogic's camera/laser cells for *timing*'s mode."""
         previous = self._applied_timing
         if timing.mode == "all_rows":
-            # Laser gating comes from the cameras, so exposure changes need
-            # no reprogramming -- only a mode change does.
-            if previous is None or previous.mode != "all_rows":
-                configure_plogic_for_all_rows(
+            cells = (
+                timing.camera_pulse_ms,
+                timing.laser_delay_ms,
+                timing.laser_pulse_ms,
+            )
+            if (
+                previous is None
+                or previous.mode != "all_rows"
+                or (
+                    previous.camera_pulse_ms,
+                    previous.laser_delay_ms,
+                    previous.laser_pulse_ms,
+                )
+                != cells
+            ):
+                self._log_delay_cell_once()
+                configure_plogic_for_delayed_laser(
                     self.hw.plogic_label,
                     self.hw.tiger_comm_hub_label,
                     self.hw.plogic_camera_cell,
                     self.hw.plogic_laser_on_cell,
+                    self.hw.plogic_laser_delay_cell,
                     self.hw.pulses_per_ms,
                     self.hw.plogic_4khz_clock_addr,
                     self.hw.plogic_trigger_ttl_addr,
                     timing.camera_pulse_ms,
-                    self._expose_out_addrs(),
+                    timing.laser_delay_ms,
+                    timing.laser_pulse_ms,
                 )
             return
         if (
@@ -1023,6 +1029,25 @@ class ASISPIMEngine(_ASITriggerEngineBase):
                 self.hw.plogic_laser_on_cell,
             )
 
+    _delay_cell_logged = False
+
+    def _log_delay_cell_once(self) -> None:
+        """Log the delay cell's programming before All Rows first overwrites it.
+
+        The cell is unused by the proven setup (ASI's diSPIM cell map lists it
+        free); this records what it held, once per session, in case it turns
+        out to matter.
+        """
+        if type(self)._delay_cell_logged:
+            return
+        type(self)._delay_cell_logged = True
+        cell = self.hw.plogic_laser_delay_cell
+        before = describe_plogic_cell(self.hw.plogic_label, cell)
+        logger.info(
+            f"PLogic cell {cell} before All Rows used it as the laser delay: "
+            f"{before or 'not readable via the PLogic adapter'}."
+        )
+
     def _set_galvo_timing(self, timing: SliceTiming) -> None:
         """Write *timing*'s per-slice delays to the galvo card, logging changes.
 
@@ -1036,7 +1061,7 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         values: list[tuple[str, float]] = [
             ("SPIMDelayBeforeCamera(ms)", timing.settle_ms),
             ("SPIMDelayBeforeLaser(ms)", timing.settle_ms),
-            ("SPIMCameraDuration(ms)", min(1.0, timing.hold_ms)),
+            ("SPIMCameraDuration(ms)", timing.hold_ms),
             ("SPIMLaserDuration(ms)", timing.hold_ms),
             ("SPIMDelayBeforeScan(ms)", 0.0),
             ("SPIMNumScansPerSlice", 1),
@@ -1133,15 +1158,11 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         if timing != self._applied_timing:
             self._apply_timing(timing)
         self._exposure_ms = exposure
-        if timing.mode != "all_rows":
-            return {}
-        return {
-            "trigger_mode": "Edge Trigger",
-            # A held-on laser can't be gated: the camera uses its normal
-            # rolling exposure instead (None restores the camera's own mode).
-            "expose_out_mode": None if held_on else "All Rows",
-            "exposure_ms": exposure,
-        }
+        # The camera stays in Level Trigger (the PLogic pulse sets each row's
+        # integration), exactly as in legacy, unless Overlap is switched on.
+        if timing.overlap:
+            return {"trigger_mode": LEVEL_TRIGGER_OVERLAP}
+        return {}
 
     def _trigger_timing_summary(self) -> str:
         timing = self._applied_timing

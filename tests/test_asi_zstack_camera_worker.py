@@ -595,10 +595,19 @@ def test_require_trigger_mode_and_set_exposure() -> None:
     )
 
     core = MagicMock()
-    core.getAllowedPropertyValues.return_value = ("Internal Trigger", "Edge Trigger")
-    assert _require_trigger_mode(core, "Camera-1", "Edge Trigger") == "Edge Trigger"
-    with pytest.raises(RuntimeError, match="no 'Level Overlap'"):
-        _require_trigger_mode(core, "Camera-1", "Level Overlap")
+    core.getAllowedPropertyValues.return_value = (
+        "Internal Trigger",
+        "Level Trigger",
+        "Level Trigger-Overlap",
+    )
+    assert _require_trigger_mode(core, "Camera-1", "Level Trigger") == "Level Trigger"
+    # matched loosely: the camera's own spelling comes back
+    assert (
+        _require_trigger_mode(core, "Camera-1", "Level Trigger Overlap")
+        == "Level Trigger-Overlap"
+    )
+    with pytest.raises(RuntimeError, match="no 'Edge Trigger'"):
+        _require_trigger_mode(core, "Camera-1", "Edge Trigger")
 
     core.getExposure.return_value = 10.0
     _set_exposure(core, "Camera-1", 10.0)

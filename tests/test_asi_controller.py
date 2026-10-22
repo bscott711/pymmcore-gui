@@ -74,63 +74,48 @@ def test_configure_plogic_no_longer_loads_a_laser_preset(
     assert commands[0] == "M E=11"
 
 
-def test_configure_plogic_for_all_rows_gates_laser_on_expose_out(
+def test_configure_plogic_for_delayed_laser(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """All Rows: short camera trigger on BNC1, laser-on = AND of Expose Out inputs."""
-    from pymmcore_gui.asi_z_stack.asi_controller import configure_plogic_for_all_rows
+    """All Rows: camera pulse S+E on BNC1, laser one-shot fired by a delay cell."""
+    from pymmcore_gui.asi_z_stack.asi_controller import (
+        configure_plogic_for_delayed_laser,
+    )
 
     fake_mmc = MagicMock()
     fake_mmc.getLoadedDevices.return_value = [TIGER_COMM_HUB_LABEL]
     fake_mmc.hasProperty.return_value = False
     monkeypatch.setattr(asi_controller, "mmc", fake_mmc)
 
-    configure_plogic_for_all_rows(
+    configure_plogic_for_delayed_laser(
         PLOGIC_LABEL,
         TIGER_COMM_HUB_LABEL,
         plogic_camera_cell=11,
         plogic_laser_on_cell=10,
+        plogic_laser_delay_cell=9,
         pulses_per_ms=4.0,
         plogic_4khz_clock_addr=192,
         plogic_trigger_ttl_addr=41,
-        trigger_pulse_ms=1.0,
-        expose_out_addrs=[34, 36],
+        camera_pulse_ms=15.25,
+        laser_delay_ms=4.75,
+        laser_pulse_ms=10.0,
     )
 
     assert _sent_commands(fake_mmc) == [
-        # Expose Out BNCs become inputs first (never left as push-pull outputs)
-        "M E=34",
-        "36CCA Y=0",
-        "M E=36",
-        "36CCA Y=0",
-        "36SS Z",
-        # camera: 1 ms NRT one-shot off the galvo slice TTL
+        # camera: NRT one-shot, 61 ticks, off the galvo slice TTL
         "M E=11",
-        "36CCA Y=14 Z=4",
+        "36CCA Y=14 Z=61",
         "36CCB X=41 Y=192 Z=0",
-        # laser on = Expose Out(Camera-1) AND Expose Out(Camera-2)
+        # delay: NRT delay cell, 19 ticks, off the same TTL
+        "M E=9",
+        "36CCA Y=15 Z=19",
+        "36CCB X=41 Y=192 Z=0",
+        # laser: NRT one-shot, 40 ticks, triggered by the delay cell
         "M E=10",
-        "36CCA Y=5 Z=0",
-        "36CCB X=34 Y=36",
-        # camera cell -> BNC1
+        "36CCA Y=14 Z=40",
+        "36CCB X=9 Y=192 Z=0",
+        # camera cell -> BNC1, saved
         "M E=33",
         "36CCA Z=11",
         "36SS Z",
     ]
-
-
-def test_configure_plogic_for_all_rows_single_camera_ties_high(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from pymmcore_gui.asi_z_stack.asi_controller import configure_plogic_for_all_rows
-
-    fake_mmc = MagicMock()
-    fake_mmc.getLoadedDevices.return_value = [TIGER_COMM_HUB_LABEL]
-    fake_mmc.hasProperty.return_value = False
-    monkeypatch.setattr(asi_controller, "mmc", fake_mmc)
-
-    configure_plogic_for_all_rows(
-        PLOGIC_LABEL, TIGER_COMM_HUB_LABEL, 11, 10, 4.0, 192, 41, 1.0, [34]
-    )
-
-    assert "36CCB X=34 Y=64" in _sent_commands(fake_mmc)

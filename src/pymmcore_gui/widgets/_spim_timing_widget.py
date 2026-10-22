@@ -42,7 +42,7 @@ if TYPE_CHECKING:
     from pymmcore_gui._qt.QtGui import QPaintEvent
 
 _MODES = {
-    "all_rows": "All Rows (pseudo-global, matches Live)",
+    "all_rows": "All Rows (delayed laser, matches Live)",
     "legacy": "Legacy (shared camera/laser pulse)",
 }
 
@@ -83,14 +83,13 @@ class _TimingStrip(QWidget):
             return 4 + ms * scale
 
         trig = t.settle_ms
-        s, e = t.readout_ms, t.exposure_ms
-        if t.mode == "all_rows" and not t.laser_held_on:
-            light = (trig + s, trig + s + e)
-        elif t.laser_held_on:
+        s, c = t.readout_ms, t.camera_pulse_ms
+        if t.laser_held_on:
             light = (0.0, t.slice_period_ms)
         else:
-            light = (trig, trig + e)
-        rows_end = trig + s + (t.camera_pulse_ms if t.mode == "legacy" else e)
+            start = trig + t.laser_delay_ms
+            light = (start, start + t.laser_pulse_ms)
+        rows_end = trig + c if t.overlap else trig + s + c
 
         # galvo settle (grey) and hold
         painter.fillRect(QRectF(x(0), 4, trig * scale, 14), QColor(150, 150, 150))
@@ -101,12 +100,11 @@ class _TimingStrip(QWidget):
         painter.setPen(QPen(QColor(60, 160, 90), 1))
         painter.setBrush(QColor(60, 160, 90, 90))
         top, bottom = 24.0, h - 22.0
-        expo = t.camera_pulse_ms if t.mode == "legacy" else s + e
         painter.drawPolygon(
             QPolygonF(
                 [
                     QPointF(x(trig), top),
-                    QPointF(x(trig + expo), top),
+                    QPointF(x(trig + c), top),
                     QPointF(x(min(rows_end, t.slice_period_ms)), bottom),
                     QPointF(x(trig + s), bottom),
                 ]
@@ -159,9 +157,16 @@ class SpimTimingWidget(QWidget):
         self.readout.setValue(cfg.readout_ms_override or cfg.fallback_readout_ms)
         self.margin = _spin(0, 20, 0.25)
         self.margin.setValue(cfg.margin_ms)
-        self.trigger = _spin(0.25, 10, 0.25)
-        self.trigger.setValue(cfg.trigger_pulse_ms)
-        self.bnc = {label: self._bnc_spin(n) for label, n in cfg.expose_out_bnc.items()}
+        self.margin.setToolTip(
+            "Laser starts this long after the last row has started; the camera "
+            "pulse ends this long after the laser"
+        )
+        self.overlap = QCheckBox("Level Trigger Overlap")
+        self.overlap.setToolTip(
+            "Start the next frame while the previous one reads out: about "
+            "readout + exposure per slice instead of 2 x readout + exposure"
+        )
+        self.overlap.setChecked(cfg.level_trigger_overlap)
 
         readout_row = QHBoxLayout()
         readout_row.addWidget(self.readout)
@@ -179,10 +184,8 @@ class SpimTimingWidget(QWidget):
         form.addRow("Galvo settle", self.settle)
         form.addRow("Volume-start settle", self.volume_settle)
         form.addRow("Camera readout", readout_row)
-        form.addRow("Galvo hold margin", self.margin)
-        form.addRow("Camera trigger pulse", self.trigger)
-        for label, spin in self.bnc.items():
-            form.addRow(f"{label} Expose Out -> PLogic BNC", spin)
+        form.addRow("Timing margin", self.margin)
+        form.addRow("Overlap", self.overlap)
         self.settings_box = QGroupBox("Timing (applies to the next MDA)")
         self.settings_box.setLayout(form)
 
@@ -234,11 +237,9 @@ class SpimTimingWidget(QWidget):
             self.volume_settle,
             self.readout,
             self.margin,
-            self.trigger,
         ):
             box.valueChanged.connect(self._apply)
-        for spin in self.bnc.values():
-            spin.valueChanged.connect(self._apply)
+        self.overlap.toggled.connect(self._apply)
         self.mode.currentIndexChanged.connect(self._apply)
         self.preview_exposure.valueChanged.connect(self._update_preview)
         self.preview_slices.valueChanged.connect(self._update_preview)
@@ -251,13 +252,6 @@ class SpimTimingWidget(QWidget):
         self._on_auto_toggled(self.readout_auto.isChecked())
 
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _bnc_spin(value: int) -> QSpinBox:
-        box = QSpinBox()
-        box.setRange(1, 8)
-        box.setValue(value)
-        return box
 
     def _live_exposure(self) -> float:
         from pymmcore_gui.asi_z_stack.camera_worker_service import CameraWorkerService
@@ -305,7 +299,7 @@ class SpimTimingWidget(QWidget):
     def _update_preview(self) -> None:
         legacy = self.mode.currentData() == "legacy"
         self.legacy_note.setVisible(legacy)
-        for box in (self.settle, self.volume_settle, self.margin, self.trigger):
+        for box in (self.settle, self.volume_settle, self.margin, self.overlap):
             box.setEnabled(not legacy)
         timing = self.timing()
         self.strip.set_timing(timing)
@@ -317,8 +311,13 @@ class SpimTimingWidget(QWidget):
             )
         if timing.mode == "all_rows":
             text += (
-                "\nAll Rows needs each camera's Expose Out cabled into the PLogic "
-                "BNCs above; without it the lasers never fire (dark frames)."
+                "\nAll Rows keeps Level Trigger and delays the laser with PLogic "
+                "cell 9 until every row is integrating"
+            )
+            text += (
+                "; Overlap also needs the cameras' Level Trigger Overlap mode."
+                if timing.overlap
+                else "."
             )
         self.summary.setText(text)
 
@@ -332,7 +331,6 @@ class SpimTimingWidget(QWidget):
             None if self.readout_auto.isChecked() else self.readout.value()
         )
         cfg.margin_ms = self.margin.value()
-        cfg.trigger_pulse_ms = self.trigger.value()
-        cfg.expose_out_bnc = {label: spin.value() for label, spin in self.bnc.items()}
+        cfg.level_trigger_overlap = self.overlap.isChecked()
         self._flush_timer.start()
         self._update_preview()

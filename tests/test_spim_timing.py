@@ -33,33 +33,55 @@ def test_legacy_waits_for_readout_when_settle_is_short() -> None:
     assert t.slice_period_ms == 16.0
 
 
-def test_all_rows_full_frame_costs_one_extra_readout() -> None:
-    """S + E + max(s, S): with the settle under S, about 2S + E."""
-    t = compute_slice_timing("all_rows", 10.0, 13.5, 2.0, margin_ms=0.5)
+def test_all_rows_delays_the_laser_into_the_all_rows_window() -> None:
+    """Cropped rig: S = 4.04 ms. Camera pulse covers S + E; laser waits for S."""
+    t = compute_slice_timing("all_rows", 10.0, 4.04, 25.75, margin_ms=0.5)
 
-    assert t.camera_pulse_ms == 1.0  # Edge Trigger
-    assert t.hold_ms == ceil_tick(2 * 13.5 + 10 - 2 + 0.5)
-    assert t.slice_period_ms == pytest.approx(37.5)
+    assert t.laser_delay_ms == 4.75  # S + margin, on the 0.25 ms clock
+    assert t.laser_pulse_ms == 10.0
+    assert t.camera_pulse_ms == 15.25  # delay + E + margin
+    # every row is integrating while the laser is on: it gets exactly E
+    assert t.laser_delay_ms >= t.readout_ms
+    assert t.laser_delay_ms + t.laser_pulse_ms <= t.camera_pulse_ms
     assert t.mean_row_light_fraction == 1.0
     assert t.last_row_light_ms == 10.0
+    # proven settle: galvo holds for the camera pulse
+    assert t.hold_ms == 15.25
+    assert t.slice_period_ms == 41.0
     assert not t.galvo_moves_during_exposure
+    assert "laser 10 ms after 4.75" in t.describe()
 
 
-def test_all_rows_cropped_roi_is_faster() -> None:
-    full = compute_slice_timing("all_rows", 10.0, 13.5, 2.0)
-    cropped = compute_slice_timing("all_rows", 10.0, 13.5 * 1143 / 2400, 2.0)
-    assert cropped.slice_period_ms < 0.65 * full.slice_period_ms
+def test_all_rows_level_trigger_waits_for_readout_with_short_settle() -> None:
+    t = compute_slice_timing("all_rows", 10.0, 4.04, 0.25, margin_ms=0.5)
+    # next trigger only once the frame has read out: hold + settle >= C + S
+    assert t.hold_ms + t.settle_ms >= t.camera_pulse_ms + t.readout_ms
+    assert t.slice_period_ms == 19.5
 
 
-def test_all_rows_long_settle_dominates() -> None:
-    t = compute_slice_timing("all_rows", 10.0, 6.0, 25.75, margin_ms=0.5)
-    assert t.hold_ms == 16.5  # S + E + margin: readout already done in the settle
-    assert t.slice_period_ms == 42.25
+def test_all_rows_overlap_steps_right_after_the_camera_pulse() -> None:
+    t = compute_slice_timing("all_rows", 10.0, 4.04, 0.25, margin_ms=0.5, overlap=True)
+    assert t.overlap
+    assert t.hold_ms == t.camera_pulse_ms == 15.25
+    assert t.slice_period_ms == 15.5  # about S + E + settle
+    assert "(overlap)" in t.describe()
+
+
+def test_all_rows_full_frame_vs_cropped() -> None:
+    full = compute_slice_timing("all_rows", 10.0, 8.48, 0.25, overlap=True)
+    cropped = compute_slice_timing("all_rows", 10.0, 4.04, 0.25, overlap=True)
+    assert full.slice_period_ms == 19.75
+    assert cropped.slice_period_ms < full.slice_period_ms
 
 
 def test_all_rows_held_on_laser_waits_for_last_row() -> None:
-    t = compute_slice_timing("all_rows", 10.0, 6.0, 25.75, laser_held_on=True)
-    assert t.hold_ms == 16.5
+    t = compute_slice_timing(
+        "all_rows", 10.0, 4.04, 25.75, laser_held_on=True, overlap=True
+    )
+    assert not t.overlap  # constant light can't use overlap (uneven rows)
+    assert t.camera_pulse_ms == 10.0
+    assert t.laser_delay_ms == 0.0
+    assert t.hold_ms == 14.75  # S + E + margin
     assert not t.galvo_moves_during_exposure
 
 

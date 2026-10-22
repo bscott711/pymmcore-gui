@@ -428,10 +428,11 @@ class SpimTimingSettingsV1(BaseMMSettings):
     """
 
     mode: Literal["legacy", "all_rows"] = "legacy"
-    """``"all_rows"``: Kinetix pseudo-global All Rows mode, lasers gated by
-    each camera's Expose Out (needs Expose Out cabled into PLogic) -- every
-    row gets the full exposure, matching Live. ``"legacy"``: camera and laser
-    share one PLogic pulse (later-read rows get less light)."""
+    """``"all_rows"``: pseudo-global exposure -- the camera's Level Trigger
+    pulse covers readout + exposure and PLogic delays the laser until every
+    row is integrating, so every row gets the full exposure, matching Live.
+    ``"legacy"``: the proven setup, camera and laser share one PLogic pulse
+    (later-read rows get less light)."""
     galvo_settle_ms: float = 25.75
     """Galvo settle between each slice step and the camera trigger (written to
     both ``SPIMDelayBeforeCamera`` and ``SPIMDelayBeforeLaser``)."""
@@ -445,14 +446,12 @@ class SpimTimingSettingsV1(BaseMMSettings):
     """Readout time assumed when the cameras haven't reported one yet (e.g.
     the first MDA of a session before any Snap/Live) and no override is set."""
     margin_ms: float = 0.5
-    """Extra galvo hold after the light ends (All Rows only)."""
-    trigger_pulse_ms: float = 1.0
-    """Camera Edge Trigger pulse width in All Rows mode."""
-    expose_out_bnc: dict[str, int] = Field(
-        default_factory=lambda: {"Camera-1": 4, "Camera-2": 2}
-    )
-    """PLogic front-panel BNC each camera's Expose Out 1 is cabled into (the
-    rig's cabling, 2026-10-21: Camera-1 -> BNC4, Camera-2 -> BNC2)."""
+    """All Rows safety margin: the laser starts this long after the last row
+    has started, and the camera pulse ends this long after the laser."""
+    level_trigger_overlap: bool = False
+    """All Rows with the cameras in Level Trigger Overlap: the next frame
+    starts exposing while the previous one reads out, so a slice costs about
+    readout + exposure instead of 2 x readout + exposure."""
 
 
 class SnapshotSettingsV1(BaseMMSettings):

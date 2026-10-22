@@ -24,8 +24,14 @@ def test_widget_previews_and_applies_timing(mmcore: CMMCorePlus, qtbot: QtBot) -
     widget.settle.setValue(2.0)
     widget.preview_exposure.setValue(10.0)
 
-    assert widget.timing().slice_period_ms == 22.5
-    assert "Expose Out cabled" in widget.summary.text()
+    # S=6, E=10, s=2, margin 0.5: camera pulse 17, hold max(17, 21) -> 23 ms
+    assert widget.timing().slice_period_ms == 23.0
+    assert "delays the laser" in widget.summary.text()
+
+    widget.overlap.setChecked(True)
+    assert SettingsV1.instance().spim_timing.level_trigger_overlap
+    assert widget.timing().slice_period_ms == 19.0  # hold = camera pulse
+    assert "Level Trigger Overlap" in widget.summary.text()
 
     # no Save step: every edit is already what the next MDA reads
     cfg = SettingsV1.instance().spim_timing

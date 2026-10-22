@@ -9,20 +9,25 @@ backplane address 41) fires the camera; the galvo holds that plane for
 Two illumination schemes:
 
 ``"all_rows"``
-    The Kinetix's pseudo-global "All Rows" mode. The camera starts exposing
-    on the trigger edge (Edge Trigger, exposure = E), rolls its rows in over
-    one readout time S, and raises Expose Out only while *every* row is
-    integrating -- the window ``[S, S+E]`` after the trigger. PLogic gates
-    the laser with Expose Out, so every row gets exactly E of light, the same
-    as Live/Snap with a continuous laser. The frame finishes reading out at
-    ``2S + E``. The galvo must not step before the light ends and the next
-    trigger must wait for the readout:
+    Pseudo-global exposure ("All Rows") made by delaying the laser. The
+    camera stays in Level Trigger with a pulse of ``C = S + E`` (plus
+    margins); its rows start over one readout time S, so every row is
+    integrating during ``[S, S+E]``. PLogic fires the laser only in that
+    window (a delay cell of ``D = S + margin`` feeding the E-long laser
+    one-shot), so every row gets exactly E of light, the same as Live/Snap
+    with a continuous laser. The galvo may step as soon as the camera pulse
+    (and the laser inside it) ends:
 
-        hold = max(S + E, 2S + E - settle) + margin
+    - Level Trigger: the next frame can't start until the readout finishes,
+      at ``C + S``, so ``hold = max(C, C + S - settle)``.
+    - Level Trigger Overlap: the next frame may start while the previous one
+      is still reading out, so ``hold = C`` and the slice period is about
+      ``S + E + settle``.
 
     A laser that can't be pulsed (one behind a mechanical shutter, held on
-    for the whole volume) uses the camera's normal rolling exposure instead,
-    and the galvo waits for the last row: ``hold = S + E + margin``.
+    for the whole volume) can't be delayed: the camera pulse is E, every row
+    integrates E under constant light, and the galvo waits for the last row
+    (``hold = S + E + margin``) in plain Level Trigger.
 
 ``"legacy"``
     The original scheme: camera (Level Trigger) and laser are the same
@@ -78,13 +83,19 @@ class SliceTiming:
     hold_ms : float
         How long the galvo holds the plane after the trigger.
     camera_pulse_ms : float
-        PLogic camera trigger pulse width (Edge Trigger: a short edge;
-        legacy Level Trigger: the exposure itself).
+        PLogic camera pulse width; with Level Trigger this is each row's
+        integration time.
     volume_start_settle_ms : float
         Extra settle before the first slice of each volume (the galvo's jump
         back to the start of the sweep).
     laser_held_on : bool
         The laser can't be pulsed (stays on for the whole volume).
+    laser_delay_ms : float
+        Delay from the trigger to the laser pulse (All Rows; 0 in legacy).
+    laser_pulse_ms : float
+        Laser pulse width (E, rounded to the clock).
+    overlap : bool
+        The camera runs in Level Trigger Overlap.
     """
 
     mode: TimingMode
@@ -95,6 +106,9 @@ class SliceTiming:
     camera_pulse_ms: float
     volume_start_settle_ms: float
     laser_held_on: bool
+    laser_delay_ms: float = 0.0
+    laser_pulse_ms: float = 0.0
+    overlap: bool = False
 
     @property
     def slice_period_ms(self) -> float:
@@ -134,18 +148,23 @@ class SliceTiming:
     @property
     def galvo_moves_during_exposure(self) -> bool:
         """Whether some row is still lit while the galvo steps (blur)."""
-        light_end = self.readout_ms + self.exposure_ms
-        if self.mode == "legacy" and not self.laser_held_on:
-            light_end = self.exposure_ms  # the pulse ends; late rows are just dark
+        if self.laser_held_on:
+            light_end = self.readout_ms + self.camera_pulse_ms  # last row stops
+        else:
+            light_end = self.laser_delay_ms + self.laser_pulse_ms
         return self.hold_ms + 1e-9 < light_end
 
     def describe(self, n_slices: int | None = None) -> str:
         """One-line human summary for logs and the timing panel."""
         text = (
-            f"{self.mode}: settle {self.settle_ms:g} + hold {self.hold_ms:g} = "
-            f"{self.slice_period_ms:g} ms/slice (E {self.exposure_ms:g}, "
-            f"readout {self.readout_ms:g}, trigger {self.camera_pulse_ms:g} ms)"
+            f"{self.mode}{' (overlap)' if self.overlap else ''}: settle "
+            f"{self.settle_ms:g} + hold {self.hold_ms:g} = "
+            f"{self.slice_period_ms:g} ms/slice (E {self.exposure_ms:g}, readout "
+            f"{self.readout_ms:g}, camera pulse {self.camera_pulse_ms:g} ms"
         )
+        if self.laser_delay_ms:
+            text += f", laser {self.laser_pulse_ms:g} ms after {self.laser_delay_ms:g}"
+        text += ")"
         if n_slices:
             text += f"; {n_slices} slices = {self.volume_ms(n_slices) / 1000:.2f} s"
         if self.mean_row_light_fraction < 0.999:
@@ -166,7 +185,7 @@ def compute_slice_timing(
     settle_ms: float,
     *,
     margin_ms: float = 0.5,
-    trigger_pulse_ms: float = 1.0,
+    overlap: bool = False,
     volume_start_settle_ms: float = 0.0,
     laser_held_on: bool = False,
 ) -> SliceTiming:
@@ -183,36 +202,46 @@ def compute_slice_timing(
     settle_ms : float
         Galvo settle between its step and the camera trigger.
     margin_ms : float
-        Safety margin added to the galvo hold (All Rows only; legacy keeps
-        the original timing exactly).
-    trigger_pulse_ms : float
-        Width of the camera's Edge Trigger pulse (All Rows only).
+        All Rows safety margin: added to the laser delay (so it starts after
+        the last row has started), to the camera pulse (so it ends after the
+        laser), and to a held-on laser's galvo hold. Legacy ignores it.
+    overlap : bool
+        All Rows with the camera in Level Trigger Overlap (pulsed lasers only).
     volume_start_settle_ms : float
         Extra settle before each volume's first slice.
     laser_held_on : bool
         The channel's laser can't be pulsed.
     """
     e, s = exposure_ms, max(0.0, readout_ms)
-    if mode == "all_rows":
-        if laser_held_on:
-            hold = s + e + margin_ms
-        else:
-            hold = max(s + e, 2 * s + e - settle_ms) + margin_ms
-        pulse = trigger_pulse_ms
+    settle = ceil_tick(settle_ms)
+    laser = ceil_tick(e)
+    delay = 0.0
+    if mode == "all_rows" and laser_held_on:
+        overlap = False  # constant light: rows must all integrate the full E
+        pulse = laser
+        hold = ceil_tick(s + e + margin_ms)
+    elif mode == "all_rows":
+        delay = ceil_tick(s + margin_ms)
+        pulse = ceil_tick(delay + laser + margin_ms)
+        hold = pulse if overlap else ceil_tick(max(pulse, pulse + s - settle))
     elif mode == "legacy":
-        hold = max(e, s + e - settle_ms)
-        pulse = e
+        overlap = False
+        pulse = laser
+        hold = ceil_tick(max(e, s + e - settle_ms))
     else:  # pragma: no cover -- guarded by the Literal type
         raise ValueError(f"Unknown timing mode {mode!r}")
     return SliceTiming(
         mode=mode,
         exposure_ms=e,
         readout_ms=s,
-        settle_ms=ceil_tick(settle_ms),
-        hold_ms=ceil_tick(hold),
-        camera_pulse_ms=ceil_tick(pulse),
+        settle_ms=settle,
+        hold_ms=hold,
+        camera_pulse_ms=pulse,
         volume_start_settle_ms=ceil_tick(volume_start_settle_ms),
         laser_held_on=laser_held_on,
+        laser_delay_ms=delay,
+        laser_pulse_ms=laser,
+        overlap=overlap,
     )
 
 
@@ -226,7 +255,7 @@ def timing_from_settings(
     """The slice timing an MDA runs with under *cfg*.
 
     All Rows uses the configured settle, volume-start settle, margin and
-    trigger pulse. Legacy ignores them and reproduces the original timing
+    overlap switch. Legacy ignores them and reproduces the original timing
     (:data:`LEGACY_SETTLE_MS`, no volume-start settle), so switching back to
     legacy always restores the known-good acquisition.
 
@@ -255,7 +284,7 @@ def timing_from_settings(
         readout_ms,
         cfg.galvo_settle_ms,
         margin_ms=cfg.margin_ms,
-        trigger_pulse_ms=cfg.trigger_pulse_ms,
+        overlap=cfg.level_trigger_overlap,
         volume_start_settle_ms=cfg.volume_start_settle_ms,
         laser_held_on=laser_held_on,
     )
