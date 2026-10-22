@@ -221,7 +221,10 @@ def _default_spectral_channels() -> list[SpectralChannelConfig]:
             position="bottom",
         ),
         SpectralChannelConfig(
-            name="mScarlet_561nm", camera="Camera-2", laser_preset="561nm", position="top"
+            name="mScarlet_561nm",
+            camera="Camera-2",
+            laser_preset="561nm",
+            position="top",
         ),
         SpectralChannelConfig(
             name="CF647_638nm",

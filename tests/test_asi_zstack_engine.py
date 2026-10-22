@@ -1066,7 +1066,58 @@ def test_legacy_mode_ignores_all_rows_settle(
     core, engine = _setup_spim_engine(monkeypatch)
     engine.setup_sequence(useq.MDASequence(channels=["488nm"]))
 
-    assert _galvo_value(core, "SPIMDelayBeforeCamera(ms)") == 25.75
+    # exactly the proven legacy writes: side delay, slice settle, hold
+    assert _galvo_value(core, "SPIMDelayBeforeSide(ms)") == 0.0
     assert _galvo_value(core, "SPIMDelayBeforeLaser(ms)") == 25.75
     assert _galvo_value(core, "SPIMLaserDuration(ms)") == 10.0
-    assert _galvo_value(core, "SPIMDelayBeforeSide(ms)") == 0.0
+    # ... and nothing the proven setup left to the card
+    written = {
+        c.args[1]
+        for c in core.setProperty.call_args_list
+        if c.args[0] == "Scanner:AB:33"
+    }
+    for prop in (
+        "SPIMDelayBeforeCamera(ms)",
+        "SPIMCameraDuration(ms)",
+        "SPIMDelayBeforeScan(ms)",
+        "SPIMNumScansPerSlice",
+    ):
+        assert prop not in written
+    # legacy PLogic: the proven E-long one-shots, never the All Rows cells
+    engine_module.configure_plogic_for_dual_nrt_pulses.assert_called_once()  # type: ignore[attr-defined]
+    settings_arg = engine_module.configure_plogic_for_dual_nrt_pulses.call_args.args[0]  # type: ignore[attr-defined]
+    assert settings_arg.camera_exposure_ms == 10.0
+    # no per-volume or after-arm changes in legacy
+    core.setProperty.reset_mock()
+    assert engine._prepare_volume(useq.MDAEvent(exposure=20.0)) == {}
+    engine._after_arm()
+    core.setProperty.assert_not_called()
+
+
+def test_all_rows_teardown_restores_card_timing(
+    monkeypatch: pytest.MonkeyPatch, settings: object
+) -> None:
+    """An All Rows run puts the galvo card's per-slice values back afterwards."""
+    monkeypatch.setattr(engine_module.time, "sleep", lambda _s: None)
+    core, engine, _all_rows = _all_rows_engine(monkeypatch, settings)
+    monkeypatch.setattr(engine, "_reclaim_from_workers", MagicMock())
+    core.getLoadedDevices.return_value = ["Scanner:AB:33"]
+    # setup wrote All Rows values over the card's "0.1234"s; teardown must
+    # write every one of them back
+    core.getProperty.return_value = "all-rows value"
+    core.setProperty.reset_mock()
+
+    engine.teardown_sequence(useq.MDASequence())
+
+    restored = {
+        c.args[1]: c.args[2]
+        for c in core.setProperty.call_args_list
+        if c.args[0] == "Scanner:AB:33" and c.args[1] != "SPIMState"
+    }
+    for prop in (
+        "SPIMDelayBeforeCamera(ms)",
+        "SPIMDelayBeforeLaser(ms)",
+        "SPIMLaserDuration(ms)",
+        "SPIMNumScansPerSlice",
+    ):
+        assert restored.get(prop) == "0.1234"

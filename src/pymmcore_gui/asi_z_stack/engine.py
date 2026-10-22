@@ -28,6 +28,7 @@ from .asi_controller import (
 from .camera_worker_service import CameraWorkerService
 from .common import AcquisitionSettings, HardwareConstants
 from .spim_timing import (
+    LEGACY_SETTLE_MS,
     SliceTiming,
     readout_ms_from_camera_timing,
     timing_from_settings,
@@ -42,6 +43,19 @@ logger = logging.getLogger(__name__)
 
 #: ``CRISP State`` values meaning the servo is actively holding focus.
 _CRISP_LOCKED_STATES = frozenset({"Lock", "In Focus"})
+
+#: Galvo per-slice properties only All Rows mode writes. The proven legacy
+#: setup never touches them (it relies on the values stored on the card), so
+#: an All Rows run snapshots them and restores them in teardown.
+_ALL_ROWS_GALVO_PROPS = (
+    "SPIMDelayBeforeCamera(ms)",
+    "SPIMDelayBeforeLaser(ms)",
+    "SPIMCameraDuration(ms)",
+    "SPIMLaserDuration(ms)",
+    "SPIMDelayBeforeScan(ms)",
+    "SPIMNumScansPerSlice",
+    "SPIMDelayBeforeSide(ms)",
+)
 
 
 @dataclass
@@ -856,6 +870,9 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         self._timing_cfg: SpimTimingSettingsV1 | None = None
         self._readout_ms = 0.0
         self._applied_timing: SliceTiming | None = None
+        # Galvo per-slice values an All Rows run overwrote, put back in
+        # teardown (see _ALL_ROWS_GALVO_PROPS).
+        self._galvo_timing_before: dict[str, str] | None = None
 
     def _check_galvo_reach(
         self, amplitude_deg: float, offset_deg: float, live_offset_deg: float = 0.0
@@ -1024,6 +1041,58 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         if changes:
             logger.info("Galvo timing: " + "; ".join(changes))
 
+    def _read_galvo_timing(self) -> dict[str, str]:
+        """The galvo card's current values of every property All Rows rewrites."""
+        mmc = self.mmcore
+        label = self.hw.galvo_a_label
+        return {
+            prop: mmc.getProperty(label, prop)
+            for prop in _ALL_ROWS_GALVO_PROPS
+            if mmc.hasProperty(label, prop)
+        }
+
+    def _restore_galvo_timing(self) -> None:
+        """Put back the per-slice delays an All Rows run overwrote (teardown)."""
+        before = self._galvo_timing_before
+        self._galvo_timing_before = None
+        if not before:
+            return
+        mmc = self.mmcore
+        label = self.hw.galvo_a_label
+        restored = []
+        for prop, value in before.items():
+            if mmc.getProperty(label, prop) != value:
+                mmc.setProperty(label, prop, value)
+                restored.append(f"{prop}={value}")
+        if restored:
+            logger.info("Galvo timing restored after All Rows: " + "; ".join(restored))
+
+    def _restore_legacy_delay_before_laser(self) -> None:
+        """Make sure the card has the proven 25.75 ms slice settle for legacy.
+
+        The legacy setup never wrote ``SPIMDelayBeforeLaser``; it relied on the
+        value stored on the card (25.75 ms, logged on every run since
+        2026-09-23). An All Rows run from before teardown restored the card
+        could have left a different value, so legacy writes the known-good one
+        back -- a no-op on a card that still has it.
+        """
+        mmc = self.mmcore
+        label = self.hw.galvo_a_label
+        prop = "SPIMDelayBeforeLaser(ms)"
+        if not mmc.hasProperty(label, prop):
+            return
+        current = mmc.getProperty(label, prop)
+        try:
+            if abs(float(current) - LEGACY_SETTLE_MS) < 1e-6:
+                return
+        except (TypeError, ValueError):
+            pass
+        logger.warning(
+            f"Galvo {prop} was {current}, not the proven {LEGACY_SETTLE_MS}; "
+            "restoring it for legacy timing."
+        )
+        mmc.setProperty(label, prop, f"{LEGACY_SETTLE_MS:.4f}")
+
     def _apply_timing(self, timing: SliceTiming) -> None:
         self._apply_plogic_timing(timing)
         self._set_galvo_timing(timing)
@@ -1031,8 +1100,12 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         logger.info(f"Slice timing: {timing.describe(self._num_slices)}")
 
     def _prepare_volume(self, event: MDAEvent) -> dict[str, Any]:
-        """Fit the slice timing to this volume's channel, return arm options."""
-        if self._timing_cfg is None:
+        """Fit the slice timing to this volume's channel, return arm options.
+
+        Legacy does nothing here: like the proven engine it keeps the PLogic
+        and galvo programming from setup_sequence for the whole run.
+        """
+        if self._timing_cfg is None or self._timing_cfg.mode != "all_rows":
             return {}
         exposure = float(event.exposure) if event.exposure else self._exposure_ms
         held_on = bool(self._shutter_gated_bncs())
@@ -1065,7 +1138,12 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         """
         cfg = self._timing_cfg
         timing = self._applied_timing
-        if cfg is None or timing is None or cfg.readout_ms_override is not None:
+        if (
+            cfg is None
+            or timing is None
+            or timing.mode != "all_rows"
+            or cfg.readout_ms_override is not None
+        ):
             return
         reported = self._reported_readout_ms()
         if reported is None or abs(reported - self._readout_ms) <= 0.05:
@@ -1170,7 +1248,24 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         timing = self._timing_for(
             self._exposure_ms, first in self.hw.shutter_gated_wavelengths
         )
-        self._apply_plogic_timing(timing)
+        if timing.mode == "all_rows":
+            self._apply_plogic_timing(timing)
+        else:
+            # Legacy: exactly the PLogic programming proven on the rig --
+            # camera and laser cells as E-long one-shots off the slice TTL.
+            configure_plogic_for_dual_nrt_pulses(
+                AcquisitionSettings(
+                    camera_exposure_ms=self._exposure_ms,
+                    laser_trig_duration_ms=self._exposure_ms,
+                ),
+                self.hw.plogic_label,
+                self.hw.tiger_comm_hub_label,
+                self.hw.plogic_camera_cell,
+                self.hw.pulses_per_ms,
+                self.hw.plogic_4khz_clock_addr,
+                self.hw.plogic_trigger_ttl_addr,
+                self.hw.plogic_laser_on_cell,
+            )
 
         # Deliberately not calling open_global_shutter() here -- it's
         # session-level (opened once via ensure_global_shutter_open), not
@@ -1230,11 +1325,23 @@ class ASISPIMEngine(_ASITriggerEngineBase):
             "SPIMDelayBeforeRepeat(ms)",
             str(self.hw.delay_before_repeat_ms),
         )
-        # Per-slice delays, the hold that sets the slice period, and the
-        # volume-start settle (SPIMDelayBeforeSide) all come from the advanced
-        # timing settings -- see _set_galvo_timing. They used to be left at
-        # whatever the card had stored, which nothing here ever read.
-        self._set_galvo_timing(timing)
+        if timing.mode == "all_rows":
+            # All Rows rewrites the card's per-slice delays (see
+            # _set_galvo_timing); remember what was there so teardown puts the
+            # card back exactly as the proven legacy setup expects it.
+            self._galvo_timing_before = self._read_galvo_timing()
+            self._set_galvo_timing(timing)
+        else:
+            # Legacy: exactly the galvo writes proven on the rig. The other
+            # per-slice delays stay whatever the card holds -- that is the
+            # configuration the microscope was tuned and verified with.
+            self.mmcore.setProperty(
+                self.hw.galvo_a_label,
+                "SPIMDelayBeforeSide(ms)",
+                str(self.hw.delay_before_side_ms),
+            )
+            self._restore_legacy_delay_before_laser()
+            self._fit_slice_period_to_exposure()
         self._applied_timing = timing
         logger.info(f"Slice timing: {timing.describe(self._num_slices)}")
         #
@@ -1276,6 +1383,7 @@ class ASISPIMEngine(_ASITriggerEngineBase):
                     self._galvo_offset_before,
                 )
                 self._galvo_offset_before = None
+            self._restore_galvo_timing()
 
         # Belt-and-suspenders: exec_event's own finally block already closes
         # any shutter-gated laser it opened after every burst, so this is
