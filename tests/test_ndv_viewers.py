@@ -252,6 +252,46 @@ def test_lock_holds_channel_and_slice(mmcore: CMMCorePlus, qtbot: QtBot) -> None
     assert current() == {"t": 2, "c": 0, "z": 1}
 
 
+def test_lock_advances_t_when_frames_arrive_in_bursts(
+    mmcore: CMMCorePlus, qtbot: QtBot
+) -> None:
+    """Regression: a locked plane must still advance t when frames come in bursts.
+
+    Updates are coalesced to the newest pending frame per viewer. On the rig a
+    whole volume streams in before the deferred update fires, so the locked
+    plane's frame used to be superseded by later slices and then dropped by
+    the lock check -- the view sat on the first timepoint forever.
+    """
+    manager = NDVViewersManager(QWidget(), mmcore)
+    seq = MDASequence(
+        z_plan=useq.ZRangeAround(range=4, step=1),  # 5 z slices
+        time_plan=useq.TIntervalLoops(interval=0, loops=4),  # pyright: ignore
+    )
+    events = list(seq)
+    handler = NumpyDisplayStore()
+    handler.reset(seq)
+    frame = np.zeros((4, 4), dtype="uint8")
+    viewer = ndv.ArrayViewer()
+
+    def current() -> dict:
+        return {str(k): v for k, v in viewer.display_model.current_index.items()}
+
+    def burst(t: int) -> None:  # one whole volume, no event-loop turn between
+        for e in (e for e in events if e.index.get("t") == t):
+            handler.frameReady(frame, e, {})  # pyright: ignore
+            manager._update_mda_viewer(viewer, handler, e)
+
+    burst(0)
+    qtbot.waitUntil(lambda: current().get("z") == 4)
+    viewer.display_model.current_index["z"] = 2
+    manager.set_viewer_slice_locked(viewer, True)
+
+    for t in (1, 2, 3):
+        burst(t)
+        qtbot.waitUntil(lambda t=t: current().get("t") == t, timeout=2000)
+        assert current() == {"t": t, "z": 2}
+
+
 def test_lock_ignores_channel_in_composite_mode(
     mmcore: CMMCorePlus, qtbot: QtBot
 ) -> None:

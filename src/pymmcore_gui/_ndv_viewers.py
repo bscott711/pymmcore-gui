@@ -769,6 +769,21 @@ class NDVViewersManager(QObject):
 
         self._update_mda_viewer(viewer, self._own_handler, event)
 
+    def _locked_out(self, viewer: ndv.ArrayViewer, event: useq.MDAEvent) -> bool:
+        """Return True if *viewer* is locked to a different slice/channel than *event*.
+
+        Composite/multichannel modes draw every channel at once, so there only
+        the locked z decides whether a frame is shown.
+        """
+        if (locked := self._locked_axes.get(viewer)) is None:
+            return False
+        multichannel = viewer.display_model.channel_mode.is_multichannel()
+        return any(
+            event.index.get(key) != val
+            for key, val in locked.items()
+            if not (key == "c" and multichannel)
+        )
+
     def _update_mda_viewer(
         self,
         viewer: ndv.ArrayViewer,
@@ -798,6 +813,16 @@ class NDVViewersManager(QObject):
         # from the original implementation) works around data handlers
         # writing asynchronously, so the frame may not be available to the
         # viewer immediately after the handler's frameReady method is called.
+        #
+        # A locked viewer's frames are filtered *here*, before coalescing: a
+        # whole volume typically streams in before the deferred update fires,
+        # so letting other planes into the pending slot would supersede the
+        # locked plane's frame and it would never be shown.
+        if self._locked_out(viewer, event):
+            # the "t" slider must still grow as new timepoints are written.
+            if isinstance(wrapper := viewer.data_wrapper, _LabeledArrayWrapper):
+                wrapper.notify_frame_written()
+            return
         already_pending = viewer in self._pending_viewer_updates
         self._pending_viewer_updates[viewer] = event
         if already_pending:
@@ -807,21 +832,13 @@ class NDVViewersManager(QObject):
             latest = self._pending_viewer_updates.pop(v, None)
             if latest is None:
                 return  # pragma: no cover
-            # Re-check the collected-data bounds regardless of whether this
-            # particular viewer's lock (below) ends up skipping the visible
-            # update -- new data has been written either way.
             if isinstance(wrapper := v.data_wrapper, _LabeledArrayWrapper):
                 wrapper.notify_frame_written()
+            # re-check: the lock may have been toggled/moved since queuing.
+            if self._locked_out(v, latest):
+                return
             index = dict(latest.index)
             if (locked := self._locked_axes.get(v)) is not None:
-                # composite/multichannel modes draw every channel at once,
-                # so only the locked z decides whether this frame is shown.
-                multichannel = v.display_model.channel_mode.is_multichannel()
-                for key, val in locked.items():
-                    if key == "c" and multichannel:
-                        continue
-                    if index.get(key) != val:
-                        return  # a different slice/channel -- skip this frame
                 # never move a locked axis: only advance t/p etc.
                 index = {k: val for k, val in index.items() if k not in locked}
             try:
