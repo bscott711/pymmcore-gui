@@ -1195,6 +1195,15 @@ class ArgusStreamSession:
 
     def sequenceStarted(self, sequence: useq.MDASequence, meta: SummaryMetaV1) -> None:
         """Start streaming this run, if eligible and enabled."""
+        if self._worker is not None:
+            # The last run never got sequenceFinished/sequenceCanceled (an
+            # earlier slot on those signals raising stops psygnal before ours).
+            # A new run means it is over: end it, or its session stays open on
+            # Argus -- holding the live lease that pauses the backfill -- for
+            # as long as this app runs, re-attaching after any Argus restart.
+            logger.warning("Argus stream: previous run never ended; closing it")
+            self._worker.finish("client_abort")
+            self._worker = None
         settings = self._get_settings()
         argus = settings.argus_stream
         if not argus.enabled:
