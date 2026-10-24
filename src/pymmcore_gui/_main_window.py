@@ -40,10 +40,11 @@ from PyQt6Ads import (
 from superqt import QIconifyIcon
 
 from ._argus_stream import ArgusStreamSession, ArgusTunnelManager, StreamState
+from ._argus_stream import _log as argus_log
 from ._mmcore_shutdown import shutdown_mmcore, track_mda_thread
 from ._ndv_viewers import NDVViewersManager
 from ._notification_manager import NotificationManager
-from ._settings import Settings
+from ._settings import USER_DATA_DIR, Settings
 from .actions import CoreAction, QCoreAction, WidgetAction, WidgetActionInfo
 from .actions._action_info import ActionInfo
 from .widgets._camera_toolbar import CameraToolBar
@@ -156,7 +157,24 @@ _ARGUS_STATE_TEXT = {
     StreamState.BACKLOG_ALARM: "Argus: backlog!",
     StreamState.FINISHING: "Argus: finishing…",
     StreamState.PAUSED: "Argus: PAUSED",
+    StreamState.STALLED: "⚠ Argus: NOT RECEIVING",
+    StreamState.ERROR: "⚠ Argus: ERROR",
 }
+# States that mean Argus isn't getting (or won't get) this run's data: the
+# label turns red, and a run-ending one also raises a notification. On
+# 2026-10-24 ten runs reached Argus empty while the label said "reconnecting…".
+_ARGUS_ALERT_STATES = {
+    StreamState.STALLED,
+    StreamState.PAUSED,
+    StreamState.ERROR,
+    StreamState.BACKLOG_ALARM,
+}
+_ARGUS_NOTIFY_STATES = {StreamState.PAUSED, StreamState.ERROR}
+# psygnal calls higher priorities first, and stops at the first slot that
+# raises. The stream's slots never raise, so running them first means a
+# viewer or writer error can no longer starve the stream of frames or of its
+# end-of-run signal (the NDV viewers connect earlier, at default priority).
+_ARGUS_SLOT_PRIORITY = 100
 
 
 class MicroManagerGUI(QMainWindow):
@@ -267,6 +285,8 @@ class MicroManagerGUI(QMainWindow):
         # without an app restart: that one first run afterward still pays
         # the JIT cost, every run after it doesn't.
         argus_settings = Settings.instance().argus_stream
+        # The stream's own log, on this PC (a copy also goes to Argus).
+        argus_log.install(USER_DATA_DIR / "logs")
         self._argus_tunnel = ArgusTunnelManager(
             argus_settings.ssh_host,
             argus_settings.local_port,
@@ -291,10 +311,13 @@ class MicroManagerGUI(QMainWindow):
         self.argus_qc_history: deque[dict] = deque(maxlen=200)
         self.argus_qc_received = self._argus_status_relay.qcReceived
         argus_mda_ev = self._mmc.mda.events
-        argus_mda_ev.sequenceStarted.connect(self._argus_stream.sequenceStarted)
-        argus_mda_ev.frameReady.connect(self._argus_stream.frameReady)
-        argus_mda_ev.sequenceFinished.connect(self._argus_stream.sequenceFinished)
-        argus_mda_ev.sequenceCanceled.connect(self._argus_stream.sequenceCanceled)
+        stream = self._argus_stream
+        first = _ARGUS_SLOT_PRIORITY
+        argus_mda_ev.sequenceStarted.connect(stream.sequenceStarted, priority=first)
+        argus_mda_ev.frameReady.connect(stream.frameReady, priority=first)
+        argus_mda_ev.sequenceFinished.connect(stream.sequenceFinished, priority=first)
+        argus_mda_ev.sequenceCanceled.connect(stream.sequenceCanceled, priority=first)
+        self._argus_last_notified = ""
 
         # Status bar -----------------------------------------
 
@@ -680,8 +703,19 @@ class MicroManagerGUI(QMainWindow):
         return super().closeEvent(a0)
 
     def _on_argus_state_changed(self, state: str, detail: str) -> None:
-        text = _ARGUS_STATE_TEXT.get(StreamState(state), f"Argus: {state}")
+        stream_state = StreamState(state)
+        text = _ARGUS_STATE_TEXT.get(stream_state, f"Argus: {state}")
         self._argus_status_label.setText(f"{text} ({detail})" if detail else text)
+        self._argus_status_label.setToolTip(detail)
+        alert = stream_state in _ARGUS_ALERT_STATES
+        self._argus_status_label.setStyleSheet(
+            "color: #d32f2f; font-weight: bold;" if alert else ""
+        )
+        message = f"{text}: {detail}" if detail else text
+        notify = stream_state in _ARGUS_NOTIFY_STATES
+        if notify and message != self._argus_last_notified:
+            self._argus_last_notified = message
+            self._notification_manager.show_warning_message(message)
 
     def _on_argus_qc(self, rec: dict) -> None:
         from pymmcore_gui.widgets._argus_qc import VERDICT_COLORS
