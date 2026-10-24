@@ -128,8 +128,17 @@ class LocalLeaf:
     stores: list[LocalStore] = field(default_factory=list)
 
 
-def scan_local_root(root: Path, max_depth: int = 6) -> list[LocalLeaf]:
-    """Every directory under ``root`` that directly holds ``*.ome.zarr`` stores."""
+_TIFF_SUFFIXES = (".tif", ".tiff")
+
+
+def scan_local_root(
+    root: Path, max_depth: int = 6, other: Counter[str] | None = None
+) -> list[LocalLeaf]:
+    """Every directory under ``root`` that directly holds ``*.ome.zarr`` stores.
+
+    TIFF files met on the way are counted in ``other`` (by folder): this tool
+    sends OME-Zarr only, so they would otherwise be left behind unsaid.
+    """
     leaves: list[LocalLeaf] = []
 
     def walk(d: Path, depth: int) -> None:
@@ -138,6 +147,10 @@ def scan_local_root(root: Path, max_depth: int = 6) -> list[LocalLeaf]:
         except OSError:
             return
         stores = []
+        if other is not None:
+            n_tiff = sum(1 for e in entries if e.name.lower().endswith(_TIFF_SUFFIXES))
+            if n_tiff:
+                other[str(d)] += n_tiff
         for e in entries:
             name_ok = e.name.endswith(".ome.zarr") and bfill.valid_store_name(e.name)
             if e.is_dir() and name_ok:
@@ -222,6 +235,7 @@ class BackfillClient:
         self.compress, self.max_mbps, self.pause_file = compress, max_mbps, pause_file
         self.order, self.reply_timeout_s = order, reply_timeout_s
         self.features: list[str] = []
+        self.tiff_folders: Counter[str] = Counter()
         self.live_active = False
         self.sent_bytes = 0
         self._t0 = time.monotonic()
@@ -329,6 +343,7 @@ class BackfillClient:
         )
         if not inv.get("ok"):
             raise BackfillError(f"inventory refused for {remote}: {inv.get('error')}")
+        self._probe_elsewhere(remote, ready, inv["stores"])
         for s in ready:
             info = inv["stores"].get(s.name, {})
             state = info.get("state")
@@ -338,6 +353,17 @@ class BackfillClient:
                 report["stores"][s.name] = {
                     "result": state,
                     "reason": info.get("reason"),
+                }
+            elif info.get("duplicate_of"):
+                # The same data is already on Argus in another folder (e.g. it
+                # came by Globus): never a second copy.
+                dup_have = info.get("duplicate_have_t", [])
+                whole = set(s.written_t) <= set(dup_have)
+                report["stores"][s.name] = {
+                    "result": "already on Argus" if whole else "partial copy elsewhere",
+                    "at": info["duplicate_of"],
+                    "has": len(dup_have),
+                    "of": len(s.written_t),
                 }
             elif set(s.written_t) <= set(info.get("have_t", [])):
                 # Every timepoint is there: the live stream brought it in
@@ -352,6 +378,8 @@ class BackfillClient:
                     "missing_timepoints": len(missing),
                     "of": len(s.written_t),
                 }
+                if info.get("stream_copy"):
+                    report["stores"][s.name]["completes_stream_copy"] = True
             else:
                 have = set(info.get("have_t", []))
                 try:
@@ -361,6 +389,40 @@ class BackfillClient:
                     logger.error("%s: %s", s.name, exc)
                     report["stores"][s.name] = {"result": "refused", "reason": str(exc)}
         return report
+
+    def _probe_elsewhere(
+        self, remote: str, stores: list[LocalStore], infos: dict[str, Any]
+    ) -> None:
+        """Tell the same data elsewhere on Argus from a run that shares the name.
+
+        For each store Argus reports under another folder, send one volume's
+        digest; Argus compares it with its copy. Updates ``infos`` in place.
+        """
+        probes = []
+        for s in stores:
+            cands = infos.get(s.name, {}).get("elsewhere") or []
+            t = next(
+                (
+                    t
+                    for t in s.written_t
+                    if any(t in c.get("have_t", []) for c in cands)
+                ),
+                None,
+            )
+            if t is None:
+                continue
+            arr = s.array()
+            vol = np.asarray(arr[t] if arr.ndim >= 4 else arr[...])
+            probe = {"t": t, "sha256": bfill.volume_digest(vol)}
+            probes.append({**s.spec(), "probe": probe})
+        if not probes:
+            return
+        header = {"leaf": remote, "stores": probes}
+        inv = self._request(bfill.BF_INVENTORY, header, "inventory")
+        if inv.get("ok"):
+            for name, info in inv["stores"].items():
+                if info.get("duplicate_of"):
+                    infos[name] = info
 
     def _sync_store(self, remote: str, s: LocalStore, have: set[int]) -> dict[str, Any]:
         t_start = time.monotonic()
@@ -546,8 +608,9 @@ class BackfillClient:
         self.ping()
         reports = []
         leaves: list[LocalLeaf] = []
+        self.tiff_folders = Counter()
         for local_root, _ in self.root_map:
-            leaves += scan_local_root(local_root)
+            leaves += scan_local_root(local_root, other=self.tiff_folders)
         leaves.sort(
             key=lambda lf: max(s.newest_mtime() for s in lf.stores),
             reverse=self.order == "newest",
@@ -564,7 +627,11 @@ class BackfillClient:
         return reports
 
 
-def summarize(reports: list[dict[str, Any]], dry_run: bool) -> str:
+def summarize(
+    reports: list[dict[str, Any]],
+    dry_run: bool,
+    tiff_folders: Counter[str] | None = None,
+) -> str:
     """What happened, for people: one line per store that needs attention."""
     counts: Counter[str] = Counter()
     lines = []
@@ -578,24 +645,41 @@ def summarize(reports: list[dict[str, Any]], dry_run: bool) -> str:
             counts[result] += 1
             if result == "would send":
                 what = f"{st['missing_timepoints']} of {st['of']} timepoints"
+                if st.get("completes_stream_copy"):
+                    what += ", completing the live stream's partial copy"
                 lines.append(f"  SEND     {name}: {what} -> {rep['remote']}")
+            elif result == "already on Argus" and st.get("at"):
+                lines.append(f"  SKIP     {name}: already on Argus at {st['at']}")
+            elif result == "partial copy elsewhere":
+                lines.append(
+                    f"  CHECK    {name}: Argus has {st['has']} of {st['of']} "
+                    f"timepoints at {st['at']}; not sent, so there is no second copy"
+                )
             elif result == "complete":
                 what = f"{st['sent_timepoints']} timepoints, {st['sent_gb']} GB"
                 lines.append(f"  SENT     {name}: {what}, verified")
             elif result in (bfill.CONFLICT, bfill.BUSY, "refused"):
                 reason = str(st.get("reason"))
                 if "exists and differs" in reason:
-                    # The live stream's own partial copy of this run: its
-                    # metadata carries the stream's tags, and Argus never
-                    # overwrites. It has to be moved aside on Argus first.
+                    # Argus never overwrites. A receiver from before 2026-10-24
+                    # refuses even the live stream's own partial copy, which a
+                    # current one completes in place.
                     reason += (
-                        " -- Argus holds the live stream's partial copy of this run;"
-                        " it has to be moved aside on Argus before this can send"
+                        " -- Argus holds a different copy of this store and never "
+                        "overwrites; if it is the live stream's partial copy, the "
+                        "backfill receiver on Argus needs updating"
                     )
                 lines.append(f"  {result.upper():8} {name}: {reason}")
     total = (
         ", ".join(f"{n} {k}" for k, n in sorted(counts.items())) or "no stores found"
     )
+    if tiff_folders:
+        n = sum(tiff_folders.values())
+        lines.append(
+            f"  Not handled: {n} TIFF file(s) in {len(tiff_folders)} folder(s) "
+            "(this tool sends OME-Zarr only; send those by Globus), e.g. "
+            f"{next(iter(sorted(tiff_folders)))}"
+        )
     head = "Dry run -- nothing was sent." if dry_run else "Done."
     return "\n".join([head, f"Stores: {total}.", *lines])
 
@@ -707,7 +791,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         while True:
             try:
-                print(summarize(client.run_once(dry_run=a.dry_run), a.dry_run))
+                reports = client.run_once(dry_run=a.dry_run)
+                print(summarize(reports, a.dry_run, client.tiff_folders))
             except BackfillError as exc:
                 logger.error("%s", exc)
                 print(f"Could not reach Argus's backfill receiver: {exc}")
