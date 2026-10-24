@@ -8,6 +8,7 @@ that live here: scanning, path mapping, the summary and the tunnel wiring.
 
 from __future__ import annotations
 
+from collections import Counter
 from pathlib import Path, PureWindowsPath
 from typing import TYPE_CHECKING, Any
 
@@ -99,7 +100,7 @@ def test_the_summary_says_what_to_do() -> None:
     assert (
         "SEND     A_mNG_488nm.ome.zarr: 3 of 3 timepoints -> /mmfs1/x/20261023" in text
     )
-    assert "live stream's partial copy" in text and "moved aside on Argus" in text
+    assert "never overwrites" in text
     assert "under no --map root" in text
 
 
@@ -145,3 +146,54 @@ def test_the_wire_helpers_match_the_receivers_contract() -> None:
     assert bfill.volume_digest(vol) == bfill.volume_digest(np.asfortranarray(vol))
     assert bfill.valid_store_name("WT_Stim_005_mNG_488nm.ome.zarr")
     assert not bfill.valid_store_name("../x.ome.zarr")
+
+
+def test_duplicates_and_stream_copies_read_plainly() -> None:
+    reports: list[dict[str, Any]] = [
+        {
+            "leaf": "S:/exp",
+            "remote": "/mmfs1/x/exp",
+            "stores": {
+                "A.ome.zarr": {
+                    "result": "already on Argus",
+                    "at": "/mmfs1/DataUpload/exp/A.ome.zarr",
+                },
+                "B.ome.zarr": {
+                    "result": "partial copy elsewhere",
+                    "at": "/mmfs1/y/B.ome.zarr",
+                    "has": 1,
+                    "of": 10,
+                },
+                "C.ome.zarr": {
+                    "result": "would send",
+                    "missing_timepoints": 9,
+                    "of": 10,
+                    "completes_stream_copy": True,
+                },
+            },
+        }
+    ]
+    tiffs: Counter[str] = Counter({"S:/old/Cell_001": 300})
+    text = bs.summarize(reports, dry_run=True, tiff_folders=tiffs)
+    assert (
+        "SKIP     A.ome.zarr: already on Argus at /mmfs1/DataUpload/exp/A.ome.zarr"
+        in text
+    )
+    assert (
+        "CHECK    B.ome.zarr: Argus has 1 of 10 timepoints" in text
+        and "no second copy" in text
+    )
+    assert "9 of 10 timepoints, completing the live stream's partial copy" in text
+    assert "Not handled: 300 TIFF file(s) in 1 folder(s)" in text
+
+
+def test_tiff_files_on_the_way_are_counted(tmp_path: Path) -> None:
+    old = tmp_path / "S" / "2025_old" / "Cell_001"
+    old.mkdir(parents=True)
+    for i in range(3):
+        (old / f"img_{i}.tif").write_bytes(b"")
+    _store(tmp_path / "S" / "2026_new" / "A_mNG_488nm.ome.zarr")
+    tiffs: Counter[str] = Counter()
+    leaves = bs.scan_local_root(tmp_path / "S", other=tiffs)
+    assert [lf.path.name for lf in leaves] == ["2026_new"]
+    assert tiffs == Counter({str(old): 3})
