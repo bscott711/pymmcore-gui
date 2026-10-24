@@ -32,6 +32,8 @@ MSG_ACK = b"ACK"
 MSG_RESUME = b"RESUME"
 MSG_QC = b"QC"
 MSG_PREPARE = b"PREPARE"
+MSG_HEARTBEAT = b"HEARTBEAT"
+MSG_CLIENT_LOG = b"CLIENT_LOG"
 
 _VALID_TYPES = frozenset(
     {
@@ -42,6 +44,8 @@ _VALID_TYPES = frozenset(
         MSG_RESUME,
         MSG_QC,
         MSG_PREPARE,
+        MSG_HEARTBEAT,
+        MSG_CLIENT_LOG,
     }
 )
 
@@ -161,12 +165,21 @@ class QCHeader(TypedDict, total=False):
     metrics: dict[str, Any]
 
 
-class SessionEndHeader(TypedDict):
+class _SessionEndOptional(TypedDict, total=False):
+    # Why, in words: shown with the run's end on Argus (naparym-live, the
+    # dashboard). Set for "client_error" and "paused".
+    detail: str
+
+
+class SessionEndHeader(_SessionEndOptional):
     """``SESSION_END`` header."""
 
     # "paused": this run stopped streaming mid-way (Argus unreachable longer
     # than the send buffer holds); Argus won't keep its partial copy.
-    reason: Literal["complete", "idle_timeout", "client_abort", "paused"]
+    # "client_error": this app's sender failed (``detail`` says how).
+    reason: Literal[
+        "complete", "idle_timeout", "client_abort", "paused", "client_error"
+    ]
 
 
 class _AckOptional(TypedDict, total=False):
@@ -174,7 +187,7 @@ class _AckOptional(TypedDict, total=False):
     # offset for the FRAME trace fields.
     server_time_s: float
     # What this receiver supports beyond the base protocol: "slabs",
-    # "blosc", "links", "resume".
+    # "blosc", "links", "resume", "heartbeat", "client_log".
     features: list[str]
     # Argus has no open session with this id: re-send SESSION_START with
     # resume_through, then everything unACKed.
@@ -189,6 +202,10 @@ class _AckOptional(TypedDict, total=False):
     # (e.g. its RAM disk is short): why, for the status label. The client
     # keeps retrying with backoff; space may come back once a drain ends.
     rejected: str
+    # With unknown_session: Argus closed this session for good (no new data
+    # for its idle timeout) and won't resume it. Retrying is pointless; the
+    # run stops streaming and its local save is the copy to send.
+    closed: bool
 
 
 class AckHeader(_AckOptional):
@@ -230,6 +247,37 @@ class PrepareHeader(_PrepareOptional):
     z_step_um: float
 
 
+class HeartbeatHeader(TypedDict, total=False):
+    """``HEARTBEAT`` header -- client -> server every few seconds.
+
+    Only once an ACK advertised ``"heartbeat"``. Tells Argus this app is
+    alive even while nothing new reaches it (a slow time-lapse, or a link
+    that can't carry data), and what it holds: Argus then keeps the session
+    open, and says why when it does close it.
+    """
+
+    state: Literal["acquiring", "finishing"]
+    links_up: int
+    links_total: int
+    unacked_bytes: int
+    unacked_volumes: int
+    submitted: int
+    acked_through: int
+    stalled_s: float
+    last_error: str
+
+
+class ClientLogHeader(TypedDict, total=False):
+    """``CLIENT_LOG`` header -- this app's own stream log lines.
+
+    Appended to the day's rig log on Argus (once an ACK advertised
+    ``"client_log"``).
+    """
+
+    lines: list[str]
+    host: str
+
+
 MessageHeader = (
     SessionStartHeader
     | FrameHeader
@@ -238,6 +286,8 @@ MessageHeader = (
     | ResumeHeader
     | QCHeader
     | PrepareHeader
+    | HeartbeatHeader
+    | ClientLogHeader
 )
 
 
