@@ -160,9 +160,9 @@ def test_duplicates_and_stream_copies_read_plainly() -> None:
                     "at": "/mmfs1/DataUpload/exp/A.ome.zarr",
                 },
                 "B.ome.zarr": {
-                    "result": "partial copy elsewhere",
+                    "result": "would complete elsewhere",
                     "at": "/mmfs1/y/B.ome.zarr",
-                    "has": 1,
+                    "missing_timepoints": 9,
                     "of": 10,
                 },
                 "C.ome.zarr": {
@@ -181,8 +181,8 @@ def test_duplicates_and_stream_copies_read_plainly() -> None:
         in text
     )
     assert (
-        "CHECK    B.ome.zarr: Argus has 1 of 10 timepoints" in text
-        and "no second copy" in text
+        "SEND     B.ome.zarr: 9 of 10 timepoints, completing the copy at "
+        "/mmfs1/y/B.ome.zarr" in text
     )
     assert "9 of 10 timepoints, completing the live stream's partial copy" in text
     assert "Not handled: 300 TIFF file(s) in 1 folder(s)" in text
