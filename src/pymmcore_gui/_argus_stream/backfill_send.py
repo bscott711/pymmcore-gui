@@ -741,8 +741,10 @@ def _ssh_host_from_settings() -> str:
 
 
 def _links_from_settings() -> int:
-    """As many tunnels as the live stream uses: each SSH connection is capped
-    (~63 MB/s measured, 2026-09-26), so N of them carry about N times that.
+    """Return as many tunnels as the live stream uses.
+
+    Each SSH connection is capped (~63 MB/s measured, 2026-09-26), so N of
+    them carry about N times that.
     """
     try:
         from pymmcore_gui._settings import Settings
