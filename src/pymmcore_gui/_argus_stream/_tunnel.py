@@ -33,7 +33,7 @@ import sys
 import threading
 import time
 from collections import deque
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -54,6 +54,124 @@ _SERVER_ALIVE_COUNT_MAX = 3
 _CONNECT_TIMEOUT_S = 10
 _STDERR_TAIL_LINES = 20
 _PREFERRED_CIPHERS = "aes128-gcm@openssh.com,aes256-gcm@openssh.com"
+# What ssh prints when a local forward's port is already taken -- on the rig,
+# typically by an ssh left over from an earlier app that didn't exit cleanly.
+# A ZMQ link then connects to that stale forward instead of a live one.
+_PORT_BUSY_MARKERS = (
+    "address already in use",
+    "cannot listen to port",
+    "could not request local forwarding",
+    "bind: ",
+)
+
+
+def port_busy(stderr_tail: Sequence[str]) -> bool:
+    """Whether ssh's output says a local forward's port was already taken."""
+    text = " ".join(stderr_tail).lower()
+    return any(marker in text for marker in _PORT_BUSY_MARKERS)
+
+
+class _KillOnCloseJob:
+    """Windows: a job object that kills every ssh in it when this app exits.
+
+    Without it, an app that crashed or was killed left its ssh processes
+    running, still holding the local ports, and the next app's tunnels could
+    not bind them. Elsewhere (and if any call fails) it does nothing.
+    """
+
+    def __init__(self) -> None:
+        self._handle: Any = None
+        self._kernel32: Any = None
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+            class _BasicLimits(ctypes.Structure):
+                _fields_: ClassVar = [
+                    ("PerProcessUserTimeLimit", ctypes.c_int64),
+                    ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t),
+                    ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD),
+                ]
+
+            class _IoCounters(ctypes.Structure):
+                _fields_: ClassVar = [
+                    (name, ctypes.c_uint64)
+                    for name in (
+                        "ReadOperationCount",
+                        "WriteOperationCount",
+                        "OtherOperationCount",
+                        "ReadTransferCount",
+                        "WriteTransferCount",
+                        "OtherTransferCount",
+                    )
+                ]
+
+            class _ExtendedLimits(ctypes.Structure):
+                _fields_: ClassVar = [
+                    ("BasicLimitInformation", _BasicLimits),
+                    ("IoInfo", _IoCounters),
+                    ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t),
+                ]
+
+            kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+            handle = kernel32.CreateJobObjectW(None, None)
+            if not handle:
+                raise ctypes.WinError(ctypes.get_last_error())  # pyright: ignore[reportAttributeAccessIssue]
+            info = _ExtendedLimits()
+            info.BasicLimitInformation.LimitFlags = 0x2000  # KILL_ON_JOB_CLOSE
+            ok = kernel32.SetInformationJobObject(
+                handle, 9, ctypes.byref(info), ctypes.sizeof(info)
+            )  # 9 = JobObjectExtendedLimitInformation
+            if not ok:
+                raise ctypes.WinError(ctypes.get_last_error())  # pyright: ignore[reportAttributeAccessIssue]
+            self._kernel32 = kernel32
+            self._handle = handle
+        except Exception:
+            logger.warning(
+                "Could not create a job object for the SSH tunnels; an ssh left "
+                "over from a crash can then hold their ports",
+                exc_info=True,
+            )
+
+    def add(self, proc: subprocess.Popen[bytes]) -> None:
+        if sys.platform != "win32":
+            return
+        if self._handle is None:
+            return
+        try:
+            import ctypes
+
+            # Popen keeps its Windows process handle in a private attribute.
+            proc_handle = int(getattr(proc, "_handle"))  # noqa: B009
+            if not self._kernel32.AssignProcessToJobObject(self._handle, proc_handle):
+                raise ctypes.WinError(ctypes.get_last_error())  # pyright: ignore[reportAttributeAccessIssue]
+        except Exception:
+            logger.warning("Could not add ssh pid %s to the job object", proc.pid)
+
+
+_JOB: _KillOnCloseJob | None = None
+_JOB_LOCK = threading.Lock()
+
+
+def _job() -> _KillOnCloseJob:
+    global _JOB
+    with _JOB_LOCK:
+        if _JOB is None:
+            _JOB = _KillOnCloseJob()
+        return _JOB
 
 
 def link_endpoints(local_port: int, links: int) -> list[str]:
@@ -155,7 +273,10 @@ class _SshProcess:
             line = raw.decode(errors="replace").rstrip()
             if line:
                 self._stderr_tail.append(line)
-                logger.debug("ssh %s: %s", self.forwards[0][0], line)
+                # INFO, not DEBUG: what ssh says ("Timeout, server not
+                # responding", a refused login) is the first thing a
+                # post-mortem needs, and it reaches the stream log file.
+                logger.info("ssh %s: %s", self.forwards[0][0], line)
 
     def _run(self) -> None:
         if self._stop.wait(self.start_delay_s):
@@ -176,6 +297,7 @@ class _SshProcess:
                 self._stop.wait(backoff)
                 backoff = min(backoff * 2, _BACKOFF_MAX_S)
                 continue
+            _job().add(proc)
             self.proc = proc
             started = time.monotonic()
             reader = threading.Thread(
@@ -205,6 +327,14 @@ class _SshProcess:
                 proc.returncode,
                 " | ".join(self._stderr_tail) or "no output",
             )
+            if port_busy(self._stderr_tail):
+                logger.error(
+                    "Local port %s is already in use, most likely by an ssh "
+                    "left over from an earlier session: the stream may be "
+                    "talking to a dead tunnel. Close pymmcore-gui, end every "
+                    "ssh.exe in Task Manager, and start it again.",
+                    ",".join(str(local) for local, _ in self.forwards),
+                )
             self.restarts += 1
             if time.monotonic() - started >= _HEALTHY_AFTER_S:
                 backoff = _BACKOFF_START_S

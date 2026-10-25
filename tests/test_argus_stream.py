@@ -1733,3 +1733,43 @@ def test_a_finished_run_argus_never_answers_gives_up(
     worker.join(timeout=3)
     assert not worker.is_alive()
     session.shutdown(timeout=1)
+
+
+def test_a_new_run_closes_a_run_that_never_got_its_finished_signal(
+    fake_receiver: _FakeReceiver,
+) -> None:
+    """Rig 2026-10-23: two runs never got sequenceFinished/sequenceCanceled
+    (an earlier slot on those signals can stop psygnal before ours), so their
+    workers stayed open all afternoon. Argus kept both sessions -- and the
+    live lease that pauses its backfill -- and after an Argus restart they
+    re-attached at once. Starting the next run must end the old one."""
+    settings = _full_settings(
+        ArgusStreamSettingsV1(
+            enabled=True, local_port=fake_receiver.port, gpfs_scratch_root="/scratch"
+        )
+    )
+    session = ArgusStreamSession(
+        _StubCore(),  # pyright: ignore[reportArgumentType]
+        _NoopTunnel(),  # pyright: ignore[reportArgumentType]
+        get_settings=lambda: settings,
+    )
+    seq = _save_seq(z_plan=None, channels=["488nm"])
+    session.sequenceStarted(seq, {})  # pyright: ignore[reportArgumentType]
+    for event in seq:  # its frames, but no sequenceFinished
+        session.frameReady(np.zeros((4, 4), dtype="uint16"), event, {})  # pyright: ignore[reportArgumentType]
+    deadline = time.monotonic() + 5
+    while not fake_receiver.frame_messages() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    first = next(s for t, s, _h, _p in fake_receiver.messages if t == MSG_SESSION_START)
+
+    session.sequenceStarted(seq, {})  # pyright: ignore[reportArgumentType]
+
+    deadline = time.monotonic() + 5
+    ends: list[tuple[str, dict]] = []
+    while not ends and time.monotonic() < deadline:
+        ends = [
+            (s, h) for t, s, h, _p in fake_receiver.messages if t == MSG_SESSION_END
+        ]
+        time.sleep(0.05)
+    assert ends == [(first, {"reason": "client_abort"})]
+    session.shutdown(timeout=1)

@@ -45,10 +45,12 @@ drifting out, defocused, bleaching, and what to change -- is handed to the
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import posixpath
 import queue
+import socket
 import sys
 import threading
 import time
@@ -73,9 +75,12 @@ from pymmcore_gui._spectral_channel_handler import (
 )
 from pymmcore_gui._vendored.mda_handlers._util import position_sizes
 
+from . import _log
 from ._protocol import (
     MSG_ACK,
+    MSG_CLIENT_LOG,
     MSG_FRAME,
+    MSG_HEARTBEAT,
     MSG_PREPARE,
     MSG_QC,
     MSG_RESUME,
@@ -159,8 +164,28 @@ _RECOVERY_RETRY_MAX_S = 30.0
 _FINISH_GIVE_UP_S = 600.0
 # If the RAM can't be read; the setting's 0 otherwise means a quarter of it.
 _FALLBACK_HARD_CAP_BYTES = 8 * 1024**3
+# Once Argus advertises "heartbeat": how often this run reports in, so Argus
+# can tell "alive but nothing gets through" from "gone" (see _protocol.py).
+_HEARTBEAT_EVERY_S = 5.0
+# Once Argus advertises "client_log": how often new stream log lines go.
+_CLIENT_LOG_EVERY_S = 10.0
+# Stall alarm: nothing ACKed for this long (plus transfer time for what is
+# outstanding) while data waits -- or this long with every link down -- and
+# the status label says Argus is not receiving. On 2026-10-24 ten runs sent
+# nothing and the label said "reconnecting…" until Argus closed each one
+# 10 min later. A volume's slabs are ACKed once its last plane lands, so the
+# first threshold has to cover a slow z-stack.
+_STALL_ALARM_S = 60.0
+_LINKS_DOWN_ALARM_S = 15.0
+# No camera plane reached the stream this long after the run started: an
+# earlier frameReady slot raising skips ours (psygnal stops the emit loop).
+_NO_FRAMES_ALARM_S = 120.0
+_STALL_LABEL_STEP_S = 10
+_HOST = socket.gethostname()
 _DTYPE_BY_BYTES_PER_PIXEL = {1: "uint8", 2: "uint16", 4: "uint32"}
-_SessionEndReason = Literal["complete", "idle_timeout", "client_abort", "paused"]
+_SessionEndReason = Literal[
+    "complete", "idle_timeout", "client_abort", "paused", "client_error"
+]
 
 
 class StreamState(str, Enum):
@@ -175,6 +200,8 @@ class StreamState(str, Enum):
     BACKLOG_ALARM = "backlog_alarm"
     FINISHING = "finishing"
     PAUSED = "paused"
+    STALLED = "stalled"
+    ERROR = "error"
 
 
 class CameraGeometry(NamedTuple):
@@ -423,22 +450,45 @@ class _BufferBudget:
     """RAM the senders of every run hold, against one hard cap.
 
     Summed across runs: a run that finished during an outage keeps its
-    unsent volumes while the next run starts buffering its own.
+    unsent volumes while the next run starts buffering its own. Over the
+    cap, the *oldest* run holding data pays: it pauses and drops its buffer
+    (its local save has it all). Until 2026-10-24 the run that noticed was
+    the one paused and a finishing run never was, so runs stuck behind a
+    dead link paused every new run on its first pass, before it sent a
+    single volume (three in the same 0.2 s at 13:25).
     """
 
     def __init__(self, cap_bytes: int) -> None:
         self.cap_bytes = cap_bytes
         self._lock = threading.Lock()
         self._held: dict[int, int] = {}
+        self._order: dict[int, int] = {}
+        self._next = 0
 
     def update(self, owner: object, nbytes: int) -> int:
         """Record what ``owner`` holds now; return the total across owners."""
         with self._lock:
+            key = id(owner)
+            if key not in self._order:
+                self._order[key] = self._next
+                self._next += 1
             if nbytes:
-                self._held[id(owner)] = nbytes
+                self._held[key] = nbytes
             else:
-                self._held.pop(id(owner), None)
+                self._held.pop(key, None)
             return sum(self._held.values())
+
+    def must_pause(self, owner: object) -> bool:
+        """Whether ``owner`` must pause: over the cap, and it is the oldest."""
+        with self._lock:
+            if sum(self._held.values()) <= self.cap_bytes or not self._held:
+                return False
+            return min(self._held, key=self._order.__getitem__) == id(owner)
+
+    def forget(self, owner: object) -> None:
+        with self._lock:
+            self._held.pop(id(owner), None)
+            self._order.pop(id(owner), None)
 
 
 def _physical_ram_bytes() -> int:
@@ -545,12 +595,19 @@ class _RunWorker(threading.Thread):
     is sent again with ``resume_through`` and then everything unACKed. It
     is retried with backoff until Argus accepts it.
 
-    Pause: if what every run holds unsent passes the hard cap, this run
-    stops streaming for good. Its buffer is dropped, SESSION_END "paused"
-    tells Argus not to keep its partial copy, and the run goes to Argus by
-    Globus instead. Acquisition and local saving never wait on any of this.
-    A finished run that Argus stops ACKing for ``_FINISH_GIVE_UP_S`` pauses
-    the same way.
+    Pause: if what every run holds unsent passes the hard cap, the oldest
+    run holding data stops streaming for good (see :class:`_BufferBudget`).
+    Its buffer is dropped, SESSION_END "paused" tells Argus not to keep its
+    partial copy, and the run goes to Argus from its local save instead.
+    Acquisition and local saving never wait on any of this. A finished run
+    that Argus stops ACKing for ``_FINISH_GIVE_UP_S`` pauses the same way, and
+    so does one Argus says it closed (``closed``: no new data for its idle
+    timeout), instead of resyncing for the rest of the run.
+
+    Reporting: once Argus advertises them, the run sends a HEARTBEAT every
+    ``_HEARTBEAT_EVERY_S`` and the stream log (CLIENT_LOG). The status label
+    turns to STALLED when Argus confirms nothing for about a minute, and to
+    ERROR (with SESSION_END "client_error") if this sender itself fails.
     """
 
     def __init__(
@@ -587,6 +644,14 @@ class _RunWorker(threading.Thread):
             "resumes": 0,
             "resyncs": 0,
         }
+        # Why this run's sender failed ("" while it hasn't); see run().
+        self.error = ""
+        # The last exception a stream slot swallowed (ArgusStreamSession),
+        # reported to Argus in the heartbeat.
+        self.last_error = ""
+        # Camera planes handed to this run's assembler: zero long after the
+        # start means our frameReady slot isn't being called at all.
+        self.planes_seen = 0
         self._header = header
         self._buffer_budget_bytes = buffer_budget_bytes
         self._budget = budget
@@ -718,6 +783,13 @@ class _RunWorker(threading.Thread):
         end_sent_at: float | None = None
         end_tries = 0
         end_confirmed = False
+        # When an ACK last moved this run forward, or data started waiting
+        # (the stall alarm's clock), and when the alarm was raised.
+        progress_at = time.monotonic()
+        started_at = progress_at
+        alarm_since: float | None = None
+        heartbeat_at = float("-inf")
+        log_sent_at = float("-inf")
 
         def up_links() -> list[_Link]:
             return [link for link in links if link.up]
@@ -799,7 +871,7 @@ class _RunWorker(threading.Thread):
         def on_ack(ack: dict[str, object]) -> None:
             nonlocal acked_through, unacked_bytes, last_ack_time, clock_offset
             nonlocal resume_sent, resync_sent, rejected, recovery_retry_s
-            nonlocal last_progress
+            nonlocal last_progress, progress_at
             features.update(cast("list[str]", ack.get("features") or ()))
             if "slabs" in features:
                 self.slabs_enabled.set()
@@ -809,6 +881,17 @@ class _RunWorker(threading.Thread):
                 # what's unACKed. A resync already out is retried on a timer.
                 if ack.get("rejected"):
                     rejected = str(ack["rejected"])
+                if ack.get("closed") or rejected.startswith("closed on Argus"):
+                    # Closed for good (no new data for its idle timeout):
+                    # retrying only loops (every 30 s, 2026-10-23). Stop.
+                    if not self.paused.is_set():
+                        pause(
+                            unacked_bytes,
+                            f"Argus closed the session: {rejected}",
+                            "Argus closed this run after receiving nothing new; "
+                            "local save continues -- send this run from it",
+                        )
+                    return
                 resume_sent = False
                 if "resume" in features and not resync_sent:
                     send_resync()
@@ -824,6 +907,8 @@ class _RunWorker(threading.Thread):
                         (start_sent_s + now) / 2
                     )
             through = cast("int", ack.get("through_frame_index", -1))
+            if through > acked_through:
+                progress_at = time.monotonic()
             acked_through = max(acked_through, through)
             for fi in [fi for fi in unacked if fi <= through]:
                 _, payload = unacked.pop(fi)
@@ -852,7 +937,7 @@ class _RunWorker(threading.Thread):
                 )
                 logger.info("Argus stream: %d links over the %s", n_links, route)
 
-        def pause(total: int, why: str) -> None:
+        def pause(total: int, why: str, status: str = "") -> None:
             nonlocal unacked_bytes
             self.paused.set()
             self._finish_reason = "paused"
@@ -878,8 +963,116 @@ class _RunWorker(threading.Thread):
                 self._budget.update(self, 0)
             self._emit(
                 StreamState.PAUSED,
-                "Argus stopped answering; local save is complete, "
+                status
+                or "Argus stopped answering; local save is complete, "
                 "send this run by Globus",
+            )
+
+        def send_heartbeat(now: float) -> None:
+            nonlocal heartbeat_at
+            if "heartbeat" not in features or now - heartbeat_at < _HEARTBEAT_EVERY_S:
+                return
+            beat = {
+                "state": "finishing" if self._finish_event.is_set() else "acquiring",
+                "links_up": len(up_links()),
+                "links_total": n_links,
+                "unacked_bytes": unacked_bytes,
+                "unacked_volumes": len(unacked),
+                "submitted": self._next_frame_index,
+                "acked_through": acked_through,
+                "stalled_s": round(now - progress_at, 1) if unacked else 0.0,
+                "last_error": self.last_error,
+            }
+            if send(pack_message(MSG_HEARTBEAT, sid, beat)) is not None:  # type: ignore[arg-type]
+                heartbeat_at = now
+
+        def flush_log(force: bool = False) -> None:
+            """Ship new stream log lines to Argus (``CLIENT_LOG``)."""
+            nonlocal log_sent_at
+            now = time.monotonic()
+            if "client_log" not in features or not up_links():
+                return
+            if not force and now - log_sent_at < _CLIENT_LOG_EVERY_S:
+                return
+            log_sent_at = now
+            with _log.BUFFER.sending:
+                through, lines = _log.BUFFER.unsent()
+                if not lines:
+                    return
+                msg = pack_message(MSG_CLIENT_LOG, sid, {"lines": lines, "host": _HOST})
+                if send(msg) is not None:
+                    _log.BUFFER.mark_sent(through)
+
+        def stall_alarm(now: float, up: list[_Link]) -> str:
+            """Why Argus isn't receiving this run, or "" if it is."""
+            nonlocal alarm_since
+            why = ""
+            if unacked:
+                waited = now - progress_at
+                limit = (
+                    _LINKS_DOWN_ALARM_S
+                    if not up
+                    else _STALL_ALARM_S + unacked_bytes / _MIN_LINK_BYTES_PER_S
+                )
+                if waited >= limit:
+                    step = int(waited // _STALL_LABEL_STEP_S * _STALL_LABEL_STEP_S)
+                    why = (
+                        f"nothing confirmed for {step} s, {len(up)}/{n_links} "
+                        f"links up, {unacked_bytes // 2**20} MiB waiting"
+                        + (f", Argus says: {rejected}" if rejected else "")
+                        + "; local save continues"
+                    )
+            elif (
+                not self.planes_seen
+                and not self._finish_event.is_set()
+                and now - started_at >= _NO_FRAMES_ALARM_S
+            ):
+                why = (
+                    f"no camera frames reached the stream in "
+                    f"{_NO_FRAMES_ALARM_S:.0f} s (a viewer error can block "
+                    "them; see the log); local save continues"
+                )
+            if why and alarm_since is None:
+                alarm_since = now
+                logger.warning("Argus is not receiving this run: %s", why)
+            elif not why and alarm_since is not None:
+                logger.info(
+                    "Argus is receiving this run again (after %.0f s)",
+                    now - alarm_since,
+                )
+                alarm_since = None
+            return why
+
+        def fail(exc: BaseException) -> None:
+            """Stop streaming this run because the sender failed, and say why.
+
+            Here and to Argus. Before 2026-10-24 the thread just ended (no
+            except), sent no SESSION_END, and the label went back to "idle".
+            """
+            nonlocal end_link
+            detail = f"{type(exc).__name__}: {exc}"[:500]
+            self.error = detail
+            self.paused.set()  # the acquisition thread stops assembling for it
+            logger.error(
+                "Argus stream sender failed; this run stops streaming (%s)",
+                detail,
+                exc_info=exc,
+            )
+            while True:
+                try:
+                    self._to_send.get_nowait()
+                except queue.Empty:
+                    break
+            try:
+                flush_log(force=True)
+                end = {"reason": "client_error", "detail": detail}
+                end_link = send(pack_message(MSG_SESSION_END, sid, end))  # type: ignore[arg-type]
+            except Exception:
+                logger.exception("Could not tell Argus the stream sender failed")
+            self._emit(
+                StreamState.ERROR,
+                f"stream sender failed ({detail}); local save continues -- "
+                "send this run from it",
             )
 
         try:
@@ -902,6 +1095,7 @@ class _RunWorker(threading.Thread):
                         # (e.g. a whole z-stack's acquisition) is instantly
                         # "stale" and triggers a spurious RESUME + resend.
                         last_ack_time = now
+                        progress_at = now
                     unacked[frame_index] = (header, payload)
                     unacked_bytes += len(payload)
                     compress(frame_index)
@@ -938,6 +1132,7 @@ class _RunWorker(threading.Thread):
                         )
                         break
                     if due:
+                        flush_log(force=True)
                         carrier = send(
                             pack_message(
                                 MSG_SESSION_END, sid, {"reason": self._finish_reason}
@@ -948,6 +1143,8 @@ class _RunWorker(threading.Thread):
                             end_tries += 1
 
                 drained_any = dispatch()
+                send_heartbeat(now)
+                flush_log()
 
                 poller = zmq.Poller()
                 for link in links:
@@ -963,9 +1160,15 @@ class _RunWorker(threading.Thread):
                     if not events.get(link.sock, 0) & zmq.POLLIN:
                         continue
                     while link.sock.poll(0):
-                        msg_type, _sid, reply, _payload = unpack_message(
-                            link.sock.recv_multipart()
-                        )
+                        try:
+                            msg_type, _sid, reply, _payload = unpack_message(
+                                link.sock.recv_multipart()
+                            )
+                        except ValueError as exc:
+                            # A newer Argus may send a type this app doesn't
+                            # know yet: skip it, never let it end the run.
+                            logger.warning("Ignoring a message from Argus: %s", exc)
+                            continue
                         if msg_type == MSG_ACK and end_sent_at is not None:
                             # The final ACK ("ended"), or "unknown" (it had
                             # already closed the session), confirms
@@ -1029,16 +1232,20 @@ class _RunWorker(threading.Thread):
                 total = unacked_bytes
                 if self._budget is not None:
                     total = self._budget.update(self, unacked_bytes)
-                    if (
-                        not self._finish_event.is_set()
-                        and total > self._budget.cap_bytes
-                    ):
-                        pause(total, f"cap {self._budget.cap_bytes // 2**20} MiB")
+                    if unacked and self._budget.must_pause(self):
+                        pause(
+                            total,
+                            f"cap {self._budget.cap_bytes // 2**20} MiB across "
+                            "runs; this is the oldest run holding data",
+                        )
                         continue
 
                 label = route if n_links == 1 else f"{route} x{len(up)}/{n_links}"
+                not_receiving = stall_alarm(time.monotonic(), up)
                 if self.paused.is_set():
                     pass
+                elif not_receiving:
+                    self._emit(StreamState.STALLED, not_receiving)
                 elif unacked_bytes > self._buffer_budget_bytes:
                     self._emit(
                         StreamState.BACKLOG_ALARM,
@@ -1076,6 +1283,8 @@ class _RunWorker(threading.Thread):
                     "paused" if self.paused.is_set() else "client_abort"
                 )
                 end_link = send(pack_message(MSG_SESSION_END, sid, {"reason": reason}))
+        except Exception as exc:
+            fail(exc)
         finally:
             self.stats["sent_bytes"] = [link.sent_bytes for link in links]
             logger.info(
@@ -1090,10 +1299,14 @@ class _RunWorker(threading.Thread):
                 self.stats["resumes"],
                 self.stats["resyncs"],
             )
+            try:
+                flush_log(force=True)
+            except Exception:
+                logger.exception("Could not send the stream log to Argus")
             for link in links:
                 link.close(_SESSION_END_LINGER_MS if link is end_link else 0)
             if self._budget is not None:
-                self._budget.update(self, 0)
+                self._budget.forget(self)
             if not self.paused.is_set():
                 self._on_state(StreamState.IDLE, "")
 
@@ -1111,6 +1324,34 @@ def _send_prepare(endpoint: str, plan: PrepareHeader) -> None:
     sock.connect(endpoint)
     sock.send_multipart(pack_message(MSG_PREPARE, prepare_id, plan))
     sock.close()
+
+
+def _never_raises(method: Callable[..., None]) -> Callable[..., None]:
+    """Make a ``core.mda.events`` slot log instead of raise.
+
+    psygnal stops an emit at the first slot that raises and skips the rest,
+    so a stream bug must never take the viewers and writers down with it (nor
+    theirs ours: the main window connects these slots first). Logged once,
+    then every 1000th time, so a per-frame failure can't flood the log.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self: ArgusStreamSession, *args: Any, **kwargs: Any) -> None:
+        try:
+            method(self, *args, **kwargs)
+        except Exception as exc:
+            self._slot_errors += 1
+            detail = f"{method.__name__}: {type(exc).__name__}: {exc}"[:300]
+            if (worker := self._worker) is not None:
+                worker.last_error = detail
+            if self._slot_errors == 1 or self._slot_errors % 1000 == 0:
+                logger.exception(
+                    "Argus stream slot failed (%d so far): %s",
+                    self._slot_errors,
+                    detail,
+                )
+
+    return wrapper
 
 
 class ArgusStreamSession:
@@ -1135,6 +1376,10 @@ class ArgusStreamSession:
         self._get_settings = get_settings
         self._on_state_changed = on_state_changed
         self._on_qc = on_qc
+        self._slot_errors = 0
+        # The stream log goes to Argus with each run (CLIENT_LOG); the main
+        # window adds the file on this PC.
+        _log.install()
         self._assembler = VolumeAssembler()
         # What every run's sender holds unsent, against one hard cap.
         self._budget = _BufferBudget(_FALLBACK_HARD_CAP_BYTES)
@@ -1161,6 +1406,21 @@ class ArgusStreamSession:
     def _emit_state(self, state: StreamState, detail: str) -> None:
         if self._on_state_changed is not None:
             self._on_state_changed(state, detail)
+
+    def _emit_worker_state(
+        self, worker: _RunWorker | None, state: StreamState, detail: str
+    ) -> None:
+        """Show a run's state, unless a newer run owns the label.
+
+        Then only an older run's pause or failure shows (an earlier run's
+        "idle" used to overwrite the current run's "streaming").
+        """
+        current = self._worker
+        if current is not None and worker is not current:
+            if state not in (StreamState.PAUSED, StreamState.ERROR):
+                return
+            detail = f"previous run: {detail}"
+        self._emit_state(state, detail)
 
     def prepare(self, sequence: useq.MDASequence) -> bool:
         """Ask Argus to warm a GPU server for the MDA being set up (``PREPARE``).
@@ -1200,8 +1460,18 @@ class ArgusStreamSession:
             logger.exception("Argus PREPARE failed (the first timepoint is slower)")
             return False
 
+    @_never_raises
     def sequenceStarted(self, sequence: useq.MDASequence, meta: SummaryMetaV1) -> None:
         """Start streaming this run, if eligible and enabled."""
+        if self._worker is not None:
+            # The last run never got sequenceFinished/sequenceCanceled (an
+            # earlier slot on those signals raising stops psygnal before ours).
+            # A new run means it is over: end it, or its session stays open on
+            # Argus -- holding the live lease that pauses the backfill -- for
+            # as long as this app runs, re-attaching after any Argus restart.
+            logger.warning("Argus stream: previous run never ended; closing it")
+            self._worker.finish("client_abort")
+            self._worker = None
         settings = self._get_settings()
         argus = settings.argus_stream
         if not argus.enabled:
@@ -1240,17 +1510,23 @@ class ArgusStreamSession:
         self._tunnel.start()
         self._assembler.reset(sequence)
         self._budget.cap_bytes = hard_cap_bytes(argus.buffer_hard_cap_mb)
+        owner: list[_RunWorker] = []
+
+        def on_state(state: StreamState, detail: str) -> None:
+            self._emit_worker_state(owner[0] if owner else None, state, detail)
+
         self._worker = _RunWorker(
             session_id=str(uuid4()),
             endpoints=link_endpoints(argus.local_port, argus.stream_links),
             header=header,
             buffer_budget_bytes=argus.buffer_budget_mb * 1024 * 1024,
-            on_state=self._emit_state,
+            on_state=on_state,
             on_qc=self._on_qc,
             direct_endpoint=argus.direct_endpoint,
             compress_over_tunnel=argus.compress_over_tunnel,
             budget=self._budget,
         )
+        owner.append(self._worker)
         self._all_workers = [w for w in self._all_workers if w.is_alive()]
         self._all_workers.append(self._worker)
         self._worker.start()
@@ -1261,6 +1537,7 @@ class ArgusStreamSession:
         worker = self._worker
         if worker is None:
             return
+        worker.planes_seen += 1
         slab_planes = (
             max(1, _SLAB_TARGET_BYTES // max(1, frame.nbytes))
             if worker.slabs_enabled.is_set()
@@ -1269,6 +1546,7 @@ class ArgusStreamSession:
         for ready in self._assembler.add_plane(frame, event, meta, slab_planes):
             worker.submit(ready)
 
+    @_never_raises
     def frameReady(
         self, frame: np.ndarray, event: useq.MDAEvent, meta: FrameMetaV1
     ) -> None:
@@ -1310,12 +1588,14 @@ class ArgusStreamSession:
             )
             self._submit_if_complete(crop, synthetic_event, meta)
 
+    @_never_raises
     def sequenceFinished(self, sequence: useq.MDASequence) -> None:
         """Signal a graceful end-of-run; does not block the acquisition thread."""
         if self._worker is not None:
             self._worker.finish("complete")
         self._worker = None
 
+    @_never_raises
     def sequenceCanceled(self, sequence: useq.MDASequence) -> None:
         """Signal an aborted run; does not block the acquisition thread."""
         if self._worker is not None:
