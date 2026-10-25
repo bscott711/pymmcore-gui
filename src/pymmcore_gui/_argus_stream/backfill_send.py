@@ -370,14 +370,29 @@ class BackfillClient:
             elif info.get("duplicate_of"):
                 # The same data is already on Argus in another folder (e.g. it
                 # came by Globus): never a second copy.
-                dup_have = info.get("duplicate_have_t", [])
-                whole = set(s.written_t) <= set(dup_have)
-                report["stores"][s.name] = {
-                    "result": "already on Argus" if whole else "partial copy elsewhere",
-                    "at": info["duplicate_of"],
-                    "has": len(dup_have),
-                    "of": len(s.written_t),
-                }
+                # A partial copy there is completed where it is.
+                dup_have = set(info.get("duplicate_have_t", []))
+                at = info["duplicate_of"]
+                if set(s.written_t) <= dup_have:
+                    report["stores"][s.name] = {"result": "already on Argus", "at": at}
+                elif dry_run:
+                    report["stores"][s.name] = {
+                        "result": "would complete elsewhere",
+                        "at": at,
+                        "missing_timepoints": len(set(s.written_t) - dup_have),
+                        "of": len(s.written_t),
+                    }
+                else:
+                    try:
+                        done = self._sync_store(str(Path(at).parent), s, dup_have)
+                        report["stores"][s.name] = {**done, "at": at}
+                    except BackfillError as exc:
+                        logger.error("%s: %s", s.name, exc)
+                        report["stores"][s.name] = {
+                            "result": "refused",
+                            "reason": str(exc),
+                            "at": at,
+                        }
             elif set(s.written_t) <= set(info.get("have_t", [])):
                 # Every timepoint is there: the live stream brought it in
                 # whole (its stores carry no backfill marker). Nothing to send,
@@ -422,6 +437,9 @@ class BackfillClient:
                 ),
                 None,
             )
+            if infos.get(s.name, {}).get("needs_probe") and s.written_t:
+                # e.g. the live stream's 4-D copy of a single 3-D volume
+                t = s.written_t[0]
             if t is None:
                 continue
             arr = s.array()
@@ -433,9 +451,7 @@ class BackfillClient:
         header = {"leaf": remote, "stores": probes}
         inv = self._request(bfill.BF_INVENTORY, header, "inventory")
         if inv.get("ok"):
-            for name, info in inv["stores"].items():
-                if info.get("duplicate_of"):
-                    infos[name] = info
+            infos.update(inv["stores"])
 
     def _sync_store(self, remote: str, s: LocalStore, have: set[int]) -> dict[str, Any]:
         t_start = time.monotonic()
@@ -690,14 +706,15 @@ def summarize(
                 lines.append(f"  SEND     {name}: {what} -> {rep['remote']}")
             elif result == "already on Argus" and st.get("at"):
                 lines.append(f"  SKIP     {name}: already on Argus at {st['at']}")
-            elif result == "partial copy elsewhere":
+            elif result == "would complete elsewhere":
+                what = f"{st['missing_timepoints']} of {st['of']} timepoints"
                 lines.append(
-                    f"  CHECK    {name}: Argus has {st['has']} of {st['of']} "
-                    f"timepoints at {st['at']}; not sent, so there is no second copy"
+                    f"  SEND     {name}: {what}, completing the copy at {st['at']}"
                 )
             elif result == "complete":
                 what = f"{st['sent_timepoints']} timepoints, {st['sent_gb']} GB"
-                lines.append(f"  SENT     {name}: {what}, verified")
+                where = f" (completed the copy at {st['at']})" if st.get("at") else ""
+                lines.append(f"  SENT     {name}: {what}, verified{where}")
             elif result in (bfill.CONFLICT, bfill.BUSY, "refused"):
                 reason = str(st.get("reason"))
                 if "exists and differs" in reason:
