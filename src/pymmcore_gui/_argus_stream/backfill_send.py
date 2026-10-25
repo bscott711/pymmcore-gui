@@ -74,10 +74,13 @@ MAX_RENAME = 9
 # answers pings while a slow request (a big folder's inventory, 30+ s) runs.
 LINK_CHECK_S = 15.0
 PING_WAIT_S = 10.0
-# A store's files other than its pixel chunks are a few kB to a few MB. More than
-# this means the pixel array wasn't recognised and its chunks would be read into
-# memory as "metadata" (suspected cause of the rig lock-up, 2026-10-25).
-META_MAX_BYTES = 64 << 20
+# A store's files other than its pixel chunks: 19 files and up to 110 MB on the
+# rig's S:\ (2026-10-25: all 341 stores measured; the acquisition writer's
+# per-frame p0/.zattrs is most of it). Far more files or bytes than that means
+# the pixel array wasn't recognised and its chunks would be read into memory as
+# "metadata". (64 MB, the first guess, refused 19 good stores.)
+META_MAX_FILES = 500
+META_MAX_BYTES = 2 << 30
 # Actions whose every volume Argus reads back and compares with this PC.
 _CHECKED_ACTIONS = frozenset(
     {
@@ -1217,12 +1220,12 @@ def _meta_too_big(path: Path, rels: list[str]) -> str | None:
             total += (path / rel).stat().st_size
         except OSError:
             continue
-    if total <= META_MAX_BYTES:
+    if total <= META_MAX_BYTES and len(rels) <= META_MAX_FILES:
         return None
     return (
         f"its files other than the pixel array come to {total / 1e9:.2f} GB in "
-        f"{len(rels)} files (expected a few MB): the pixel array was not "
-        "recognised, so nothing was sent"
+        f"{len(rels)} files (expected about 19 files, at most a few hundred MB): "
+        "the pixel array was not recognised, so nothing was sent"
     )
 
 
