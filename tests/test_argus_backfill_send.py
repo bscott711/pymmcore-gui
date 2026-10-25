@@ -384,3 +384,33 @@ def test_a_volume_is_read_with_several_files_in_flight(
     assert bfill.volume_digest(bs.read_volume(four, 1)) == bfill.volume_digest(
         np.asarray(real(four, 1))
     )
+
+
+def test_volumes_are_hashed_side_by_side_and_the_slabs_are_the_same_bytes(
+    tmp_path: Path,
+) -> None:
+    """The PC side of a verified copy hashed one volume at a time, ~130 MB/s on one core
+    (2026-10-25). Digests and slabs must be exactly what the one-at-a-time path made."""
+    path = _store(tmp_path / "c_GFP_488.ome.zarr", written=(0, 1, 2))
+    store = bs.LocalStore.load(path)
+    assert store is not None
+    arr = store.array()
+    want = {t: bfill.volume_digest(np.asarray(arr[t])) for t in (0, 1, 2)}
+    assert bs.digest_volumes(arr, [0, 1, 2]) == want
+    assert bs.digest_volumes(arr, []) == {}
+
+    client = bs.BackfillClient.__new__(bs.BackfillClient)
+    client.runlog = None
+    client.compress = False
+    client.features = set()
+    client.slab_bytes = 2 * 5 * 6 * 2  # two planes a slab
+    digests: dict[int, str] = {}
+    got = list(client._slab_stream("/r", store, arr, [2, 0, 1], digests, store.name))
+    assert digests == want
+    assert [k for k, _h, _p in got] == [
+        (t, z) for t in (2, 0, 1) for z in (0, 2)
+    ]  # volumes in order, each in two slabs
+    for (t, z0), header, payload in got:
+        slab = np.frombuffer(payload, dtype="<u2").reshape(-1, 5, 6)
+        assert np.array_equal(slab, np.asarray(arr[t])[z0 : z0 + slab.shape[0]])
+        assert header["sha256"] == bfill.volume_digest(slab)
