@@ -29,7 +29,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
+import re
 import socket
 import time
 import uuid
@@ -43,6 +45,7 @@ import zarr
 import zmq
 
 from . import _bfill as bfill
+from . import _bfill_run as bfill_run
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -57,6 +60,13 @@ PAUSE_POLL_S = 10.0
 MAX_RETRIES = 3
 TUNNEL_UP_TIMEOUT_S = 30.0
 SCAN_PROGRESS_S = 5.0
+# Commit waits for Argus to read the whole store back; allow it this rate at worst.
+COMMIT_READBACK_MBPS = 50.0
+# `<prefix>_<Channel>_<wavelength>[nm]`, as opym's discovery groups a run's stores.
+_CHANNEL_SUFFIX = re.compile(
+    r"^(?P<prefix>.+)_(?P<channel>[A-Za-z]+)_(?P<wavelength>\d+(?:nm)?)$"
+)
+MAX_RENAME = 9
 
 
 class BackfillError(RuntimeError):
@@ -236,7 +246,10 @@ class BackfillClient:
         pause_file: Path | None = None,
         order: str = "newest",
         reply_timeout_s: float = REPLY_TIMEOUT_S,
+        runs_dir: Path | None = None,
     ) -> None:
+        self.runs_dir = runs_dir
+        self.runlog: bfill_run.RunLog | None = None
         self.root_map = [(Path(a), b.rstrip("/")) for a, b in root_map]
         # `client_id` owns the per-store lock, so it is stable across restarts
         # of this PC's sender (a crashed run resumes at once); the ZMQ
@@ -271,11 +284,15 @@ class BackfillClient:
         header: dict[str, Any],
         expect: str,
         payload: bytes | None = None,
+        timeout_s: float | None = None,
     ) -> dict[str, Any]:
         """Send one control request; wait for its reply (our echo token)."""
         token = uuid.uuid4().hex
         header = {**header, "client": self.client_id, "echo": token}
-        deadline = time.monotonic() + self.reply_timeout_s
+        if self.runlog is not None:
+            header["run_id"] = self.runlog.run_id
+        timeout_s = max(timeout_s or 0.0, self.reply_timeout_s)
+        deadline = time.monotonic() + timeout_s
         self.link.send(bfill.pack(msg_type, self.client_id, header, payload))
         while time.monotonic() < deadline:
             reply = self.link.recv_any(500)
@@ -287,9 +304,27 @@ class BackfillClient:
             if reply.get("kind") == "volume":
                 self._stash.append(reply)
         raise BackfillError(
-            f"no {expect} reply from Argus within {self.reply_timeout_s:.0f} s "
+            f"no {expect} reply from Argus within {timeout_s:.0f} s "
             "(is the SSH tunnel up, and opym-receive-backfill running?)"
         )
+
+    def _send_run(self, header: dict[str, Any]) -> None:
+        """Mirror the run record to Argus.
+
+        Its start and end wait for the reply (the end is the last thing sent
+        before the sockets close, which drops anything unsent); heartbeats and
+        per-store results don't.
+        """
+        if "run_log" not in self.features:
+            return
+        if header.get("op") in ("start", "end"):
+            try:
+                self._request(bfill.BF_RUN, header, "run")
+            except BackfillError as exc:
+                logger.warning("the run record did not reach Argus: %s", exc)
+        else:
+            msg = {**header, "client": self.client_id}
+            self.link.send(bfill.pack(bfill.BF_RUN, self.client_id, msg))
 
     def ping(self) -> bool:
         self._request(bfill.BF_INVENTORY, {"leaf": "/", "stores": []}, "inventory")
@@ -335,20 +370,49 @@ class BackfillClient:
     # ---- one leaf -----------------------------------------------------------
 
     def sync_leaf(self, leaf: LocalLeaf, dry_run: bool = False) -> dict[str, Any]:
-        report: dict[str, Any] = {"leaf": str(leaf.path), "stores": {}}
+        """Plan and carry out one folder (what ``run_once`` does for each)."""
+        remote, decisions = self.plan_leaf(leaf)
+        report: dict[str, Any] = {"leaf": str(leaf.path), "remote": remote}
+        report["stores"] = {
+            d["store"].name: self._carry_out(d, dry_run) for d in decisions
+        }
+        return report
+
+    # ---- planning -----------------------------------------------------------
+
+    def plan_leaf(
+        self, leaf: LocalLeaf, skip: frozenset[str] | set[str] = frozenset()
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Decide what to do with each store of ``leaf`` from Argus's inventory.
+
+        Sends nothing but questions.
+        """
         remote = self.remote_leaf(leaf.path)
-        report["remote"] = remote
+        decisions: list[dict[str, Any]] = []
         ready = []
         for s in leaf.stores:
+            d: dict[str, Any] = {"store": s, "remote": remote, "name": s.name}
             age = time.time() - s.newest_mtime()
-            if age < self.settle_s:
-                report["stores"][s.name] = {"result": "settling", "idle_s": int(age)}
+            if str(s.path) in skip:
+                d.update(
+                    action="skip", result="already complete", reason="previous run"
+                )
+            elif age < self.settle_s:
+                d.update(action="wait", result="settling", idle_s=int(age))
             elif not s.written_t:
-                report["stores"][s.name] = {"result": "empty"}
+                d.update(action="wait", result="empty")
+            elif len(s.shape) < 3:
+                d.update(
+                    action="report",
+                    result="no pixel data",
+                    reason=f"no image array on this PC (largest: {s.shape} {s.dtype})",
+                )
             else:
                 ready.append(s)
+                continue
+            decisions.append(d)
         if not ready:
-            return report
+            return remote, decisions
         inv = self._request(
             bfill.BF_INVENTORY,
             {"leaf": remote, "stores": [s.spec() for s in ready]},
@@ -356,67 +420,199 @@ class BackfillClient:
         )
         if not inv.get("ok"):
             raise BackfillError(f"inventory refused for {remote}: {inv.get('error')}")
-        self._probe_elsewhere(remote, ready, inv["stores"])
+        infos = inv["stores"]
+        self._probe_elsewhere(remote, ready, infos)
         for s in ready:
-            info = inv["stores"].get(s.name, {})
-            state = info.get("state")
-            if state == bfill.MARKED:
-                report["stores"][s.name] = {"result": "already complete"}
-            elif state in (bfill.BUSY, bfill.CONFLICT):
-                report["stores"][s.name] = {
-                    "result": state,
-                    "reason": info.get("reason"),
+            decisions.append(self._decide(remote, s, infos.get(s.name, {})))
+        self._resolve_renames(remote, decisions)
+        return remote, decisions
+
+    def _decide(
+        self, remote: str, s: LocalStore, info: dict[str, Any]
+    ) -> dict[str, Any]:
+        d: dict[str, Any] = {"store": s, "remote": remote, "name": s.name}
+        state = info.get("state")
+        have = set(info.get("have_t", []))
+        if state == bfill.MARKED:
+            return {**d, "action": "skip", "result": "already complete"}
+        if state == bfill.BUSY:
+            return {
+                **d,
+                "action": "report",
+                "result": state,
+                "reason": info.get("reason"),
+            }
+        if state == bfill.CONFLICT:
+            return {
+                **d,
+                "action": "report",
+                "result": state,
+                "reason": str(info.get("reason") or ""),
+                "different_run": _different_run(s, info),
+            }
+        if info.get("duplicate_of"):
+            # The same data is already on Argus in another folder (e.g. it
+            # came by Globus): never a second copy. A partial copy there is
+            # completed where it is.
+            at = info["duplicate_of"]
+            dup_have = set(info.get("duplicate_have_t", []))
+            if set(s.written_t) <= dup_have:
+                return {**d, "action": "skip", "result": "already on Argus", "at": at}
+            return {
+                **d,
+                "action": "complete elsewhere",
+                "remote": str(Path(at).parent),
+                "have": dup_have,
+                "at": at,
+            }
+        if set(s.written_t) <= have and not info.get("backfill_started"):
+            # Every timepoint is there: the live stream (or Globus) brought it
+            # in whole. Nothing to send, and its stream-tagged metadata would
+            # only be refused.
+            return {**d, "action": "skip", "result": "already on Argus"}
+        action = "complete stream copy" if info.get("stream_copy") else "send"
+        return {**d, "action": action, "have": have}
+
+    def _resolve_renames(self, remote: str, decisions: list[dict[str, Any]]) -> None:
+        """Send a different run under a name Argus holds as ``<run>_pc<N>_...``.
+
+        The acquisition software has reused run names. Every channel of the run
+        gets the same N, so they stay one dataset; N is the first that is free,
+        or that already holds this very store from an earlier run.
+        """
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for d in decisions:
+            m = _CHANNEL_SUFFIX.match(d["name"].removesuffix(".ome.zarr"))
+            groups.setdefault(m.group("prefix") if m else d["name"], []).append(d)
+        source = f"{socket.gethostname()}:"
+        for prefix, members in groups.items():
+            differ = [d for d in members if d.get("different_run")]
+            if not differ:
+                continue
+            if len(differ) != len(members):
+                for d in differ:
+                    d["reason"] += (
+                        "; not renamed: other channels of this run are not "
+                        "conflicts, so a person has to decide"
+                    )
+                continue
+            if "marker_from" not in self.features:
+                continue  # an older receiver can't tell a renamed copy is this run
+            for n in range(2, MAX_RENAME + 1):
+                names = {d["name"]: _renamed(prefix, d["name"], n) for d in differ}
+                specs = [
+                    {**d["store"].spec(), "name": names[d["name"]]} for d in differ
+                ]
+                inv = self._request(
+                    bfill.BF_INVENTORY, {"leaf": remote, "stores": specs}, "inventory"
+                )
+                if not inv.get("ok"):
+                    break
+                infos = {
+                    d["name"]: inv["stores"].get(names[d["name"]], {}) for d in differ
                 }
-            elif info.get("duplicate_of"):
-                # The same data is already on Argus in another folder (e.g. it
-                # came by Globus): never a second copy.
-                # A partial copy there is completed where it is.
-                dup_have = set(info.get("duplicate_have_t", []))
-                at = info["duplicate_of"]
-                if set(s.written_t) <= dup_have:
-                    report["stores"][s.name] = {"result": "already on Argus", "at": at}
-                elif dry_run:
-                    report["stores"][s.name] = {
-                        "result": "would complete elsewhere",
-                        "at": at,
-                        "missing_timepoints": len(set(s.written_t) - dup_have),
-                        "of": len(s.written_t),
-                    }
-                else:
-                    try:
-                        done = self._sync_store(str(Path(at).parent), s, dup_have)
-                        report["stores"][s.name] = {**done, "at": at}
-                    except BackfillError as exc:
-                        logger.error("%s: %s", s.name, exc)
-                        report["stores"][s.name] = {
-                            "result": "refused",
-                            "reason": str(exc),
-                            "at": at,
-                        }
-            elif set(s.written_t) <= set(info.get("have_t", [])):
-                # Every timepoint is there: the live stream brought it in
-                # whole (its stores carry no backfill marker). Nothing to send,
-                # and its stream-tagged metadata would only be refused.
-                report["stores"][s.name] = {"result": "already on Argus"}
-            elif dry_run:
-                have = set(info.get("have_t", []))
-                missing = [t for t in s.written_t if t not in have]
-                report["stores"][s.name] = {
-                    "result": "would send",
-                    "missing_timepoints": len(missing),
-                    "of": len(s.written_t),
-                }
-                if info.get("stream_copy"):
-                    report["stores"][s.name]["completes_stream_copy"] = True
-            else:
-                have = set(info.get("have_t", []))
-                try:
-                    report["stores"][s.name] = self._sync_store(remote, s, have)
-                except BackfillError as exc:
-                    # One refused store must not hide what the others did.
-                    logger.error("%s: %s", s.name, exc)
-                    report["stores"][s.name] = {"result": "refused", "reason": str(exc)}
-        return report
+
+                def usable(d: dict[str, Any], i: dict[str, Any]) -> bool:
+                    state = i.get("state")
+                    if state == bfill.ABSENT:
+                        return True
+                    if state == bfill.PARTIAL:
+                        return not i.get("stream_copy") and not i.get("elsewhere")
+                    mine = f"{source}{d['store'].path}"
+                    return bool(state == bfill.MARKED and i.get("from") == mine)
+
+                if not all(usable(d, infos[d["name"]]) for d in differ):
+                    continue
+                for d in differ:
+                    i, new = infos[d["name"]], names[d["name"]]
+                    d.update(
+                        name=new,
+                        renamed_from=d["name"],
+                        reason=None,
+                        different_run=False,
+                    )
+                    if i.get("state") == bfill.MARKED:
+                        d.update(
+                            action="skip",
+                            result="already on Argus",
+                            at=f"{remote}/{new}",
+                        )
+                    else:
+                        d.update(
+                            action="send renamed",
+                            result=None,
+                            have=set(i.get("have_t", [])),
+                        )
+                break
+
+    def plan_entry(self, d: dict[str, Any]) -> dict[str, Any]:
+        """The decision as the run record lists it."""
+        s: LocalStore = d["store"]
+        per_t = 0
+        if len(s.shape) >= 3:
+            per_t = math.prod(s.shape[-3:]) * np.dtype(s.dtype).itemsize
+        have = d.get("have", set(s.written_t))
+        send_t = len([t for t in s.written_t if t not in have])
+        entry: dict[str, Any] = {
+            "key": f"{d['remote']}/{d['name']}",
+            "leaf": d["remote"],
+            "name": d["name"],
+            "local": str(s.path),
+            "action": d["action"],
+            "timepoints": len(s.written_t),
+            "send_t": send_t,
+            "bytes": send_t * per_t,
+        }
+        for k in ("result", "reason", "renamed_from", "at"):
+            if d.get(k):
+                entry[k] = d[k]
+        return entry
+
+    # ---- carrying it out ----------------------------------------------------
+
+    def _carry_out(self, d: dict[str, Any], dry_run: bool) -> dict[str, Any]:
+        """Return the store's report entry, sending it unless ``dry_run``."""
+        s: LocalStore = d["store"]
+        action = d["action"]
+        out: dict[str, Any]
+        if action in ("skip", "wait", "report"):
+            keys = ("result", "reason", "at", "idle_s")
+            out = {k: d[k] for k in keys if d.get(k) is not None}
+        elif dry_run:
+            have = d.get("have", set())
+            results = {
+                "send": "would send",
+                "complete stream copy": "would send",
+                "complete elsewhere": "would complete elsewhere",
+                "send renamed": "would send renamed",
+            }
+            out = {
+                "result": results[action],
+                "missing_timepoints": len([t for t in s.written_t if t not in have]),
+                "of": len(s.written_t),
+            }
+            if action == "complete stream copy":
+                out["completes_stream_copy"] = True
+        else:
+            try:
+                out = self._sync_store(
+                    d["remote"],
+                    s,
+                    d.get("have", set()),
+                    name=d["name"],
+                    renamed_from=d.get("renamed_from"),
+                )
+            except BackfillError as exc:
+                # One refused store must not hide what the others did.
+                logger.error("%s: %s", s.name, exc)
+                out = {"result": "refused", "reason": str(exc)}
+        if d.get("at") and action != "skip":
+            out["at"] = d["at"]
+        if d.get("renamed_from"):
+            out["as"] = d["name"]
+        if self.runlog is not None and not dry_run:
+            self.runlog.store(f"{d['remote']}/{d['name']}", out)
+        return out
 
     def _probe_elsewhere(
         self, remote: str, stores: list[LocalStore], infos: dict[str, Any]
@@ -468,38 +664,56 @@ class BackfillClient:
         vol = np.asarray(arr[t] if arr.ndim >= 4 else arr[...])
         return {"t": t, "sha256": bfill.volume_digest(vol)}
 
-    def _sync_store(self, remote: str, s: LocalStore, have: set[int]) -> dict[str, Any]:
+    def _sync_store(
+        self,
+        remote: str,
+        s: LocalStore,
+        have: set[int],
+        name: str | None = None,
+        renamed_from: str | None = None,
+    ) -> dict[str, Any]:
+        name = name or s.name
         t_start = time.monotonic()
         before = self.sent_bytes
-        self._send_meta(remote, s)
+        self._send_meta(remote, s, name)
         arr = s.array()
         digests: dict[int, str] = {}
         todo = [t for t in s.written_t if t not in have]
-        self._pump(self._slab_stream(remote, s, arr, todo, digests))
+        self._pump(self._slab_stream(remote, s, arr, todo, digests, name))
         for t in s.written_t:  # volumes Argus already held: hash locally
             if t not in digests:
                 vol = np.asarray(arr[t] if arr.ndim >= 4 else arr[...])
                 digests[t] = bfill.volume_digest(vol)
         zattrs = s.path / ".zattrs"
         root_zattrs = zattrs.read_bytes() if zattrs.exists() else None
+        # Argus reads every volume back before it answers (~19 GB for a
+        # 100-timepoint run), so the wait scales with the store.
+        nbytes = len(digests) * math.prod(s.shape[-3:]) * np.dtype(s.dtype).itemsize
+        readback_s = nbytes / (COMMIT_READBACK_MBPS * 1e6)
+        commit: dict[str, Any] = {
+            "leaf": remote,
+            "store": name,
+            "digests": {str(t): d for t, d in digests.items()},
+            "declared_t": s.shape[0] if len(s.shape) >= 4 else 1,
+            "root_zattrs": root_zattrs,
+            "source": f"{socket.gethostname()}:{s.path}",
+        }
+        if renamed_from:
+            commit["renamed_from"] = renamed_from
         while True:
             self.wait_if_paused()
-            commit = {
-                "leaf": remote,
-                "store": s.name,
-                "digests": {str(t): d for t, d in digests.items()},
-                "declared_t": s.shape[0] if len(s.shape) >= 4 else 1,
-                "root_zattrs": root_zattrs,
-                "source": f"{socket.gethostname()}:{s.path}",
-            }
-            reply = self._request(bfill.BF_COMMIT, commit, "commit")
+            if self.runlog is not None:
+                self.runlog.heartbeat(f"{remote}/{name}", None, force=True)
+            reply = self._request(
+                bfill.BF_COMMIT, commit, "commit", timeout_s=readback_s
+            )
             if reply.get("hold"):
                 self.live_active = True
                 continue
             break
         if not reply.get("ok"):
             raise BackfillError(
-                f"{s.name}: commit failed: {reply.get('error')} "
+                f"{name}: commit failed: {reply.get('error')} "
                 f"{reply.get('mismatch', '')}"
             )
         sent = self.sent_bytes - before
@@ -513,15 +727,15 @@ class BackfillClient:
             "verified": reply.get("verified"),
         }
 
-    def _send_meta(self, remote: str, s: LocalStore) -> None:
+    def _send_meta(self, remote: str, s: LocalStore, name: str) -> None:
         files = [
             {"rel": rel, "data": (s.path / rel).read_bytes()}
             for rel in bfill.meta_files(s.path, s.main_rel)
         ]
-        header = {"leaf": remote, "store": s.name, "files": files}
+        header = {"leaf": remote, "store": name, "files": files}
         reply = self._request(bfill.BF_META, header, "meta")
         if not reply.get("ok"):
-            raise BackfillError(f"{s.name}: metadata refused: {reply.get('error')}")
+            raise BackfillError(f"{name}: metadata refused: {reply.get('error')}")
 
     # ---- volumes ------------------------------------------------------------
 
@@ -551,15 +765,18 @@ class BackfillClient:
         arr: zarr.Array,
         todo: list[int],
         digests: dict[int, str],
+        name: str,
     ) -> Iterator[tuple[tuple[int, int], dict[str, Any], bytes]]:
         for t in todo:
+            if self.runlog is not None:
+                self.runlog.heartbeat(f"{remote}/{name}", t)
             vol = np.asarray(arr[t] if arr.ndim >= 4 else arr[...])
             digests[t] = bfill.volume_digest(vol)
             for z0, nz in self._slab_runs(s, t, vol.shape[0]):
                 slab = vol[z0 : z0 + nz]
                 header: dict[str, Any] = {
                     "leaf": remote,
-                    "store": s.name,
+                    "store": name,
                     "t": t,
                     "z0": z0,
                     "nz": nz,
@@ -648,9 +865,15 @@ class BackfillClient:
 
     # ---- everything ---------------------------------------------------------
 
-    def run_once(self, dry_run: bool = False) -> list[dict[str, Any]]:
+    def run_once(
+        self, dry_run: bool = False, resume: dict[str, Any] | None = None
+    ) -> list[dict[str, Any]]:
+        """Scan, plan every folder, record the plan, then carry it out.
+
+        ``resume`` is a previous run's record (``_bfill_run.load_run``); the
+        stores it finished are not looked at again.
+        """
         self.ping()
-        reports = []
         leaves: list[LocalLeaf] = []
         self.tiff_folders = Counter()
         folders = 0
@@ -681,21 +904,129 @@ class BackfillClient:
             key=lambda lf: max(s.newest_mtime() for s in lf.stores),
             reverse=self.order == "newest",
         )
+        skip = bfill_run.done_locals(resume)
+        runlog = bfill_run.RunLog(
+            self.runs_dir,
+            client=self.client_id,
+            dry_run=dry_run,
+            maps=[(str(a), b) for a, b in self.root_map],
+            send=self._send_run,
+        )
+        self.runlog = runlog
+        try:
+            plans = self._plan_all(leaves, skip)
+            entries = [self.plan_entry(d) for _lf, _r, ds, _e in plans for d in ds]
+            runlog.plan(entries)
+            n_send = sum(
+                1
+                for e in entries
+                if e["send_t"] and e["action"] not in ("skip", "wait", "report")
+            )
+            gb = (
+                sum(
+                    e["bytes"]
+                    for e in entries
+                    if e["action"] not in ("skip", "wait", "report")
+                )
+                / 1e9
+            )
+            where = f" -- recorded in {runlog.path}" if runlog.path else ""
+            print(
+                f"Plan: {n_send} store(s) to send, {gb:.1f} GB{where}"
+                + (" (Argus keeps a copy)" if "run_log" in self.features else ""),
+                flush=True,
+            )
+            reports: list[dict[str, Any]] = []
+            for i, (leaf, remote, decisions, error) in enumerate(plans, 1):
+                if error is not None:
+                    rep: dict[str, Any] = {"leaf": str(leaf.path), "error": error}
+                else:
+                    rep = {"leaf": str(leaf.path), "remote": remote, "stores": {}}
+                    for d in decisions:
+                        self.wait_if_paused()
+                        rep["stores"][d["store"].name] = self._carry_out(d, dry_run)
+                logger.debug("%s", json.dumps(rep, default=str))
+                results = Counter(st["result"] for st in rep.get("stores", {}).values())
+                what = ", ".join(f"{n} {k}" for k, n in sorted(results.items()))
+                print(
+                    f"[{i}/{len(plans)}] {leaf.path}: {what or rep.get('error', '')}",
+                    flush=True,
+                )
+                reports.append(rep)
+            if not dry_run:
+                self._retry_refused(plans, reports)
+            runlog.end("complete")
+            return reports
+        except BaseException as exc:
+            runlog.end("failed", error=repr(exc))
+            raise
+        finally:
+            self.runlog = None
+
+    def _plan_all(
+        self, leaves: list[LocalLeaf], skip: set[str]
+    ) -> list[tuple[LocalLeaf, str | None, list[dict[str, Any]], str | None]]:
+        plans: list[tuple[LocalLeaf, str | None, list[dict[str, Any]], str | None]] = []
         for i, leaf in enumerate(leaves, 1):
             self.wait_if_paused()
             try:
-                rep = self.sync_leaf(leaf, dry_run=dry_run)
+                remote, decisions = self.plan_leaf(leaf, skip)
+                plans.append((leaf, remote, decisions, None))
             except BackfillError as exc:
                 logger.error("%s: %s", leaf.path, exc)
-                rep = {"leaf": str(leaf.path), "error": str(exc)}
-            logger.debug("%s", json.dumps(rep))
-            results = Counter(st["result"] for st in rep.get("stores", {}).values())
-            what = ", ".join(f"{n} {k}" for k, n in sorted(results.items())) or rep.get(
-                "error", ""
-            )
-            print(f"[{i}/{len(leaves)}] {leaf.path}: {what}", flush=True)
-            reports.append(rep)
-        return reports
+                plans.append((leaf, None, [], str(exc)))
+            print(f"Planning [{i}/{len(leaves)}] {leaf.path}", flush=True)
+        return plans
+
+    def _retry_refused(
+        self,
+        plans: list[tuple[LocalLeaf, str | None, list[dict[str, Any]], str | None]],
+        reports: list[dict[str, Any]],
+    ) -> None:
+        """Try each refused store once more, re-planned from what Argus holds now."""
+        for (leaf, _remote, decisions, error), rep in zip(plans, reports, strict=True):
+            if error is not None:
+                continue
+            failed = {
+                d["store"].name
+                for d in decisions
+                if rep["stores"][d["store"].name].get("result") == "refused"
+            }
+            if not failed:
+                continue
+            print(f"Retrying {len(failed)} refused store(s) in {leaf.path}", flush=True)
+            retry = LocalLeaf(leaf.path, [s for s in leaf.stores if s.name in failed])
+            try:
+                _remote, again = self.plan_leaf(retry)
+            except BackfillError as exc:
+                logger.error("%s: retry: %s", leaf.path, exc)
+                continue
+            for d in again:
+                self.wait_if_paused()
+                out = self._carry_out(d, dry_run=False)
+                out["retried"] = True
+                rep["stores"][d["store"].name] = out
+
+
+def _different_run(s: LocalStore, info: dict[str, Any]) -> bool:
+    """Whether Argus's store of this name is certainly another acquisition.
+
+    Its volumes have another z/y/x size or pixel type, which one run can't
+    change. Differing only in the declared number of timepoints may be the same
+    run, so that stays a conflict.
+    """
+    shape, dtype = info.get("argus_shape"), info.get("argus_dtype")
+    if not shape or len(shape) < 3 or len(s.shape) < 3:
+        return False
+    return list(shape[-3:]) != list(s.shape[-3:]) or dtype != s.dtype
+
+
+def _renamed(prefix: str, name: str, n: int) -> str:
+    """``<prefix>_pc<n>_<channel>.ome.zarr`` for a run sent under a new name."""
+    m = _CHANNEL_SUFFIX.match(name.removesuffix(".ome.zarr"))
+    if m is None:
+        return f"{name.removesuffix('.ome.zarr')}_pc{n}.ome.zarr"
+    return f"{prefix}_pc{n}_{m.group('channel')}_{m.group('wavelength')}.ome.zarr"
 
 
 def summarize(
@@ -719,8 +1050,16 @@ def summarize(
                 if st.get("completes_stream_copy"):
                     what += ", completing the live stream's partial copy"
                 lines.append(f"  SEND     {name}: {what} -> {rep['remote']}")
+            elif result == "would send renamed":
+                what = f"{st['missing_timepoints']} of {st['of']} timepoints"
+                lines.append(
+                    f"  SEND     {name}: {what} as {st['as']} (Argus holds a "
+                    f"different run under this name) -> {rep['remote']}"
+                )
             elif result == "already on Argus" and st.get("at"):
                 lines.append(f"  SKIP     {name}: already on Argus at {st['at']}")
+            elif result == "no pixel data":
+                lines.append(f"  NO DATA  {name}: {st.get('reason')}")
             elif result == "would complete elsewhere":
                 what = f"{st['missing_timepoints']} of {st['of']} timepoints"
                 lines.append(
@@ -729,6 +1068,8 @@ def summarize(
             elif result == "complete":
                 what = f"{st['sent_timepoints']} timepoints, {st['sent_gb']} GB"
                 where = f" (completed the copy at {st['at']})" if st.get("at") else ""
+                if st.get("as"):
+                    where += f" as {st['as']}"
                 lines.append(f"  SENT     {name}: {what}, verified{where}")
             elif result in (bfill.CONFLICT, bfill.BUSY, "refused"):
                 reason = str(st.get("reason"))
@@ -853,6 +1194,20 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--order", choices=("newest", "oldest"), default="newest")
     p.add_argument("--dry-run", action="store_true", help="report what would be sent")
     p.add_argument("--watch", type=float, default=None, metavar="SECONDS")
+    p.add_argument(
+        "--runs-dir",
+        type=Path,
+        default=bfill_run.default_runs_dir(),
+        help="where this run's record is kept (default %(default)s)",
+    )
+    p.add_argument(
+        "--resume",
+        nargs="?",
+        const="latest",
+        default=None,
+        metavar="RUN_ID",
+        help="skip what the latest (or the named) run already finished",
+    )
     a = p.parse_args(argv)
 
     tunnel = None
@@ -885,11 +1240,17 @@ def main(argv: list[str] | None = None) -> int:
         max_mbps=a.max_mbps,
         pause_file=a.pause_file,
         order=a.order,
+        runs_dir=a.runs_dir,
     )
     try:
         while True:
             try:
-                reports = client.run_once(dry_run=a.dry_run)
+                resume = None
+                if a.resume:
+                    resume = bfill_run.load_run(a.runs_dir, a.resume)
+                    if resume is None:
+                        print(f"No earlier run record in {a.runs_dir}; sending it all.")
+                reports = client.run_once(dry_run=a.dry_run, resume=resume)
                 print(summarize(reports, a.dry_run, client.tiff_folders))
             except BackfillError as exc:
                 logger.error("%s", exc)
