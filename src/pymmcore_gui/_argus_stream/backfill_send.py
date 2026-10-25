@@ -45,7 +45,7 @@ import zmq
 from . import _bfill as bfill
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,7 @@ REPLY_TIMEOUT_S = 180.0
 PAUSE_POLL_S = 10.0
 MAX_RETRIES = 3
 TUNNEL_UP_TIMEOUT_S = 30.0
+SCAN_PROGRESS_S = 5.0
 
 
 class BackfillError(RuntimeError):
@@ -135,7 +136,10 @@ _SKIP_DIRS = {"$recycle.bin", "system volume information", "recycler", "found.00
 
 
 def scan_local_root(
-    root: Path, max_depth: int = 6, other: Counter[str] | None = None
+    root: Path,
+    max_depth: int = 6,
+    other: Counter[str] | None = None,
+    progress: Callable[[Path, int], None] | None = None,
 ) -> list[LocalLeaf]:
     """Every directory under ``root`` that directly holds ``*.ome.zarr`` stores.
 
@@ -145,6 +149,8 @@ def scan_local_root(
     leaves: list[LocalLeaf] = []
 
     def walk(d: Path, depth: int) -> None:
+        if progress is not None:
+            progress(d, sum(len(lf.stores) for lf in leaves))
         try:
             entries = sorted(os.scandir(d), key=lambda e: e.name)
         except OSError:
@@ -616,20 +622,47 @@ class BackfillClient:
         reports = []
         leaves: list[LocalLeaf] = []
         self.tiff_folders = Counter()
+        folders = 0
+        last = time.monotonic()
+
+        def progress(d: Path, stores: int) -> None:
+            nonlocal folders, last
+            folders += 1
+            if time.monotonic() - last >= SCAN_PROGRESS_S:
+                last = time.monotonic()
+                print(
+                    f"Scanning: {folders} folders, {stores} stores so far ({d})",
+                    flush=True,
+                )
+
         for local_root, _ in self.root_map:
-            leaves += scan_local_root(local_root, other=self.tiff_folders)
+            print(f"Scanning {local_root} for OME-Zarr stores...", flush=True)
+            leaves += scan_local_root(
+                local_root, other=self.tiff_folders, progress=progress
+            )
+        n_stores = sum(len(lf.stores) for lf in leaves)
+        print(
+            f"Found {n_stores} stores in {len(leaves)} folders; checking each "
+            "with Argus.",
+            flush=True,
+        )
         leaves.sort(
             key=lambda lf: max(s.newest_mtime() for s in lf.stores),
             reverse=self.order == "newest",
         )
-        for leaf in leaves:
+        for i, leaf in enumerate(leaves, 1):
             self.wait_if_paused()
             try:
                 rep = self.sync_leaf(leaf, dry_run=dry_run)
             except BackfillError as exc:
                 logger.error("%s: %s", leaf.path, exc)
                 rep = {"leaf": str(leaf.path), "error": str(exc)}
-            logger.info("%s", json.dumps(rep))
+            logger.debug("%s", json.dumps(rep))
+            results = Counter(st["result"] for st in rep.get("stores", {}).values())
+            what = ", ".join(f"{n} {k}" for k, n in sorted(results.items())) or rep.get(
+                "error", ""
+            )
+            print(f"[{i}/{len(leaves)}] {leaf.path}: {what}", flush=True)
             reports.append(rep)
         return reports
 
