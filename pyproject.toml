@@ -109,6 +109,8 @@ allow-direct-references = true
 [project.scripts]
 mmgui = "pymmcore_gui.__main__:main"
 microscope-control = "pymmcore_gui.asi_z_stack.__main__:main"
+# Send finished runs to Argus over SSH (the live stream's fallback).
+opym-backfill-send = "pymmcore_gui._argus_stream.backfill_send:main"
 
 [project.urls]
 homepage = "https://github.com/tlambert03/pymmcore-gui"
