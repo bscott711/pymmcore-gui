@@ -31,7 +31,7 @@ _VALID = frozenset({BF_INVENTORY, BF_META, BF_VOLUME, BF_COMMIT, BF_ACK})
 MARKER_NAME = ".opym_complete.json"
 LOCK_NAME = ".opym_backfill.lock"
 MARKER_FORMAT = 1
-FEATURES = ["blosc", "links"]
+FEATURES = ["blosc", "links", "plane_probe"]
 
 # Store state words the server returns in an inventory reply.
 ABSENT, PARTIAL, MARKED, BUSY, CONFLICT = (
