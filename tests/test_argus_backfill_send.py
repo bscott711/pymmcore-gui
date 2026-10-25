@@ -220,3 +220,68 @@ def test_the_scan_reports_progress_and_skips_chunks(tmp_path: Path) -> None:
     assert len(leaves) == 3 and seen[0] == (tmp_path / "S", 0)
     assert all("p0" not in d.parts for d, _ in seen)  # never inside a store
     assert bfill.main_array_rel(leaves[0].stores[0].path) == "p0"
+
+
+def test_a_renamed_run_keeps_its_channel_suffix() -> None:
+    assert (
+        bs._renamed("Cell_005", "Cell_005_GFP_488.ome.zarr", 2)
+        == "Cell_005_pc2_GFP_488.ome.zarr"
+    )
+    assert (
+        bs._renamed("WT_004", "WT_004_mNG_488nm.ome.zarr", 3)
+        == "WT_004_pc3_mNG_488nm.ome.zarr"
+    )
+    assert bs._renamed("odd", "odd.ome.zarr", 2) == "odd_pc2.ome.zarr"
+
+
+def test_only_another_volume_size_or_type_counts_as_a_different_run(
+    tmp_path: Path,
+) -> None:
+    store = bs.LocalStore.load(_store(tmp_path / "c_GFP_488.ome.zarr"))
+    assert store is not None
+    other_z = {"argus_shape": [3, 9, 5, 6], "argus_dtype": "<u2"}
+    other_t = {"argus_shape": [7, 4, 5, 6], "argus_dtype": "<u2"}
+    assert bs._different_run(store, other_z)
+    assert not bs._different_run(store, other_t)  # may be the same run
+    assert not bs._different_run(store, {})  # an older receiver says nothing
+
+
+def test_the_summary_names_a_renamed_send_and_a_store_without_pixels() -> None:
+    reports: list[dict[str, Any]] = [
+        {
+            "leaf": "S:\\x",
+            "remote": "/r/x",
+            "stores": {
+                "Cell_005_GFP_488.ome.zarr": {
+                    "result": "would send renamed",
+                    "missing_timepoints": 150,
+                    "of": 150,
+                    "as": "Cell_005_pc2_GFP_488.ome.zarr",
+                },
+                "Cell_004_GFP_488.ome.zarr": {
+                    "result": "no pixel data",
+                    "reason": "no image array on this PC (largest: [111] <f8)",
+                },
+            },
+        }
+    ]
+    text = bs.summarize(reports, dry_run=True)
+    assert "as Cell_005_pc2_GFP_488.ome.zarr" in text
+    assert "NO DATA  Cell_004_GFP_488.ome.zarr" in text
+
+
+def test_the_run_record_is_written_before_and_after(tmp_path: Path) -> None:
+    from pymmcore_gui._argus_stream import _bfill_run as bfill_run
+
+    sent: list[dict[str, Any]] = []
+    log = bfill_run.RunLog(
+        tmp_path, client="EEP230-OPM", dry_run=False, maps=[], send=sent.append
+    )
+    log.plan([{"key": "/r/x/a.ome.zarr", "local": "S:\\x\\a.ome.zarr"}])
+    assert log.path is not None and log.path.exists()
+    log.store("/r/x/a.ome.zarr", {"result": "complete"})
+    log.end()
+    assert [h["op"] for h in sent] == ["start", "store", "end"]
+    doc = bfill_run.load_run(tmp_path)
+    assert doc is not None and doc["counts"] == {"complete": 1}
+    assert bfill_run.done_locals(doc) == {"S:\\x\\a.ome.zarr"}
