@@ -124,11 +124,12 @@ def test_no_tunnel_means_a_plain_message_not_a_hang(
 
     monkeypatch.setattr(_tunnel, "ArgusTunnelManager", _DeadTunnel)
     monkeypatch.setattr(bs, "TUNNEL_UP_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(bs, "_links_from_settings", lambda: 4)
     code = bs.main(
         ["--map", f"{tmp_path}=/remote", "--ssh-host", "Argus", "--local-port", "1"]
     )
     assert code == 2
-    assert started[0] == ("Argus", 1, bs.REMOTE_PORT, 2)
+    assert started[0] == ("Argus", 1, bs.REMOTE_PORT, 4)  # as many links as the stream
     assert started[-1][0] == "stopped"
     assert "Could not open an SSH tunnel to 'Argus'" in capsys.readouterr().out
 

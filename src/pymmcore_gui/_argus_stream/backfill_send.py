@@ -740,6 +740,18 @@ def _ssh_host_from_settings() -> str:
         return "Argus"
 
 
+def _links_from_settings() -> int:
+    """As many tunnels as the live stream uses: each SSH connection is capped
+    (~63 MB/s measured, 2026-09-26), so N of them carry about N times that.
+    """
+    try:
+        from pymmcore_gui._settings import Settings
+
+        return max(1, Settings.instance().argus_stream.stream_links)
+    except Exception:
+        return 4
+
+
 def _wait_for_port(port: int, timeout_s: float) -> bool:
     """Whether the tunnel's local port accepts a connection within the timeout."""
     deadline = time.monotonic() + timeout_s
@@ -780,14 +792,24 @@ def main(argv: list[str] | None = None) -> int:
         "--ssh-host", default=None, help="ssh Host alias (default: the stream's)"
     )
     p.add_argument("--local-port", type=int, default=DEFAULT_LOCAL_PORT)
-    p.add_argument("--links", type=int, default=2, help="parallel SSH tunnels")
+    p.add_argument(
+        "--links",
+        type=int,
+        default=None,
+        help="parallel SSH tunnels (default: the stream's stream_links, 4)",
+    )
     p.add_argument(
         "--settle",
         type=float,
         default=900.0,
         help="skip stores written to within this many seconds",
     )
-    p.add_argument("--window", type=int, default=8, help="slabs in flight")
+    p.add_argument(
+        "--window",
+        type=int,
+        default=None,
+        help="slabs in flight (default: 4 per link)",
+    )
     p.add_argument(
         "--max-mbps", type=float, default=None, help="cap the send rate (MB/s)"
     )
@@ -801,11 +823,13 @@ def main(argv: list[str] | None = None) -> int:
 
     tunnel = None
     connect = a.connect
+    links = a.links or (len(connect) if connect else _links_from_settings())
+    window = a.window or 4 * links
     if not connect:
         from ._tunnel import ArgusTunnelManager
 
         host = a.ssh_host or _ssh_host_from_settings()
-        tunnel = ArgusTunnelManager(host, a.local_port, REMOTE_PORT, links=a.links)
+        tunnel = ArgusTunnelManager(host, a.local_port, REMOTE_PORT, links=links)
         tunnel.start()
         connect = tunnel.endpoints
         logger.info(
@@ -823,7 +847,7 @@ def main(argv: list[str] | None = None) -> int:
         connect,
         a.maps,
         settle_s=a.settle,
-        window=a.window,
+        window=window,
         max_mbps=a.max_mbps,
         pause_file=a.pause_file,
         order=a.order,
