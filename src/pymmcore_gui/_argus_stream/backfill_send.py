@@ -129,6 +129,9 @@ class LocalLeaf:
 
 
 _TIFF_SUFFIXES = (".tif", ".tiff")
+# Never walked: the Windows recycle bin (deleted runs must not be sent) and
+# other system folders at a drive's root.
+_SKIP_DIRS = {"$recycle.bin", "system volume information", "recycler", "found.000"}
 
 
 def scan_local_root(
@@ -161,7 +164,11 @@ def scan_local_root(
             leaves.append(LocalLeaf(d, stores))
         if depth < max_depth:
             for e in entries:
-                hidden = e.name.startswith(".") or e.name.endswith(".ome.zarr")
+                hidden = (
+                    e.name.startswith((".", "$"))
+                    or e.name.endswith(".ome.zarr")
+                    or e.name.lower() in _SKIP_DIRS
+                )
                 if e.is_dir() and not hidden:
                     walk(Path(e.path), depth + 1)
 
