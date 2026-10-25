@@ -197,3 +197,13 @@ def test_tiff_files_on_the_way_are_counted(tmp_path: Path) -> None:
     leaves = bs.scan_local_root(tmp_path / "S", other=tiffs)
     assert [lf.path.name for lf in leaves] == ["2026_new"]
     assert tiffs == Counter({str(old): 3})
+
+
+def test_the_recycle_bin_and_system_folders_are_never_walked(tmp_path: Path) -> None:
+    """A whole-drive map must not send runs someone deleted."""
+    drive = tmp_path / "S"
+    _store(drive / "$RECYCLE.BIN" / "S-1-5-21" / "$R0X1" / "Deleted_mNG_488nm.ome.zarr")
+    _store(drive / "System Volume Information" / "X_mNG_488nm.ome.zarr")
+    _store(drive / "20261023_exp" / "Kept_mNG_488nm.ome.zarr")
+    leaves = bs.scan_local_root(drive)
+    assert [s.name for lf in leaves for s in lf.stores] == ["Kept_mNG_488nm.ome.zarr"]
