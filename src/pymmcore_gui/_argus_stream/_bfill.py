@@ -138,16 +138,22 @@ def main_array_rel(store: Path) -> str | None:
     (then the largest). Everything else in the store is small metadata.
     """
     best: tuple[tuple[int, int], str] | None = None
-    for z in Path(store).rglob(".zarray"):
+    store = Path(store)
+    for dirpath, dirnames, filenames in os.walk(store):
+        if ".zarray" not in filenames:
+            continue
+        # An array's subdirectories are its chunks: never walk them (a 200-timepoint
+        # store holds ~30,000 chunk files; rglob read them all, store after store).
+        dirnames[:] = []
         try:
-            meta = json.loads(z.read_text())
+            meta = json.loads((Path(dirpath) / ".zarray").read_text())
         except (OSError, ValueError):
             continue
         shape = meta.get("shape", [])
         key = (len(shape), math.prod(shape) if shape else 0)
-        rel = z.parent.relative_to(store).as_posix()
+        rel = Path(dirpath).relative_to(store).as_posix()
         if best is None or key > best[0]:
-            best = (key, "." if rel == "" else rel)
+            best = (key, "." if rel in ("", ".") else rel)
     return best[1] if best else None
 
 
