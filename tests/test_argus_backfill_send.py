@@ -341,3 +341,46 @@ def test_a_dead_tunnel_is_skipped_and_the_last_one_is_never_given_up_silently() 
             raise AssertionError("picked a dead tunnel")
     finally:
         link.close()
+
+
+def test_a_volume_is_read_with_several_files_in_flight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The S: drive reads ~13x faster with 8 files in flight than one at a time
+    (2026-10-25); the bytes must be exactly what ``arr[t]`` gives."""
+    import threading
+
+    root = zarr.open_group(str(tmp_path / "s.ome.zarr"), mode="w")
+    rng = np.random.default_rng(0)
+    four = root.create_dataset(
+        "p0",
+        shape=(2, 11, 5, 6),
+        chunks=(1, 2, 5, 6),
+        dtype="<u2",
+        dimension_separator="/",
+    )  # 11 planes in chunks of 2: the last span is ragged
+    four[...] = rng.integers(0, 4000, size=four.shape, dtype=np.uint16)
+    three = root.create_dataset(
+        "q0",
+        shape=(7, 5, 6),
+        chunks=(1, 5, 6),
+        dtype="<u2",
+        dimension_separator="/",
+    )
+    three[...] = rng.integers(0, 4000, size=three.shape, dtype=np.uint16)
+
+    threads: set[int] = set()
+    real = zarr.Array.__getitem__
+
+    def spy(self: zarr.Array, sel: Any) -> Any:
+        threads.add(threading.get_ident())
+        return real(self, sel)
+
+    monkeypatch.setattr(zarr.Array, "__getitem__", spy)
+    for t in (0, 1):
+        assert np.array_equal(bs.read_volume(four, t), np.asarray(real(four, t)))
+    assert np.array_equal(bs.read_volume(three), np.asarray(real(three, ...)))
+    assert len(threads) > 1
+    assert bfill.volume_digest(bs.read_volume(four, 1)) == bfill.volume_digest(
+        np.asarray(real(four, 1))
+    )
