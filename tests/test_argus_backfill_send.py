@@ -207,3 +207,15 @@ def test_the_recycle_bin_and_system_folders_are_never_walked(tmp_path: Path) -> 
     _store(drive / "20261023_exp" / "Kept_mNG_488nm.ome.zarr")
     leaves = bs.scan_local_root(drive)
     assert [s.name for lf in leaves for s in lf.stores] == ["Kept_mNG_488nm.ome.zarr"]
+
+
+def test_the_scan_reports_progress_and_skips_chunks(tmp_path: Path) -> None:
+    for k in range(3):
+        _store(tmp_path / "S" / f"exp_{k}" / f"R{k}_mNG_488nm.ome.zarr")
+    seen: list[tuple[Path, int]] = []
+    leaves = bs.scan_local_root(
+        tmp_path / "S", progress=lambda d, n: seen.append((d, n))
+    )
+    assert len(leaves) == 3 and seen[0] == (tmp_path / "S", 0)
+    assert all("p0" not in d.parts for d, _ in seen)  # never inside a store
+    assert bfill.main_array_rel(leaves[0].stores[0].path) == "p0"
