@@ -285,3 +285,21 @@ def test_the_run_record_is_written_before_and_after(tmp_path: Path) -> None:
     doc = bfill_run.load_run(tmp_path)
     assert doc is not None and doc["counts"] == {"complete": 1}
     assert bfill_run.done_locals(doc) == {"S:\\x\\a.ome.zarr"}
+
+
+def test_a_whole_copy_made_another_way_is_checked_not_trusted(tmp_path: Path) -> None:
+    """2026-10-25: a faithful copy of S:\\ is the point; copies the live stream or
+    Globus made had only ever been counted, never compared with the PC."""
+    store = bs.LocalStore.load(_store(tmp_path / "c_GFP_488.ome.zarr"))
+    assert store is not None
+    whole = {"state": bfill.PARTIAL, "have_t": [0, 1], "stream_copy": True}
+    client = bs.BackfillClient(["tcp://127.0.0.1:1"], [(tmp_path, "/r")])
+    try:
+        d = client._decide("/r", store, whole)
+        assert d["action"] == "verify" and not d["pixels_only"]
+        single = {**whole, "single_volume_as_4d": True}
+        assert client._decide("/r", store, single)["pixels_only"]
+        client.verify = False
+        assert client._decide("/r", store, whole)["result"] == "already on Argus"
+    finally:
+        client.close()
