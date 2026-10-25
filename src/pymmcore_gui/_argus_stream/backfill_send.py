@@ -67,6 +67,17 @@ _CHANNEL_SUFFIX = re.compile(
     r"^(?P<prefix>.+)_(?P<channel>[A-Za-z]+)_(?P<wavelength>\d+(?:nm)?)$"
 )
 MAX_RENAME = 9
+# A tunnel can stay connected and swallow everything sent into it (2026-10-24 and
+# 2026-10-25: a request vanished, the sender waited 180 s per store). A request with
+# no reply for this long gets its tunnel pinged; a tunnel whose ping isn't answered
+# within PING_WAIT_S is dropped and the request goes out on another one. Argus
+# answers pings while a slow request (a big folder's inventory, 30+ s) runs.
+LINK_CHECK_S = 15.0
+PING_WAIT_S = 10.0
+# A store's files other than its pixel chunks are a few kB to a few MB. More than
+# this means the pixel array wasn't recognised and its chunks would be read into
+# memory as "metadata" (suspected cause of the rig lock-up, 2026-10-25).
+META_MAX_BYTES = 64 << 20
 # Actions whose every volume Argus reads back and compares with this PC.
 _CHECKED_ACTIONS = frozenset(
     {
@@ -204,10 +215,15 @@ def scan_local_root(
 
 
 class _Link:
-    """DEALER sockets to the receiver: one per tunnel, so parallel tunnels add up."""
+    """DEALER sockets to the receiver: one per tunnel, so parallel tunnels add up.
+
+    Each socket is a tunnel that can die on its own. A dead one is dropped
+    (``mark_dead``) and the rest carry on; sends never block.
+    """
 
     def __init__(self, addrs: list[str], client_id: str) -> None:
         self.ctx = zmq.Context.instance()
+        self.addrs = list(addrs)
         self.socks: list[zmq.Socket[bytes]] = []
         for k, addr in enumerate(addrs):
             s = self.ctx.socket(zmq.DEALER)
@@ -215,23 +231,59 @@ class _Link:
             s.setsockopt(zmq.LINGER, 0)
             s.connect(addr)
             self.socks.append(s)
+        self.alive = [True] * len(self.socks)
         self.poller = zmq.Poller()
         for s in self.socks:
             self.poller.register(s, zmq.POLLIN)
         self._rr = 0
 
-    def send(self, parts: list[bytes]) -> None:
-        s = self.socks[self._rr % len(self.socks)]
-        self._rr += 1
-        s.send_multipart(parts)
+    def live(self) -> list[int]:
+        return [k for k, ok in enumerate(self.alive) if ok]
 
-    def recv_any(self, timeout_ms: int) -> dict[str, Any] | None:
+    def pick(self, avoid: int | None = None) -> int:
+        """Return the next live tunnel (round robin), other than ``avoid``."""
+        live = [k for k in self.live() if k != avoid] or self.live()
+        if not live:
+            raise BackfillError(
+                "no tunnel to Argus answers (all "
+                f"{len(self.socks)} dropped); is the SSH tunnel up?"
+            )
+        k = live[self._rr % len(live)]
+        self._rr += 1
+        return k
+
+    def mark_dead(self, k: int, why: str) -> None:
+        if self.alive[k]:
+            self.alive[k] = False
+            logger.warning("tunnel %s dropped: %s", self.addrs[k], why)
+            print(
+                f"Tunnel {k + 1} ({self.addrs[k]}) dropped: {why}. "
+                f"{len(self.live())} of {len(self.socks)} left.",
+                flush=True,
+            )
+
+    def send(self, parts: list[bytes], k: int | None = None) -> int:
+        """Send on tunnel ``k`` (or the next live one); return which was used.
+
+        A tunnel that can't take the message at once (no peer, or full) is
+        dropped and the next one is tried, so a dead tunnel can't block.
+        """
+        k = self.pick() if k is None else k
+        while True:
+            try:
+                self.socks[k].send_multipart(parts, flags=zmq.NOBLOCK)
+                return k
+            except zmq.Again:
+                self.mark_dead(k, "it would not take a message")
+                k = self.pick()
+
+    def recv_any(self, timeout_ms: int) -> tuple[dict[str, Any], int] | None:
         ready = dict(self.poller.poll(timeout_ms))
-        for s in self.socks:
+        for k, s in enumerate(self.socks):
             if s in ready:
                 msg_type, _sid, header, _payload = bfill.unpack(s.recv_multipart())
                 if msg_type == bfill.BF_ACK:
-                    return header
+                    return header, k
         return None
 
     def close(self) -> None:
@@ -282,6 +334,10 @@ class BackfillClient:
         self._t0 = time.monotonic()
         # Volume ACKs that arrived while a control request was waiting.
         self._stash: list[dict[str, Any]] = []
+        # Outstanding link checks: ping token -> (tunnel, sent at).
+        self._pings: dict[str, tuple[int, float]] = {}
+        self._slab_link: dict[tuple[int, int], int] = {}
+        self._last_ack: dict[int, float] = {}
 
     def close(self) -> None:
         self.link.close()
@@ -292,6 +348,50 @@ class BackfillClient:
         self.features = reply.get("features", self.features)
         if "live_active" in reply:
             self.live_active = bool(reply["live_active"])
+        self._pings.pop(str(reply.get("echo")), None)  # a link check answered
+
+    # ---- link health ---------------------------------------------------------
+
+    def _ping_link(self, k: int) -> str:
+        """Ask tunnel ``k`` alone for a trivial reply; return the ping's token."""
+        token = "ping-" + uuid.uuid4().hex
+        header = {"leaf": "/", "stores": [], "client": self.client_id, "echo": token}
+        self.link.send(bfill.pack(bfill.BF_INVENTORY, self.client_id, header), k)
+        self._pings[token] = (k, time.monotonic())
+        return token
+
+    def _reap_pings(self) -> None:
+        """Drop the tunnels whose ping went unanswered."""
+        now = time.monotonic()
+        for token, (k, sent) in list(self._pings.items()):
+            if now - sent > PING_WAIT_S:
+                del self._pings[token]
+                self.link.mark_dead(
+                    k, f"no answer to a check within {PING_WAIT_S:.0f} s"
+                )
+
+    def probe_links(self) -> None:
+        """Check every tunnel on its own before anything is sent."""
+        tokens = {self._ping_link(k): k for k in self.link.live()}
+        deadline = time.monotonic() + PING_WAIT_S
+        while time.monotonic() < deadline and any(t in self._pings for t in tokens):
+            got = self.link.recv_any(200)
+            if got is not None:
+                self._note(got[0])
+        self._reap_pings_now(tokens)
+        print(
+            f"Tunnels answering: {len(self.link.live())} of {len(self.link.socks)}",
+            flush=True,
+        )
+        if not self.link.live():
+            raise BackfillError("no tunnel to Argus answers; is the SSH tunnel up?")
+
+    def _reap_pings_now(self, tokens: dict[str, int]) -> None:
+        for token, k in tokens.items():
+            if self._pings.pop(token, None) is not None:
+                self.link.mark_dead(
+                    k, f"no answer to a check within {PING_WAIT_S:.0f} s"
+                )
 
     def _request(
         self,
@@ -301,23 +401,45 @@ class BackfillClient:
         payload: bytes | None = None,
         timeout_s: float | None = None,
     ) -> dict[str, Any]:
-        """Send one control request; wait for its reply (our echo token)."""
+        """Send one control request; wait for its reply (our echo token).
+
+        A request unanswered for ``LINK_CHECK_S`` gets its tunnel checked; if the
+        tunnel is dead the request goes out again on another one (requests are
+        safe to repeat). Gives up after ``timeout_s`` in all.
+        """
         token = uuid.uuid4().hex
         header = {**header, "client": self.client_id, "echo": token}
         if self.runlog is not None:
             header["run_id"] = self.runlog.run_id
         timeout_s = max(timeout_s or 0.0, self.reply_timeout_s)
         deadline = time.monotonic() + timeout_s
-        self.link.send(bfill.pack(msg_type, self.client_id, header, payload))
+        msg = bfill.pack(msg_type, self.client_id, header, payload)
+        k = self.link.send(msg)
+        check_at, ping = time.monotonic() + LINK_CHECK_S, None
         while time.monotonic() < deadline:
-            reply = self.link.recv_any(500)
-            if reply is None:
+            got = self.link.recv_any(500)
+            if got is not None:
+                reply, _k = got
+                self._note(reply)
+                if reply.get("echo") == token:
+                    return reply
+                if reply.get("kind") == "volume":
+                    self._stash.append(reply)
+                if ping is not None and ping not in self._pings:
+                    # the tunnel answered its check: Argus is just busy
+                    ping, check_at = None, time.monotonic() + 2 * LINK_CHECK_S
                 continue
-            self._note(reply)
-            if reply.get("echo") == token:
-                return reply
-            if reply.get("kind") == "volume":
-                self._stash.append(reply)
+            now = time.monotonic()
+            if ping is None and now >= check_at:
+                ping = self._ping_link(k)
+            elif ping is not None and ping in self._pings:
+                if now - self._pings[ping][1] > PING_WAIT_S:
+                    del self._pings[ping]
+                    self.link.mark_dead(
+                        k, f"no answer to a check within {PING_WAIT_S:.0f} s"
+                    )
+                    k = self.link.send(msg)  # the same request, another tunnel
+                    check_at, ping = time.monotonic() + LINK_CHECK_S, None
         raise BackfillError(
             f"no {expect} reply from Argus within {timeout_s:.0f} s "
             "(is the SSH tunnel up, and opym-receive-backfill running?)"
@@ -416,6 +538,10 @@ class BackfillClient:
                 d.update(action="wait", result="settling", idle_s=int(age))
             elif not s.written_t:
                 d.update(action="wait", result="empty")
+            elif len(s.shape) >= 3 and (
+                big := _meta_too_big(s.path, bfill.meta_files(s.path, s.main_rel))
+            ):
+                d.update(action="report", result="not sendable", reason=big)
             elif len(s.shape) < 3:
                 d.update(
                     action="report",
@@ -781,10 +907,11 @@ class BackfillClient:
         }
 
     def _send_meta(self, remote: str, s: LocalStore, name: str) -> None:
-        files = [
-            {"rel": rel, "data": (s.path / rel).read_bytes()}
-            for rel in bfill.meta_files(s.path, s.main_rel)
-        ]
+        rels = bfill.meta_files(s.path, s.main_rel)
+        too_big = _meta_too_big(s.path, rels)
+        if too_big:
+            raise BackfillError(too_big)
+        files = [{"rel": rel, "data": (s.path / rel).read_bytes()} for rel in rels]
         header = {"leaf": remote, "store": name, "files": files}
         reply = self._request(bfill.BF_META, header, "meta")
         if not reply.get("ok"):
@@ -868,8 +995,13 @@ class BackfillClient:
             if not inflight:  # paused with nothing outstanding
                 self.wait_if_paused()
                 continue
-            reply = self._stash.pop(0) if self._stash else self.link.recv_any(500)
+            if self._stash:
+                reply: dict[str, Any] | None = self._stash.pop(0)
+            else:
+                got = self.link.recv_any(500)
+                reply = got[0] if got is not None else None
             now = time.monotonic()
+            self._check_slab_links(inflight, now)
             if reply is not None:
                 self._note(reply)
                 if reply.get("kind") == "volume":
@@ -880,6 +1012,7 @@ class BackfillClient:
                     header, payload, _sent, attempts = entry
                     if reply.get("ok"):
                         del inflight[key]
+                        self._last_ack[self._slab_link.get(key, 0)] = now
                     elif reply.get("hold"):
                         del inflight[key]
                         self.live_active = True
@@ -894,7 +1027,11 @@ class BackfillClient:
                             f"{reply.get('error')}"
                         )
             for key, (header, payload, sent, attempts) in list(inflight.items()):
-                if now - sent > self.reply_timeout_s:
+                if not self.link.alive[self._slab_link.get(key, 0)]:
+                    # its tunnel was dropped: send it again on a live one
+                    del inflight[key]
+                    self._send_slab(key, header, payload, inflight, attempts)
+                elif now - sent > self.reply_timeout_s:
                     if attempts >= MAX_RETRIES:
                         raise BackfillError(
                             f"volume t={key[0]} z0={key[1]} got no reply "
@@ -912,9 +1049,21 @@ class BackfillClient:
         attempts: int,
     ) -> None:
         header = {**header, "client": self.client_id}
-        self.link.send(bfill.pack(bfill.BF_VOLUME, self.client_id, header, payload))
+        k = self.link.send(bfill.pack(bfill.BF_VOLUME, self.client_id, header, payload))
+        self._slab_link[key] = k
         inflight[key] = (header, payload, time.monotonic(), attempts)
         self._throttle(len(payload))
+
+    def _check_slab_links(self, inflight: _Inflight, now: float) -> None:
+        """Ping a tunnel whose slabs have waited ``LINK_CHECK_S``; drop it if silent."""
+        self._reap_pings()
+        pinged = {k for k, _t in self._pings.values()}
+        for key, (_h, _p, sent, _a) in inflight.items():
+            k = self._slab_link.get(key, 0)
+            if now - sent > LINK_CHECK_S and self.link.alive[k] and k not in pinged:
+                if now - self._last_ack.get(k, 0.0) > LINK_CHECK_S:
+                    self._ping_link(k)
+                    pinged.add(k)
 
     # ---- everything ---------------------------------------------------------
 
@@ -927,6 +1076,7 @@ class BackfillClient:
         stores it finished are not looked at again.
         """
         self.ping()
+        self.probe_links()
         leaves: list[LocalLeaf] = []
         self.tiff_folders = Counter()
         folders = 0
@@ -1054,6 +1204,28 @@ class BackfillClient:
                 rep["stores"][d["store"].name] = out
 
 
+def _meta_too_big(path: Path, rels: list[str]) -> str | None:
+    """Why a store's non-pixel files must not be sent, or None.
+
+    They are a few kB to a few MB. Far more means files the sender doesn't
+    recognise as the pixel array (a second large array, an unusual layout)
+    would be read into memory and sent in one message.
+    """
+    total = 0
+    for rel in rels:
+        try:
+            total += (path / rel).stat().st_size
+        except OSError:
+            continue
+    if total <= META_MAX_BYTES:
+        return None
+    return (
+        f"its files other than the pixel array come to {total / 1e9:.2f} GB in "
+        f"{len(rels)} files (expected a few MB): the pixel array was not "
+        "recognised, so nothing was sent"
+    )
+
+
 def _different_run(s: LocalStore, info: dict[str, Any]) -> bool:
     """Whether Argus's store of this name is certainly another acquisition.
 
@@ -1106,6 +1278,8 @@ def summarize(
                 lines.append(f"  SKIP     {name}: already on Argus at {st['at']}")
             elif result == "no pixel data":
                 lines.append(f"  NO DATA  {name}: {st.get('reason')}")
+            elif result == "not sendable":
+                lines.append(f"  NOT SENT {name}: {st.get('reason')}")
             elif result == "would verify":
                 where = f" at {st['at']}" if st.get("at") else ""
                 lines.append(
@@ -1183,6 +1357,27 @@ def _links_from_settings() -> int:
         return max(1, Settings.instance().argus_stream.stream_links)
     except Exception:
         return 4
+
+
+def _lower_priority() -> None:
+    """Run in the background: lower CPU, disk and memory priority.
+
+    The acquisition PC must stay usable (2026-10-25: a run made it unreachable
+    by remote desktop). On Windows this is PROCESS_MODE_BACKGROUND_BEGIN, which
+    also lowers disk and memory priority; elsewhere ``nice``.
+    """
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            k32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            handle = k32.GetCurrentProcess()
+            k32.SetPriorityClass(handle, 0x00004000)  # BELOW_NORMAL_PRIORITY_CLASS
+            k32.SetPriorityClass(handle, 0x00100000)  # PROCESS_MODE_BACKGROUND_BEGIN
+        else:
+            os.nice(10)
+    except Exception as exc:  # never a reason not to run
+        logger.warning("could not lower this process's priority: %s", exc)
 
 
 def _wait_for_port(port: int, timeout_s: float) -> bool:
@@ -1273,7 +1468,15 @@ def main(argv: list[str] | None = None) -> int:
         help="trust copies the live stream or Globus made instead of checking "
         "them against this PC",
     )
+    p.add_argument(
+        "--priority",
+        choices=("low", "normal"),
+        default="low",
+        help="low (default) runs in the background so the PC stays usable",
+    )
     a = p.parse_args(argv)
+    if a.priority == "low":
+        _lower_priority()
 
     tunnel = None
     connect = a.connect
