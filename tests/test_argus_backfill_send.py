@@ -311,11 +311,20 @@ def test_a_store_whose_non_pixel_files_are_huge_is_not_sent(tmp_path: Path) -> N
     path = _store(tmp_path / "c_GFP_488.ome.zarr")
     rels = bfill.meta_files(path, "p0")
     assert bs._meta_too_big(path, rels) is None
+    zattrs = path / "p0" / ".zattrs"  # real: per-frame metadata, up to 110 MB on S:
+    with zattrs.open("ab") as f:
+        f.truncate(110 << 20)
+    assert bs._meta_too_big(path, [*rels, "p0/.zattrs"]) is None
     big = path / "extra.bin"
     with big.open("wb") as f:
         f.truncate(bs.META_MAX_BYTES + 1)
     reason = bs._meta_too_big(path, [*rels, "extra.bin"])
     assert reason is not None and "nothing was sent" in reason
+    leaked = [f"p1/0/{z}" for z in range(bs.META_MAX_FILES + 1)]  # chunks as "meta"
+    for rel in leaked:
+        (path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (path / rel).write_bytes(b"x")
+    assert bs._meta_too_big(path, [*rels, *leaked]) is not None
 
 
 def test_a_dead_tunnel_is_skipped_and_the_last_one_is_never_given_up_silently() -> None:
