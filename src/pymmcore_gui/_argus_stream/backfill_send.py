@@ -58,6 +58,7 @@ REMOTE_PORT = 5556
 DEFAULT_LOCAL_PORT = 5566
 REPLY_TIMEOUT_S = 180.0
 READ_WORKERS = 8
+VOLUME_WORKERS = 4
 PAUSE_POLL_S = 10.0
 MAX_RETRIES = 3
 TUNNEL_UP_TIMEOUT_S = 30.0
@@ -124,6 +125,24 @@ def read_volume(arr: zarr.Array, t: int | None = None) -> np.ndarray:
             for _ in pool.map(read, spans):
                 pass
     return out
+
+
+def digest_volumes(arr: zarr.Array, ts: list[int]) -> dict[int, str]:
+    """SHA-256 of each volume in ``ts``, a few volumes at a time.
+
+    The PC-side check of a copy already on Argus spent its time in one core hashing at
+    ~130 MB/s while the drive could read 770 MB/s and the machine was 16% busy
+    (2026-10-25). hashlib releases the GIL, so volumes hash side by side.
+    """
+
+    def one(t: int) -> tuple[int, str]:
+        vol = read_volume(arr, t if arr.ndim >= 4 else None)
+        return t, bfill.volume_digest(vol)
+
+    if len(ts) <= 1:
+        return dict(map(one, ts))
+    with ThreadPoolExecutor(VOLUME_WORKERS) as pool:
+        return dict(pool.map(one, ts))
 
 
 @dataclass
@@ -890,10 +909,8 @@ class BackfillClient:
         digests: dict[int, str] = {}
         todo = [t for t in s.written_t if t not in have]
         self._pump(self._slab_stream(remote, s, arr, todo, digests, name))
-        for t in s.written_t:  # volumes Argus already held: hash locally
-            if t not in digests:
-                vol = read_volume(arr, t if arr.ndim >= 4 else None)
-                digests[t] = bfill.volume_digest(vol)
+        # volumes Argus already held: hash locally
+        digests.update(digest_volumes(arr, [t for t in s.written_t if t not in digests]))
         zattrs = s.path / ".zattrs"
         root_zattrs = zattrs.read_bytes() if meta and zattrs.exists() else None
         # Argus reads every volume back before it answers (~19 GB for a
@@ -978,11 +995,31 @@ class BackfillClient:
         digests: dict[int, str],
         name: str,
     ) -> Iterator[tuple[tuple[int, int], dict[str, Any], bytes]]:
-        for t in todo:
+        def load(t: int) -> np.ndarray:
+            return read_volume(arr, t if arr.ndim >= 4 else None)
+
+        # The next volume is read, and this one hashed, while this one's slabs are sent.
+        with ThreadPoolExecutor(2) as pool:
+            yield from self._slabs(remote, s, todo, digests, name, load, pool)
+
+    def _slabs(
+        self,
+        remote: str,
+        s: LocalStore,
+        todo: list[int],
+        digests: dict[int, str],
+        name: str,
+        load: Callable[[int], np.ndarray],
+        pool: ThreadPoolExecutor,
+    ) -> Iterator[tuple[tuple[int, int], dict[str, Any], bytes]]:
+        ahead = pool.submit(load, todo[0]) if todo else None
+        for i, t in enumerate(todo):
             if self.runlog is not None:
                 self.runlog.heartbeat(f"{remote}/{name}", t)
-            vol = read_volume(arr, t if arr.ndim >= 4 else None)
-            digests[t] = bfill.volume_digest(vol)
+            assert ahead is not None
+            vol = ahead.result()
+            ahead = pool.submit(load, todo[i + 1]) if i + 1 < len(todo) else None
+            digest = pool.submit(bfill.volume_digest, vol)
             for z0, nz in self._slab_runs(s, t, vol.shape[0]):
                 slab = vol[z0 : z0 + nz]
                 header: dict[str, Any] = {
@@ -1006,6 +1043,7 @@ class BackfillClient:
                 else:
                     payload = np.ascontiguousarray(slab).tobytes()
                 yield (t, z0), header, payload
+            digests[t] = digest.result()
 
     def _pump(
         self, stream: Iterator[tuple[tuple[int, int], dict[str, Any], bytes]]
