@@ -303,3 +303,32 @@ def test_a_whole_copy_made_another_way_is_checked_not_trusted(tmp_path: Path) ->
         assert client._decide("/r", store, whole)["result"] == "already on Argus"
     finally:
         client.close()
+
+
+def test_a_store_whose_non_pixel_files_are_huge_is_not_sent(tmp_path: Path) -> None:
+    """2026-10-25: the rig locked up right as a store's 'metadata' was gathered.
+    Gigabytes of unrecognised array chunks must never go out as metadata."""
+    path = _store(tmp_path / "c_GFP_488.ome.zarr")
+    rels = bfill.meta_files(path, "p0")
+    assert bs._meta_too_big(path, rels) is None
+    big = path / "extra.bin"
+    with big.open("wb") as f:
+        f.truncate(bs.META_MAX_BYTES + 1)
+    reason = bs._meta_too_big(path, [*rels, "extra.bin"])
+    assert reason is not None and "nothing was sent" in reason
+
+
+def test_a_dead_tunnel_is_skipped_and_the_last_one_is_never_given_up_silently() -> None:
+    link = bs._Link(["tcp://127.0.0.1:1", "tcp://127.0.0.1:2"], "t")
+    try:
+        link.mark_dead(0, "test")
+        assert {link.pick() for _ in range(4)} == {1}
+        link.mark_dead(1, "test")
+        try:
+            link.pick()
+        except bs.BackfillError as exc:
+            assert "no tunnel to Argus answers" in str(exc)
+        else:
+            raise AssertionError("picked a dead tunnel")
+    finally:
+        link.close()
