@@ -36,6 +36,7 @@ import socket
 import time
 import uuid
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -56,6 +57,7 @@ REMOTE_PORT = 5556
 # Local end of this tool's own tunnel: clear of the live stream's 5555+.
 DEFAULT_LOCAL_PORT = 5566
 REPLY_TIMEOUT_S = 180.0
+READ_WORKERS = 8
 PAUSE_POLL_S = 10.0
 MAX_RETRIES = 3
 TUNNEL_UP_TIMEOUT_S = 30.0
@@ -96,6 +98,32 @@ _CHECKED_ACTIONS = frozenset(
 
 class BackfillError(RuntimeError):
     pass
+
+
+def read_volume(arr: zarr.Array, t: int | None = None) -> np.ndarray:
+    """Volume ``t`` of a 4-D array (the whole array when 3-D), read with several threads.
+
+    One plane is one file, and the PC's S: drive reads ~57 MB/s one file at a time but
+    ~770 MB/s with 8 in flight (2026-10-25), so a single-threaded ``arr[t]`` made
+    verifying 2.7 TB take hours. Same bytes as ``arr[t]``.
+    """
+    four_d = arr.ndim >= 4
+    shape = arr.shape[1:] if four_d else arr.shape
+    out = np.empty(shape, dtype=arr.dtype)
+    step = max(1, arr.chunks[-3])  # whole chunks per read
+    spans = [(z, min(z + step, shape[0])) for z in range(0, shape[0], step)]
+
+    def read(span: tuple[int, int]) -> None:
+        z0, z1 = span
+        out[z0:z1] = arr[t, z0:z1] if four_d else arr[z0:z1]
+
+    if len(spans) == 1:
+        read(spans[0])
+    else:
+        with ThreadPoolExecutor(READ_WORKERS) as pool:
+            for _ in pool.map(read, spans):
+                pass
+    return out
 
 
 @dataclass
@@ -841,7 +869,7 @@ class BackfillClient:
                 z = present[len(present) // 2]
                 plane = np.asarray(arr[t, z] if arr.ndim >= 4 else arr[z])
                 return {"t": t, "z": z, "sha256": bfill.volume_digest(plane)}
-        vol = np.asarray(arr[t] if arr.ndim >= 4 else arr[...])
+        vol = read_volume(arr, t if arr.ndim >= 4 else None)
         return {"t": t, "sha256": bfill.volume_digest(vol)}
 
     def _sync_store(
@@ -864,7 +892,7 @@ class BackfillClient:
         self._pump(self._slab_stream(remote, s, arr, todo, digests, name))
         for t in s.written_t:  # volumes Argus already held: hash locally
             if t not in digests:
-                vol = np.asarray(arr[t] if arr.ndim >= 4 else arr[...])
+                vol = read_volume(arr, t if arr.ndim >= 4 else None)
                 digests[t] = bfill.volume_digest(vol)
         zattrs = s.path / ".zattrs"
         root_zattrs = zattrs.read_bytes() if meta and zattrs.exists() else None
@@ -953,7 +981,7 @@ class BackfillClient:
         for t in todo:
             if self.runlog is not None:
                 self.runlog.heartbeat(f"{remote}/{name}", t)
-            vol = np.asarray(arr[t] if arr.ndim >= 4 else arr[...])
+            vol = read_volume(arr, t if arr.ndim >= 4 else None)
             digests[t] = bfill.volume_digest(vol)
             for z0, nz in self._slab_runs(s, t, vol.shape[0]):
                 slab = vol[z0 : z0 + nz]
