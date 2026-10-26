@@ -414,3 +414,32 @@ def test_volumes_are_hashed_side_by_side_and_the_slabs_are_the_same_bytes(
         slab = np.frombuffer(payload, dtype="<u2").reshape(-1, 5, 6)
         assert np.array_equal(slab, np.asarray(arr[t])[z0 : z0 + slab.shape[0]])
         assert header["sha256"] == bfill.volume_digest(slab)
+
+
+def test_a_copy_held_elsewhere_on_argus_keeps_its_posix_path_on_the_pc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """2026-10-25: on the PC ``str(Path(at).parent)`` made ``\\mmfs1\\scratch\\...`` and Argus
+    refused 8 stores as outside its raw roots."""
+    store = bs.LocalStore.load(_store(tmp_path / "c_GFP_488.ome.zarr"))
+    assert store is not None
+    at = "/mmfs1/scratch/x/DataUpload/20260917/c_GFP_488.ome.zarr"
+    info = {
+        "state": bfill.PARTIAL,
+        "have_t": [],
+        "duplicate_of": at,
+        "duplicate_have_t": [0, 1],
+        "elsewhere": [{"path": at, "have_t": [0, 1], "marked": False}],
+    }
+    client = bs.BackfillClient(["tcp://127.0.0.1:1"], [(tmp_path, "/r")])
+    monkeypatch.setattr(bs, "Path", PureWindowsPath)  # what Path is on the rig
+    try:
+        d = client._decide("/r", store, info)
+        assert d["action"] == "verify elsewhere"
+        assert d["remote"] == "/mmfs1/scratch/x/DataUpload/20260917"
+        part = {**info, "duplicate_have_t": [0]}
+        d = client._decide("/r", store, part)
+        assert d["action"] == "complete elsewhere"
+        assert d["remote"] == "/mmfs1/scratch/x/DataUpload/20260917"
+    finally:
+        client.close()
