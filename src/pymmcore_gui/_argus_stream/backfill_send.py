@@ -38,7 +38,7 @@ import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -99,6 +99,12 @@ _CHECKED_ACTIONS = frozenset(
 
 class BackfillError(RuntimeError):
     pass
+
+
+def _remote_parent(at: str) -> str:
+    """Folder of an Argus path. Argus paths are POSIX: ``str(Path(at).parent)`` on the PC
+    gave ``\\mmfs1\\scratch\\...`` and the receiver refused 8 stores (2026-10-25)."""
+    return str(PurePosixPath(at).parent)
 
 
 def read_volume(arr: zarr.Array, t: int | None = None) -> np.ndarray:
@@ -659,14 +665,14 @@ class BackfillClient:
                 return {
                     **d,
                     "action": "verify elsewhere",
-                    "remote": str(Path(at).parent),
+                    "remote": _remote_parent(at),
                     "have": dup_have,
                     "at": at,
                 }
             return {
                 **d,
                 "action": "complete elsewhere",
-                "remote": str(Path(at).parent),
+                "remote": _remote_parent(at),
                 "have": dup_have,
                 "at": at,
             }
