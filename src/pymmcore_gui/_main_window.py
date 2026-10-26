@@ -7,9 +7,10 @@ from collections.abc import Callable
 from contextlib import suppress
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast, overload
+from typing import TYPE_CHECKING, Any, Literal, cast, overload
 from weakref import WeakValueDictionary
 
+from psygnal import SignalInstance
 from pymmcore_plus import CMMCorePlus
 from pymmcore_widgets import ConfigWizard
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
@@ -177,6 +178,20 @@ _ARGUS_NOTIFY_STATES = {StreamState.PAUSED, StreamState.ERROR}
 _ARGUS_SLOT_PRIORITY = 100
 
 
+def _connect_first(signal: Any, slot: Callable[..., Any]) -> None:
+    """Connect ``slot`` ahead of default-priority slots where the backend allows.
+
+    ``priority`` is a psygnal feature. The app forces the Qt signals backend
+    (``PYMM_SIGNALS_BACKEND=qt``), whose signals reject the keyword. There a
+    raising slot doesn't stop the others from running, so the plain connect
+    already gives the stream the isolation the priority exists to provide.
+    """
+    if isinstance(signal, SignalInstance):
+        signal.connect(slot, priority=_ARGUS_SLOT_PRIORITY)
+    else:
+        signal.connect(slot)
+
+
 class MicroManagerGUI(QMainWindow):
     """Micro-Manager minimal GUI."""
 
@@ -313,11 +328,10 @@ class MicroManagerGUI(QMainWindow):
         self.argus_qc_received = self._argus_status_relay.qcReceived
         argus_mda_ev = self._mmc.mda.events
         stream = self._argus_stream
-        first = _ARGUS_SLOT_PRIORITY
-        argus_mda_ev.sequenceStarted.connect(stream.sequenceStarted, priority=first)
-        argus_mda_ev.frameReady.connect(stream.frameReady, priority=first)
-        argus_mda_ev.sequenceFinished.connect(stream.sequenceFinished, priority=first)
-        argus_mda_ev.sequenceCanceled.connect(stream.sequenceCanceled, priority=first)
+        _connect_first(argus_mda_ev.sequenceStarted, stream.sequenceStarted)
+        _connect_first(argus_mda_ev.frameReady, stream.frameReady)
+        _connect_first(argus_mda_ev.sequenceFinished, stream.sequenceFinished)
+        _connect_first(argus_mda_ev.sequenceCanceled, stream.sequenceCanceled)
         self._argus_last_notified = ""
 
         # Status bar -----------------------------------------
