@@ -32,6 +32,7 @@ if TYPE_CHECKING:
         FocusCalibration,
         LockLimits,
     )
+    from pymmcore_gui.asi_z_stack.spot_focus import SpotCalibration, SpotLoopParams
 
 APP_NAME = "pymmcore-gui"
 USER_DATA_DIR = Path(user_data_dir(appname=APP_NAME))
@@ -516,8 +517,10 @@ class ImageFocusSettingsV1(BaseMMSettings):
     :class:`~pymmcore_gui.asi_z_stack.image_focus.LockLimits`.
     """
 
-    mode: Literal["crisp", "image", "off"] = "crisp"
-    """Which focus hold runs during an acquisition."""
+    mode: Literal["crisp", "image", "spot", "off"] = "crisp"
+    """Which focus hold runs. ``"image"`` is read per sequence; ``"spot"`` is the
+    standalone spot lock (:class:`SpotFocusSettingsV1`), which the image lock
+    ignores."""
     box: FocusBoxSettings | None = None
     """The measurement box; ``None`` until the user draws one."""
     calibrations: dict[str, CalibrationRecord] = Field(default_factory=dict)
@@ -566,6 +569,75 @@ class ImageFocusSettingsV1(BaseMMSettings):
         )
 
 
+class SpotSourceSettingsV1(BaseModel):
+    """Where the spot lock's frames come from (see ``toupcam_source.make_source``)."""
+
+    kind: Literal["toupcam", "fake"] = "toupcam"
+    """``"toupcam"`` is the AmScope camera; ``"fake"`` is a simulated spot."""
+    serial: str | None = None
+    """Camera serial (``None`` takes the first camera found)."""
+    sdk_dir: str | None = None
+    """Folder holding the vendor's ``toupcam.py``; ``None`` uses the
+    ``TOUPCAM_SDK_DIR`` environment variable."""
+    fake: dict[str, Any] = Field(default_factory=dict)
+    """Keyword arguments of ``FakeSpotSource`` (``kind == "fake"`` only)."""
+
+
+class SpotLoopParamsSettings(BaseModel):
+    """Persisted form of ``asi_z_stack.spot_focus.SpotLoopParams``."""
+
+    kp: float = 0.6
+    ki: float = 0.05
+    deadband_um: float = 0.03
+    max_step_um: float = 0.5
+    max_rate_hz: float = 2.0
+    avg_frames: int = 8
+    lateral_limit_px: float = 8.0
+    min_amplitude: float = 20.0
+    p_min_um: float = 0.0
+    p_max_um: float = 150.0
+    max_excursion_um: float = 5.0
+    strikes: int = 5
+
+    def to_params(self) -> "SpotLoopParams":
+        """Return the numpy-only parameters the spot loop works with."""
+        from pymmcore_gui.asi_z_stack.spot_focus import SpotLoopParams
+
+        return SpotLoopParams.from_dict(self.model_dump())
+
+
+class SpotFocusSettingsV1(BaseMMSettings):
+    """Spot focus lock: the CRISP LED spot on a side camera, held by piezo P.
+
+    The loop runs from Start until Stop, independent of any acquisition (see
+    ``docs/spot_focus_lock.md``).
+    """
+
+    source: SpotSourceSettingsV1 = Field(default_factory=SpotSourceSettingsV1)
+    exposure_ms: float = 5.0
+    gain: int = 100
+    """Camera gain in percent (ToupTek convention, 100 = unity)."""
+    roi: tuple[int, int, int, int] | None = None
+    """Camera ROI ``(x, y, w, h)``; ``None`` uses the full frame."""
+    channel: Literal["sum", "red"] = "red"
+    """Which Bayer sites the spot is measured on. The LED is 720 nm on a colour
+    sensor, so only the red sites carry it."""
+    bayer: Literal["RGGB", "BGGR", "GRBG", "GBRG"] = "RGGB"
+    led_intensity: float | None = None
+    """CRISP LED intensity set on Start; ``None`` leaves it as it is."""
+    params: SpotLoopParamsSettings = Field(default_factory=SpotLoopParamsSettings)
+    calibration: dict[str, Any] | None = None
+    """``SpotCalibration.to_dict()`` of the last calibration."""
+
+    def to_calibration(self) -> "SpotCalibration | None":
+        """Return the stored calibration, ``None`` if there is none."""
+        if not self.calibration:
+            return None
+        from pymmcore_gui.asi_z_stack.spot_focus import SpotCalibration
+
+        return SpotCalibration.from_dict(self.calibration)
+
+
 class SnapshotSettingsV1(BaseMMSettings):
     """Where the Save Image action writes Snap/Live frames."""
 
@@ -590,6 +662,7 @@ class SettingsV1(BaseMMSettings):
     mda_writer: MdaWriterSettingsV1 = Field(default_factory=MdaWriterSettingsV1)
     focus: FocusOffsetSettingsV1 = Field(default_factory=FocusOffsetSettingsV1)
     image_focus: ImageFocusSettingsV1 = Field(default_factory=ImageFocusSettingsV1)
+    spot_focus: SpotFocusSettingsV1 = Field(default_factory=SpotFocusSettingsV1)
     snapshot: SnapshotSettingsV1 = Field(default_factory=SnapshotSettingsV1)
     spim_timing: SpimTimingSettingsV1 = Field(default_factory=SpimTimingSettingsV1)
 
