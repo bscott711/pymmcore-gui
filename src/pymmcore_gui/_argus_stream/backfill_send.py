@@ -102,8 +102,9 @@ class BackfillError(RuntimeError):
 
 
 def _remote_parent(at: str) -> str:
-    """Folder of an Argus path. Argus paths are POSIX: ``str(Path(at).parent)`` on the PC
-    gave ``\\mmfs1\\scratch\\...`` and the receiver refused 8 stores (2026-10-25)."""
+    r"""Folder of an Argus path. Argus paths are POSIX: ``str(Path(at).parent)`` on the PC
+    gave ``\\mmfs1\\scratch\\...`` and the receiver refused 8 stores (2026-10-25).
+    """
     return str(PurePosixPath(at).parent)
 
 
