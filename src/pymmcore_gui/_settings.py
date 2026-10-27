@@ -2,8 +2,9 @@ import json
 import os
 import threading
 import warnings
+from dataclasses import asdict
 from pathlib import Path
-from typing import Annotated, Any, Literal, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
 from platformdirs import user_data_dir
 from pydantic import (
@@ -24,6 +25,13 @@ from pydantic_settings import (
 )
 
 from pymmcore_gui.actions.widget_actions import WidgetAction
+
+if TYPE_CHECKING:
+    from pymmcore_gui.asi_z_stack.image_focus import (
+        FocusBox,
+        FocusCalibration,
+        LockLimits,
+    )
 
 APP_NAME = "pymmcore-gui"
 USER_DATA_DIR = Path(user_data_dir(appname=APP_NAME))
@@ -454,6 +462,110 @@ class SpimTimingSettingsV1(BaseMMSettings):
     readout + exposure instead of 2 x readout + exposure."""
 
 
+class FocusBoxSettings(BaseModel):
+    """Persisted form of :class:`~pymmcore_gui.asi_z_stack.image_focus.FocusBox`."""
+
+    camera: str
+    """Physical camera device label, e.g. ``"Camera-1"``."""
+    preset: str
+    """Single-laser preset whose frames are measured, e.g. ``"488nm"``."""
+    slice_index: int = 0
+    """Which slice of the volume is measured."""
+    rect: tuple[int, int, int, int]
+    """``(x, y, w, h)`` in full-sensor pixel coordinates (x = column, y = row)."""
+
+    def to_box(self) -> "FocusBox":
+        """Return the numpy-only box the focus-lock logic works with."""
+        from pymmcore_gui.asi_z_stack.image_focus import FocusBox
+
+        return FocusBox(self.camera, self.preset, self.slice_index, self.rect)
+
+
+class CalibrationRecord(BaseModel):
+    """Persisted form of ``image_focus.FocusCalibration`` (see that module)."""
+
+    rows_per_um: float
+    """Signed rows of content shift per +1 um of piezo."""
+    intercept_rows: float = 0.0
+    r2: float
+    """Fit quality; the lock refuses calibrations below ``min_r2``."""
+    range_um: tuple[float, float]
+    """Linear range of the sweep that was kept (min, max piezo)."""
+    n_points: int
+    date: str
+    """ISO timestamp the calibration was made."""
+
+    def to_calibration(self) -> "FocusCalibration":
+        """Return the numpy-only calibration the focus-lock logic works with."""
+        from pymmcore_gui.asi_z_stack.image_focus import FocusCalibration
+
+        return FocusCalibration(**self.model_dump())
+
+    @classmethod
+    def from_calibration(cls, cal: "FocusCalibration") -> "CalibrationRecord":
+        """Build a record from a fresh :func:`fit_calibration` result."""
+        return cls(**asdict(cal))
+
+
+class ImageFocusSettingsV1(BaseMMSettings):
+    """Image-based focus lock (an alternative to CRISP) configuration.
+
+    Per volume, the row-intensity profile inside ``box`` is compared with a
+    reference and the piezo is moved to cancel the measured row shift (see
+    ``pymmcore_gui.asi_z_stack.image_focus``). The limits mirror
+    :class:`~pymmcore_gui.asi_z_stack.image_focus.LockLimits`.
+    """
+
+    mode: Literal["crisp", "image", "off"] = "crisp"
+    """Which focus hold runs during an acquisition."""
+    box: FocusBoxSettings | None = None
+    """The measurement box; ``None`` until the user draws one."""
+    calibrations: dict[str, CalibrationRecord] = Field(default_factory=dict)
+    """Piezo-to-row-shift calibrations keyed by
+    :func:`~pymmcore_gui.asi_z_stack.image_focus.calibration_key`
+    (``"camera|preset|window"``)."""
+    end_of_run: Literal["restore", "stay"] = "restore"
+    """After the run, return the piezo to where it started or leave it."""
+
+    loop_gain: float = 0.5
+    """Fraction of the measured error corrected per volume."""
+    deadband_rows: float = 0.5
+    """Errors up to this size are left alone."""
+    max_step_um: float = 0.3
+    """Largest piezo move in a single volume."""
+    max_excursion_um: float = 3.0
+    """Largest distance the piezo may end up from where the run started."""
+    min_confidence: float = 0.5
+    """Minimum peak correlation to trust a measurement."""
+    max_centroid_disagreement_rows: float = 3.0
+    """Largest allowed gap between the correlation and centroid shifts."""
+    min_signal: float = 1.0
+    """Minimum background-subtracted profile mean."""
+    max_strikes: int = 3
+    """Consecutive rejected measurements before the lock falls back."""
+    max_saturated: int = 3
+    """Consecutive clipped moves before the lock falls back."""
+    min_r2: float = 0.9
+    """Calibrations fitting worse than this are refused."""
+
+    def to_limits(self) -> "LockLimits":
+        """Return the numpy-only limits the focus-lock logic works with."""
+        from pymmcore_gui.asi_z_stack.image_focus import LockLimits
+
+        return LockLimits(
+            loop_gain=self.loop_gain,
+            deadband_rows=self.deadband_rows,
+            max_step_um=self.max_step_um,
+            max_excursion_um=self.max_excursion_um,
+            min_confidence=self.min_confidence,
+            max_centroid_disagreement_rows=self.max_centroid_disagreement_rows,
+            min_signal=self.min_signal,
+            max_strikes=self.max_strikes,
+            max_saturated=self.max_saturated,
+            min_r2=self.min_r2,
+        )
+
+
 class SnapshotSettingsV1(BaseMMSettings):
     """Where the Save Image action writes Snap/Live frames."""
 
@@ -477,6 +589,7 @@ class SettingsV1(BaseMMSettings):
     argus_stream: ArgusStreamSettingsV1 = Field(default_factory=ArgusStreamSettingsV1)
     mda_writer: MdaWriterSettingsV1 = Field(default_factory=MdaWriterSettingsV1)
     focus: FocusOffsetSettingsV1 = Field(default_factory=FocusOffsetSettingsV1)
+    image_focus: ImageFocusSettingsV1 = Field(default_factory=ImageFocusSettingsV1)
     snapshot: SnapshotSettingsV1 = Field(default_factory=SnapshotSettingsV1)
     spim_timing: SpimTimingSettingsV1 = Field(default_factory=SpimTimingSettingsV1)
 
