@@ -136,3 +136,73 @@ Rules:
   - Killing the worker gives a fault and no more moves.
   - Calibration recovers the fake's slope and direction.
   - `stop` restores the CRISP state.
+
+## Live camera view and controls (2026-10-27)
+
+The user needs to see the camera **live at full resolution** to align the beam, place the ROI and set exposure. No
+downsampled view: images are drawn at native resolution, with nearest-neighbour pixels when zoomed.
+
+Rig camera: ICMOS03100KPB (MD310C-BS), 2048x1536, **RAW8 only**, RGGB. 11.5 fps at full frame, 31 fps at a 640x480 ROI.
+Exposure runs 0.105 ms to 15 s, gain 100 to 5000. After a settings change the camera delivers stale frames for up to 3-4
+frames.
+
+### Frames: shared memory, never the pipe (`asi_z_stack/spot_frame_shm.py`)
+- `FrameBuffer.create(max_bytes) -> FrameBuffer` is the writer, in the worker.
+- `FrameBuffer.attach(name) -> FrameBuffer` is the reader, in the main process. It uses `track=False`.
+- `.name`, `.close()`, `.unlink()`.
+- `write(image, *, t, roi, sensor, bits, spot, spot_ok, saturated_frac, max_value)`. A seqlock header (sequence number odd
+  while writing) means a reader never sees a torn frame.
+- `read(last_seq=None) -> LiveFrame | None` returns None when there's nothing newer than `last_seq`. It copies the
+  image out.
+- `LiveFrame` (dataclass) fields:
+  - `image`: 2-D uint8 or uint16, ROI-sized
+  - `seq`, `t`
+  - `roi`: `(x, y, w, h)` in sensor px
+  - `sensor`: `(W, H)`
+  - `bits`
+  - `spot`: `(x, y)` sensor px, or None
+  - `spot_ok`, `saturated_frac`, `max_value`
+
+### Worker
+- States: `idle`, `preview`, `running`, `stopped`, `fault`. New messages: `preview_start` and `preview_stop`.
+- Every frame goes to the shared buffer while previewing, running, or measuring for calibration.
+  - The spot is fitted for the overlay at most 5 Hz in preview.
+  - While running, it is fitted every frame, as before.
+- `thumb` messages are dropped; the live view replaces them.
+- **All spot positions are in sensor pixels**: the ROI offset is added. That covers fixes, the calibration, telemetry,
+  measurements and the setpoint. A calibration therefore survives ROI changes, as long as the spot stays inside.
+- `set_camera` applies live:
+  - `exposure_ms`, `gain`, `channel` (`sum` or `red`)
+  - `roi`: `(x, y, w, h)`; `(0, 0, 0, 0)` means full frame
+- **Settle is time-based.** After a move ack or any camera change, frames are ignored until both of these hold: at least
+  4 frames have arrived, and `max(2*exposure + 1/fps, 0.05)` s has passed. This replaces `SETTLE_FRAMES = 2`.
+- The `ready` info carries: `shm`, `sensor`, `bits`, `model`, `serial`, `exposure_range_ms`, `gain_range`, `roi`,
+  `exposure_ms`, `gain`.
+
+### Service
+- `start_preview()` and `stop_preview()`; `preview_active`.
+- `latest_frame(last_seq=None) -> LiveFrame | None`.
+- `camera_info`: the ready info.
+- `set_camera(exposure_ms=None, gain=None, roi=None, channel=None)`.
+- `stop()` returns to `preview` if preview was on.
+- Calibrate works while previewing.
+
+### GUI
+- **Camera section** of the Spot panel:
+  - SDK folder: a line edit plus Browse, saved to `spot_focus.source.sdk_dir`.
+  - A camera info label: model, serial, sensor, bits.
+  - A **Preview** toggle.
+  - Exposure (ms), gain and channel. Each applies live and is saved.
+  - ROI x, y, w, h, with **Apply ROI** and **Full frame**.
+  - Readouts: fps, max value, % saturated.
+  - Camera errors show in the panel's fault label.
+- **Live view** (`widgets/_spot_live_view.py`), a separate resizable top-level window titled "Spot camera":
+  - It is a QGraphicsView whose scene is the sensor. Each frame is drawn at native resolution at its ROI offset.
+  - Wheel zooms around the cursor, left-drag pans, and there are **Fit** and **1:1** buttons. Smooth scaling is off.
+  - **Draw ROI** mode: dragging a rectangle (snapped to even ints, clamped to the sensor) emits
+    `roiDrawn(x, y, w, h)`. The panel fills its ROI spins and applies them.
+  - Overlays: the sensor outline, the current ROI, the spot (a cross) and the calibrated setpoint (a circle).
+  - Levels are linear. The fixed range is 0 to 2^bits−1, with an **Auto levels** option (min to max).
+  - Under the cursor it shows x, y and the pixel value.
+  - A 30 Hz timer polls `latest_frame` and repaints only on a new `seq`.
+  - Closing the window stops preview, unless the lock is running.
