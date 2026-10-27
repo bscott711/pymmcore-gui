@@ -15,6 +15,7 @@ from ._action_info import ActionKey, WidgetActionInfo, _ensure_isinstance
 
 if TYPE_CHECKING:
     import pymmcore_widgets as pmmw
+    import useq
     from PyQt6.QtCore import QObject
 
     from pymmcore_gui._main_window import MicroManagerGUI
@@ -42,6 +43,7 @@ class WidgetAction(ActionKey):
     STAGE_CONTROL = "pymmcore_gui.stage_control_widget"
     CONFIG_WIZARD = "pymmcore_gui.hardware_config_wizard"
     CRISP = "pymmcore_gui.crisp_widget"
+    IMAGE_FOCUS = "pymmcore_gui.image_focus_widget"
     SPECTRAL_CHANNELS = "pymmcore_gui.spectral_channel_config"
     SPIM_TIMING = "pymmcore_gui.spim_timing_widget"
     CAMERA_ALIGNMENT = "pymmcore_gui.camera_alignment_widget"
@@ -187,6 +189,26 @@ def create_crisp_widget(parent: QWidget) -> QWidget:
     from pymmcore_gui.widgets._crisp_widget import CrispWidget
 
     return CrispWidget(parent=parent, mmcore=_get_core(parent))
+
+
+def create_image_focus_widget(parent: QWidget) -> QWidget:
+    """Create the image-based focus lock panel (source, box, calibration, status)."""
+    from pymmcore_gui.widgets._image_focus_widget import ImageFocusWidget
+
+    def base_sequence() -> useq.MDASequence:
+        # What a calibration is built from: the channels and z plan being set up.
+        window = _get_mm_main_window(parent)
+        try:
+            mda = window.get_widget(WidgetAction.MDA_WIDGET, create=False)  # type: ignore[union-attr]
+        except (AttributeError, KeyError):
+            raise ValueError(
+                "Open the MDA window and set up the acquisition first."
+            ) from None
+        return mda.value()
+
+    return ImageFocusWidget(  # type: ignore[return-value]
+        _get_core(parent), parent, sequence_source=base_sequence
+    )
 
 
 def create_spectral_channel_config(parent: QWidget) -> QWidget:
@@ -345,6 +367,14 @@ show_crisp = WidgetActionInfo(
     text="CRISPy Autofocus",
     icon="mdi:focus-auto",
     create_widget=create_crisp_widget,
+    dock_area=DockWidgetArea.RightDockWidgetArea,
+)
+
+show_image_focus = WidgetActionInfo(
+    key=WidgetAction.IMAGE_FOCUS,
+    text="Image Focus Lock",
+    icon="mdi:image-filter-center-focus",
+    create_widget=create_image_focus_widget,
     dock_area=DockWidgetArea.RightDockWidgetArea,
 )
 

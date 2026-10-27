@@ -5,11 +5,13 @@ The lock itself lives in :mod:`~pymmcore_gui.asi_z_stack.image_focus_run`
 it is doing through the module-level :data:`focus_lock_signals`, which a UI
 panel can connect to.
 
-**Threading:** every signal is emitted from the **MDA thread** (the engine's
-``exec_event`` / ``setup_sequence`` / ``teardown_sequence`` caller), never the
-GUI thread. A slot that touches Qt widgets must connect with
-``focus_lock_signals.report.connect(slot, thread="main")`` (psygnal queues the
-call onto the main thread). A slot that raises is swallowed and logged by the
+**Threading:** every signal but ``box_changed`` is emitted from the **MDA
+thread** (the engine's ``exec_event`` / ``setup_sequence`` /
+``teardown_sequence`` caller), never the GUI thread. A slot that touches Qt
+widgets must hop threads itself: ``connect(slot, thread="main")`` delivers
+nothing unless psygnal's emission queue is being drained, so the UI forwards
+each signal to a ``pyqtSignal`` on a GUI-thread ``QObject`` (see
+``ImageFocusWidget``). A slot that raises is swallowed and logged by the
 emitting side, so a broken panel cannot stall an acquisition.
 """
 
@@ -57,6 +59,9 @@ class FocusLockSignals(SignalGroup):
     """``(calibration_key, fit)`` after a calibration run was fitted and saved."""
     stopped = Signal(str)
     """The lock ended or gave up; the argument is the reason."""
+    box_changed = Signal()
+    """``image_focus.box`` was drawn, moved or cleared in the UI (emitted on the
+    GUI thread, unlike the others, which come from the MDA thread)."""
 
 
 #: Process-wide instance the engine emits on and the UI connects to.
