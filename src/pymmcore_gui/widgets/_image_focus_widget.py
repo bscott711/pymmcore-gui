@@ -3,7 +3,10 @@
 The lock (see :mod:`~pymmcore_gui.asi_z_stack.image_focus_run`) holds the piezo
 by watching a box on the camera image instead of using CRISP-P. This panel
 
-- picks the focus source for the next acquisition (CRISP-P / Image / Off);
+- picks the focus source for the next acquisition (CRISP-P / Image / Spot / Off).
+  Spot is not tied to an acquisition: its panel
+  (:mod:`~pymmcore_gui.widgets._spot_focus_panel`) starts and stops it, and the
+  image lock stays out of the way while it is selected;
 - shows the focus box drawn in the MDA viewer ("Focus box" button) and whether
   it is calibrated, and runs the piezo-sweep calibration for it;
 - shows what the lock is doing while a run is in progress;
@@ -49,6 +52,7 @@ from pymmcore_gui.asi_z_stack.image_focus_run import (
     build_calibration_sequence,
     window_for_box,
 )
+from pymmcore_gui.widgets._spot_focus_panel import SpotFocusPanel
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -72,6 +76,7 @@ RUN_FINISHED = "run finished"
 _SOURCES = {
     "crisp": "CRISP-P (hardware autofocus)",
     "image": "Image (focus box)",
+    "spot": "Spot (CRISP LED on side camera)",
     "off": "Off (piezo not touched)",
 }
 
@@ -422,8 +427,12 @@ class ImageFocusWidget(QWidget):
         self.limits_group.toggled.connect(limits_body.setVisible)
         limits_body.setVisible(False)
 
+        self.spot_panel = SpotFocusPanel(self._mmc, self)
+        self.spot_panel.modeForced.connect(self.refresh)
+
         layout = QVBoxLayout(self)
         layout.addWidget(source_box)
+        layout.addWidget(self.spot_panel)
         layout.addWidget(box_group)
         layout.addWidget(cal_group)
         layout.addWidget(status_group)
@@ -471,6 +480,7 @@ class ImageFocusWidget(QWidget):
         self._loading = True
         try:
             self.mode_buttons[cfg.mode].setChecked(True)
+            self.spot_panel.setVisible(cfg.mode == "spot")
             for field, spin in self.limit_spins.items():
                 spin.setValue(getattr(cfg, field))
             self.end_of_run.setCurrentIndex(
@@ -545,8 +555,11 @@ class ImageFocusWidget(QWidget):
     def _set_mode(self, mode: str) -> None:
         if self._loading:
             return
+        if mode != "spot" and self.spot_panel.state in ("running", "fault"):
+            self.spot_panel.stop()  # one owner of the piezo at a time
         SettingsV1.instance().image_focus.mode = mode  # type: ignore[assignment]
         SettingsV1.instance().flush()
+        self.spot_panel.setVisible(mode == "spot")
 
     def _set_limit(self, field: str, value: float) -> None:
         if self._loading:

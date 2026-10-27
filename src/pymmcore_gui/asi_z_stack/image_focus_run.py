@@ -72,6 +72,7 @@ from .image_focus_events import (
     CALIBRATION_METADATA_KEY,
     FocusLockReport,
     focus_lock_signals,
+    spot_focus_flag,
 )
 
 if TYPE_CHECKING:
@@ -270,6 +271,12 @@ class ImageFocusRun:
         self._save_dir = widgets_meta.get("save_dir") or None
         self._save_name = widgets_meta.get("save_name") or None
 
+        if spot_focus_flag.active and (
+            CALIBRATION_METADATA_KEY in meta or cfg.mode == "image"
+        ):
+            self.mode = "off"
+            self._stop("the spot focus lock is running; running without the image lock")
+            return
         if CALIBRATION_METADATA_KEY in meta:
             self._configure_calibration(meta[CALIBRATION_METADATA_KEY])
             return

@@ -66,3 +66,17 @@ class FocusLockSignals(SignalGroup):
 
 #: Process-wide instance the engine emits on and the UI connects to.
 focus_lock_signals = FocusLockSignals()
+
+
+class SpotFocusFlag:
+    """Whether the standalone spot focus lock is running (set by its panel).
+
+    The spot lock owns piezo P until stopped, so the image lock (and its
+    calibration sweep) must not start while :attr:`active` is true.
+    """
+
+    active: bool = False
+
+
+#: Process-wide instance the spot panel sets and ``ImageFocusRun`` reads.
+spot_focus_flag = SpotFocusFlag()
