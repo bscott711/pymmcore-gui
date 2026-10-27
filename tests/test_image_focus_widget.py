@@ -473,6 +473,30 @@ def test_dragging_the_roi_saves_the_box_for_the_displayed_slice_and_channel(
     assert seen == [1]
 
 
+def test_slice_or_channel_change_recommits_the_box_while_checked(
+    qtbot: QtBot, core: CMMCorePlus
+) -> None:
+    cfg = SettingsV1.instance().image_focus
+    cfg.box = BOX  # Camera-1, 488nm, slice 1
+    viewer, button, _ = _viewer_box(core)
+    assert button.isChecked()
+    assert button.text() == "Focus box: slice 0 \u00b7 488nm"
+
+    viewer.display_model.current_index.update({"z": 3, "c": 1})
+    assert button.text() == "Focus box: slice 3 \u00b7 560nm"
+    qtbot.waitUntil(lambda: cfg.box.slice_index == 3, timeout=3000)
+    assert cfg.box.preset == "560nm"
+    assert cfg.box.rect == BOX.rect  # same place, new slice and channel
+
+    # unchecked: the sliders move freely, nothing is written
+    button.setChecked(False)
+    assert button.text() == "Focus box"
+    viewer.display_model.current_index.update({"z": 0, "c": 0})
+    qtbot.wait(800)
+    assert cfg.box.slice_index == 3
+    assert cfg.box.preset == "560nm"
+
+
 def test_focus_box_button_creates_a_default_box_and_hides_it(
     qtbot: QtBot, core: CMMCorePlus
 ) -> None:

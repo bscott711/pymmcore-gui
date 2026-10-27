@@ -144,6 +144,7 @@ class ViewerFocusBox(QObject):
 
         self._model: RectangularROIModel | None = None
         self._settling = False  # ignore the model events our own writes cause
+        self._last_selection = self.selection()
 
         button.setToolTip(
             "Show the image focus lock box. Drag it over a bright, sharp "
@@ -151,6 +152,15 @@ class ViewerFocusBox(QObject):
             "the displayed slice and channel once you stop moving it."
         )
         button.toggled.connect(self._on_toggled)
+        # The box follows the viewer's slice and channel while it is shown: the
+        # user picks them with the sliders.
+        self._index = viewer.display_model.current_index
+        self._index.value_changed.connect(self._on_index_changed)
+        self.destroyed.connect(
+            lambda *_, idx=self._index, cb=self._on_index_changed: suppress_disconnect(
+                idx.value_changed, cb
+            )
+        )
 
         # The saved box, if it is for this camera, is shown at once.
         saved = SettingsV1.instance().image_focus.box
@@ -217,6 +227,7 @@ class ViewerFocusBox(QObject):
                 self._settling = False
 
     def _on_toggled(self, checked: bool) -> None:
+        self._update_label()
         if not checked:
             self._timer.stop()
             self._hide()
@@ -240,6 +251,23 @@ class ViewerFocusBox(QObject):
     def _on_bbox_changed(self, *_: object) -> None:
         if not self._settling:
             self._timer.start()
+
+    def _on_index_changed(self, *_: object) -> None:
+        """Re-commit (debounced) when the displayed slice or channel changes."""
+        sel = self.selection()
+        if sel == self._last_selection:  # t, p ... moved, not z or c
+            return
+        self._last_selection = sel
+        self._update_label()
+        if self._button.isChecked() and self._model is not None:
+            self._timer.start()
+
+    def _update_label(self) -> None:
+        """Show on the button what the box is (or will be) bound to."""
+        sel = self.selection() if self._button.isChecked() else None
+        self._button.setText(
+            "Focus box" if sel is None else f"Focus box: slice {sel[1]} \u00b7 {sel[0]}"
+        )
 
     # -- settings ------------------------------------------------------
 
