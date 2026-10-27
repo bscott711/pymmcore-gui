@@ -23,6 +23,8 @@ FAKE_SDK = textwrap.dedent(
     TOUPCAM_OPTION_RAW = 0x04
     TOUPCAM_OPTION_BITDEPTH = 0x06
     FULL = (64, 48)
+    EIGHT_BIT_ONLY = False  # RAW8-only models reject OPTION_BITDEPTH
+    FAIL_EXPO = False
 
     class _Dev:
         id = "tp-0001"
@@ -41,19 +43,23 @@ FAKE_SDK = textwrap.dedent(
             return cls.last
 
         def __init__(self):
+            self.closed = 0
             self.options = {}
             self.roi = (0, 0, 0, 0)
             self.cb = None
             self.lock_probe = None  # set by the test: returns True if held
 
         def put_Option(self, k, v):
+            if k == TOUPCAM_OPTION_BITDEPTH and EIGHT_BIT_ONLY:
+                raise RuntimeError("HRESULTException: Not implemented")
             self.options[k] = v
 
         def put_AutoExpoEnable(self, v):
             pass
 
         def put_ExpoTime(self, us):
-            pass
+            if FAIL_EXPO:
+                raise RuntimeError("put_ExpoTime failed")
 
         def put_ExpoAGain(self, g):
             pass
@@ -90,7 +96,7 @@ FAKE_SDK = textwrap.dedent(
             fun(TOUPCAM_EVENT_IMAGE, ctx)
 
         def Close(self):
-            pass
+            self.closed += 1
     """
 )
 
@@ -134,3 +140,35 @@ def test_set_roi_does_not_hold_the_callback_lock(source):
     # Negative control: the old code took the lock around put_Roi.
     with source._lock, pytest.raises(RuntimeError, match="deadlock"):
         cam.put_Roi(0, 0, 32, 32)
+
+
+def _make(tmp_path, **flags):
+    sdk = FAKE_SDK
+    for name, value in flags.items():
+        sdk = sdk.replace(f"{name} = False", f"{name} = {value}", 1)
+    (tmp_path / "toupcam.py").write_text(sdk)
+    return ToupcamSource(sdk_dir=str(tmp_path))
+
+
+def test_eight_bit_only_camera_opens(tmp_path):
+    # ICMOS03100KPB: put_Option(BITDEPTH) raises "Not implemented".
+    src = _make(tmp_path, EIGHT_BIT_ONLY=True)
+    src.open()
+    try:
+        cam = _cam(src)
+        assert src._sdk.TOUPCAM_OPTION_BITDEPTH not in cam.options
+        cam.fire()
+        frame, _t = src.latest(1.0)
+        assert frame.dtype == np.uint8 and frame.shape == (48, 64)
+        assert int(frame.max()) == 200
+        assert src.info()["bits"] == 8
+    finally:
+        src.close()
+
+
+def test_failed_open_closes_the_handle(tmp_path):
+    src = _make(tmp_path, FAIL_EXPO=True)
+    with pytest.raises(RuntimeError, match="put_ExpoTime"):
+        src.open()
+    assert src._cam is None
+    assert _cam(src).closed == 1

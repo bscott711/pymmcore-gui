@@ -165,14 +165,30 @@ class ToupcamSource:
         if cam is None:
             raise RuntimeError(f"Open({dev.id}) failed")
         self._cam = cam
-        cam.put_Option(self._const("OPTION_RAW"), 1)  # raw Bayer, no demosaic
-        cam.put_Option(self._const("OPTION_BITDEPTH"), 1)  # sensor's max depth
-        cam.put_AutoExpoEnable(0)
-        cam.put_ExpoTime(int(self._exposure_ms * 1000))  # microseconds
-        cam.put_ExpoAGain(int(self._gain))  # percent
-        self._alloc()
-        self._roi = (0, 0, *self._size)
-        cam.StartPullModeWithCallback(self._on_event, self)
+        try:
+            cam.put_Option(self._const("OPTION_RAW"), 1)  # raw Bayer, no demosaic
+            try:
+                # Sensor's max depth. RAW8-only models (e.g. ICMOS03100KPB) raise
+                # "Not implemented"; the real depth is read from get_RawFormat.
+                cam.put_Option(self._const("OPTION_BITDEPTH"), 1)
+            except Exception:
+                logger.debug(
+                    "OPTION_BITDEPTH not supported; using the camera's native depth",
+                    exc_info=True,
+                )
+            cam.put_AutoExpoEnable(0)
+            cam.put_ExpoTime(int(self._exposure_ms * 1000))  # microseconds
+            cam.put_ExpoAGain(int(self._gain))  # percent
+            self._alloc()
+            self._roi = (0, 0, *self._size)
+            cam.StartPullModeWithCallback(self._on_event, self)
+        except BaseException:
+            self._cam = None
+            try:
+                cam.Close()
+            except Exception:
+                logger.exception("Closing the camera after a failed open failed")
+            raise
 
     def close(self) -> None:
         """Stop the camera; safe to call twice."""
