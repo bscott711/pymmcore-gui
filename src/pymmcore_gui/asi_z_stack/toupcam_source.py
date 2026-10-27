@@ -91,8 +91,8 @@ def _load_sdk(sdk_dir: str | None) -> Any:
 class ToupcamSource:
     """The ToupTek / AmScope camera in raw, fixed-exposure pull mode.
 
-    SDK names below follow the standard ToupTek python wrapper and are UNVERIFIED
-    against hardware: marked ``# SDK?`` where the exact spelling is a guess.
+    Calls checked against the ToupTek SDK 20260519 python wrapper and its docs;
+    not yet run against the camera itself.
     """
 
     def __init__(self, serial: str | None = None, sdk_dir: str | None = None) -> None:
@@ -105,6 +105,8 @@ class ToupcamSource:
         self._new = threading.Event()
         self._frame: tuple[np.ndarray, float] | None = None
         self._buf: bytes = b""
+        self._dtype: type[np.unsignedinteger] = np.uint16
+        self._bits = 16
         self._size = (0, 0)
         self._roi = (0, 0, 0, 0)
         self._exposure_ms = 10.0
@@ -117,9 +119,16 @@ class ToupcamSource:
         return getattr(self._sdk, f"{prefix}_{suffix}")
 
     def _alloc(self) -> None:
-        w, h = self._cam.get_Size()
+        # In RAW mode PullImage ignores its ``bits`` argument: the sample depth
+        # comes from OPTION_BITDEPTH (set in open) and the frame is the ROI.
+        _x, _y, w, h = self._cam.get_Roi()
+        if not (w and h):
+            w, h = self._cam.get_Size()
+        bits = int(self._cam.get_RawFormat()[1])
+        self._bits = bits
+        self._dtype = np.uint8 if bits <= 8 else np.uint16
         self._size = (w, h)
-        self._buf = bytes(w * h * 2)  # 16-bit samples; pull fills it in place
+        self._buf = bytes(w * h * np.dtype(self._dtype).itemsize)
 
     def _on_event(self, event: int, _ctx: Any) -> None:
         """SDK callback (SDK thread): pull the newest frame into the 1-slot buffer."""
@@ -127,13 +136,12 @@ class ToupcamSource:
             return
         with self._lock:
             try:
-                # bits=16 in raw mode: SDK? some sensors want the native bit depth
-                self._cam.PullImageV2(self._buf, 16, None)
+                self._cam.PullImageV2(self._buf, 0, None)  # bits ignored in RAW
             except Exception:
                 logger.exception("PullImageV2 failed")
                 return
             w, h = self._size
-            frame = np.frombuffer(self._buf, dtype=np.uint16).reshape(h, w).copy()
+            frame = np.frombuffer(self._buf, dtype=self._dtype).reshape(h, w).copy()
             self._frame = (frame, time.monotonic())
         self._new.set()
 
@@ -158,6 +166,7 @@ class ToupcamSource:
             raise RuntimeError(f"Open({dev.id}) failed")
         self._cam = cam
         cam.put_Option(self._const("OPTION_RAW"), 1)  # raw Bayer, no demosaic
+        cam.put_Option(self._const("OPTION_BITDEPTH"), 1)  # sensor's max depth
         cam.put_AutoExpoEnable(0)
         cam.put_ExpoTime(int(self._exposure_ms * 1000))  # microseconds
         cam.put_ExpoAGain(int(self._gain))  # percent
@@ -202,8 +211,10 @@ class ToupcamSource:
         if self._cam is None:
             raise RuntimeError("set_roi before open()")
         x, y, w, h = (int(v) // 2 * 2 for v in (x, y, w, h))
+        # Not under self._lock: put_Roi waits for a running callback to end, and
+        # the callback takes self._lock (deadlock per the SDK docs).
+        self._cam.put_Roi(x, y, w, h)
         with self._lock:
-            self._cam.put_Roi(x, y, w, h)  # SDK? may need Stop/StartPullMode
             self._alloc()
             self._roi = (x, y, w, h)
             self._frame = None
@@ -217,6 +228,7 @@ class ToupcamSource:
             "serial": self.serial,
             "size": self._size,
             "roi": self._roi,
+            "bits": self._bits,
             "exposure_ms": self._exposure_ms,
             "gain": self._gain,
         }

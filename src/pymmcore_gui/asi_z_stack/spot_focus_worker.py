@@ -142,6 +142,9 @@ class _Worker:
         #: ``locate_spot`` options (roi_half, channel, bayer, saturation); not
         #: a source argument, so split off before ``make_source``.
         self.analysis: dict[str, Any] = dict(spec.pop("analysis", {}) or {})
+        #: Saturation ceiling from the camera's bit depth (12-bit data arrives in
+        #: uint16); None falls back to the dtype maximum in ``locate_spot``.
+        self.saturation: int | None = None
         self.spec = spec
         self.source: Any = None
         self.running = False
@@ -199,7 +202,7 @@ class _Worker:
             roi_half=int(self.analysis.get("roi_half", 50)),
             channel=self.analysis.get("channel", "sum"),
             bayer=self.analysis.get("bayer", "RGGB"),
-            saturation=self.analysis.get("saturation"),
+            saturation=self.analysis.get("saturation", self.saturation),
             min_amplitude=min_amplitude,
         )
 
@@ -403,6 +406,9 @@ class _Worker:
         try:
             self.source = make_source(self.spec)
             self.source.open()
+            bits = self.source.info().get("bits")
+            if bits:
+                self.saturation = (1 << int(bits)) - 1
         except Exception as exc:
             self.send(
                 {
