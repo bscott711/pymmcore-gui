@@ -354,6 +354,83 @@ def test_shutdown_right_after_start_restores_crisp() -> None:
 
 
 # --------------------------------------------------------------------------
+# CRISP LED: lit only in Ready (or Lock...), off in Idle
+# --------------------------------------------------------------------------
+
+
+def test_led_on_sets_ready_and_intensity_and_led_off_restores_idle() -> None:
+    mmc = FakeMMC()
+    with _service(mmc) as svc:
+        assert not svc.led_is_on
+        svc.led_on(40)
+        assert svc.led_is_on
+        assert mmc.props[(CRISP, "CRISP State")] == "Ready"
+        assert mmc.props[(CRISP, "LED Intensity")] == "40"
+        svc.set_led_intensity(70)  # live
+        assert mmc.props[(CRISP, "LED Intensity")] == "70"
+        svc.led_off()
+        assert not svc.led_is_on
+        assert mmc.props[(CRISP, "CRISP State")] == "Idle"
+
+
+def test_led_on_leaves_a_lit_state_alone() -> None:
+    mmc = FakeMMC()
+    mmc.props[(CRISP, "CRISP State")] = "Lock"
+    with _service(mmc) as svc:
+        svc.led_on(20)
+        assert mmc.props[(CRISP, "CRISP State")] == "Lock"
+        svc.led_off()
+        assert mmc.props[(CRISP, "CRISP State")] == "Lock"
+
+
+def test_preview_and_lock_overlap_keep_the_led_on_until_both_are_gone() -> None:
+    mmc = FakeMMC()
+    with _service(mmc) as svc:
+        svc.led_on(30, owner="preview")
+        svc.start(_params(), _cal(), led_intensity=30)  # the lock joins
+        assert mmc.props[(CRISP, "CRISP State")] == "Ready"
+        svc.stop()  # lock gone, preview still on
+        assert svc.led_is_on
+        assert mmc.props[(CRISP, "CRISP State")] == "Ready"
+        svc.led_off("preview")
+        assert not svc.led_is_on
+        assert mmc.props[(CRISP, "CRISP State")] == "Idle"
+    # And the other order: preview leaves first, the lock's stop restores.
+    mmc = FakeMMC()
+    with _service(mmc) as svc:
+        svc.led_on(30, owner="preview")
+        svc.start(_params(), _cal())
+        svc.led_off("preview")
+        assert mmc.props[(CRISP, "CRISP State")] == "Ready"
+        svc.stop()
+        assert mmc.props[(CRISP, "CRISP State")] == "Idle"
+
+
+def test_shutdown_restores_a_lit_led() -> None:
+    mmc = FakeMMC()
+    svc = _service(mmc)
+    svc.led_on(30, owner="preview")
+    svc.led_on(30, owner="manual")
+    assert mmc.props[(CRISP, "CRISP State")] == "Ready"
+    svc.shutdown()
+    assert mmc.props[(CRISP, "CRISP State")] == "Idle"
+
+
+def test_led_calls_are_a_no_op_without_a_crisp_device() -> None:
+    mmc = FakeMMC()
+    svc = SpotFocusService(mmc, P_LABEL, None, _spec(), ready_timeout_s=20.0)
+    with svc:
+        svc.led_on(50)
+        assert not svc.led_is_on
+        svc.set_led_intensity(60)
+        svc.led_off()
+        assert svc.crisp_label is None
+        assert svc.crisp_state() is None
+        assert mmc.props[(CRISP, "CRISP State")] == "Idle"
+        assert mmc.props[(CRISP, "LED Intensity")] == "0"
+
+
+# --------------------------------------------------------------------------
 # Live view: preview, shared memory, camera controls
 # --------------------------------------------------------------------------
 

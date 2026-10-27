@@ -455,6 +455,56 @@ def _preview_on(qtbot: QtBot, panel: SpotFocusPanel) -> SpotFocusService:
     return svc
 
 
+def test_preview_lights_the_led_and_off_restores_crisp(
+    qtbot: QtBot, panel: SpotFocusPanel, mmc: FakeMMC
+) -> None:
+    """The CRISP LED is lit only in Ready: Preview must put CRISP there."""
+    assert mmc.props[(CRISP, "CRISP State")] == "Idle"
+    _preview_on(qtbot, panel)
+    # Without the fix CRISP stays Idle here and the camera sees a dark frame.
+    qtbot.waitUntil(lambda: mmc.props[(CRISP, "CRISP State")] == "Ready", timeout=3000)
+    qtbot.waitUntil(lambda: panel.led_button.isChecked(), timeout=WAIT_MS)
+    assert mmc.props[(CRISP, "LED Intensity")] == "50.0"  # the default
+    assert panel.led_spin.value() == 50
+    assert "Ready" in panel.crisp_readout.text()
+    assert CRISP in panel.crisp_readout.text()
+    panel.preview_button.click()  # off
+    assert mmc.props[(CRISP, "CRISP State")] == "Idle"
+    qtbot.waitUntil(lambda: not panel.led_button.isChecked(), timeout=WAIT_MS)
+    assert "Idle" in panel.crisp_readout.text()
+
+
+def test_led_button_and_spin_apply_live_and_are_saved(
+    qtbot: QtBot, panel: SpotFocusPanel, mmc: FakeMMC, _isolated_settings: SettingsV1
+) -> None:
+    panel.led_button.click()
+    qtbot.waitUntil(
+        lambda: mmc.props[(CRISP, "CRISP State")] == "Ready", timeout=WAIT_MS
+    )
+    panel.led_spin.setValue(80)
+    assert mmc.props[(CRISP, "LED Intensity")] == "80.0"
+    assert _isolated_settings.spot_focus.led_intensity == 80.0
+    panel.led_button.click()  # off
+    qtbot.waitUntil(
+        lambda: mmc.props[(CRISP, "CRISP State")] == "Idle", timeout=WAIT_MS
+    )
+
+
+def test_no_crisp_device_is_said_not_silent(qtbot: QtBot, mmc: FakeMMC) -> None:
+    def make(spec: dict, led: float | None) -> SpotFocusService:
+        return SpotFocusService(mmc, P_LABEL, None, spec, ready_timeout_s=25.0)
+
+    widget = SpotFocusPanel(mmc, service_factory=make)
+    qtbot.addWidget(widget)
+    try:
+        widget.preview_button.click()
+        qtbot.waitUntil(lambda: not widget._preview_busy, timeout=WAIT_MS)
+        assert "no CRISP device (focus.crisp_label)" in widget.fault_label.text()
+        assert mmc.props[(CRISP, "CRISP State")] == "Idle"
+    finally:
+        widget.shutdown()
+
+
 def test_preview_opens_a_full_resolution_live_view(
     qtbot: QtBot, panel: SpotFocusPanel
 ) -> None:

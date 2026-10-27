@@ -112,9 +112,16 @@ Rules:
   - It drops a move if the previous one is still in flight, so moves are never queued.
 - Signals: `telemetry(dict)`, `thumb(ndarray)`, `fault(str)`, `state(str)`, `moved(dict)`.
 - `start(params, calibration)`
-  - Reads P once with `getPosition`, sets CRISP to Ready (property `"CRISP State"`) and remembers the previous state.
-  - Sets the LED intensity if one is configured, then sends `start`.
-- `stop()` sends `stop` and restores the previous CRISP state. It never moves P.
+  - Reads P once with `getPosition`, calls `led_on(owner="lock")` (CRISP to Ready, previous state remembered), then sends
+    `start`.
+- `stop()` sends `stop` and lets go of the lock's claim on the LED. It never moves P.
+- CRISP LED (the LED is lit only in CRISP State Ready / Lock / Dither..., off in Idle, the power-up state):
+  - `led_on(intensity=None, owner="manual")` remembers the previous CRISP state once, sets Ready unless CRISP is already
+    in a lit state, and sets `"LED Intensity"` (default: the constructor's `led_intensity`).
+  - `led_off(owner)` drops that owner's claim. Owners are "preview", "lock", "manual" and "calibrate"; the previous state
+    is restored when the last one is gone, so stopping the lock with Preview on keeps the LED lit.
+  - `led_is_on`, `crisp_state()`, `crisp_label`, `set_led_intensity(v)` (live). With no CRISP label all of it is a no-op
+    and `led_is_on` stays False.
 - `shutdown()` and context manager support.
 - If the worker process dies, the service emits `fault("worker died")`, the state becomes fault, and no further moves
   are sent.
@@ -191,7 +198,10 @@ frames.
 - **Camera section** of the Spot panel:
   - SDK folder: a line edit plus Browse, saved to `spot_focus.source.sdk_dir`.
   - A camera info label: model, serial, sensor, bits.
-  - A **Preview** toggle.
+  - A **Preview** toggle. It lights the CRISP LED (CRISP State Ready) and turning it off restores CRISP, unless the lock is
+    running.
+  - An **LED** toggle and a live **LED %** spin (saved, default 50), next to a readout of CRISP's state and device label,
+    read once after each change. With no CRISP device the fault label says "no CRISP device (focus.crisp_label)".
   - Exposure (ms), gain and channel. Each applies live and is saved.
   - ROI x, y, w, h, with **Apply ROI** and **Full frame**.
   - Readouts: fps, max value, % saturated.
