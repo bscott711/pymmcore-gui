@@ -202,8 +202,10 @@ class SpotFocusService:
         if self._shutting_down:
             return
         self._shutting_down = True
-        if self._state == "running":
-            self._restore_crisp()
+        # Restore whenever start() changed CRISP, not only once the worker has
+        # reported "running": Stop or close right after Start used to leave
+        # CRISP in Ready (seen on the rig PC, 2026-10-27).
+        self._restore_crisp()
         self._send({"type": "shutdown"})
         # The reader keeps draining meanwhile: a worker blocked on a full pipe
         # would never read ``shutdown``.

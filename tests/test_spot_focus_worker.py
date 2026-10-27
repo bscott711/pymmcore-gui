@@ -327,3 +327,15 @@ def test_shutdown_reaches_a_worker_whose_reader_is_late() -> None:
             proc.kill()
             proc.join(2.0)
         conn.close()
+
+
+def test_shutdown_right_after_start_restores_crisp() -> None:
+    """Regression (rig PC, 2026-10-27): shutdown before the worker reported
+    "running" skipped the CRISP restore and left CRISP in Ready."""
+    mmc = FakeMMC()
+    svc = _service(mmc)
+    assert svc.wait_ready()
+    svc.start(_params(), _cal())
+    assert mmc.props[(CRISP, "CRISP State")] == "Ready"
+    svc.shutdown()  # no wait for the worker's "running"
+    assert mmc.props[(CRISP, "CRISP State")] == "Idle"
