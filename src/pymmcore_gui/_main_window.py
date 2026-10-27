@@ -42,6 +42,7 @@ from superqt import QIconifyIcon
 
 from ._argus_stream import ArgusStreamSession, ArgusTunnelManager, StreamState
 from ._argus_stream import _log as argus_log
+from ._focus_box import ViewerFocusBox
 from ._mmcore_shutdown import shutdown_mmcore, track_mda_thread
 from ._ndv_viewers import NDVViewersManager
 from ._notification_manager import NotificationManager
@@ -233,6 +234,7 @@ class MicroManagerGUI(QMainWindow):
         ],
         Menu.PLUGINS: [
             WidgetAction.CRISP,
+            WidgetAction.IMAGE_FOCUS,
             WidgetAction.SPECTRAL_CHANNELS,
             WidgetAction.SPIM_TIMING,
             WidgetAction.CAMERA_ALIGNMENT,
@@ -939,9 +941,32 @@ class MicroManagerGUI(QMainWindow):
             )
         )
         lock_layout.addWidget(lock_checkbox)
+        # "Focus box": draw the image focus lock's measurement box on this
+        # viewer (see ViewerFocusBox; the Image Focus Lock panel shows it).
+        focus_box_button = QPushButton("Focus box", lock_row)
+        focus_box_button.setCheckable(True)
+        # The box follows the viewer's slice/channel; without the lock, a live
+        # run would drag it along with every new frame's z and c.
+        focus_box_button.toggled.connect(
+            lambda checked, cb=lock_checkbox: checked and cb.setChecked(True)
+        )
+        lock_layout.addWidget(focus_box_button)
         lock_layout.addStretch()
         container_layout.addWidget(lock_row)
         container_layout.addWidget(q_viewer)
+        try:
+            # a child of the container: lives and dies with the viewer's tab
+            ViewerFocusBox(
+                ndv_viewer,
+                sequence,
+                camera_label,
+                focus_box_button,
+                self._mmc,
+                container,
+            )
+        except Exception:
+            logger.warning("No focus box tool for this viewer", exc_info=True)
+            focus_box_button.setEnabled(False)
 
         # NOTE: don't call q_viewer.setWindowFlags(Qt.WindowType.Dialog) here --
         # changing window flags on an already-parented widget forces Qt to hide
