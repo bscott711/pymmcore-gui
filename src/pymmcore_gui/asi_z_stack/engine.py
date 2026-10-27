@@ -28,6 +28,7 @@ from .asi_controller import (
 )
 from .camera_worker_service import CameraWorkerService
 from .common import AcquisitionSettings, HardwareConstants
+from .image_focus_run import FocusVolumeRow, ImageFocusRun
 from .spim_timing import (
     LEGACY_SETTLE_MS,
     SliceTiming,
@@ -100,6 +101,12 @@ class _VolumeRecord:
     galvo_offset_deg: str | None
     piezo_after: float | None = None
     frames: dict[str, int] = field(default_factory=dict)
+    # Image focus lock outcome for this volume, filled in AFTER the volume log
+    # line (the lock runs once the cameras are stopped; piezo_after is read
+    # before it and so still means "after the volume, before any correction").
+    focus_error_um: float | None = None
+    focus_move_um: float | None = None
+    focus_note: str | None = None
 
 
 def _try_float(value: Any) -> float | None:
@@ -154,6 +161,9 @@ class _ASITriggerEngineBase(MDAEngine):
         self._snapshot: CameraHandoffSnapshot | None = None
         self._worker_pool: CameraWorkerPool | None = None
         self._piezo_pos_at_setup: float | None = None
+        # Image-based focus lock for the current sequence (SPIM engine only,
+        # see image_focus_run.py); None when not in use.
+        self._focus_run: ImageFocusRun | None = None
         # Plan positions of the galvo sweep, in slice order; used to give each
         # frame its real z_pos. Empty when nothing scans (stationary engine).
         self._z_positions: tuple[float, ...] = ()
@@ -324,10 +334,21 @@ class _ASITriggerEngineBase(MDAEngine):
         ):
             return
         current = mmc.getPosition(self.hw.piezo_a_label)
-        delta = current - self._piezo_pos_at_setup
+        # The image focus lock moves the piezo on purpose; only motion beyond
+        # its own corrections is suspicious.
+        run = self._focus_run
+        intentional = run.intentional_um if run is not None else 0.0
+        expected = self._piezo_pos_at_setup + intentional
+        delta = current - expected
         if abs(delta) > 0.05:  # um -- above readback noise, well below a real move
             state = self._crisp_state()
-            if state in _CRISP_LOCKED_STATES:
+            if run is not None and run.owns_piezo:
+                cause = (
+                    "The image focus lock owns the piezo this run, so this is "
+                    "motion it did not command -- check CRISP (it must stay "
+                    "unlocked), the joystick wheel, and the lock's own log."
+                )
+            elif state in _CRISP_LOCKED_STATES:
                 cause = (
                     f"CRISP is locked ({state!r}), so this is CRISP moving the "
                     "objective -- in this OPM that shifts the imaged volume "
@@ -339,10 +360,14 @@ class _ASITriggerEngineBase(MDAEngine):
                     "-- check the joystick wheel and whether the ASI SPIM state "
                     "machine is auto-homing it."
                 )
+            owned = (
+                f" beyond the image focus lock's own {intentional:+.3f} um"
+                if intentional
+                else ""
+            )
             logger.warning(
-                f"Piezo ({self.hw.piezo_a_label}) moved {delta:+.3f} um during "
-                f"acquisition: {self._piezo_pos_at_setup:.3f} -> {current:.3f}. "
-                + cause
+                f"Piezo ({self.hw.piezo_a_label}) moved {delta:+.3f} um{owned} "
+                f"during acquisition: {expected:.3f} -> {current:.3f}. " + cause
             )
 
     def _log_galvo_spim_properties(self, label: str, tag: str) -> None:
@@ -418,6 +443,30 @@ class _ASITriggerEngineBase(MDAEngine):
                 f"than {self._num_slices}; z labels for that volume may be "
                 "shifted."
             )
+
+    def _note_focus_outcome(self, record: _VolumeRecord | None) -> None:
+        """Copy the focus lock's result for this volume into *record* and log it.
+
+        A second short line after the volume's own line, because the lock runs
+        once the cameras are stopped, i.e. after that line was written.
+        """
+        run = self._focus_run
+        row: FocusVolumeRow | None = run.last_row if run is not None else None
+        if record is None or row is None:
+            return
+        record.focus_error_um = row.error_um
+        record.focus_move_um = row.move_um
+        record.focus_note = row.reason or None
+        parts = [f"Volume {record.index}: image focus lock:"]
+        if row.error_rows is not None and row.error_um is not None:
+            parts.append(f"error {row.error_rows:+.2f} rows ({row.error_um:+.3f} um)")
+        if row.move_um is not None:
+            parts.append(f"move {row.move_um:+.3f} um")
+        if row.confidence is not None:
+            parts.append(f"confidence {row.confidence:.2f}")
+        if row.reason:
+            parts.append(f"({row.reason})")
+        logger.info(" ".join(parts))
 
     def _log_drift_summary(self) -> None:
         """Summarize piezo motion across this run's volumes (see _VolumeRecord)."""
@@ -812,6 +861,12 @@ class _ASITriggerEngineBase(MDAEngine):
         logger.info(f"{self._master_axis_label} SPIMState readback: '{spim_state}'.")
 
         runner_t0 = event.metadata.get("runner_t0")
+        # Image focus lock: sees each frame before it is yielded, and acts
+        # once the volume has finished (see image_focus_run.py). Both hooks
+        # catch everything; a focus-lock fault never reaches the acquisition.
+        focus_run = self._focus_run
+        focus_preset = event.channel.config if event.channel else None
+        completed = False
         try:
             for (
                 camera_label,
@@ -824,6 +879,8 @@ class _ASITriggerEngineBase(MDAEngine):
                 frames_per_camera[camera_label] = (
                     frames_per_camera.get(camera_label, 0) + 1
                 )
+                if focus_run is not None:
+                    focus_run.on_frame(camera_label, focus_preset, slice_idx, img)
                 new_index = {**event.index, "z": slice_idx}
                 if n_cameras > 1:
                     new_index["cam"] = cam_index
@@ -854,6 +911,7 @@ class _ASITriggerEngineBase(MDAEngine):
                 if received == "cancel":
                     logger.info("MDA cancelled -- stopping camera workers.")
                     return
+            completed = True
             if record is not None:
                 record.frames = frames_per_camera
                 try:
@@ -903,6 +961,17 @@ class _ASITriggerEngineBase(MDAEngine):
             # so frames left queued by a cancel/error would otherwise be read
             # by the next Snap/Live/MDA as its own.
             self._worker_pool.stop_and_drain(timeout=self.hw.worker_shutdown_timeout_s)
+
+        # Only here -- after a normal finish, with the cameras stopped and
+        # drained -- is it safe to move the piezo; a cancel/error/abandoned
+        # generator never reaches this line. This is the idle gap before the
+        # runner's next timepoint.
+        if completed and focus_run is not None:
+            focus_run.after_volume(dict(event.index), focus_preset)
+            try:
+                self._note_focus_outcome(record)
+            except Exception:
+                logger.debug("Could not log the focus outcome.", exc_info=True)
 
 
 class ASISPIMEngine(_ASITriggerEngineBase):
@@ -1239,6 +1308,15 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         # config switch -- see _reset_channel_config_cache's docstring.
         self._reset_channel_config_cache()
         self._snapshot_piezo_position()
+        # Image-based focus lock / calibration for this sequence. Decides its
+        # mode from a snapshot of the settings; touches no hardware until
+        # start() below, and never raises.
+        self._focus_run = ImageFocusRun.for_sequence(
+            self.mmcore,
+            self.hw,
+            sequence,
+            crisp_locked=lambda: self._crisp_state() in _CRISP_LOCKED_STATES,
+        )
 
         # The galvo offset Live sits at defines the Live plane; every z-plan
         # is placed relative to it (see z_scan.py).
@@ -1434,6 +1512,9 @@ class ASISPIMEngine(_ASITriggerEngineBase):
             f"offset={galvo_offset_deg:.4f}deg, "
             f"exposure={self._exposure_ms:.1f}ms)"
         )
+        # Last, so that nothing above (z-plan reference, galvo reach check)
+        # sees a piezo the focus lock has already moved.
+        self._focus_run.start()
 
         # Return summary metadata. This automatically queries
         # getNumberOfCameraChannels() and informs the OmeWritersSink
@@ -1443,7 +1524,12 @@ class ASISPIMEngine(_ASITriggerEngineBase):
     def teardown_sequence(self, sequence: MDASequence) -> None:
         """Clean up hardware state after the sequence finishes."""
         logger.info("--- SEQUENCE FINISHED: Cleaning up hardware ---")
+        # Restore the piezo (and write the focus log) first, so the piezo
+        # check below compares against the position the run ends at.
+        if self._focus_run is not None:
+            self._focus_run.teardown()
         self._warn_if_piezo_moved()
+        self._focus_run = None
         self._log_drift_summary()
         set_plogic_evaluation_clock(self.hw.tiger_comm_hub_label, running=False)
         if self.hw.galvo_a_label in self.mmcore.getLoadedDevices():
