@@ -6,13 +6,15 @@ nudging it rarely. This panel
 
 - starts and stops the loop (it runs until Stop, independent of any MDA);
 - calibrates it (a piezo sweep, on a background thread);
-- shows the spot (a live ROI thumbnail with the fitted spot and the setpoint),
-  a strip chart of the focus error and the commanded piezo over the last five
-  minutes, and move statistics;
-- edits the loop parameters, camera exposure and CRISP LED intensity.
+- runs the camera: SDK folder, Preview (which opens the full-resolution
+  :class:`~pymmcore_gui.widgets._spot_live_view.SpotLiveView`), exposure, gain,
+  channel and ROI, all applied live;
+- shows a strip chart of the focus error and the commanded piezo over the last
+  five minutes, and move statistics;
+- edits the loop parameters and CRISP LED intensity.
 
 Everything is written to ``SettingsV1.spot_focus``. The service is created
-lazily on Start or Calibrate and shut down with the panel or the app. Its
+lazily on Preview, Start or Calibrate and shut down with the panel or the app. Its
 signals come from the reader thread, so each goes through a GUI-thread
 :class:`QObject` signal (Qt queues the call), the same way as in
 :mod:`~pymmcore_gui.widgets._image_focus_widget`.
@@ -27,27 +29,32 @@ import threading
 import time
 from collections import deque
 from contextlib import suppress
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import numpy as np
-
 from pymmcore_gui._qt.QtCore import QObject, QPointF, QRectF, Qt, QTimer, Signal
-from pymmcore_gui._qt.QtGui import QColor, QImage, QPainter, QPen
+from pymmcore_gui._qt.QtGui import QColor, QPainter, QPen
 from pymmcore_gui._qt.QtWidgets import (
     QApplication,
+    QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QSizePolicy,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 from pymmcore_gui._settings import SettingsV1
 from pymmcore_gui.asi_z_stack.image_focus_events import spot_focus_flag
 from pymmcore_gui.asi_z_stack.spot_focus_service import SpotFocusService
+from pymmcore_gui.widgets._spot_live_view import SpotLiveView
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -65,7 +72,8 @@ CHART_WINDOW_S = 300.0
 _FLUSH_DELAY_MS = 500
 #: Readout refresh period (move statistics), ms.
 _STATS_PERIOD_MS = 1000
-_THUMB_SIZE = 256
+#: How long Preview waits for the camera to open, s.
+_OPEN_TIMEOUT_S = 30.0
 
 # (settings field, label, min, max, step, decimals, suffix, tooltip)
 _PARAMS: tuple[tuple[str, str, float, float, float, int, str, str], ...] = (
@@ -119,6 +127,17 @@ def source_spec(cfg: Any) -> dict[str, Any]:
     return spec
 
 
+def _rebuild_key(spec: dict | None) -> dict | None:
+    """*spec* without the settings that change live (the analysis channel)."""
+    if spec is None:
+        return None
+    key = dict(spec)
+    analysis = dict(key.get("analysis") or {})
+    analysis.pop("channel", None)
+    key["analysis"] = analysis
+    return key
+
+
 def _colored(text: str, color: str) -> str:
     return f'<span style="color:{color}">{html.escape(text)}</span>'
 
@@ -126,83 +145,6 @@ def _colored(text: str, color: str) -> str:
 # ---------------------------------------------------------------------------
 # drawing widgets
 # ---------------------------------------------------------------------------
-
-
-class SpotThumbView(QWidget):
-    """The live ROI thumbnail with markers at the fitted spot and the setpoint."""
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setMinimumSize(_THUMB_SIZE // 2, _THUMB_SIZE // 2)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self._image: QImage | None = None
-        self._data: np.ndarray | None = None  # keeps the QImage buffer alive
-        self._spot: tuple[float, float] | None = None
-        self._setpoint: tuple[float, float] | None = None
-
-    def sizeHint(self):
-        """Return the preferred size."""
-        from pymmcore_gui._qt.QtCore import QSize
-
-        return QSize(_THUMB_SIZE, _THUMB_SIZE)
-
-    @property
-    def has_image(self) -> bool:
-        """Whether a thumbnail has been received."""
-        return self._image is not None
-
-    @property
-    def markers(self) -> tuple[tuple[float, float] | None, tuple[float, float] | None]:
-        """``(spot, setpoint)`` in thumbnail pixels (``None`` when unknown)."""
-        return self._spot, self._setpoint
-
-    def set_thumb(
-        self,
-        image: np.ndarray,
-        spot: tuple[float, float] | None,
-        setpoint: tuple[float, float] | None,
-    ) -> None:
-        """Show *image* (uint8, 2-D); marker positions are in its pixels."""
-        data = np.ascontiguousarray(image, dtype=np.uint8)
-        h, w = data.shape
-        self._data = data
-        self._image = QImage(data.data, w, h, w, QImage.Format.Format_Grayscale8)
-        self._spot, self._setpoint = spot, setpoint
-        self.update()
-
-    def clear(self) -> None:
-        """Forget the thumbnail."""
-        self._image = self._data = None
-        self._spot = self._setpoint = None
-        self.update()
-
-    def paintEvent(self, event) -> None:
-        """Draw the thumbnail and the markers."""
-        p = QPainter(self)
-        p.fillRect(self.rect(), QColor("#101010"))
-        if self._image is None:
-            p.setPen(QColor("#888888"))
-            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "no image")
-            return
-        iw, ih = self._image.width(), self._image.height()
-        scale = min(self.width() / iw, self.height() / ih)
-        ox = (self.width() - iw * scale) / 2
-        oy = (self.height() - ih * scale) / 2
-        p.drawImage(QRectF(ox, oy, iw * scale, ih * scale), self._image)
-
-        def at(pt: tuple[float, float]) -> QPointF:
-            return QPointF(ox + (pt[0] + 0.5) * scale, oy + (pt[1] + 0.5) * scale)
-
-        if self._setpoint is not None:  # ring: where the spot should be
-            p.setPen(QPen(QColor("#ff9a1f"), 2))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            c = at(self._setpoint)
-            p.drawEllipse(c, 9.0, 9.0)
-        if self._spot is not None:  # cross: where it is
-            p.setPen(QPen(QColor("#3df25a"), 2))
-            c = at(self._spot)
-            p.drawLine(QPointF(c.x() - 7, c.y()), QPointF(c.x() + 7, c.y()))
-            p.drawLine(QPointF(c.x(), c.y() - 7), QPointF(c.x(), c.y() + 7))
 
 
 class StripChart(QWidget):
@@ -290,20 +232,18 @@ class _Relay(QObject):
     """Hands service / worker-thread results to the GUI thread."""
 
     telemetry = Signal(object)
-    thumb = Signal(object)
     fault = Signal(str)
     state = Signal(str)
     moved = Signal(object)
     started = Signal()
     startFailed = Signal(str)
+    previewStarted = Signal()
+    previewFailed = Signal(str)
     calibrated = Signal(object)
     calibrateFailed = Signal(str)
 
     def on_telemetry(self, msg: dict) -> None:
         self.telemetry.emit(msg)
-
-    def on_thumb(self, msg: dict) -> None:
-        self.thumb.emit(msg)
 
     def on_fault(self, reason: str) -> None:
         self.fault.emit(reason)
@@ -371,6 +311,9 @@ class SpotFocusPanel(QWidget):
         self._owner = _Owner()
         self._loading = False
         self._busy = ""  # "starting" / "calibrating" while a thread works
+        self._preview_busy = False  # a thread is opening the camera
+        self._sensor: tuple[int, int] | None = None  # known once the camera is open
+        self._drop_preview_after_run = False  # view closed while the lock ran
         self.state = "idle"
         self._telemetry: dict | None = None
         self._cal: SpotCalibration | None = None
@@ -397,8 +340,11 @@ class SpotFocusPanel(QWidget):
         self.calibration_label.setWordWrap(True)
 
         # -- views ---------------------------------------------------------
-        self.thumb_view = SpotThumbView()
         self.chart = StripChart()
+        self.live_view = SpotLiveView(parent=self)
+        self.live_view.roiDrawn.connect(self._on_roi_drawn)
+        self.live_view.windowClosed.connect(self._on_view_closed)
+        self.live_view.statsChanged.connect(self._on_view_stats)
 
         # -- readouts ------------------------------------------------------
         self.readout_labels: dict[str, QLabel] = {}
@@ -428,29 +374,20 @@ class SpotFocusPanel(QWidget):
         self.led_spin.setSpecialValueText("unchanged")
         self.led_spin.valueChanged.connect(self._set_led)
         form.addRow("LED", self.led_spin)
-        self.exposure_spin = self._spin(
-            0.05, 1000.0, 1.0, 2, " ms", "Camera exposure (applies at once)"
-        )
-        self.exposure_spin.valueChanged.connect(self._set_exposure)
-        form.addRow("Exposure", self.exposure_spin)
         params_group = QGroupBox("Parameters")
         params_group.setLayout(form)
+        camera_group = self._build_camera_group()
 
         # -- layout --------------------------------------------------------
-        top = QHBoxLayout()
-        top.addWidget(self.thumb_view, 1)
-        right = QVBoxLayout()
-        right.addLayout(readouts)
-        right.addStretch()
-        top.addLayout(right)
         box = QGroupBox("Spot focus lock")
         layout = QVBoxLayout(box)
         layout.addLayout(buttons)
         layout.addWidget(self.state_label)
         layout.addWidget(self.fault_label)
         layout.addWidget(self.calibration_label)
-        layout.addLayout(top)
-        layout.addWidget(self.chart)
+        layout.addWidget(camera_group)
+        layout.addWidget(self.chart, 1)
+        layout.addLayout(readouts)
         layout.addWidget(params_group)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -468,11 +405,12 @@ class SpotFocusPanel(QWidget):
 
         self._relay = _Relay(self)
         self._relay.telemetry.connect(self._on_telemetry)
-        self._relay.thumb.connect(self._on_thumb)
         self._relay.fault.connect(self._on_fault)
         self._relay.state.connect(self._on_state)
         self._relay.started.connect(self._on_started)
         self._relay.startFailed.connect(self._on_start_failed)
+        self._relay.previewStarted.connect(self._on_preview_started)
+        self._relay.previewFailed.connect(self._on_preview_failed)
         self._relay.calibrated.connect(self._on_calibrated)
         self._relay.calibrateFailed.connect(self._on_calibrate_failed)
 
@@ -484,6 +422,100 @@ class SpotFocusPanel(QWidget):
 
         self._set_state("idle")
         self.refresh()
+
+    def _build_camera_group(self) -> QGroupBox:
+        """The Camera section: SDK folder, Preview, exposure/gain/channel, ROI."""
+        self.sdk_edit = QLineEdit()
+        self.sdk_edit.setPlaceholderText("folder holding the vendor's toupcam.py")
+        self.sdk_edit.setToolTip(
+            "Folder with the ToupTek SDK's toupcam.py and its native library. "
+            "Empty uses the TOUPCAM_SDK_DIR environment variable."
+        )
+        self.sdk_edit.editingFinished.connect(self._set_sdk_dir)
+        self.browse_button = QPushButton("Browse...")
+        self.browse_button.clicked.connect(self._browse_sdk)
+        sdk_row = QHBoxLayout()
+        sdk_row.addWidget(self.sdk_edit, 1)
+        sdk_row.addWidget(self.browse_button)
+
+        self.camera_label = QLabel()
+        self.camera_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.camera_label.setWordWrap(True)
+
+        self.preview_button = QPushButton("Preview")
+        self.preview_button.setCheckable(True)
+        self.preview_button.setToolTip(
+            "Stream the camera into the Spot camera window (full resolution)"
+        )
+        self.preview_button.clicked.connect(self.set_preview)
+        self.show_view_button = QPushButton("Show view")
+        self.show_view_button.setToolTip("Bring the Spot camera window to the front")
+        self.show_view_button.clicked.connect(self._show_live_view)
+        self.camera_readout = QLabel("-")
+        preview_row = QHBoxLayout()
+        preview_row.addWidget(self.preview_button)
+        preview_row.addWidget(self.show_view_button)
+        preview_row.addWidget(self.camera_readout, 1)
+
+        self.exposure_spin = self._spin(
+            0.1, 15000.0, 1.0, 2, " ms", "Camera exposure (applies at once)"
+        )
+        self.exposure_spin.valueChanged.connect(self._set_exposure)
+        self.gain_spin = QSpinBox()
+        self.gain_spin.setRange(100, 5000)
+        self.gain_spin.setSingleStep(100)
+        self.gain_spin.setSuffix(" %")
+        self.gain_spin.setKeyboardTracking(False)
+        self.gain_spin.setToolTip("Camera gain, percent (100 = unity)")
+        self.gain_spin.valueChanged.connect(self._set_gain)
+        self.channel_combo = QComboBox()
+        self.channel_combo.addItems(["red", "sum"])
+        self.channel_combo.setToolTip(
+            "Bayer sites the spot is measured on: red only (the LED is 720 nm) "
+            "or the sum of all"
+        )
+        self.channel_combo.currentTextChanged.connect(self._set_channel)
+
+        self.roi_spins: dict[str, QSpinBox] = {}
+        roi_row = QHBoxLayout()
+        for name in ("x", "y", "w", "h"):
+            spin = QSpinBox()
+            spin.setRange(0, 16384)
+            spin.setSingleStep(2)
+            spin.setKeyboardTracking(False)
+            spin.setToolTip(f"ROI {name} in sensor pixels (even); 0 width = full frame")
+            self.roi_spins[name] = spin
+            roi_row.addWidget(QLabel(name))
+            roi_row.addWidget(spin)
+        self.apply_roi_button = QPushButton("Apply ROI")
+        self.apply_roi_button.clicked.connect(self.apply_roi)
+        self.full_frame_button = QPushButton("Full frame")
+        self.full_frame_button.clicked.connect(self.full_frame)
+        roi_buttons = QHBoxLayout()
+        roi_buttons.addWidget(self.apply_roi_button)
+        roi_buttons.addWidget(self.full_frame_button)
+        roi_buttons.addStretch()
+
+        grid = QGridLayout()
+        grid.addWidget(QLabel("Exposure"), 0, 0)
+        grid.addWidget(self.exposure_spin, 0, 1)
+        grid.addWidget(QLabel("Gain"), 0, 2)
+        grid.addWidget(self.gain_spin, 0, 3)
+        grid.addWidget(QLabel("Channel"), 0, 4)
+        grid.addWidget(self.channel_combo, 0, 5)
+        grid.setColumnStretch(6, 1)
+
+        group = QGroupBox("Camera")
+        lay = QVBoxLayout(group)
+        lay.addWidget(QLabel("SDK folder"))
+        lay.addLayout(sdk_row)
+        lay.addWidget(self.camera_label)
+        lay.addLayout(preview_row)
+        lay.addLayout(grid)
+        lay.addWidget(QLabel("ROI (sensor pixels)"))
+        lay.addLayout(roi_row)
+        lay.addLayout(roi_buttons)
+        return group
 
     @staticmethod
     def _spin(
@@ -524,14 +556,15 @@ class SpotFocusPanel(QWidget):
         owner = self._owner
         with owner.lock:
             svc = owner.service
-            if svc is not None and (owner.dead or owner.spec != spec):
+            if svc is not None and (
+                owner.dead or _rebuild_key(owner.spec) != _rebuild_key(spec)
+            ):
                 with suppress(Exception):
                     svc.shutdown()
                 svc = owner.service = None
             if svc is None:
                 svc = self._factory(spec, cfg.led_intensity)
                 svc.telemetry.connect(self._relay.on_telemetry)
-                svc.thumb_msg.connect(self._relay.on_thumb)
                 svc.fault.connect(self._relay.on_fault)
                 svc.state.connect(self._relay.on_state)
                 svc.moved.connect(self._relay.on_moved)
@@ -540,6 +573,9 @@ class SpotFocusPanel(QWidget):
 
     def shutdown(self) -> None:
         """Stop the loop (restoring CRISP) and end the worker process."""
+        self.live_view.set_service(None)
+        self.live_view.hide()
+        self.preview_button.setChecked(False)
         self._owner.shutdown()
         self._set_state("idle")
 
@@ -574,9 +610,16 @@ class SpotFocusPanel(QWidget):
                 spin.setValue(getattr(cfg.params, field))
             self.led_spin.setValue(cfg.led_intensity or 0.0)
             self.exposure_spin.setValue(cfg.exposure_ms)
+            self.gain_spin.setValue(cfg.gain)
+            self.channel_combo.setCurrentText(cfg.channel)
+            self.sdk_edit.setText(cfg.source.sdk_dir or "")
+            self._load_roi_spins(cfg.roi)
         finally:
             self._loading = False
         self._cal = cfg.to_calibration()
+        self.live_view.set_setpoint(
+            None if self._cal is None else (self._cal.x0, self._cal.y0)
+        )
         self._refresh_calibration()
         self._update_enabled()
 
@@ -612,13 +655,256 @@ class SpotFocusPanel(QWidget):
         SettingsV1.instance().spot_focus.led_intensity = value or None
         self._write()
 
+    def _apply_camera(self, **kwargs: Any) -> None:
+        """Send a live camera change to the worker (if there is one)."""
+        svc = self.service
+        if svc is None or self.state == "fault":
+            return
+        try:
+            svc.set_camera(**kwargs)
+        except Exception as err:
+            logger.warning("spot focus set_camera failed", exc_info=True)
+            self.fault_label.setText(_colored(f"Camera: {err}", ALERT_COLOR))
+
     def _set_exposure(self, value: float) -> None:
         if self._loading:
             return
         SettingsV1.instance().spot_focus.exposure_ms = value
         self._write()
-        if (svc := self.service) is not None and self.state != "fault":
-            svc.set_camera(exposure_ms=value)
+        self._apply_camera(exposure_ms=value)
+
+    def _set_gain(self, value: int) -> None:
+        if self._loading:
+            return
+        SettingsV1.instance().spot_focus.gain = int(value)
+        self._write()
+        self._apply_camera(gain=int(value))
+
+    def _set_channel(self, value: str) -> None:
+        if self._loading or value not in ("red", "sum"):
+            return
+        SettingsV1.instance().spot_focus.channel = value  # type: ignore[assignment]
+        self._write()
+        self._apply_camera(channel=value)
+
+    # -- SDK folder -----------------------------------------------------
+
+    def _set_sdk_dir(self) -> None:
+        if self._loading:
+            return
+        text = self.sdk_edit.text().strip()
+        cfg = SettingsV1.instance().spot_focus
+        if (text or None) == cfg.source.sdk_dir:
+            return
+        cfg.source.sdk_dir = text or None
+        self._write()
+        # A running camera keeps the old folder; the next Preview rebuilds.
+        if self.preview_button.isChecked() and self.state != "running":
+            self._stop_preview()
+
+    def _browse_sdk(self) -> None:
+        start = self.sdk_edit.text().strip() or str(Path.home())
+        folder = QFileDialog.getExistingDirectory(
+            self, "Folder with the ToupTek SDK (toupcam.py)", start
+        )
+        if folder:
+            self.sdk_edit.setText(folder)
+            self._set_sdk_dir()
+
+    # -- ROI -------------------------------------------------------------
+
+    def _load_roi_spins(self, roi: tuple[int, int, int, int] | None) -> None:
+        if roi is None:
+            sw, sh = self._sensor or (0, 0)
+            roi = (0, 0, sw, sh)
+        for spin, value in zip(self.roi_spins.values(), roi, strict=True):
+            spin.setValue(int(value))
+
+    def apply_roi(self) -> None:
+        """Apply the ROI spins (a zero width or height means full frame)."""
+        x, y, w, h = (spin.value() for spin in self.roi_spins.values())
+        x, y, w, h = x // 2 * 2, y // 2 * 2, w // 2 * 2, h // 2 * 2
+        if w <= 0 or h <= 0:
+            self.full_frame()
+            return
+        if self._sensor is not None:
+            sw, sh = self._sensor
+            x, y = min(x, sw - 2), min(y, sh - 2)
+            w, h = min(w, sw - x) // 2 * 2, min(h, sh - y) // 2 * 2
+        self._set_roi((x, y, w, h))
+
+    def full_frame(self) -> None:
+        """Use the whole sensor."""
+        self._set_roi(None)
+
+    def _set_roi(self, roi: tuple[int, int, int, int] | None) -> None:
+        if roi is not None and self._sensor is not None:
+            if roi == (0, 0, *self._sensor):
+                roi = None
+        SettingsV1.instance().spot_focus.roi = roi
+        self._write()
+        self._loading = True
+        try:
+            self._load_roi_spins(roi)
+        finally:
+            self._loading = False
+        self._apply_camera(roi=roi or (0, 0, 0, 0))
+
+    def _on_roi_drawn(self, x: int, y: int, w: int, h: int) -> None:
+        self._set_roi((x, y, w, h))
+
+    # -- camera info -----------------------------------------------------
+
+    def _apply_camera_info(self, info: dict) -> None:
+        """Show the camera and set the spin ranges from what it reported."""
+        if not info:
+            return
+        self._loading = True
+        try:
+            if rng := info.get("exposure_range_ms"):
+                self.exposure_spin.setRange(float(rng[0]), float(rng[1]))
+            if rng := info.get("gain_range"):
+                self.gain_spin.setRange(int(rng[0]), int(rng[1]))
+            sensor = info.get("sensor")
+            if sensor:
+                self._sensor = (int(sensor[0]), int(sensor[1]))
+                sw, sh = self._sensor
+                for name, limit in (("x", sw - 2), ("y", sh - 2), ("w", sw), ("h", sh)):
+                    self.roi_spins[name].setMaximum(limit)
+            cfg = SettingsV1.instance().spot_focus
+            self.exposure_spin.setValue(cfg.exposure_ms)
+            self.gain_spin.setValue(cfg.gain)
+            self._load_roi_spins(cfg.roi)
+        finally:
+            self._loading = False
+        parts = [str(info.get("model") or "camera")]
+        if info.get("serial"):
+            parts.append(f"serial {info['serial']}")
+        if sensor:
+            parts.append(f"{sensor[0]} x {sensor[1]}")
+        if info.get("bits"):
+            parts.append(f"{info['bits']}-bit")
+        self.camera_label.setText("  |  ".join(parts))
+
+    # -- preview ---------------------------------------------------------
+
+    def set_preview(self, on: bool) -> None:
+        """Turn the camera preview (and the live view window) on or off."""
+        if on:
+            self._start_preview()
+        else:
+            self._stop_preview()
+
+    def _start_preview(self) -> None:
+        if self._preview_busy:
+            return
+        if self.state == "running" and self.service is not None:
+            # The lock already streams frames; only the window is missing.
+            self.preview_button.setChecked(True)
+            self._drop_preview_after_run = False
+            self._show_live_view()
+            return
+        cfg = SettingsV1.instance().spot_focus
+        exposure, gain, channel = cfg.exposure_ms, cfg.gain, cfg.channel
+        roi = cfg.roi or (0, 0, 0, 0)
+        self.fault_label.setText("")
+        self._preview_busy = True
+        self.preview_button.setChecked(True)
+        self.preview_button.setEnabled(False)
+        self.camera_label.setText("opening the camera...")
+
+        def work() -> SpotFocusService:
+            svc = self._ensure_service()
+            deadline = time.monotonic() + _OPEN_TIMEOUT_S
+            while not svc.wait_ready(0.2):
+                if svc.current_state == "fault":
+                    raise RuntimeError("the camera could not be opened")
+                if time.monotonic() > deadline:
+                    raise RuntimeError("the camera did not become ready")
+            svc.set_camera(exposure_ms=exposure, gain=gain, roi=roi, channel=channel)
+            svc.start_preview()
+            return svc
+
+        self._run_async(
+            "preview",
+            work,
+            lambda _: self._relay.previewStarted.emit(),
+            self._relay.previewFailed.emit,
+        )
+
+    def _on_preview_started(self) -> None:
+        self._preview_busy = False
+        self.preview_button.setEnabled(True)
+        self.preview_button.setChecked(True)
+        svc = self.service
+        if svc is None:
+            return
+        if self.state == "fault":
+            self._set_state("idle")
+        self.fault_label.setText("")
+        self._apply_camera_info(self._camera_info(svc))
+        self.live_view.set_service(svc)
+        self._show_live_view()
+
+    def _on_preview_failed(self, message: str) -> None:
+        self._preview_busy = False
+        self.preview_button.setEnabled(True)
+        self.preview_button.setChecked(False)
+        self.camera_label.setText("no camera")
+        if self.state != "fault":  # a worker fault already says why
+            self.fault_label.setText(_colored(f"Camera: {message}", ALERT_COLOR))
+        self._owner.dead = True  # build a fresh service on the next Preview
+
+    def _stop_preview(self) -> None:
+        if self._preview_busy:
+            return
+        if self.state == "running" or self._busy == "starting":
+            # The lock needs the camera: leave it streaming.
+            self.preview_button.setChecked(True)
+            self.fault_label.setText(
+                _colored("Preview stays on while the lock runs.", ATTENTION_COLOR)
+            )
+            return
+        self.preview_button.setChecked(False)
+        svc = self.service
+        if svc is not None:
+            try:
+                svc.stop_preview()
+            except Exception:
+                logger.warning("spot focus stop_preview failed", exc_info=True)
+        self.live_view.hide()  # hide(), not close(): no windowClosed echo
+        self.live_view.clear()
+        self.camera_readout.setText("-")
+
+    def _show_live_view(self) -> None:
+        svc = self.service
+        if svc is None:
+            return
+        self.live_view.set_service(svc)
+        self.live_view.show()
+        self.live_view.raise_()
+        self.live_view.activateWindow()
+
+    def _on_view_closed(self) -> None:
+        """The user closed the Spot camera window."""
+        if self.state == "running" or self._busy == "starting":
+            self.preview_button.setChecked(False)
+            self._drop_preview_after_run = True  # stop streaming after Stop
+            return
+        self._stop_preview()
+
+    def _on_view_stats(self, fps: float, max_value: int, saturated_pct: float) -> None:
+        sat = f"{saturated_pct:.2f}% saturated"
+        if saturated_pct >= 1.0:
+            sat = _colored(sat, ATTENTION_COLOR)
+        else:
+            sat = html.escape(sat)
+        self.camera_readout.setText(f"{fps:.1f} fps | max {max_value} | {sat}")
+
+    @staticmethod
+    def _camera_info(svc: SpotFocusService) -> dict:
+        info = getattr(svc, "camera_info", None)
+        return dict(info) if info else dict(svc.info)
 
     # ------------------------------------------------------------------
     # state
@@ -646,6 +932,8 @@ class SpotFocusPanel(QWidget):
             self.start_button.setToolTip("Hold the spot at its setpoint until Stop")
 
     def _on_state(self, state: str) -> None:
+        if state == "preview":
+            return  # the camera streams; the lock itself is not running
         if state in ("running", "stopped", "fault", "idle"):
             self._set_state(state)
 
@@ -675,7 +963,8 @@ class SpotFocusPanel(QWidget):
             settings.flush()
             self.modeForced.emit()
         params = cfg.params.to_params()
-        exposure, gain, roi, led = cfg.exposure_ms, cfg.gain, cfg.roi, cfg.led_intensity
+        exposure, gain, led = cfg.exposure_ms, cfg.gain, cfg.led_intensity
+        roi, channel = cfg.roi or (0, 0, 0, 0), cfg.channel
         self.fault_label.setText("")
         self._telemetry = None
         self.chart.clear()
@@ -685,7 +974,7 @@ class SpotFocusPanel(QWidget):
         def work() -> None:
             svc = self._ensure_service()
             svc.wait_ready()
-            svc.set_camera(exposure_ms=exposure, gain=gain, roi=roi)
+            svc.set_camera(exposure_ms=exposure, gain=gain, roi=roi, channel=channel)
             svc.start(params, cal, led)
 
         self._run_async(
@@ -698,6 +987,10 @@ class SpotFocusPanel(QWidget):
     def _on_started(self) -> None:
         self._busy = ""
         svc = self.service
+        if svc is not None:
+            self.live_view.set_service(svc)
+            if self.live_view.isVisible():
+                self.preview_button.setChecked(True)
         # The service's own state signals may have beaten us here.
         self._set_state(svc.current_state if svc is not None else "idle")
         if self.state not in ("running", "fault"):
@@ -723,6 +1016,9 @@ class SpotFocusPanel(QWidget):
             self.fault_label.text() if self.state != "fault" else ""
         )
         self._set_state("stopped")
+        if self._drop_preview_after_run:
+            self._drop_preview_after_run = False
+            self._stop_preview()
 
     # ------------------------------------------------------------------
     # calibrate
@@ -740,7 +1036,12 @@ class SpotFocusPanel(QWidget):
             svc = self._ensure_service()
             cfg = SettingsV1.instance().spot_focus
             svc.wait_ready()
-            svc.set_camera(exposure_ms=cfg.exposure_ms, gain=cfg.gain, roi=cfg.roi)
+            svc.set_camera(
+                exposure_ms=cfg.exposure_ms,
+                gain=cfg.gain,
+                roi=cfg.roi or (0, 0, 0, 0),
+                channel=cfg.channel,
+            )
             return svc.calibrate()
 
         self._run_async(
@@ -756,6 +1057,7 @@ class SpotFocusPanel(QWidget):
         settings.spot_focus.calibration = cal.to_dict()
         settings.flush()
         self._cal = cal
+        self.live_view.set_setpoint((cal.x0, cal.y0))
         self._refresh_calibration()
         self._set_state(self.state)
 
@@ -783,18 +1085,6 @@ class SpotFocusPanel(QWidget):
         labels["error"].setText("-" if along is None else f"{along:+.3f} µm")
         labels["lateral"].setText("-" if lateral is None else f"{lateral:+.2f} px")
         labels["fps"].setText(f"{msg.get('fps') or 0.0:.1f}")
-
-    def _on_thumb(self, msg: dict) -> None:
-        x0, y0, k = msg["x0"], msg["y0"], msg.get("scale", 1.0)
-
-        def place(pt: tuple[float, float] | None) -> tuple[float, float] | None:
-            return None if pt is None else ((pt[0] - x0) * k, (pt[1] - y0) * k)
-
-        # Before Start the worker has no calibration yet; use the saved one.
-        setpoint = msg.get("setpoint")
-        if setpoint is None and self._cal is not None:
-            setpoint = (self._cal.x0, self._cal.y0)
-        self.thumb_view.set_thumb(msg["image"], place(msg.get("spot")), place(setpoint))
 
     def _refresh_stats(self) -> None:
         svc = self.service

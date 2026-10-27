@@ -52,10 +52,24 @@ class FrameSource(Protocol):
         """Set the analogue gain in percent (100 = 1x)."""
 
     def set_roi(self, x: int, y: int, w: int, h: int) -> None:
-        """Restrict readout to a hardware ROI in full-sensor pixels."""
+        """Restrict readout to a hardware ROI in full-sensor pixels.
+
+        ``(0, 0, 0, 0)`` clears the ROI (full frame).
+        """
+
+    def exposure_range_ms(self) -> tuple[float, float]:
+        """Return the camera's ``(min, max)`` exposure time in milliseconds."""
+
+    def gain_range(self) -> tuple[int, int]:
+        """Return the camera's ``(min, max)`` analogue gain in percent."""
 
     def info(self) -> dict[str, Any]:
-        """Return a small dict describing the source (model, size, ROI, ...)."""
+        """Return a dict describing the source.
+
+        Keys: ``kind, model, serial, sensor`` (full ``(W, H)``), ``size`` and
+        ``roi`` (``(x, y, w, h)`` of the current frames in sensor pixels),
+        ``bits``, ``exposure_ms``, ``gain``.
+        """
 
     def set_actuator_um(self, p: float) -> None:
         """Tell the source the commanded piezo P. No-op for real cameras."""
@@ -107,10 +121,14 @@ class ToupcamSource:
         self._buf: bytes = b""
         self._dtype: type[np.unsignedinteger] = np.uint16
         self._bits = 16
-        self._size = (0, 0)
+        self._size = (0, 0)  # size of the frames now (the ROI, or the sensor)
+        self._sensor = (0, 0)  # full sensor, from get_Size
         self._roi = (0, 0, 0, 0)
         self._exposure_ms = 10.0
         self._gain = 100
+        self._exp_range_ms = (0.1, 15000.0)
+        self._gain_range = (100, 5000)
+        self._camid = ""
 
     # -- helpers -----------------------------------------------------------
 
@@ -121,28 +139,45 @@ class ToupcamSource:
     def _alloc(self) -> None:
         # In RAW mode PullImage ignores its ``bits`` argument: the sample depth
         # comes from OPTION_BITDEPTH (set in open) and the frame is the ROI.
-        _x, _y, w, h = self._cam.get_Roi()
+        # get_Roi returns zeros when no ROI is set (full frame).
+        x, y, w, h = self._cam.get_Roi()
         if not (w and h):
-            w, h = self._cam.get_Size()
+            x = y = 0
+            w, h = self._sensor
         bits = int(self._cam.get_RawFormat()[1])
         self._bits = bits
         self._dtype = np.uint8 if bits <= 8 else np.uint16
         self._size = (w, h)
-        self._buf = bytes(w * h * np.dtype(self._dtype).itemsize)
+        self._roi = (x, y, w, h)
+        # The buffer always holds the full sensor. The SDK callback runs on its
+        # own thread and may pull a frame between put_Roi and this call; a
+        # buffer sized for the old, smaller ROI would be overrun.
+        sw, sh = self._sensor
+        self._buf = bytes(sw * sh * np.dtype(self._dtype).itemsize)
 
     def _on_event(self, event: int, _ctx: Any) -> None:
         """SDK callback (SDK thread): pull the newest frame into the 1-slot buffer."""
         if event != self._const("EVENT_IMAGE") or self._cam is None:
             return
         with self._lock:
+            info_cls = getattr(
+                self._sdk, f"{self._sdk._spot_prefix.capitalize()}FrameInfoV2", None
+            )
+            info = info_cls() if info_cls is not None else None
             try:
-                self._cam.PullImageV2(self._buf, 0, None)  # bits ignored in RAW
+                self._cam.PullImageV2(self._buf, 0, info)  # bits ignored in RAW
             except Exception:
                 logger.exception("PullImageV2 failed")
                 return
             w, h = self._size
-            frame = np.frombuffer(self._buf, dtype=self._dtype).reshape(h, w).copy()
-            self._frame = (frame, time.monotonic())
+            # The SDK reports the size of the frame it just wrote; trust that
+            # over our own bookkeeping, which can lag a ROI change.
+            iw, ih = int(getattr(info, "width", 0)), int(getattr(info, "height", 0))
+            if iw > 0 and ih > 0:
+                w, h = iw, ih
+            n = w * h
+            frame = np.frombuffer(self._buf, dtype=self._dtype, count=n)
+            self._frame = (frame.reshape(h, w).copy(), time.monotonic())
         self._new.set()
 
     # -- FrameSource -------------------------------------------------------
@@ -161,6 +196,7 @@ class ToupcamSource:
             )
         dev = devices[0]
         self._model = getattr(dev, "displayname", "") or ""
+        self._camid = str(getattr(dev, "id", "") or "")
         cam = cls.Open(dev.id)
         if cam is None:
             raise RuntimeError(f"Open({dev.id}) failed")
@@ -177,10 +213,13 @@ class ToupcamSource:
                     exc_info=True,
                 )
             cam.put_AutoExpoEnable(0)
+            self._sensor = tuple(int(v) for v in cam.get_Size())  # type: ignore[assignment]
+            self._read_ranges()
+            self._exposure_ms = self._clamp_exposure(self._exposure_ms)
+            self._gain = self._clamp_gain(self._gain)
             cam.put_ExpoTime(int(self._exposure_ms * 1000))  # microseconds
             cam.put_ExpoAGain(int(self._gain))  # percent
             self._alloc()
-            self._roi = (0, 0, *self._size)
             cam.StartPullModeWithCallback(self._on_event, self)
         except BaseException:
             self._cam = None
@@ -189,6 +228,29 @@ class ToupcamSource:
             except Exception:
                 logger.exception("Closing the camera after a failed open failed")
             raise
+
+    def _read_ranges(self) -> None:
+        """Read the exposure and gain limits (microseconds / percent)."""
+        try:
+            lo, hi, _default = self._cam.get_ExpTimeRange()
+            self._exp_range_ms = (lo / 1000.0, hi / 1000.0)
+            glo, ghi, _gd = self._cam.get_ExpoAGainRange()
+            self._gain_range = (int(glo), int(ghi))
+        except Exception:
+            logger.warning(
+                "could not read the exposure/gain range; using %s ms, %s",
+                self._exp_range_ms,
+                self._gain_range,
+                exc_info=True,
+            )
+
+    def _clamp_exposure(self, ms: float) -> float:
+        lo, hi = self._exp_range_ms
+        return min(max(float(ms), lo), hi)
+
+    def _clamp_gain(self, gain: int) -> int:
+        lo, hi = self._gain_range
+        return min(max(int(gain), lo), hi)
 
     def close(self) -> None:
         """Stop the camera; safe to call twice."""
@@ -211,37 +273,62 @@ class ToupcamSource:
         return out
 
     def set_exposure_ms(self, ms: float) -> None:
-        """Set exposure in ms (SDK takes microseconds)."""
-        self._exposure_ms = float(ms)
+        """Set exposure in ms (SDK takes microseconds); clamped to the range."""
+        self._exposure_ms = self._clamp_exposure(ms)
         if self._cam is not None:
-            self._cam.put_ExpoTime(int(ms * 1000))
+            self._cam.put_ExpoTime(int(self._exposure_ms * 1000))
 
     def set_gain(self, gain: int) -> None:
-        """Set analogue gain in percent."""
-        self._gain = int(gain)
+        """Set analogue gain in percent; clamped to the range."""
+        self._gain = self._clamp_gain(gain)
         if self._cam is not None:
-            self._cam.put_ExpoAGain(int(gain))
+            self._cam.put_ExpoAGain(self._gain)
+
+    def exposure_range_ms(self) -> tuple[float, float]:
+        """The camera's ``(min, max)`` exposure in ms (``get_ExpTimeRange``)."""
+        return self._exp_range_ms
+
+    def gain_range(self) -> tuple[int, int]:
+        """The camera's ``(min, max)`` gain in percent (``get_ExpoAGainRange``)."""
+        return self._gain_range
 
     def set_roi(self, x: int, y: int, w: int, h: int) -> None:
-        """Set the hardware ROI; the SDK wants even offsets and sizes."""
+        """Set the hardware ROI; ``(0, 0, 0, 0)`` clears it (full frame).
+
+        The SDK wants even offsets and sizes (at least 8), relative to the full
+        sensor. The request is clamped to the sensor.
+        """
         if self._cam is None:
             raise RuntimeError("set_roi before open()")
-        x, y, w, h = (int(v) // 2 * 2 for v in (x, y, w, h))
+        sw, sh = self._sensor
+        if not (int(w) > 0 and int(h) > 0):
+            x = y = w = h = 0
+        else:
+            w = max(8, min(int(w) // 2 * 2, sw // 2 * 2))
+            h = max(8, min(int(h) // 2 * 2, sh // 2 * 2))
+            x = max(0, min(int(x) // 2 * 2, (sw - w) // 2 * 2))
+            y = max(0, min(int(y) // 2 * 2, (sh - h) // 2 * 2))
+            if (x, y, w, h) == (0, 0, sw, sh):
+                w = h = 0  # the whole sensor is "no ROI"
         # Not under self._lock: put_Roi waits for a running callback to end, and
         # the callback takes self._lock (deadlock per the SDK docs).
         self._cam.put_Roi(x, y, w, h)
         with self._lock:
-            self._alloc()
-            self._roi = (x, y, w, h)
+            self._alloc()  # reads the ROI back, so the camera's rounding wins
             self._frame = None
         self._new.clear()
 
     def info(self) -> dict[str, Any]:
-        """Describe the camera; ``roi`` is ``(x, y, w, h)`` of the frames."""
+        """Describe the camera.
+
+        ``sensor`` is the full ``(W, H)``; ``roi`` is ``(x, y, w, h)`` of the
+        frames in sensor pixels (the whole sensor when no ROI is set).
+        """
         return {
             "kind": "toupcam",
             "model": self._model,
-            "serial": self.serial,
+            "serial": self.serial or self._camid,
+            "sensor": self._sensor,
             "size": self._size,
             "roi": self._roi,
             "bits": self._bits,
@@ -266,7 +353,11 @@ class FakeSpotSource:
     the setpoint. *cal_like* is a plain dict with ``x0, y0, ux, uy,
     slope_px_per_um`` and ``p0_um`` (a ``SpotCalibration.to_dict()`` works).
     ``lateral_px_per_s`` drifts the spot perpendicular to ``u``, which focus
-    cannot cancel. Drift accrues from :meth:`open`.
+    cannot cancel. Drift accrues from :meth:`open`. ``shape`` is the full
+    sensor ``(rows, cols)``; the spot is placed in sensor pixels and the ROI
+    crops the rendered frames, as on the real camera. The spot's amplitude
+    scales with exposure (relative to 10 ms) and gain (relative to 100 %), so
+    exposure and gain behave like a camera's in the live view.
     """
 
     def __init__(
@@ -280,6 +371,7 @@ class FakeSpotSource:
         lateral_px_per_s: float = 0.0,
         seed: int = 0,
         fps: float = 50.0,
+        bits: int = 16,
     ) -> None:
         self.cal = dict(cal_like)
         self.drift_um_per_s = drift_um_per_s
@@ -289,7 +381,8 @@ class FakeSpotSource:
         self.shape = (int(shape[0]), int(shape[1]))
         self.lateral_px_per_s = lateral_px_per_s
         self.fps = fps
-        self.offset = 100.0  # camera pedestal, counts
+        self.bits = int(bits)
+        self.offset = 100.0 if self.bits > 8 else 10.0  # camera pedestal, counts
         self._rng = np.random.default_rng(seed)
         self._p = float(self.cal.get("p0_um", 0.0))
         self._t0: float | None = None
@@ -319,17 +412,20 @@ class FakeSpotSource:
         rows, cols = self.shape
         img = np.full((rows, cols), self.offset, dtype=np.float64)
         s = self.sigma_px
+        scale = (self._exposure_ms / 10.0) * (self._gain / 100.0)
         r0, r1 = max(int(sy - 6 * s), 0), min(int(sy + 6 * s) + 2, rows)
         c0, c1 = max(int(sx - 6 * s), 0), min(int(sx + 6 * s) + 2, cols)
         if r1 > r0 and c1 > c0:
             gy = np.exp(-((np.arange(r0, r1) - sy) ** 2) / (2 * s**2))
             gx = np.exp(-((np.arange(c0, c1) - sx) ** 2) / (2 * s**2))
-            img[r0:r1, c0:c1] += self.amplitude * np.outer(gy, gx)
+            img[r0:r1, c0:c1] += self.amplitude * scale * np.outer(gy, gx)
         if self.noise > 0:
             img += self._rng.normal(0.0, self.noise, img.shape)
         x, y, w, h = self._roi
         img = img[y : y + h, x : x + w]
-        return np.clip(np.rint(img), 0, 65535).astype(np.uint16)
+        top = (1 << self.bits) - 1
+        dtype = np.uint8 if self.bits <= 8 else np.uint16
+        return np.clip(np.rint(img), 0, top).astype(dtype)
 
     # -- FrameSource -------------------------------------------------------
 
@@ -357,24 +453,49 @@ class FakeSpotSource:
         return self.render(stamp - self._t0), stamp
 
     def set_exposure_ms(self, ms: float) -> None:
-        """Stored only."""
-        self._exposure_ms = float(ms)
+        """Set the exposure, clamped to :meth:`exposure_range_ms`."""
+        lo, hi = self.exposure_range_ms()
+        self._exposure_ms = min(max(float(ms), lo), hi)
 
     def set_gain(self, gain: int) -> None:
-        """Stored only."""
-        self._gain = int(gain)
+        """Set the gain, clamped to :meth:`gain_range`."""
+        lo, hi = self.gain_range()
+        self._gain = min(max(int(gain), lo), hi)
 
     def set_roi(self, x: int, y: int, w: int, h: int) -> None:
-        """Crop the rendered frames to the ROI (full-sensor pixels)."""
-        self._roi = (int(x), int(y), int(w), int(h))
+        """Crop the rendered frames to the ROI (full-sensor pixels).
+
+        ``(0, 0, 0, 0)`` clears it. Like the camera: even values, clamped to the
+        sensor.
+        """
+        rows, cols = self.shape
+        if not (int(w) > 0 and int(h) > 0):
+            self._roi = (0, 0, cols, rows)
+            return
+        w = max(8, min(int(w) // 2 * 2, cols // 2 * 2))
+        h = max(8, min(int(h) // 2 * 2, rows // 2 * 2))
+        x = max(0, min(int(x) // 2 * 2, (cols - w) // 2 * 2))
+        y = max(0, min(int(y) // 2 * 2, (rows - h) // 2 * 2))
+        self._roi = (x, y, w, h)
+
+    def exposure_range_ms(self) -> tuple[float, float]:
+        """The rig camera's exposure range, 0.105 ms to 15 s."""
+        return (0.105, 15000.0)
+
+    def gain_range(self) -> tuple[int, int]:
+        """The rig camera's gain range, 100 to 5000 percent."""
+        return (100, 5000)
 
     def info(self) -> dict[str, Any]:
         """Describe the fake; ``roi`` is ``(x, y, w, h)`` of the frames."""
         return {
             "kind": "fake",
             "model": "FakeSpotSource",
-            "size": (self.shape[1], self.shape[0]),
+            "serial": "FAKE-0001",
+            "sensor": (self.shape[1], self.shape[0]),
+            "size": (self._roi[2], self._roi[3]),
             "roi": self._roi,
+            "bits": self.bits,
             "exposure_ms": self._exposure_ms,
             "gain": self._gain,
         }

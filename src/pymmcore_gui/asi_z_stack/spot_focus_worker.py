@@ -12,21 +12,29 @@ code itself uses neither Qt nor pymmcore and creates no QApplication).
 
 Wire protocol: two one-way :func:`multiprocessing.Pipe` s (commands in, events
 out; see :class:`Link`); every message is a ``dict`` with a ``"type"``.
-Main to worker: ``start``, ``stop``, ``update_params``, ``set_camera``,
-``measure``, ``moved``, ``shutdown``. Worker to main: ``ready``, ``move``,
-``telemetry``, ``thumb``, ``fault``, ``status``, ``measurement``, ``error``.
+Main to worker: ``start``, ``stop``, ``preview_start``, ``preview_stop``,
+``update_params``, ``set_camera``, ``measure``, ``moved``, ``shutdown``.
+Worker to main: ``ready``, ``move``, ``telemetry``, ``camera``, ``fault``,
+``status``, ``measurement``, ``error``.
+
+Frames never travel on the pipe: while previewing, running or measuring every
+frame goes to a shared-memory slot (:mod:`.spot_frame_shm`) whose name is in
+the ``ready`` info. **All spot positions are in sensor pixels**: the ROI offset
+is added to every fit, so a calibration survives ROI changes.
 
 The loop exits on ``shutdown`` or when the pipe closes (the parent died), so no
 orphan process is left behind.
 
 The control loop never blocks on output: :class:`_Outbox` sends from its own
-thread. A Windows pipe holds only a few kB, so a synchronous send of telemetry or
-a 16 kB thumbnail stalls as soon as the main process reads late, and the loop
-then misses ``shutdown`` (seen on the rig PC, 2026-10-27).
+thread. A Windows pipe holds only a few kB, so a synchronous send of telemetry
+stalls as soon as the main process reads late, and the loop then misses
+``shutdown`` (seen on the rig PC, 2026-10-27).
 """
 
 from __future__ import annotations
 
+import dataclasses
+import logging
 import math
 import threading
 import time
@@ -37,18 +45,62 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from multiprocessing.connection import Connection
 
-#: Frames discarded right after a move is acknowledged (camera pipeline latency).
-SETTLE_FRAMES = 2
+logger = logging.getLogger(__name__)
+
+#: After a move acknowledgement or a camera change the camera delivers stale
+#: frames. Ignore frames until at least this many have arrived ...
+SETTLE_MIN_FRAMES = 4
+#: ... and until max(2 * exposure + 1 / fps, SETTLE_MIN_S) seconds have passed.
+SETTLE_MIN_S = 0.05
 #: A move the main process has not acknowledged for this long is a fault.
 MOVE_ACK_TIMEOUT_S = 10.0
-#: Running with no new frame for this long is a fault (camera stalled).
+#: Running with no new frame for this long is a fault (camera stalled); the
+#: limit grows with the exposure (see ``_Worker.no_frame_limit_s``).
 NO_FRAME_TIMEOUT_S = 3.0
-#: Telemetry and thumbnail periods.
+#: Telemetry period.
 TELEMETRY_PERIOD_S = 0.1
-THUMB_PERIOD_S = 0.2
-THUMB_MAX = 128
+#: In preview the spot is fitted for the overlay at most this often (5 Hz).
+PREVIEW_FIT_PERIOD_S = 0.2
+#: A fit older than this is not drawn on a newer frame.
+SPOT_MAX_AGE_S = 0.5
 #: Per-poll wait for a frame, which also paces the loop.
 FRAME_WAIT_S = 0.05
+#: Camera channels ``set_camera`` accepts.
+CHANNELS = ("sum", "red")
+
+
+def settle_time_s(exposure_ms: float, fps: float) -> float:
+    """Seconds to wait after a change: ``max(2 * exposure + 1 / fps, 0.05)``."""
+    frame_s = 1.0 / fps if fps > 0 else 0.0
+    return max(2.0 * exposure_ms / 1000.0 + frame_s, SETTLE_MIN_S)
+
+
+class Settle:
+    """Decides which frames to ignore after a move ack or a camera change.
+
+    A frame is usable only when more than :data:`SETTLE_MIN_FRAMES` frames have
+    arrived since :meth:`arm` (so the first four are ignored) **and**
+    :func:`settle_time_s` has elapsed since :meth:`arm`. Replaces the old
+    fixed count of two frames, which was shorter than the camera's pipeline.
+    """
+
+    def __init__(self) -> None:
+        self.seen = SETTLE_MIN_FRAMES + 1
+        self.until = 0.0
+
+    def arm(self, now: float, exposure_ms: float, fps: float) -> None:
+        """Start a settle period at *now*."""
+        self.seen = 0
+        self.until = now + settle_time_s(exposure_ms, fps)
+
+    def frame(self, now: float) -> bool:
+        """Count a frame that arrived at *now*; True if it may be used."""
+        self.seen += 1
+        return self.seen > SETTLE_MIN_FRAMES and now >= self.until
+
+    def remaining_s(self, now: float) -> float:
+        """Seconds of the time criterion left (0 once it has passed)."""
+        return max(self.until - now, 0.0)
 
 
 # --------------------------------------------------------------------------
@@ -115,11 +167,11 @@ class _Outbox:
     """Sends the worker's messages from its own thread.
 
     Control messages (``move``, ``fault``, ``status`` ...) queue in order and are
-    never dropped. ``telemetry`` and ``thumb`` keep only the newest of each, so
-    a slow reader costs stale telemetry, never a stalled control loop.
+    never dropped. ``telemetry`` keeps only the newest, so a slow reader costs
+    stale telemetry, never a stalled control loop.
     """
 
-    _LATEST = ("telemetry", "thumb")
+    _LATEST = ("telemetry",)
 
     def __init__(self, link: Link, on_broken: Any) -> None:
         self._link = link
@@ -187,51 +239,6 @@ def _cal_from(obj: Any) -> Any:
     return obj if isinstance(obj, SpotCalibration) else SpotCalibration.from_dict(obj)
 
 
-def _thumb_origin(shape: Any, x: float, y: float) -> tuple[int, int]:
-    """Top-left ``(x0, y0)`` of the thumbnail window around (x, y), kept in frame."""
-    h, w = shape[:2]
-    half = THUMB_MAX // 2
-    cx = round(min(max(x, 0.0), w - 1.0))
-    cy = round(min(max(y, 0.0), h - 1.0))
-    return (
-        max(0, min(cx - half, w - THUMB_MAX)),
-        max(0, min(cy - half, h - THUMB_MAX)),
-    )
-
-
-def _thumb(frame: Any, x: float, y: float) -> Any:
-    """Return a uint8 crop (at most 128x128) of *frame* around (x, y)."""
-    import numpy as np
-
-    x0, y0 = _thumb_origin(frame.shape, x, y)
-    crop = np.asarray(frame[y0 : y0 + THUMB_MAX, x0 : x0 + THUMB_MAX], dtype=np.float32)
-    lo, hi = float(crop.min()), float(crop.max())
-    if hi <= lo:
-        return np.zeros(crop.shape, dtype=np.uint8)
-    return ((crop - lo) * (255.0 / (hi - lo))).astype(np.uint8)
-
-
-def thumb_message(frame: Any, x: float, y: float, cal: Any = None) -> dict:
-    """The ``thumb`` message: the crop, where it came from and the markers.
-
-    ``x0, y0`` is the crop's top-left in frame pixels and ``scale`` the
-    thumbnail pixels per frame pixel (the crop is not resampled, so 1.0).
-    ``spot`` is the fitted spot and ``setpoint`` the calibrated setpoint
-    (``None`` without a calibration), both in frame pixels. A marker's place in
-    the thumbnail is ``(px - x0) * scale``.
-    """
-    x0, y0 = _thumb_origin(frame.shape, x, y)
-    return {
-        "type": "thumb",
-        "image": _thumb(frame, x, y),
-        "x0": x0,
-        "y0": y0,
-        "scale": 1.0,
-        "spot": (float(x), float(y)),
-        "setpoint": None if cal is None else (float(cal.x0), float(cal.y0)),
-    }
-
-
 class _Worker:
     """The state of one worker process (single thread, one pipe)."""
 
@@ -248,6 +255,7 @@ class _Worker:
         self.spec = spec
         self.source: Any = None
         self.running = False
+        self.preview = False
         self.state = "idle"
         self.exit = False
 
@@ -258,19 +266,30 @@ class _Worker:
         self.seq = 0
         self.inflight: int | None = None
         self.inflight_since = 0.0
-        self.skip = 0
+        self.settle = Settle()
+
+        # Camera state, mirrored from ``source.info()`` after every change.
+        self.sensor: tuple[int, int] = (0, 0)
+        self.roi: tuple[int, int, int, int] = (0, 0, 0, 0)
+        self.bits = 8
+        self.exposure_ms = 10.0
+        self.gain = 100
+        self.shm: Any = None
 
         self.last_ts: float | None = None
         self.last_frame_wall = time.monotonic()
         self.fps = 0.0
         self.last_fix: Any = None
-        self._frame: Any = None
+        self.fix_time = -math.inf
+        self.t_fit = -math.inf
         self.last_along: float | None = None
         self.last_lateral: float | None = None
+        self.last_max = 0
+        self.last_sat_frac = 0.0
         self.t_telemetry = 0.0
-        self.t_thumb = 0.0
         self.p_cmd: float | None = None
         self.n_moves = 0
+        self._shm_warned = False
 
     # -- io ---------------------------------------------------------------
 
@@ -293,12 +312,57 @@ class _Worker:
         self.set_state("fault")
         self.send({"type": "fault", "reason": reason})
 
+    def error(self, message: str) -> None:
+        self.send(
+            {"type": "error", "message": message, "traceback": traceback.format_exc()}
+        )
+
+    # -- camera -----------------------------------------------------------
+
+    def refresh_camera(self) -> dict[str, Any]:
+        """Re-read the source's state; return the full camera info dict."""
+        info = dict(self.source.info())
+        size = info.get("size") or (0, 0)
+        sensor = info.get("sensor") or size
+        self.sensor = (int(sensor[0]), int(sensor[1]))
+        roi = info.get("roi") or (0, 0, *self.sensor)
+        self.roi = tuple(int(v) for v in roi)  # type: ignore[assignment]
+        bits = info.get("bits")
+        self.bits = int(bits) if bits else 16
+        self.saturation = (1 << self.bits) - 1
+        self.exposure_ms = float(info.get("exposure_ms", self.exposure_ms))
+        self.gain = int(info.get("gain", self.gain))
+        exp_range = getattr(self.source, "exposure_range_ms", None)
+        gain_range = getattr(self.source, "gain_range", None)
+        info.update(
+            sensor=self.sensor,
+            roi=self.roi,
+            bits=self.bits,
+            exposure_ms=self.exposure_ms,
+            gain=self.gain,
+            exposure_range_ms=tuple(exp_range()) if exp_range else None,
+            gain_range=tuple(gain_range()) if gain_range else None,
+            channel=self.analysis.get("channel", "sum"),
+        )
+        return info
+
+    def arm_settle(self, now: float | None = None) -> None:
+        """Ignore frames until the camera has caught up with a change."""
+        self.settle.arm(
+            time.monotonic() if now is None else now, self.exposure_ms, self.fps
+        )
+
+    def no_frame_limit_s(self) -> float:
+        """How long running may go without a frame before it is a fault."""
+        return max(NO_FRAME_TIMEOUT_S, 3.0 * self.exposure_ms / 1000.0 + 2.0)
+
     # -- measurement ------------------------------------------------------
 
-    def locate(self, frame: Any, min_amplitude: float = 0.0) -> Any:
+    def locate(self, frame: Any, roi: Any, min_amplitude: float = 0.0) -> Any:
+        """Fit the spot; the result is in sensor pixels (the ROI offset added)."""
         from .spot_focus import locate_spot
 
-        return locate_spot(
+        fix = locate_spot(
             frame,
             roi_half=int(self.analysis.get("roi_half", 50)),
             channel=self.analysis.get("channel", "sum"),
@@ -306,6 +370,59 @@ class _Worker:
             saturation=self.analysis.get("saturation", self.saturation),
             min_amplitude=min_amplitude,
         )
+        ox, oy = roi[0], roi[1]
+        if ox or oy:
+            fix = dataclasses.replace(fix, x=fix.x + ox, y=fix.y + oy)
+        return fix
+
+    def frame_roi(self, frame: Any) -> tuple[int, int, int, int] | None:
+        """The sensor ROI of *frame*, or None if it is stale.
+
+        A frame pulled just before an ROI change has the old shape; it is
+        dropped rather than drawn at the new offset.
+        """
+        h, w = frame.shape[:2]
+        if (self.roi[3], self.roi[2]) != (h, w):
+            try:
+                self.refresh_camera()
+            except Exception:
+                logger.exception("could not read the camera state")
+            if (self.roi[3], self.roi[2]) != (h, w):
+                return None
+        return self.roi
+
+    def write_frame(self, frame: Any, ts: float, roi: Any, now: float) -> None:
+        """Put *frame* in the shared slot with the newest fit as its overlay."""
+        import numpy as np
+
+        if self.shm is None:
+            return
+        top = self.saturation if self.saturation else int(np.iinfo(frame.dtype).max)
+        self.last_max = int(frame.max())
+        self.last_sat_frac = float(np.count_nonzero(frame >= top)) / frame.size
+        fix = self.last_fix
+        spot = None
+        ok = False
+        if fix is not None and now - self.fix_time <= SPOT_MAX_AGE_S:
+            if math.isfinite(fix.x) and math.isfinite(fix.y):
+                spot = (fix.x, fix.y)
+                ok = bool(fix.ok)
+        try:
+            self.shm.write(
+                frame,
+                t=ts,
+                roi=roi,
+                sensor=self.sensor,
+                bits=self.bits,
+                spot=spot,
+                spot_ok=ok,
+                saturated_frac=self.last_sat_frac,
+                max_value=self.last_max,
+            )
+        except Exception:
+            if not self._shm_warned:
+                self._shm_warned = True
+                logger.exception("could not write a frame to the shared buffer")
 
     # -- messages ---------------------------------------------------------
 
@@ -319,7 +436,16 @@ class _Worker:
             self.running = False
             self.inflight = None
             if self.state != "fault":
-                self.set_state("stopped")
+                self.set_state("preview" if self.preview else "stopped")
+        elif kind == "preview_start":
+            self.preview = True
+            self.t_fit = -math.inf
+            if not self.running and self.state != "fault":
+                self.set_state("preview")
+        elif kind == "preview_stop":
+            self.preview = False
+            if not self.running and self.state == "preview":
+                self.set_state("idle")
         elif kind == "update_params":
             self.on_update_params(msg)
         elif kind == "set_camera":
@@ -340,7 +466,6 @@ class _Worker:
         self.n_moves = 0
         self.window.clear()
         self.inflight = None
-        self.skip = 0
         self.last_along = self.last_lateral = None
         self.source.set_actuator_um(p_start)
         self.last_frame_wall = time.monotonic()
@@ -353,21 +478,48 @@ class _Worker:
             self.ctl.params = self.params
 
     def on_set_camera(self, msg: dict) -> None:
+        """Apply exposure, gain, channel and ROI now; an ROI of zeros is full frame."""
+        changed = False
         try:
+            if msg.get("channel") is not None:
+                channel = str(msg["channel"])
+                if channel not in CHANNELS:
+                    raise ValueError(
+                        f"channel must be one of {CHANNELS}, not {channel!r}"
+                    )
+                if self.analysis.get("channel", "sum") != channel:
+                    self.analysis["channel"] = channel
+                    changed = True
             if msg.get("exposure_ms") is not None:
                 self.source.set_exposure_ms(float(msg["exposure_ms"]))
+                changed = True
             if msg.get("gain") is not None:
                 self.source.set_gain(int(msg["gain"]))
+                changed = True
             if msg.get("roi") is not None:
-                self.source.set_roi(*[int(v) for v in msg["roi"]])
+                roi = [int(v) for v in msg["roi"]]
+                if len(roi) != 4:
+                    raise ValueError(f"roi must be (x, y, w, h), not {msg['roi']!r}")
+                self.source.set_roi(*roi)
+                changed = True
         except Exception as exc:
-            self.send(
-                {
-                    "type": "error",
-                    "message": f"set_camera: {exc}",
-                    "traceback": traceback.format_exc(),
-                }
-            )
+            self.error(f"set_camera: {exc}")
+        if not changed:
+            return
+        try:
+            info = self.refresh_camera()
+        except Exception as exc:
+            self.error(f"camera state: {exc}")
+            return
+        # The camera now delivers stale frames for a few frames, and any fit or
+        # averaging window from before the change describes the old image.
+        self.arm_settle()
+        self.window.clear()
+        self.last_fix = None
+        self.last_along = self.last_lateral = None
+        self.t_fit = -math.inf
+        info.pop("shm", None)
+        self.send({"type": "camera", "info": info})
 
     def on_moved(self, msg: dict) -> None:
         if msg.get("seq") != self.inflight:
@@ -377,7 +529,7 @@ class _Worker:
             self.fault("move failed")
             return
         self.window.clear()
-        self.skip = SETTLE_FRAMES
+        self.arm_settle()
 
     def on_measure(self, msg: dict) -> None:
         """Average *n_frames* fresh spot fixes at P = *p_um* (loop stopped)."""
@@ -388,12 +540,20 @@ class _Worker:
         if p_um is not None:
             self.source.set_actuator_um(float(p_um))
         t0 = time.monotonic()
+        self.arm_settle(t0)
         xs: list[float] = []
         ys: list[float] = []
         amps: list[float] = []
         seen: float | None = None
-        skip = SETTLE_FRAMES
-        deadline = t0 + float(msg.get("timeout_s", 5.0 + n / 5.0))
+        frame_s = max(
+            1.0 / self.fps if self.fps > 0 else 0.1, self.exposure_ms / 1000.0
+        )
+        default_timeout = (
+            self.settle.remaining_s(t0)
+            + (n + SETTLE_MIN_FRAMES + 2) * frame_s * 1.5
+            + 5.0
+        )
+        deadline = t0 + float(msg.get("timeout_s", default_timeout))
         while len(xs) < n and time.monotonic() < deadline and not self.exit:
             got = self.source.latest(FRAME_WAIT_S)
             if got is None:
@@ -402,11 +562,15 @@ class _Worker:
             if ts == seen:
                 continue
             seen = ts
-            if skip > 0:
-                skip -= 1
+            now = time.monotonic()
+            roi = self.frame_roi(frame)
+            if roi is None:
                 continue
-            fix = self.locate(frame)
-            if fix.ok:
+            usable = self.settle.frame(now)
+            fix = self.locate(frame, roi)
+            self.last_fix, self.fix_time = fix, now
+            self.write_frame(frame, ts, roi, now)
+            if usable and fix.ok:
                 xs.append(fix.x)
                 ys.append(fix.y)
                 amps.append(fix.amplitude)
@@ -420,20 +584,30 @@ class _Worker:
     # -- per-frame --------------------------------------------------------
 
     def on_frame(self, frame: Any, ts: float, now: float) -> None:
+        """Handle one new frame: overlay fit, shared buffer, then control."""
         from .spot_focus import focus_error
 
-        min_amp = self.params.min_amplitude if self.params is not None else 0.0
-        fix = self.locate(frame, min_amplitude=min_amp)
-        self.last_fix = fix
-        self._frame = frame
-        if self.cal is not None and fix.ok:
-            self.last_along, self.last_lateral = focus_error(fix, self.cal)
-        else:
-            self.last_along = self.last_lateral = None
+        if not (self.running or self.preview):
+            return  # idle: frames are drained, not processed
+        roi = self.frame_roi(frame)
+        if roi is None:
+            return  # stale frame from before an ROI change
+        usable = self.settle.frame(now)
+        # While running the spot is fitted every frame; in preview at <= 5 Hz.
+        if self.running or now - self.t_fit >= PREVIEW_FIT_PERIOD_S:
+            self.t_fit = now
+            min_amp = self.params.min_amplitude if self.params is not None else 0.0
+            fix = self.locate(frame, roi, min_amplitude=min_amp)
+            self.last_fix, self.fix_time = fix, now
+            if self.cal is not None and fix.ok:
+                self.last_along, self.last_lateral = focus_error(fix, self.cal)
+            else:
+                self.last_along = self.last_lateral = None
+        self.write_frame(frame, ts, roi, now)
         if not self.running:
             return
-        if self.skip > 0:
-            self.skip -= 1
+        fix = self.last_fix
+        if not usable:
             return
         ctl, params = self.ctl, self.params
         if fix.saturated:
@@ -475,7 +649,7 @@ class _Worker:
 
     def publish(self, now: float) -> None:
         fix = self.last_fix
-        if fix is None:
+        if fix is None or not (self.running or self.preview):
             return
         if now - self.t_telemetry >= TELEMETRY_PERIOD_S:
             self.t_telemetry = now
@@ -493,13 +667,36 @@ class _Worker:
                     "n_moves": 0 if self.ctl is None else self.ctl.n_moves,
                     "ok": bool(fix.ok),
                     "reason": fix.reason,
+                    "max_value": self.last_max,
+                    "saturated_frac": self.last_sat_frac,
                 }
             )
-        if now - self.t_thumb >= THUMB_PERIOD_S and fix.ok:
-            self.t_thumb = now
-            self.send(thumb_message(self._frame, fix.x, fix.y, self.cal))
 
     # -- main loop --------------------------------------------------------
+
+    def open_shm(self) -> str | None:
+        """Create the shared frame buffer; return an error text on failure."""
+        from .spot_frame_shm import FrameBuffer
+
+        w, h = self.sensor
+        try:
+            self.shm = FrameBuffer.create(max(w * h, 1) * 2)
+        except Exception as exc:
+            logger.exception("could not create the shared frame buffer")
+            self.shm = None
+            return str(exc)
+        return None
+
+    def close_shm(self) -> None:
+        """Unlink the buffer's name and drop our handle (at exit)."""
+        shm, self.shm = self.shm, None
+        if shm is None:
+            return
+        try:
+            shm.unlink()
+        except Exception:
+            logger.exception("could not unlink the shared frame buffer")
+        shm.close()
 
     def run(self) -> None:
         from .toupcam_source import make_source
@@ -507,9 +704,7 @@ class _Worker:
         try:
             self.source = make_source(self.spec)
             self.source.open()
-            bits = self.source.info().get("bits")
-            if bits:
-                self.saturation = (1 << int(bits)) - 1
+            info = self.refresh_camera()
         except Exception as exc:
             self.send(
                 {
@@ -518,16 +713,20 @@ class _Worker:
                     "traceback": traceback.format_exc(),
                 }
             )
+            try:
+                if self.source is not None:
+                    self.source.close()
+            except Exception:
+                pass
             self.outbox.close()  # deliver the error before the process exits
             self.conn.close()
             return
         try:
-            self.send(
-                {
-                    "type": "ready",
-                    "info": dict(self.source.info()),
-                }
-            )
+            shm_error = self.open_shm()
+            info["shm"] = None if self.shm is None else self.shm.name
+            if shm_error:
+                info["shm_error"] = shm_error
+            self.send({"type": "ready", "info": info})
             self.send({"type": "status", "state": "idle"})
             self.loop()
         except Exception as exc:
@@ -544,6 +743,9 @@ class _Worker:
             except Exception:
                 pass
             self.outbox.close()
+            # Last: on Windows the segment lives while any handle is open, and
+            # the main process may still be reading its final frame.
+            self.close_shm()
             self.conn.close()
 
     def loop(self) -> None:
@@ -565,7 +767,10 @@ class _Worker:
             got = self.source.latest(FRAME_WAIT_S)
             now = time.monotonic()
             if got is None:
-                if self.running and now - self.last_frame_wall > NO_FRAME_TIMEOUT_S:
+                if (
+                    self.running
+                    and now - self.last_frame_wall > self.no_frame_limit_s()
+                ):
                     self.fault("no frames from camera")
                 continue
             frame, ts = got

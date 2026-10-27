@@ -92,6 +92,56 @@ def test_locate_spot_bayer_red_channel(bayer):
     assert not locate_spot(mosaic, channel="red", bayer=wrong, min_amplitude=50).ok
 
 
+BIG = (1536, 2048)  # full camera frame; takes the coarse-then-refine path
+
+
+@pytest.mark.parametrize(
+    ("x", "y"), [(1234.37, 801.81), (40.9, 60.1), (2000.4, 1480.7), (1027.5, 767.25)]
+)
+def test_locate_spot_subpixel_large_frame(x, y):
+    fix = locate_spot(render(x, y, noise=2.0, shape=BIG))
+    assert fix.ok, fix.reason
+    assert fix.x == pytest.approx(x, abs=0.05)
+    assert fix.y == pytest.approx(y, abs=0.05)
+    assert fix.sigma_x == pytest.approx(5.0, rel=0.05)
+    assert fix.amplitude == pytest.approx(800.0, rel=0.05)
+    assert fix.background == pytest.approx(100.0, abs=3)
+
+
+@pytest.mark.parametrize("bayer", ["RGGB", "BGGR", "GRBG", "GBRG"])
+def test_locate_spot_bayer_red_large_frame(bayer):
+    x, y = 1311.3, 955.6
+    full = render(x, y, amp=900.0, noise=1.0, shape=BIG)
+    oy, ox = {"RGGB": (0, 0), "BGGR": (1, 1), "GRBG": (0, 1), "GBRG": (1, 0)}[bayer]
+    mosaic = np.full_like(full, 100)
+    mosaic[oy::2, ox::2] = full[oy::2, ox::2]
+    fix = locate_spot(mosaic, channel="red", bayer=bayer)
+    assert fix.ok, fix.reason
+    assert fix.x == pytest.approx(x, abs=0.15)
+    assert fix.y == pytest.approx(y, abs=0.15)
+
+
+def test_locate_spot_large_frame_ignores_hot_pixel():
+    frame = render(900.2, 500.7, shape=BIG, amp=300.0).astype(np.uint16)
+    frame[1400, 1900] = 4000  # brighter than the spot, but one pixel
+    fix = locate_spot(frame)
+    assert (fix.x, fix.y) == pytest.approx((900.2, 500.7), abs=0.1)
+
+
+def test_locate_spot_large_frame_speed():
+    """Full-frame uint8 must stay well under the 87 ms camera frame period."""
+    import time
+
+    frame = render(1234.37, 801.81, amp=200.0, bg=20.0, shape=BIG).astype(np.uint8)
+    locate_spot(frame)  # warm up
+    times = []
+    for _ in range(15):
+        t0 = time.perf_counter()
+        locate_spot(frame)
+        times.append(time.perf_counter() - t0)
+    assert float(np.median(times)) < 0.025
+
+
 def test_locate_spot_flags():
     sat = locate_spot(render(300, 200, amp=70000.0), saturation=65535)
     assert sat.saturated

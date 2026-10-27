@@ -25,9 +25,11 @@ from typing import TYPE_CHECKING, Any
 from psygnal import Signal
 
 from .spot_focus_worker import launch_worker
+from .spot_frame_shm import FrameBuffer, unlink_by_name
 
 if TYPE_CHECKING:
     from .spot_focus import SpotCalibration, SpotLoopParams
+    from .spot_frame_shm import LiveFrame
 
 logger = logging.getLogger(__name__)
 
@@ -60,9 +62,8 @@ class SpotFocusService:
     """
 
     telemetry = Signal(dict)
-    thumb = Signal(object)
-    thumb_msg = Signal(dict)
-    """The whole ``thumb`` message (image, crop origin, scale, spot, setpoint)."""
+    camera_changed = Signal(dict)
+    """The camera's info after a ``set_camera`` (actual exposure, gain, ROI)."""
     fault = Signal(str)
     state = Signal(str)
     moved = Signal(dict)
@@ -92,6 +93,11 @@ class SpotFocusService:
         self._move_busy = False
         self._ready = threading.Event()
         self._info: dict = {}
+        self._preview = False
+        #: The reader's view of the worker's shared frame buffer.
+        self._fb: FrameBuffer | None = None
+        self._fb_name: str | None = None
+        self._fb_lock = threading.Lock()
         self._meas: Queue[dict] = Queue()
         self._prev_crisp: str | None = None
         self._last_fault: str | None = None
@@ -119,8 +125,22 @@ class SpotFocusService:
 
     @property
     def current_state(self) -> str:
-        """The service state: idle, running, stopped or fault."""
+        """The service state: idle, preview, running, stopped or fault."""
         return self._state
+
+    @property
+    def preview_active(self) -> bool:
+        """True while the live camera view is on (also during a run)."""
+        return self._preview
+
+    @property
+    def camera_info(self) -> dict:
+        """The camera's ``ready`` info, kept current by ``set_camera``.
+
+        Keys: ``shm, sensor, bits, model, serial, exposure_range_ms,
+        gain_range, roi, exposure_ms, gain`` (and ``channel``, ``size``).
+        """
+        return dict(self._info)
 
     @property
     def worker_pid(self) -> int | None:
@@ -129,7 +149,7 @@ class SpotFocusService:
 
     @property
     def info(self) -> dict:
-        """The worker's ``ready`` payload (camera info)."""
+        """The worker's ``ready`` payload (camera info); see :attr:`camera_info`."""
         return dict(self._info)
 
     @property
@@ -176,11 +196,38 @@ class SpotFocusService:
         )
 
     def stop(self) -> None:
-        """Stop the loop and restore CRISP. Never moves P."""
+        """Stop the loop and restore CRISP. Never moves P.
+
+        Back to ``preview`` if the live view was on, else ``stopped``.
+        """
         self._send({"type": "stop"})
         if self._state != "fault":
-            self._set_state("stopped")
+            self._set_state("preview" if self._preview else "stopped")
         self._restore_crisp()
+
+    def start_preview(self) -> None:
+        """Turn the live camera view on (frames into the shared buffer)."""
+        self._preview = True
+        self._send({"type": "preview_start"})
+        if self._state in ("idle", "stopped"):
+            self._set_state("preview")
+
+    def stop_preview(self) -> None:
+        """Turn the live camera view off. A running lock keeps running."""
+        self._preview = False
+        self._send({"type": "preview_stop"})
+        if self._state == "preview":
+            self._set_state("idle")
+
+    def latest_frame(self, last_seq: int | None = None) -> LiveFrame | None:
+        """The newest frame as a :class:`LiveFrame` copy, or None.
+
+        None if the buffer is not attached, or nothing is newer than
+        *last_seq*. Safe to call from the GUI thread.
+        """
+        with self._fb_lock:
+            fb = self._fb
+            return None if fb is None else fb.read(last_seq)
 
     def update_params(self, params: SpotLoopParams) -> None:
         """Change the loop parameters while running."""
@@ -191,10 +238,21 @@ class SpotFocusService:
         exposure_ms: float | None = None,
         gain: int | None = None,
         roi: tuple[int, int, int, int] | None = None,
+        channel: str | None = None,
     ) -> None:
-        """Set exposure, gain and ROI on the worker's camera."""
+        """Set exposure, gain, ROI and channel on the worker's camera, live.
+
+        *roi* is ``(x, y, w, h)`` in sensor pixels; ``(0, 0, 0, 0)`` is full
+        frame. *channel* is ``"sum"`` or ``"red"``. ``None`` leaves a value.
+        """
         self._send(
-            {"type": "set_camera", "exposure_ms": exposure_ms, "gain": gain, "roi": roi}
+            {
+                "type": "set_camera",
+                "exposure_ms": exposure_ms,
+                "gain": gain,
+                "roi": None if roi is None else tuple(int(v) for v in roi),
+                "channel": channel,
+            }
         )
 
     def shutdown(self, timeout_s: float = 5.0) -> None:
@@ -222,6 +280,7 @@ class SpotFocusService:
             pass
         if threading.current_thread() is not self._reader:
             self._reader.join(timeout_s)
+        self._close_frames()
 
     # -- calibration ------------------------------------------------------
 
@@ -239,6 +298,8 @@ class SpotFocusService:
 
         if self._state == "running":
             raise RuntimeError("stop the loop before calibrating")
+        # Calibrating while previewing is fine: the sweep's frames also go to
+        # the live view.
         if not self.wait_ready():
             raise RuntimeError("spot focus worker did not become ready")
         mmc = self._mmc
@@ -261,7 +322,7 @@ class SpotFocusService:
                 mmc.waitForDevice(self._piezo)
                 self._flush_measurements()
                 self._send({"type": "measure", "n_frames": n_frames, "p_um": float(p)})
-                m = self._meas.get(timeout=30.0 + n_frames)
+                m = self._meas.get(timeout=self._measure_timeout(n_frames))
                 if m.get("n", 0) > 0:
                     good_p.append(float(p))
                     xs.append(m["x_mean"])
@@ -280,7 +341,7 @@ class SpotFocusService:
             raise RuntimeError("stop the loop before measuring")
         self._flush_measurements()
         self._send({"type": "measure", "n_frames": n_frames, "p_um": p_um})
-        return self._meas.get(timeout=30.0 + n_frames)
+        return self._meas.get(timeout=self._measure_timeout(n_frames))
 
     # -- stats ------------------------------------------------------------
 
@@ -302,6 +363,35 @@ class SpotFocusService:
         }
 
     # -- internals --------------------------------------------------------
+
+    def _measure_timeout(self, n_frames: int) -> float:
+        """Generous wait for a ``measurement`` reply (slow at long exposures)."""
+        exposure_s = float(self._info.get("exposure_ms") or 0.0) / 1000.0
+        return 30.0 + n_frames * max(1.0, 3.0 * exposure_s) + 10.0 * exposure_s
+
+    def _attach_frames(self, name: str | None) -> None:
+        """Attach to the worker's shared frame buffer (reader thread)."""
+        if not name:
+            return
+        try:
+            fb = FrameBuffer.attach(name)
+        except Exception:
+            logger.exception("could not attach to the shared frame buffer %r", name)
+            self._info["shm_error"] = f"could not attach to {name!r}"
+            return
+        with self._fb_lock:
+            self._fb, self._fb_name = fb, name
+
+    def _close_frames(self) -> None:
+        """Close the reader's handle and remove the name if the worker could not."""
+        with self._fb_lock:
+            fb, self._fb = self._fb, None
+        if fb is not None:
+            fb.close()
+        if self._fb_name:
+            # Normally the worker unlinked it at exit; after a kill it did not.
+            unlink_by_name(self._fb_name)
+            self._fb_name = None
 
     def _flush_measurements(self) -> None:
         while True:
@@ -377,19 +467,22 @@ class SpotFocusService:
         kind = msg.get("type")
         if kind == "ready":
             self._info = dict(msg.get("info", {}))
+            self._attach_frames(self._info.get("shm"))
             self._ready.set()
+        elif kind == "camera":
+            self._info.update(msg.get("info", {}))
+            self._emit(self.camera_changed, dict(self._info))
         elif kind == "move":
             self._on_move(msg)
         elif kind == "telemetry":
             self._last_telemetry = msg
             self._emit(self.telemetry, msg)
-        elif kind == "thumb":
-            self._emit(self.thumb, msg["image"])
-            self._emit(self.thumb_msg, msg)
         elif kind == "fault":
             self._fault(str(msg.get("reason", "fault")))
         elif kind == "status":
             st = str(msg.get("state", ""))
+            if st == "idle" and self._preview:
+                return  # the worker's start-up "idle" must not hide a preview
             if self._state != "fault" or st == "running":
                 self._set_state(st)
         elif kind == "measurement":
