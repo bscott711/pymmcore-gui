@@ -497,7 +497,9 @@ def test_no_save_target_means_no_csv_and_no_error(tmp_path) -> None:
     _core, engine, _pool, _rig, run = _rig_engine()
     _volume(engine, 0)
     run.teardown()  # must not raise
-    assert not list(tmp_path.iterdir())
+    # Only the CSV matters: the real conftest's _mock_pyconify puts an
+    # ``icons`` folder in every tmp_path.
+    assert not list(tmp_path.rglob("*.csv"))
 
 
 # --------------------------------------------------------------------------
