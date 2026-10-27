@@ -85,6 +85,8 @@ class SpotFocusService:
         self._spec = dict(source_spec or DEFAULT_SOURCE_SPEC)
 
         self._lock = threading.Lock()
+        #: The GUI thread and the reader thread (``moved`` replies) both send.
+        self._send_lock = threading.Lock()
         self._state = "idle"
         self._shutting_down = False
         self._move_busy = False
@@ -202,10 +204,9 @@ class SpotFocusService:
         self._shutting_down = True
         if self._state == "running":
             self._restore_crisp()
-        try:
-            self._conn.send({"type": "shutdown"})
-        except (OSError, ValueError):
-            pass
+        self._send({"type": "shutdown"})
+        # The reader keeps draining meanwhile: a worker blocked on a full pipe
+        # would never read ``shutdown``.
         self._proc.join(timeout_s)
         if self._proc.is_alive():
             self._proc.terminate()
@@ -309,7 +310,8 @@ class SpotFocusService:
 
     def _send(self, msg: dict) -> bool:
         try:
-            self._conn.send(msg)
+            with self._send_lock:
+                self._conn.send(msg)
             return True
         except (OSError, ValueError):
             if not self._shutting_down:
@@ -352,7 +354,8 @@ class SpotFocusService:
         self._fault("worker died")
 
     def _read_loop(self) -> None:
-        while not self._shutting_down:
+        """Drain the worker until its pipe closes, also while shutting down."""
+        while True:
             try:
                 if not self._conn.poll(0.2):
                     if not self._proc.is_alive():

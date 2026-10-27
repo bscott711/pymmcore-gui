@@ -10,19 +10,25 @@ Started like the camera workers: a plain ``spawn`` process with a module-level
 :func:`worker_main` (importing the package in the child is accepted; the worker
 code itself uses neither Qt nor pymmcore and creates no QApplication).
 
-Wire protocol: a :func:`multiprocessing.Pipe`; every message is a ``dict`` with
-a ``"type"``. Main to worker: ``start``, ``stop``, ``update_params``,
-``set_camera``, ``measure``, ``moved``, ``shutdown``. Worker to main: ``ready``,
-``move``, ``telemetry``, ``thumb``, ``fault``, ``status``, ``measurement``,
-``error``.
+Wire protocol: two one-way :func:`multiprocessing.Pipe` s (commands in, events
+out; see :class:`Link`); every message is a ``dict`` with a ``"type"``.
+Main to worker: ``start``, ``stop``, ``update_params``, ``set_camera``,
+``measure``, ``moved``, ``shutdown``. Worker to main: ``ready``, ``move``,
+``telemetry``, ``thumb``, ``fault``, ``status``, ``measurement``, ``error``.
 
 The loop exits on ``shutdown`` or when the pipe closes (the parent died), so no
 orphan process is left behind.
+
+The control loop never blocks on output: :class:`_Outbox` sends from its own
+thread. A Windows pipe holds only a few kB, so a synchronous send of telemetry or
+a 16 kB thumbnail stalls as soon as the main process reads late, and the loop
+then misses ``shutdown`` (seen on the rig PC, 2026-10-27).
 """
 
 from __future__ import annotations
 
 import math
+import threading
 import time
 import traceback
 from collections import deque
@@ -50,25 +56,118 @@ FRAME_WAIT_S = 0.05
 # --------------------------------------------------------------------------
 
 
-def launch_worker(source_spec: dict) -> tuple[Any, Connection]:
+class Link:
+    """One end of the worker link: sends on one one-way pipe, receives on another.
+
+    Two one-way pipes instead of one duplex pipe, so the thread that receives
+    and the thread that sends never share a :class:`Connection` object.
+    """
+
+    def __init__(self, rx: Connection, tx: Connection) -> None:
+        self.rx = rx
+        self.tx = tx
+
+    def send(self, msg: dict) -> None:
+        """Send *msg* (may block while the pipe is full)."""
+        self.tx.send(msg)
+
+    def poll(self, timeout: float = 0.0) -> bool:
+        """True if a message is waiting."""
+        return self.rx.poll(timeout)
+
+    def recv(self) -> Any:
+        """Receive one message."""
+        return self.rx.recv()
+
+    def close(self) -> None:
+        """Close both pipes."""
+        for c in (self.tx, self.rx):
+            try:
+                c.close()
+            except OSError:
+                pass
+
+
+def launch_worker(source_spec: dict) -> tuple[Any, Link]:
     """Start the worker in a spawned, daemon process.
 
-    Returns ``(process, parent_conn)``. The child end of the pipe is closed in
-    this process so a dead worker shows up as EOF on ``parent_conn``.
+    Returns ``(process, link)``. The child's pipe ends are closed in this
+    process so a dead worker shows up as EOF on ``link.recv``.
     """
     import multiprocessing as mp
 
     ctx = mp.get_context("spawn")
-    parent_conn, child_conn = ctx.Pipe(duplex=True)
+    cmd_rx, cmd_tx = ctx.Pipe(duplex=False)
+    evt_rx, evt_tx = ctx.Pipe(duplex=False)
     proc = ctx.Process(
         target=worker_main,
-        args=(child_conn, dict(source_spec)),
+        args=(Link(cmd_rx, evt_tx), dict(source_spec)),
         name="spot-focus-worker",
         daemon=True,
     )
     proc.start()
-    child_conn.close()
-    return proc, parent_conn
+    cmd_rx.close()
+    evt_tx.close()
+    return proc, Link(evt_rx, cmd_tx)
+
+
+class _Outbox:
+    """Sends the worker's messages from its own thread.
+
+    Control messages (``move``, ``fault``, ``status`` ...) queue in order and are
+    never dropped. ``telemetry`` and ``thumb`` keep only the newest of each, so
+    a slow reader costs stale telemetry, never a stalled control loop.
+    """
+
+    _LATEST = ("telemetry", "thumb")
+
+    def __init__(self, link: Link, on_broken: Any) -> None:
+        self._link = link
+        self._on_broken = on_broken
+        self._cv = threading.Condition()
+        self._control: deque[dict] = deque()
+        self._latest: dict[str, dict] = {}
+        self._closing = False
+        self._thread = threading.Thread(
+            target=self._run, name="spot-focus-outbox", daemon=True
+        )
+        self._thread.start()
+
+    def put(self, msg: dict) -> None:
+        """Queue *msg*; never blocks."""
+        with self._cv:
+            if msg.get("type") in self._LATEST:
+                self._latest[msg["type"]] = msg
+            else:
+                self._control.append(msg)
+            self._cv.notify()
+
+    def close(self, timeout_s: float = 2.0) -> None:
+        """Send the queued control messages (bounded wait), then stop."""
+        with self._cv:
+            self._closing = True
+            self._latest.clear()
+            self._cv.notify()
+        self._thread.join(timeout_s)
+
+    def _next(self) -> dict | None:
+        with self._cv:
+            while not (self._control or self._latest or self._closing):
+                self._cv.wait()
+            if self._control:
+                return self._control.popleft()
+            for kind in self._LATEST:
+                if kind in self._latest:
+                    return self._latest.pop(kind)
+            return None  # closing and drained
+
+    def _run(self) -> None:
+        while (msg := self._next()) is not None:
+            try:
+                self._link.send(msg)
+            except (OSError, ValueError, BrokenPipeError):
+                self._on_broken()
+                return
 
 
 # --------------------------------------------------------------------------
@@ -136,8 +235,9 @@ def thumb_message(frame: Any, x: float, y: float, cal: Any = None) -> dict:
 class _Worker:
     """The state of one worker process (single thread, one pipe)."""
 
-    def __init__(self, conn: Connection, source_spec: dict) -> None:
+    def __init__(self, conn: Link, source_spec: dict) -> None:
         self.conn = conn
+        self.outbox = _Outbox(conn, self._broken)
         spec = dict(source_spec)
         #: ``locate_spot`` options (roi_half, channel, bayer, saturation); not
         #: a source argument, so split off before ``make_source``.
@@ -175,10 +275,11 @@ class _Worker:
     # -- io ---------------------------------------------------------------
 
     def send(self, msg: dict) -> None:
-        try:
-            self.conn.send(msg)
-        except (OSError, ValueError, BrokenPipeError):
-            self.exit = True
+        """Queue *msg* for the outbox thread; never blocks the loop."""
+        self.outbox.put(msg)
+
+    def _broken(self) -> None:
+        self.exit = True  # the parent is gone
 
     def set_state(self, state: str) -> None:
         self.state = state
@@ -417,6 +518,8 @@ class _Worker:
                     "traceback": traceback.format_exc(),
                 }
             )
+            self.outbox.close()  # deliver the error before the process exits
+            self.conn.close()
             return
         try:
             self.send(
@@ -440,10 +543,8 @@ class _Worker:
                 self.source.close()
             except Exception:
                 pass
-            try:
-                self.conn.close()
-            except Exception:
-                pass
+            self.outbox.close()
+            self.conn.close()
 
     def loop(self) -> None:
         while not self.exit:
@@ -480,6 +581,6 @@ class _Worker:
             self.publish(now)
 
 
-def worker_main(conn: Connection, source_spec: dict) -> None:
+def worker_main(conn: Link, source_spec: dict) -> None:
     """Subprocess entry point (module-level so ``spawn`` can pickle it)."""
     _Worker(conn, source_spec).run()

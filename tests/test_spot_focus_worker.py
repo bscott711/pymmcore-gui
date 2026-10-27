@@ -13,6 +13,7 @@ import os
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -105,12 +106,10 @@ def _wait(cond, timeout: float = 10.0, step: float = 0.02) -> bool:
     return cond()
 
 
-def _gone(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return True
-    return False
+def _gone(proc: Any) -> bool:
+    """True once *proc* has exited. Not ``os.kill(pid, 0)``: on Windows signal 0
+    is CTRL_C_EVENT, which sends a console Ctrl+C and never raises."""
+    return not proc.is_alive() and proc.exitcode is not None
 
 
 @pytest.fixture(autouse=True)
@@ -148,7 +147,7 @@ def closed_loop() -> dict:
             svc.moved.connect(moved.append)
             assert svc.wait_ready()
             info = svc.info
-            pid = svc.worker_pid
+            proc = svc._proc
             svc.start(_params(max_rate_hz=RATE_CAP_HZ), _cal())
             t0 = time.monotonic()
             time.sleep(RUN_S)
@@ -163,7 +162,7 @@ def closed_loop() -> dict:
             "stats": stats,
             "elapsed": elapsed,
             "info": info,
-            "pid": pid,
+            "proc": proc,
             "state": final_state,
         }
     finally:
@@ -213,7 +212,7 @@ def test_move_rate_respects_cap_and_never_waits(closed_loop: dict) -> None:
 
 def test_run_ends_stopped_and_worker_exits(closed_loop: dict) -> None:
     assert closed_loop["state"] == "stopped"
-    assert _wait(lambda: _gone(closed_loop["pid"]), 5.0)
+    assert _wait(lambda: _gone(closed_loop["proc"]), 5.0)
 
 
 def test_killing_the_worker_faults_and_stops_moves() -> None:
@@ -223,8 +222,8 @@ def test_killing_the_worker_faults_and_stops_moves() -> None:
         svc.fault.connect(faults.append)
         svc.start(_params(), _cal())
         assert _wait(lambda: len(mmc.sets) >= 2, 8.0)
-        pid = svc.worker_pid
-        svc._proc.kill()
+        proc = svc._proc
+        proc.kill()
         assert _wait(lambda: faults, 5.0)
         assert faults == ["worker died"]
         assert svc.current_state == "fault"
@@ -233,7 +232,7 @@ def test_killing_the_worker_faults_and_stops_moves() -> None:
         assert len(mmc.sets) == n
         with pytest.raises(RuntimeError):
             svc.start(_params(), _cal())
-    assert _wait(lambda: _gone(pid), 5.0)
+    assert _wait(lambda: _gone(proc), 5.0)
 
 
 def test_lateral_drift_is_a_fault_and_not_a_move() -> None:
@@ -285,12 +284,12 @@ def test_shutdown_exits_cleanly_without_orphans() -> None:
     mmc = FakeMMC()
     svc = _service(mmc)
     assert svc.wait_ready()
-    pid, proc = svc.worker_pid, svc._proc
+    proc = svc._proc
     svc.shutdown()
     svc.shutdown()  # idempotent
     assert not proc.is_alive()
     assert proc.exitcode == 0
-    assert _gone(pid)
+    assert _gone(proc)
     assert not svc._reader.is_alive()
 
 
@@ -308,3 +307,23 @@ def test_worker_exits_when_the_pipe_closes() -> None:
         if proc.is_alive():
             proc.kill()
             proc.join(2.0)
+
+
+def test_shutdown_reaches_a_worker_whose_reader_is_late() -> None:
+    """Regression (rig PC, 2026-10-27): with nobody reading, the worker's
+    telemetry and thumbnails fill the pipe. A synchronous send then blocked the
+    control loop, so ``shutdown`` was never read and the worker never exited."""
+    proc, conn = launch_worker(_spec())
+    try:
+        assert _wait(lambda: conn.poll(0.1), 15.0)
+        assert conn.recv()["type"] == "ready"
+        time.sleep(3.0)  # read nothing while the worker publishes
+        conn.send({"type": "shutdown"})
+        proc.join(8.0)
+        assert not proc.is_alive()
+        assert proc.exitcode == 0
+    finally:
+        if proc.is_alive():
+            proc.kill()
+            proc.join(2.0)
+        conn.close()
