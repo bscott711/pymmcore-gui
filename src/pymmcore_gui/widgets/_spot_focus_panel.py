@@ -11,7 +11,8 @@ nudging it rarely. This panel
   channel and ROI, all applied live;
 - shows a strip chart of the focus error and the commanded piezo over the last
   five minutes, and move statistics;
-- edits the loop parameters and CRISP LED intensity.
+- lights the CRISP LED (LED button, live LED %; Preview turns it on) and edits the
+  loop parameters.
 
 Everything is written to ``SettingsV1.spot_focus``. The service is created
 lazily on Preview, Start or Calibrate and shut down with the panel or the app. Its
@@ -74,6 +75,9 @@ _FLUSH_DELAY_MS = 500
 _STATS_PERIOD_MS = 1000
 #: How long Preview waits for the camera to open, s.
 _OPEN_TIMEOUT_S = 30.0
+#: LED intensity, %, when the settings hold none.
+DEFAULT_LED_PCT = 50.0
+_NO_CRISP = "no CRISP device (focus.crisp_label)"
 
 # (settings field, label, min, max, step, decimals, suffix, tooltip)
 _PARAMS: tuple[tuple[str, str, float, float, float, int, str, str], ...] = (
@@ -241,6 +245,9 @@ class _Relay(QObject):
     previewFailed = Signal(str)
     calibrated = Signal(object)
     calibrateFailed = Signal(str)
+    #: ``(crisp_state_text, led_is_on)`` read once after each LED change.
+    crispChanged = Signal(str, bool)
+    ledFailed = Signal(str)
 
     def on_telemetry(self, msg: dict) -> None:
         self.telemetry.emit(msg)
@@ -368,12 +375,6 @@ class SpotFocusPanel(QWidget):
             spin.valueChanged.connect(lambda v, f=field: self._set_param(f, v))
             self.param_spins[field] = spin
             form.addRow(label, spin)
-        self.led_spin = self._spin(
-            0.0, 100.0, 1.0, 0, " %", "CRISP LED intensity, set on the next Start"
-        )
-        self.led_spin.setSpecialValueText("unchanged")
-        self.led_spin.valueChanged.connect(self._set_led)
-        form.addRow("LED", self.led_spin)
         params_group = QGroupBox("Parameters")
         params_group.setLayout(form)
         camera_group = self._build_camera_group()
@@ -413,6 +414,8 @@ class SpotFocusPanel(QWidget):
         self._relay.previewFailed.connect(self._on_preview_failed)
         self._relay.calibrated.connect(self._on_calibrated)
         self._relay.calibrateFailed.connect(self._on_calibrate_failed)
+        self._relay.crispChanged.connect(self._on_crisp_changed)
+        self._relay.ledFailed.connect(self._on_led_failed)
 
         # Closures over the owner, not self: they run while self is going away.
         owner = self._owner
@@ -456,6 +459,25 @@ class SpotFocusPanel(QWidget):
         preview_row.addWidget(self.preview_button)
         preview_row.addWidget(self.show_view_button)
         preview_row.addWidget(self.camera_readout, 1)
+
+        self.led_button = QPushButton("LED")
+        self.led_button.setCheckable(True)
+        self.led_button.setToolTip(
+            "Light the CRISP LED (CRISP State Ready). Preview lights it too; "
+            "the previous CRISP state is restored when it goes off."
+        )
+        self.led_button.clicked.connect(self.set_led)
+        self.led_spin = self._spin(
+            0.0, 100.0, 1.0, 0, " %", "CRISP LED intensity (applies at once)"
+        )
+        self.led_spin.valueChanged.connect(self._set_led)
+        self.crisp_readout = QLabel("CRISP: -")
+        self.crisp_readout.setTextFormat(Qt.TextFormat.PlainText)
+        led_row = QHBoxLayout()
+        led_row.addWidget(self.led_button)
+        led_row.addWidget(QLabel("LED %"))
+        led_row.addWidget(self.led_spin)
+        led_row.addWidget(self.crisp_readout, 1)
 
         self.exposure_spin = self._spin(
             0.1, 15000.0, 1.0, 2, " ms", "Camera exposure (applies at once)"
@@ -511,6 +533,7 @@ class SpotFocusPanel(QWidget):
         lay.addLayout(sdk_row)
         lay.addWidget(self.camera_label)
         lay.addLayout(preview_row)
+        lay.addLayout(led_row)
         lay.addLayout(grid)
         lay.addWidget(QLabel("ROI (sensor pixels)"))
         lay.addLayout(roi_row)
@@ -608,7 +631,7 @@ class SpotFocusPanel(QWidget):
         try:
             for field, spin in self.param_spins.items():
                 spin.setValue(getattr(cfg.params, field))
-            self.led_spin.setValue(cfg.led_intensity or 0.0)
+            self.led_spin.setValue(self._led_value())
             self.exposure_spin.setValue(cfg.exposure_ms)
             self.gain_spin.setValue(cfg.gain)
             self.channel_combo.setCurrentText(cfg.channel)
@@ -649,11 +672,78 @@ class SpotFocusPanel(QWidget):
         if self.state == "running" and (svc := self.service) is not None:
             svc.update_params(cfg.params.to_params())
 
+    @staticmethod
+    def _led_value() -> float:
+        """The saved LED intensity, % (``DEFAULT_LED_PCT`` when unset)."""
+        led = SettingsV1.instance().spot_focus.led_intensity
+        return DEFAULT_LED_PCT if led is None else float(led)
+
     def _set_led(self, value: float) -> None:
         if self._loading:
             return
-        SettingsV1.instance().spot_focus.led_intensity = value or None
+        SettingsV1.instance().spot_focus.led_intensity = float(value)
         self._write()
+        svc = self.service
+        if svc is not None:
+            try:
+                svc.set_led_intensity(value)
+            except Exception:
+                logger.warning("spot focus set_led_intensity failed", exc_info=True)
+
+    def set_led(self, on: bool) -> None:
+        """Light or darken the CRISP LED (the LED button)."""
+        led = self._led_value()
+        if on:
+            self._led_async("led on", lambda svc: svc.led_on(led, owner="manual"))
+        else:
+            # The user's off beats Preview's claim; the lock's claim stays.
+            def off(svc: SpotFocusService) -> None:
+                svc.led_off("manual")
+                svc.led_off("preview")
+
+            self._led_async("led off", off)
+
+    def _led_async(self, name: str, action: Callable[[SpotFocusService], None]) -> None:
+        """Run an LED change off the GUI thread, then show CRISP's state."""
+
+        def work() -> None:
+            svc = self._ensure_service()
+            action(svc)
+            self._report_crisp(svc)
+
+        def failed(message: str) -> None:
+            self._relay.ledFailed.emit(message)
+
+        self._run_async(name, work, lambda _: None, failed)
+
+    def _report_crisp(self, svc: SpotFocusService) -> None:
+        """Read CRISP's state once and hand it to the GUI thread."""
+        label = svc.crisp_label
+        if label is None:
+            self._relay.crispChanged.emit("", False)
+            return
+        state = svc.crisp_state()
+        self._relay.crispChanged.emit(
+            f"CRISP: {state if state is not None else '?'} ({label})", svc.led_is_on
+        )
+
+    def _on_crisp_changed(self, text: str, led_on: bool) -> None:
+        self.led_button.blockSignals(True)
+        self.led_button.setChecked(led_on)
+        self.led_button.blockSignals(False)
+        if not text:
+            self.crisp_readout.setText("CRISP: none")
+            self.fault_label.setText(_colored(_NO_CRISP, ATTENTION_COLOR))
+            return
+        self.crisp_readout.setText(text)
+        if self.fault_label.text() == _colored(_NO_CRISP, ATTENTION_COLOR):
+            self.fault_label.setText("")
+
+    def _on_led_failed(self, message: str) -> None:
+        self.led_button.blockSignals(True)
+        self.led_button.setChecked(False)
+        self.led_button.blockSignals(False)
+        self.fault_label.setText(_colored(f"LED: {message}", ALERT_COLOR))
 
     def _apply_camera(self, **kwargs: Any) -> None:
         """Send a live camera change to the worker (if there is one)."""
@@ -807,6 +897,7 @@ class SpotFocusPanel(QWidget):
         cfg = SettingsV1.instance().spot_focus
         exposure, gain, channel = cfg.exposure_ms, cfg.gain, cfg.channel
         roi = cfg.roi or (0, 0, 0, 0)
+        led = self._led_value()
         self.fault_label.setText("")
         self._preview_busy = True
         self.preview_button.setChecked(True)
@@ -823,6 +914,12 @@ class SpotFocusPanel(QWidget):
                     raise RuntimeError("the camera did not become ready")
             svc.set_camera(exposure_ms=exposure, gain=gain, roi=roi, channel=channel)
             svc.start_preview()
+            try:
+                svc.led_on(led, owner="preview")
+            except Exception as err:
+                logger.warning("spot focus led_on failed", exc_info=True)
+                self._relay.ledFailed.emit(str(err) or type(err).__name__)
+            self._report_crisp(svc)
             return svc
 
         self._run_async(
@@ -841,7 +938,9 @@ class SpotFocusPanel(QWidget):
             return
         if self.state == "fault":
             self._set_state("idle")
-        self.fault_label.setText("")
+        self.fault_label.setText(
+            _colored(_NO_CRISP, ATTENTION_COLOR) if svc.crisp_label is None else ""
+        )
         self._apply_camera_info(self._camera_info(svc))
         self.live_view.set_service(svc)
         self._show_live_view()
@@ -870,6 +969,8 @@ class SpotFocusPanel(QWidget):
         if svc is not None:
             try:
                 svc.stop_preview()
+                svc.led_off("preview")
+                self._report_crisp(svc)
             except Exception:
                 logger.warning("spot focus stop_preview failed", exc_info=True)
         self.live_view.hide()  # hide(), not close(): no windowClosed echo
@@ -963,7 +1064,7 @@ class SpotFocusPanel(QWidget):
             settings.flush()
             self.modeForced.emit()
         params = cfg.params.to_params()
-        exposure, gain, led = cfg.exposure_ms, cfg.gain, cfg.led_intensity
+        exposure, gain, led = cfg.exposure_ms, cfg.gain, self._led_value()
         roi, channel = cfg.roi or (0, 0, 0, 0), cfg.channel
         self.fault_label.setText("")
         self._telemetry = None
@@ -976,6 +1077,7 @@ class SpotFocusPanel(QWidget):
             svc.wait_ready()
             svc.set_camera(exposure_ms=exposure, gain=gain, roi=roi, channel=channel)
             svc.start(params, cal, led)
+            self._report_crisp(svc)
 
         self._run_async(
             "start",
@@ -1008,6 +1110,7 @@ class SpotFocusPanel(QWidget):
         if svc is not None:
             try:
                 svc.stop()
+                self._report_crisp(svc)
             except Exception as err:
                 logger.warning("spot focus stop failed", exc_info=True)
                 self.fault_label.setText(_colored(f"Stop failed: {err}", ALERT_COLOR))

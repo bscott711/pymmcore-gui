@@ -38,6 +38,14 @@ CRISP_STATE_PROP = "CRISP State"
 CRISP_LED_PROP = "LED Intensity"
 #: Settable CRISP state that stands in for a reported "locked" state on restore.
 _LOCKED_STATES = frozenset({"Lock", "In Focus", "Focusing"})
+#: CRISP states in which the LED is already lit; ``led_on`` leaves them alone.
+_LIT_STATES = _LOCKED_STATES | {
+    "Ready",
+    "Dither",
+    "loG_cal",
+    "gain_Cal",
+    "Calibrating",
+}
 DEFAULT_SOURCE_SPEC: dict[str, Any] = {"kind": "toupcam"}
 
 
@@ -52,8 +60,9 @@ class SpotFocusService:
     piezo_label : str
         The piezo the loop drives (default ``"PiezoStage:P:34"``).
     crisp_label : str or None
-        The CRISP device. When set, :meth:`start` puts it in ``Ready`` and
-        :meth:`stop` restores the previous state.
+        The CRISP device. When set, :meth:`led_on` (and :meth:`start`) put it
+        in ``Ready``, which lights the LED; the previous state is restored
+        when the last user (preview, lock, manual) lets go.
     source_spec : dict
         Passed to ``make_source`` in the worker (``{"kind": "toupcam"}`` or
         ``{"kind": "fake", ...}``).
@@ -100,6 +109,10 @@ class SpotFocusService:
         self._fb_lock = threading.Lock()
         self._meas: Queue[dict] = Queue()
         self._prev_crisp: str | None = None
+        #: Who needs the LED lit ("preview", "lock", "manual", ...). CRISP is
+        #: restored when the last one lets go.
+        self._led_owners: set[str] = set()
+        self._led_lock = threading.RLock()
         self._last_fault: str | None = None
         self._moves: list[float] = []  # setPosition durations (ms)
         self._move_times: list[float] = []  # wall times of moves
@@ -175,14 +188,7 @@ class SpotFocusService:
         if not self.wait_ready():
             raise RuntimeError("spot focus worker did not become ready")
         p_start = float(self._mmc.getPosition(self._piezo))
-        self._prev_crisp = None
-        if self._crisp:
-            self._prev_crisp = str(self._mmc.getProperty(self._crisp, CRISP_STATE_PROP))
-            if self._prev_crisp != "Ready":
-                self._mmc.setProperty(self._crisp, CRISP_STATE_PROP, "Ready")
-            led = self._led if led_intensity is None else led_intensity
-            if led is not None:
-                self._mmc.setProperty(self._crisp, CRISP_LED_PROP, led)
+        self.led_on(led_intensity, owner="lock", force_ready=True)
         self._last_fault = None
         self._moves.clear()
         self._move_times.clear()
@@ -203,7 +209,7 @@ class SpotFocusService:
         self._send({"type": "stop"})
         if self._state != "fault":
             self._set_state("preview" if self._preview else "stopped")
-        self._restore_crisp()
+        self.led_off("lock")
 
     def start_preview(self) -> None:
         """Turn the live camera view on (frames into the shared buffer)."""
@@ -263,7 +269,9 @@ class SpotFocusService:
         # Restore whenever start() changed CRISP, not only once the worker has
         # reported "running": Stop or close right after Start used to leave
         # CRISP in Ready (seen on the rig PC, 2026-10-27).
-        self._restore_crisp()
+        with self._led_lock:
+            self._led_owners.clear()
+            self._restore_crisp()
         self._send({"type": "shutdown"})
         # The reader keeps draining meanwhile: a worker blocked on a full pipe
         # would never read ``shutdown``.
@@ -281,6 +289,79 @@ class SpotFocusService:
         if threading.current_thread() is not self._reader:
             self._reader.join(timeout_s)
         self._close_frames()
+
+    # -- CRISP LED --------------------------------------------------------
+
+    @property
+    def crisp_label(self) -> str | None:
+        """The CRISP device label, ``None`` when there is no CRISP device."""
+        return self._crisp or None
+
+    @property
+    def led_is_on(self) -> bool:
+        """True while some user holds the LED lit (always False with no CRISP)."""
+        return bool(self._crisp) and bool(self._led_owners)
+
+    def crisp_state(self) -> str | None:
+        """The CRISP device's current ``CRISP State`` (``None`` if unreadable)."""
+        if not self._crisp:
+            return None
+        try:
+            return str(self._mmc.getProperty(self._crisp, CRISP_STATE_PROP))
+        except Exception:
+            logger.warning("could not read the CRISP state", exc_info=True)
+            return None
+
+    def led_on(
+        self,
+        intensity: float | None = None,
+        *,
+        owner: str = "manual",
+        force_ready: bool = False,
+    ) -> None:
+        """Light the CRISP LED: put CRISP in ``Ready`` and set the intensity.
+
+        The state CRISP was in is remembered once, when the first *owner*
+        arrives, and restored when the last one calls :meth:`led_off`. A state
+        in which the LED is already lit (Ready, Lock, Dither, ...) is left
+        alone unless *force_ready*. *intensity* (else the one given at
+        construction) is set every call. Does nothing without a CRISP device.
+        """
+        if not self._crisp:
+            return
+        with self._led_lock:
+            first = not self._led_owners
+            self._led_owners.add(owner)
+            try:
+                if first:
+                    cur = str(self._mmc.getProperty(self._crisp, CRISP_STATE_PROP))
+                    self._prev_crisp = None
+                    if cur != "Ready" and (force_ready or cur not in _LIT_STATES):
+                        self._prev_crisp = cur
+                        self._mmc.setProperty(self._crisp, CRISP_STATE_PROP, "Ready")
+                if intensity is not None:
+                    self._led = intensity
+                if self._led is not None:
+                    self._mmc.setProperty(self._crisp, CRISP_LED_PROP, self._led)
+            except Exception:
+                self._led_owners.discard(owner)
+                if not self._led_owners:
+                    self._restore_crisp()
+                raise
+
+    def led_off(self, owner: str = "manual") -> None:
+        """Let go of the LED; restores CRISP once no owner is left."""
+        with self._led_lock:
+            self._led_owners.discard(owner)
+            if not self._led_owners:
+                self._restore_crisp()
+
+    def set_led_intensity(self, value: float) -> None:
+        """Change the LED intensity; applied at once if the LED is lit."""
+        self._led = value
+        if self.led_is_on:
+            with self._led_lock:
+                self._mmc.setProperty(self._crisp, CRISP_LED_PROP, self._led)
 
     # -- calibration ------------------------------------------------------
 
@@ -304,14 +385,7 @@ class SpotFocusService:
             raise RuntimeError("spot focus worker did not become ready")
         mmc = self._mmc
         p0 = float(mmc.getPosition(self._piezo))
-        was_ready = False
-        if self._crisp:
-            prev = str(mmc.getProperty(self._crisp, CRISP_STATE_PROP))
-            was_ready = prev == "Ready"
-            if not was_ready:
-                mmc.setProperty(self._crisp, CRISP_STATE_PROP, "Ready")
-            if self._led is not None:
-                mmc.setProperty(self._crisp, CRISP_LED_PROP, self._led)
+        self.led_on(owner="calibrate", force_ready=True)
         ps = p0 + np.linspace(-span_um / 2.0, span_um / 2.0, steps)
         xs: list[float] = []
         ys: list[float] = []
@@ -332,8 +406,7 @@ class SpotFocusService:
             mmc.setPosition(self._piezo, p0)
             mmc.waitForDevice(self._piezo)
             self._send({"type": "measure", "n_frames": 1, "p_um": p0, "timeout_s": 0.5})
-            if self._crisp and not was_ready:
-                self._restore_crisp(prev)
+            self.led_off("calibrate")
 
     def measure(self, n_frames: int = 20, p_um: float | None = None) -> dict:
         """One averaged measurement from the worker (loop stopped)."""
@@ -410,9 +483,8 @@ class SpotFocusService:
                 self._worker_died()
             return False
 
-    def _restore_crisp(self, prev: str | None = None) -> None:
-        prev = self._prev_crisp if prev is None else prev
-        self._prev_crisp = None
+    def _restore_crisp(self) -> None:
+        prev, self._prev_crisp = self._prev_crisp, None
         if not self._crisp or prev is None or prev == "Ready":
             return
         target = "Lock" if prev in _LOCKED_STATES else prev
