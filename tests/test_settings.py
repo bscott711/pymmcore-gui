@@ -94,3 +94,52 @@ def test_focus_offset_bad_offsets_entry_degrades_gracefully() -> None:
     with pytest.warns(RuntimeWarning, match="Could not validate key 'offsets'"):
         cleaned = _settings._good_data_only(SettingsV1, data)
     assert cleaned == {"focus": {"enabled": True}}
+
+
+def test_image_focus_settings_roundtrip() -> None:
+    s = SettingsV1()
+    assert s.image_focus.mode == "crisp"
+    assert s.image_focus.box is None
+    assert s.image_focus.calibrations == {}
+    assert s.image_focus.end_of_run == "restore"
+
+    s.image_focus.mode = "image"
+    s.image_focus.end_of_run = "stay"
+    s.image_focus.loop_gain = 0.4
+    s.image_focus.box = _settings.FocusBoxSettings(
+        camera="Camera-1", preset="488nm", slice_index=60, rect=(100, 320, 150, 120)
+    )
+    s.image_focus.calibrations = {
+        "Camera-1|488nm|": _settings.CalibrationRecord(
+            rows_per_um=-1.5,
+            intercept_rows=0.2,
+            r2=0.98,
+            range_um=(-2.0, 2.0),
+            n_points=9,
+            date="2026-10-26T12:00:00",
+        )
+    }
+
+    s2 = SettingsV1.model_validate_json(s.model_dump_json())
+    assert s2.image_focus.mode == "image"
+    assert s2.image_focus.end_of_run == "stay"
+    assert s2.image_focus.box == s.image_focus.box
+    assert s2.image_focus.calibrations == s.image_focus.calibrations
+
+    box = s2.image_focus.box.to_box()  # pyright: ignore[reportOptionalMemberAccess]
+    assert (box.camera, box.preset, box.slice_index) == ("Camera-1", "488nm", 60)
+    assert box.rect == (100, 320, 150, 120)
+    limits = s2.image_focus.to_limits()
+    assert limits.loop_gain == 0.4 and limits.max_step_um == 0.3
+    cal = s2.image_focus.calibrations["Camera-1|488nm|"].to_calibration()
+    assert cal.rows_per_um == -1.5 and cal.range_um == (-2.0, 2.0)
+    back = _settings.CalibrationRecord.from_calibration(cal)
+    assert back == s.image_focus.calibrations["Camera-1|488nm|"]
+
+
+def test_settings_without_image_focus_still_load() -> None:
+    old = '{"version": "1.0", "focus": {"enabled": true}}'
+    s = SettingsV1.model_validate_json(old)
+    assert s.focus.enabled is True
+    assert s.image_focus.mode == "crisp"
+    assert s.image_focus.to_limits().max_strikes == 3
