@@ -37,6 +37,8 @@ if TYPE_CHECKING:
 _RED_SITE = {"RGGB": (0, 0), "BGGR": (1, 1), "GRBG": (0, 1), "GBRG": (1, 0)}
 _SQRT_2PI = math.sqrt(2.0 * math.pi)
 _BLUR = 5  # box-blur width (pixels) used to find the peak, robust to hot pixels
+_BLOCK = 4  # coarse-search block size; 4 keeps the 2x2 Bayer phase
+_COARSE_MIN_PIXELS = 512 * 512  # planes larger than this use the coarse search
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +79,46 @@ def _box_blur(img: np.ndarray, k: int = _BLUR) -> np.ndarray:
     cols = sum(out[:, i : i + img.shape[1] + 2 * pad - k + 1] for i in range(k))
     rows = sum(cols[i : i + img.shape[0]] for i in range(k))
     return rows / (k * k)
+
+
+def _find_peak(plane: np.ndarray) -> tuple[int, int]:
+    """Return the (row, col) of the brightest blurred spot in *plane*.
+
+    Small planes are blurred directly. Larger ones are block-summed (integer
+    arithmetic, edges trimmed to a multiple of the block) so the coarse search
+    runs on a small image, then the peak is refined at full resolution inside
+    the winning block's neighbourhood. *plane* may be a strided view (the red
+    Bayer sites); block sums of it keep the site parity by construction.
+    """
+    rows, cols = plane.shape
+    if rows * cols <= _COARSE_MIN_PIXELS:
+        py, px = np.unravel_index(
+            int(np.argmax(_box_blur(plane.astype(np.float64)))), plane.shape
+        )
+        return int(py), int(px)
+    b = _BLOCK
+    nr, nc = rows // b, cols // b
+    if plane.dtype.kind in "ui" and plane.itemsize <= 2:
+        acc1 = np.uint16 if plane.itemsize == 1 else np.uint32
+        acc2 = np.uint32
+    else:
+        acc1 = acc2 = np.float64
+    # Rows first (contiguous inner axis), then columns: several times faster
+    # than a single reduction over both block axes.
+    strip = plane[: nr * b, : nc * b].reshape(nr, b, nc * b).sum(axis=1, dtype=acc1)
+    blocks = strip.reshape(nr, nc, b).sum(axis=2, dtype=acc2)
+    cy, cx = np.unravel_index(int(np.argmax(_box_blur(blocks, 3))), blocks.shape)
+    # Full-resolution neighbourhood: the winning block plus one block each side,
+    # and a blur margin that is cropped again after the blur.
+    m = _BLUR // 2
+    y0, y1 = max((cy - 1) * b - m, 0), min((cy + 2) * b + m, rows)
+    x0, x1 = max((cx - 1) * b - m, 0), min((cx + 2) * b + m, cols)
+    blur = _box_blur(plane[y0:y1, x0:x1].astype(np.float64))
+    iy0, iy1 = max((cy - 1) * b, 0) - y0, min((cy + 2) * b, rows) - y0
+    ix0, ix1 = max((cx - 1) * b, 0) - x0, min((cx + 2) * b, cols) - x0
+    inner = blur[iy0:iy1, ix0:ix1]
+    iy, ix = np.unravel_index(int(np.argmax(inner)), inner.shape)
+    return int(y0 + iy0 + iy), int(x0 + ix0 + ix)
 
 
 def _moments(profile: np.ndarray) -> tuple[float, float]:
@@ -185,14 +227,14 @@ def locate_spot(
     else:
         raise ValueError(f"channel must be 'sum' or 'red', not {channel!r}")
 
-    plane = arr[oy::step, ox::step].astype(np.float64)
+    plane = arr[oy::step, ox::step]  # a view: the full frame is never copied
     half = max(int(roi_half) // step, 3)
     rows, cols = plane.shape
 
-    py, px = np.unravel_index(int(np.argmax(_box_blur(plane))), plane.shape)
+    py, px = _find_peak(plane)
     r0, r1 = max(py - half, 0), min(py + half + 1, rows)
     c0, c1 = max(px - half, 0), min(px + half + 1, cols)
-    roi = plane[r0:r1, c0:c1]
+    roi = plane[r0:r1, c0:c1].astype(np.float64)
 
     border = np.concatenate([roi[0], roi[-1], roi[1:-1, 0], roi[1:-1, -1]])
     bg = float(np.median(border))
