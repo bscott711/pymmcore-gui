@@ -88,23 +88,49 @@ def _cal_from(obj: Any) -> Any:
     return obj if isinstance(obj, SpotCalibration) else SpotCalibration.from_dict(obj)
 
 
-def _thumb(frame: Any, x: float, y: float) -> Any:
-    """Return a uint8 crop (at most 128x128) of *frame* centred on (x, y)."""
-    import numpy as np
-
-    h, w = frame.shape[:2]
+def _thumb_origin(shape: Any, x: float, y: float) -> tuple[int, int]:
+    """Top-left ``(x0, y0)`` of the thumbnail window around (x, y), kept in frame."""
+    h, w = shape[:2]
     half = THUMB_MAX // 2
     cx = round(min(max(x, 0.0), w - 1.0))
     cy = round(min(max(y, 0.0), h - 1.0))
-    x0, y0 = (
+    return (
         max(0, min(cx - half, w - THUMB_MAX)),
         max(0, min(cy - half, h - THUMB_MAX)),
     )
+
+
+def _thumb(frame: Any, x: float, y: float) -> Any:
+    """Return a uint8 crop (at most 128x128) of *frame* around (x, y)."""
+    import numpy as np
+
+    x0, y0 = _thumb_origin(frame.shape, x, y)
     crop = np.asarray(frame[y0 : y0 + THUMB_MAX, x0 : x0 + THUMB_MAX], dtype=np.float32)
     lo, hi = float(crop.min()), float(crop.max())
     if hi <= lo:
         return np.zeros(crop.shape, dtype=np.uint8)
     return ((crop - lo) * (255.0 / (hi - lo))).astype(np.uint8)
+
+
+def thumb_message(frame: Any, x: float, y: float, cal: Any = None) -> dict:
+    """The ``thumb`` message: the crop, where it came from and the markers.
+
+    ``x0, y0`` is the crop's top-left in frame pixels and ``scale`` the
+    thumbnail pixels per frame pixel (the crop is not resampled, so 1.0).
+    ``spot`` is the fitted spot and ``setpoint`` the calibrated setpoint
+    (``None`` without a calibration), both in frame pixels. A marker's place in
+    the thumbnail is ``(px - x0) * scale``.
+    """
+    x0, y0 = _thumb_origin(frame.shape, x, y)
+    return {
+        "type": "thumb",
+        "image": _thumb(frame, x, y),
+        "x0": x0,
+        "y0": y0,
+        "scale": 1.0,
+        "spot": (float(x), float(y)),
+        "setpoint": None if cal is None else (float(cal.x0), float(cal.y0)),
+    }
 
 
 class _Worker:
@@ -367,7 +393,7 @@ class _Worker:
             )
         if now - self.t_thumb >= THUMB_PERIOD_S and fix.ok:
             self.t_thumb = now
-            self.send({"type": "thumb", "image": _thumb(self._frame, fix.x, fix.y)})
+            self.send(thumb_message(self._frame, fix.x, fix.y, self.cal))
 
     # -- main loop --------------------------------------------------------
 

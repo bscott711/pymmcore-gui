@@ -302,8 +302,8 @@ class _Relay(QObject):
     def on_telemetry(self, msg: dict) -> None:
         self.telemetry.emit(msg)
 
-    def on_thumb(self, image: object) -> None:
-        self.thumb.emit(image)
+    def on_thumb(self, msg: dict) -> None:
+        self.thumb.emit(msg)
 
     def on_fault(self, reason: str) -> None:
         self.fault.emit(reason)
@@ -531,7 +531,7 @@ class SpotFocusPanel(QWidget):
             if svc is None:
                 svc = self._factory(spec, cfg.led_intensity)
                 svc.telemetry.connect(self._relay.on_telemetry)
-                svc.thumb.connect(self._relay.on_thumb)
+                svc.thumb_msg.connect(self._relay.on_thumb)
                 svc.fault.connect(self._relay.on_fault)
                 svc.state.connect(self._relay.on_state)
                 svc.moved.connect(self._relay.on_moved)
@@ -784,19 +784,17 @@ class SpotFocusPanel(QWidget):
         labels["lateral"].setText("-" if lateral is None else f"{lateral:+.2f} px")
         labels["fps"].setText(f"{msg.get('fps') or 0.0:.1f}")
 
-    def _on_thumb(self, image: np.ndarray) -> None:
-        tel = self._telemetry
-        h, w = image.shape[:2]
-        spot = setpoint = None
-        if tel is not None and tel.get("x") is not None:
-            # The worker crops a window centred on the spot (clamped to the frame);
-            # the frame size is not sent, so assume it is not at an edge.
-            x0 = round(tel["x"]) - w // 2
-            y0 = round(tel["y"]) - h // 2
-            spot = (tel["x"] - x0, tel["y"] - y0)
-            if self._cal is not None:
-                setpoint = (self._cal.x0 - x0, self._cal.y0 - y0)
-        self.thumb_view.set_thumb(image, spot, setpoint)
+    def _on_thumb(self, msg: dict) -> None:
+        x0, y0, k = msg["x0"], msg["y0"], msg.get("scale", 1.0)
+
+        def place(pt: tuple[float, float] | None) -> tuple[float, float] | None:
+            return None if pt is None else ((pt[0] - x0) * k, (pt[1] - y0) * k)
+
+        # Before Start the worker has no calibration yet; use the saved one.
+        setpoint = msg.get("setpoint")
+        if setpoint is None and self._cal is not None:
+            setpoint = (self._cal.x0, self._cal.y0)
+        self.thumb_view.set_thumb(msg["image"], place(msg.get("spot")), place(setpoint))
 
     def _refresh_stats(self) -> None:
         svc = self.service

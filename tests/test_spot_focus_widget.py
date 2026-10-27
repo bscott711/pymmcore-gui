@@ -420,3 +420,58 @@ def test_dock_spot_radio_and_exclusion(qtbot: QtBot, mmc: FakeMMC) -> None:
     assert widget.mode_buttons["spot"].isChecked()
     widget.spot_panel.shutdown()
     assert mmc.props[(CRISP, "CRISP State")] == "Idle"
+
+
+# ---------------------------------------------------------------------------
+# thumbnail markers near the frame edge
+# ---------------------------------------------------------------------------
+
+EDGE_CAL = {**CAL, "x0": 8.0, "y0": 470.0}  # corner of a 640 x 480 frame
+
+
+def test_thumb_message_carries_origin_near_the_edge() -> None:
+    import numpy as np
+
+    from pymmcore_gui.asi_z_stack.spot_focus import SpotCalibration
+    from pymmcore_gui.asi_z_stack.spot_focus_worker import THUMB_MAX, thumb_message
+
+    frame = np.zeros((480, 640), dtype=np.uint16)
+    cal = SpotCalibration.from_dict(EDGE_CAL)
+    msg = thumb_message(frame, 8.4, 470.2, cal)
+    # The window is clamped into the frame, so the spot is not at its centre.
+    assert (msg["x0"], msg["y0"]) == (0, 480 - THUMB_MAX)
+    assert msg["scale"] == 1.0
+    assert msg["image"].shape == (THUMB_MAX, THUMB_MAX)
+    assert msg["spot"] == pytest.approx((8.4, 470.2))
+    assert msg["setpoint"] == pytest.approx((8.0, 470.0))
+    # The old "centred" assumption would put it 56 px off horizontally.
+    assert msg["spot"][0] - msg["x0"] < THUMB_MAX // 2 - 50
+    mid = thumb_message(frame, 320.0, 240.0)
+    assert (mid["x0"], mid["y0"]) == (320 - THUMB_MAX // 2, 240 - THUMB_MAX // 2)
+    assert mid["setpoint"] is None
+
+
+def test_panel_places_markers_for_a_spot_at_the_edge(
+    qtbot: QtBot, panel: SpotFocusPanel
+) -> None:
+    settings = SettingsV1.instance()
+    settings.spot_focus.source.fake = {
+        "cal_like": dict(EDGE_CAL),
+        "noise": 2.0,
+        "fps": 50.0,
+        "sigma_px": 3.0,
+    }
+    settings.spot_focus.calibration = dict(EDGE_CAL)
+    panel.refresh()
+    panel.start()
+    qtbot.waitUntil(lambda: panel.thumb_view.has_image, timeout=WAIT_MS)
+    qtbot.waitUntil(lambda: panel.thumb_view.markers[0] is not None, timeout=WAIT_MS)
+    spot, setpoint = panel.thumb_view.markers
+    assert spot is not None
+    assert setpoint is not None
+    # Near the left/bottom edge the markers sit inside the crop at its edge,
+    # at (8, 470 - 352) = (8, 118), not at its centre (64, 64).
+    assert spot[0] == pytest.approx(8.0, abs=2.5)
+    assert spot[1] == pytest.approx(118.0, abs=2.5)
+    assert setpoint == pytest.approx((8.0, 118.0))
+    panel.stop()

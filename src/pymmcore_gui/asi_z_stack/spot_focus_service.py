@@ -61,6 +61,8 @@ class SpotFocusService:
 
     telemetry = Signal(dict)
     thumb = Signal(object)
+    thumb_msg = Signal(dict)
+    """The whole ``thumb`` message (image, crop origin, scale, spot, setpoint)."""
     fault = Signal(str)
     state = Signal(str)
     moved = Signal(dict)
@@ -378,6 +380,7 @@ class SpotFocusService:
             self._emit(self.telemetry, msg)
         elif kind == "thumb":
             self._emit(self.thumb, msg["image"])
+            self._emit(self.thumb_msg, msg)
         elif kind == "fault":
             self._fault(str(msg.get("reason", "fault")))
         elif kind == "status":
