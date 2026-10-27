@@ -945,6 +945,11 @@ class MicroManagerGUI(QMainWindow):
         # viewer (see ViewerFocusBox; the Image Focus Lock panel shows it).
         focus_box_button = QPushButton("Focus box", lock_row)
         focus_box_button.setCheckable(True)
+        # The box follows the viewer's slice/channel; without the lock, a live
+        # run would drag it along with every new frame's z and c.
+        focus_box_button.toggled.connect(
+            lambda checked, cb=lock_checkbox: checked and cb.setChecked(True)
+        )
         lock_layout.addWidget(focus_box_button)
         lock_layout.addStretch()
         container_layout.addWidget(lock_row)
