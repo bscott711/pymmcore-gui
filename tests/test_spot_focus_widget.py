@@ -42,7 +42,11 @@ from pymmcore_gui.asi_z_stack.image_focus_events import (
     spot_focus_flag,
 )
 from pymmcore_gui.asi_z_stack.image_focus_run import ImageFocusRun
-from pymmcore_gui.asi_z_stack.spot_focus import EdgeCalibration, measure_edge
+from pymmcore_gui.asi_z_stack.spot_focus import (
+    EdgeCalibration,
+    FocusCalibration,
+    measure_edge,
+)
 from pymmcore_gui.asi_z_stack.spot_focus_service import SpotFocusService
 from pymmcore_gui.asi_z_stack.toupcam_source import make_source
 from pymmcore_gui.widgets._spot_focus_panel import (
@@ -71,6 +75,11 @@ CAL_LIKE = {
 }
 #: Across the left edge of the fake patch; clear of its corners and the ghost.
 BOX = (232, 210, 80, 60)
+#: Across the top edge (y = 194); with BOX, both edges move under a diagonal motion.
+BOX2 = (288, 154, 64, 80)
+#: What the rig's saved calibration looked like (a single "edge" dict, P negative).
+RIG_P = -45.5
+RIG_SLOPE = 1.919
 WAIT_MS = 30_000  # a spawned worker needs a few seconds to import
 
 
@@ -192,9 +201,74 @@ def _edge_cal() -> EdgeCalibration:
     )
 
 
+def _focus_cal() -> FocusCalibration:
+    """The same calibration as a (one-edge) ``FocusCalibration``."""
+    return FocusCalibration(
+        edges=[_edge_cal()], p0_um=P0, created="2026-10-28T00:00:00"
+    )
+
+
 def _calibrated(settings: SettingsV1) -> None:
-    settings.spot_focus.calibration = _edge_cal().to_dict()
+    settings.spot_focus.calibration = _focus_cal().to_dict()
     settings.spot_focus.edge_box = BOX
+
+
+def _use_diagonal_motion(settings: SettingsV1, sign: float = 1.0) -> None:
+    """Make the fake patch move diagonally so that both BOX and BOX2 edges move."""
+    fake = dict(settings.spot_focus.source.fake)
+    fake["cal_like"] = {
+        **CAL_LIKE,
+        "ux": 0.8,
+        "uy": 0.6,
+        "slope_px_per_um": sign * SLOPE,
+    }
+    settings.spot_focus.source.fake = fake
+
+
+def _rig_cal_like() -> dict:
+    """A fake whose top edge moves along y by the rig's 1.919 px/um, P near -45.5."""
+    return {
+        "x0": 320.0,
+        "y0": 240.0,
+        "ux": 0.0,
+        "uy": 1.0,
+        "slope_px_per_um": RIG_SLOPE,
+        "p0_um": RIG_P,
+    }
+
+
+def _rig_saved_edge(e0: float) -> dict:
+    """The single "edge" dict an older version saved (no "edges" key)."""
+    return {
+        "kind": "edge",
+        "box": list(BOX2),
+        "axis": "y",
+        "polarity": 1,
+        "slope_px_per_um": RIG_SLOPE,
+        "e0_px": e0,
+        "p0_um": -45.497,
+        "r2": 0.993,
+        "residual_px": 0.05,
+        "linear_range_um": 1.0,
+        "noise_px": 0.02,
+        "angle_deg": 0.0,
+        "contrast": 700.0,
+        "n_points": 9,
+        "sweep": [],
+        "warnings": [],
+        "record_path": "",
+        "created": "2026-10-28T13:11:49",
+    }
+
+
+def _rig_e0() -> float:
+    """Where the rig-shaped fake shows its top edge at P = -45.5."""
+    src = make_source(
+        {"kind": "fake", "cal_like": _rig_cal_like(), "noise": 2.0, "fps": 50.0}
+    )
+    fixes = [measure_edge(src.render(0.0), BOX2) for _ in range(5)]  # type: ignore[attr-defined]
+    assert all(f.ok for f in fixes)
+    return float(sum(f.position for f in fixes) / len(fixes))
 
 
 # ---------------------------------------------------------------------------
@@ -210,9 +284,11 @@ def test_spot_settings_defaults_and_roundtrip() -> None:
     assert cfg.calibration is None
     assert cfg.to_calibration() is None
     assert cfg.calibration_status()[0] is None
-    assert cfg.edge_box is None
+    assert cfg.edge_box is None and cfg.edge_box_2 is None
     assert (cfg.sweep_span_um, cfg.sweep_steps, cfg.sweep_frames) == (2.0, 9, 3)
+    assert cfg.params.max_edge_disagreement_um == 0.3
     params = cfg.params.to_params()
+    assert params.max_edge_disagreement_um == 0.3
     assert params.deadband_um == pytest.approx(0.03)
     assert params.avg_frames == 4
     assert params.offset_um == 0.0
@@ -224,19 +300,42 @@ def test_spot_settings_defaults_and_roundtrip() -> None:
     cfg.params.kp = 0.3
     cfg.params.offset_um = 0.25
     cfg.params.min_contrast = 25.0
-    cfg.calibration = _edge_cal().to_dict()
+    cfg.params.max_edge_disagreement_um = 0.45
+    cfg.calibration = _focus_cal().to_dict()
     cfg.edge_box = BOX
+    cfg.edge_box_2 = BOX2
     cfg.sweep_span_um, cfg.sweep_steps, cfg.sweep_frames = 1.5, 7, 2
     s2 = SettingsV1.model_validate_json(s.model_dump_json())
     assert s2.spot_focus == s.spot_focus
     assert s2.spot_focus.roi == (10, 20, 300, 200)
-    assert s2.spot_focus.edge_box == BOX
+    assert s2.spot_focus.edge_box == BOX and s2.spot_focus.edge_box_2 == BOX2
     assert (s2.spot_focus.sweep_span_um, s2.spot_focus.sweep_steps) == (1.5, 7)
     cal = s2.spot_focus.to_calibration()
-    assert cal is not None and cal.slope_px_per_um == SLOPE
+    assert isinstance(cal, FocusCalibration)
+    assert cal.edges[0].slope_px_per_um == SLOPE
     assert s2.spot_focus.calibration_status()[1] == ""
     p2 = s2.spot_focus.params.to_params()
     assert (p2.kp, p2.offset_um, p2.min_contrast) == (0.3, 0.25, 25.0)
+    assert p2.max_edge_disagreement_um == 0.45
+
+
+def test_rig_shaped_single_edge_calibration_loads_as_one_edge() -> None:
+    """The calibration saved before two-edge fusion keeps working."""
+    cfg = SettingsV1().spot_focus
+    rig = _rig_saved_edge(194.0)
+    rig.update(box=[762, 590, 176, 114], slope_px_per_um=1.919)
+    cfg.calibration = rig
+    cal, message = cfg.calibration_status()
+    assert message == ""
+    assert isinstance(cal, FocusCalibration) and len(cal.edges) == 1
+    assert cal.edges[0].box == (762, 590, 176, 114)
+    assert cal.edges[0].slope_px_per_um == pytest.approx(1.919)
+    assert cal.p0_um == pytest.approx(-45.497)
+    assert cal.created == "2026-10-28T13:11:49"
+    assert cfg.to_calibration() == cal
+    # and it survives a settings round trip, still in the old shape
+    s2 = SettingsV1.model_validate_json(SettingsV1(spot_focus=cfg).model_dump_json())
+    assert s2.spot_focus.to_calibration() == cal
 
 
 def test_old_calibration_in_settings_is_ignored_not_raised() -> None:
@@ -326,10 +425,16 @@ def test_buttons_and_readouts_are_the_edge_workflow(panel: SpotFocusPanel) -> No
         "moves",
         "move_ms",
         "edge",
+        "edge2",
         "contrast",
         "fps",
+        "disagreement",
         "error",
     ]
+    assert panel.draw_edge2_button.text() == "Draw edge box 2"
+    assert panel.clear_edge2_button.text() == "Clear box 2"
+    assert panel.edge_box2_label.text() == "none (optional)"
+    assert not panel.clear_edge2_button.isEnabled()
     assert "lateral" not in panel.readout_labels
     # Nothing calibrated yet: Lock and Calibrate try (and ask for a box), Zero waits.
     assert panel.start_button.isEnabled() and panel.calibrate_button.isEnabled()
@@ -406,6 +511,262 @@ def test_drawing_an_edge_box_saves_it_and_shows_the_overlay(
     assert panel.edge_box_label.text() == "none"
 
 
+def test_drawing_and_clearing_edge_box_2_persists_and_overlays(
+    qtbot: QtBot, panel: SpotFocusPanel
+) -> None:
+    cfg = SettingsV1.instance().spot_focus
+    view = panel.live_view
+    assert not view._edge_box2_item.isVisible()
+    view.edgeBox2Drawn.emit(*BOX2)
+    assert cfg.edge_box_2 == BOX2
+    assert panel.edge_box2_label.text() == "288, 154, 64, 80"
+    assert view.edge_box2 == BOX2 and view._edge_box2_item.isVisible()
+    r = view._edge_box2_item.rect()
+    assert (r.x(), r.y(), r.width(), r.height()) == BOX2
+    assert panel.clear_edge2_button.isEnabled()
+    assert cfg.edge_box is None  # box 1 is its own setting
+    # a refresh (an app restart) shows the saved box 2 again
+    view.set_edge_box2(None)
+    panel.refresh()
+    assert view.edge_box2 == BOX2 and view._edge_box2_item.isVisible()
+    panel.clear_edge2_button.click()
+    assert cfg.edge_box_2 is None and not view._edge_box2_item.isVisible()
+    assert panel.edge_box2_label.text() == "none (optional)"
+    assert not panel.clear_edge2_button.isEnabled()
+    assert view.edge_box2 is None
+
+
+def test_stale_box_warning_covers_both_boxes(
+    qtbot: QtBot, panel: SpotFocusPanel
+) -> None:
+    settings = SettingsV1.instance()
+    _calibrated(settings)
+    panel.refresh()
+    assert "changed since the calibration" not in panel.calibration_label.text()
+    panel.set_edge_box2(BOX2)  # a box the calibration does not have
+    assert "changed since the calibration" in panel.calibration_label.text()
+    panel.set_edge_box2(None)
+    assert "changed since the calibration" not in panel.calibration_label.text()
+    panel.set_edge_box((0, 0, 64, 64))
+    assert "edge box changed since the calibration" in panel.calibration_label.text()
+
+
+def test_draw_edge_box_2_button_drags_box_2_to_the_worker(
+    qtbot: QtBot, panel: SpotFocusPanel
+) -> None:
+    svc = _preview_on(qtbot, panel)
+    view = panel.live_view
+    cfg = SettingsV1.instance().spot_focus
+    panel.set_edge_box(BOX)
+    panel.draw_edge2_button.click()
+    assert panel.draw_edge2_button.isChecked()
+    assert view.draw_target == "edge2" and view.view.draw_mode
+    assert view.draw_edge2_button.isChecked()
+    # the three Draw modes are exclusive
+    panel.draw_edge_button.click()
+    assert view.draw_target == "edge" and not panel.draw_edge2_button.isChecked()
+    panel.draw_edge2_button.click()
+    assert view.draw_target == "edge2" and not view.draw_edge_button.isChecked()
+    with patch.object(svc, "set_edge_boxes", wraps=svc.set_edge_boxes) as spy:
+        view._on_rect_drawn(QPointF(288.3, 154.2), QPointF(351.1, 233.8))
+        spy.assert_called_with([BOX, BOX2])
+    assert cfg.edge_box_2 == BOX2 and cfg.edge_box == BOX
+    assert not panel.draw_edge2_button.isChecked()  # one box per click
+    assert view.draw_target is None
+    # The preview measures both: the second cross lands on the top edge.
+    qtbot.waitUntil(
+        lambda: view._spot2_item.isVisible()
+        and abs(view._spot2_item.pos().y() - 194.5) < 3,
+        timeout=WAIT_MS,
+    )
+
+
+def test_telemetry_shows_both_edges_the_disagreement_and_the_note(
+    qtbot: QtBot, panel: SpotFocusPanel
+) -> None:
+    labels = panel.readout_labels
+    view = panel.live_view
+    two = {
+        "edge_px": 272.0,
+        "contrast": 700.0,
+        "fps": 30.0,
+        "along_um": 0.05,
+        "disagreement_um": 0.12,
+        "note": "",
+        "reason": "",
+        "edges": [
+            {"edge_px": 272.0, "x": 272.0, "y": 240.0, "ok": True},
+            {"edge_px": 194.25, "x": 320.0, "y": 194.25, "ok": True},
+        ],
+    }
+    panel._on_telemetry(two)
+    assert labels["edge"].text() == "272.00 px"
+    assert labels["edge2"].text() == "194.25 px"
+    assert labels["disagreement"].text() == "0.120"
+    assert labels["error"].text() == "+0.050 µm"
+    assert panel.note_label.text() == ""
+    assert view._spot2_item.isVisible()
+    assert view._spot2_item.pos().x() == pytest.approx(320.5)
+    assert view._spot2_item.pos().y() == pytest.approx(194.75)
+
+    # Edge 2 lost: the lock goes on edge 1 and says so.
+    lost = {
+        **two,
+        "disagreement_um": None,
+        "note": "edge 2 lost; using edge 1",
+        "edges": [
+            two["edges"][0],
+            {"edge_px": None, "x": None, "y": None, "ok": False},
+        ],
+    }
+    panel._on_telemetry(lost)
+    assert "edge 2 lost; using edge 1" in panel.note_label.text()
+    assert labels["edge2"].text() == "—"
+    assert labels["disagreement"].text() == "—"
+    assert labels["error"].text() == "+0.050 µm"
+    assert not view._spot2_item.isVisible()
+
+    # A bad frame without a note shows its reason; one edge has no edge 2.
+    bad = {
+        "edge_px": 272.0,
+        "contrast": 5.0,
+        "along_um": None,
+        "reason": "edges disagree by 0.40 um (lateral drift or a changed image)",
+        "edges": [two["edges"][0]],
+    }
+    panel._on_telemetry(bad)
+    assert "edges disagree by 0.40 um" in panel.note_label.text()
+    assert labels["error"].text() == "—" and labels["edge2"].text() == "—"
+    panel._on_telemetry({**bad, "reason": "", "along_um": 0.0})
+    assert panel.note_label.text() == ""
+
+
+def test_preview_error_appears_after_calibrate(
+    qtbot: QtBot, panel: SpotFocusPanel
+) -> None:
+    svc = _preview_on(qtbot, panel)
+    panel.set_edge_box(BOX)
+    labels = panel.readout_labels
+    # The edge is measured in the preview, but there is no calibration: no error.
+    qtbot.waitUntil(lambda: "px" in labels["edge"].text(), timeout=WAIT_MS)
+    assert labels["error"].text() == "—"
+    with patch.object(svc, "set_calibration", wraps=svc.set_calibration) as spy:
+        panel.calibrate()
+        qtbot.waitUntil(lambda: not panel._busy, timeout=WAIT_MS)
+        assert panel.fault_label.text() == "", panel.fault_label.text()
+        spy.assert_called()
+        sent = spy.call_args[0][0]
+        assert isinstance(sent, FocusCalibration) and sent.boxes == [BOX]
+    # Now the preview shows the error (about 0 um: the fake is at its zero).
+    qtbot.waitUntil(lambda: "µm" in labels["error"].text(), timeout=WAIT_MS)
+    assert abs(float(labels["error"].text().split()[0])) < 0.5
+    assert labels["edge2"].text() == "—"
+
+
+@pytest.mark.parametrize("sign", [1.0, -1.0])
+def test_calibrate_with_two_boxes_gives_a_two_line_label(
+    qtbot: QtBot, panel: SpotFocusPanel, mmc: FakeMMC, sign: float
+) -> None:
+    settings = SettingsV1.instance()
+    cfg = settings.spot_focus
+    _use_diagonal_motion(settings, sign)
+    cfg.edge_box, cfg.edge_box_2 = BOX, BOX2
+    cfg.sweep_span_um, cfg.sweep_steps, cfg.sweep_frames = 1.6, 7, 2
+    panel.refresh()
+    svc = _preview_on(qtbot, panel)  # the preview then shows the fused error
+    with patch.object(svc, "calibrate", wraps=svc.calibrate) as spy:
+        panel.calibrate()
+        qtbot.waitUntil(lambda: not panel._busy, timeout=WAIT_MS)
+        assert spy.call_args[0][0] == [BOX, BOX2]
+    stored = cfg.calibration
+    assert stored is not None, panel.fault_label.text()
+    assert stored["kind"] == "edges" and len(stored["edges"]) == 2
+    left, top = stored["edges"]
+    assert left["slope_px_per_um"] == pytest.approx(sign * SLOPE * 0.8, rel=0.15)
+    assert top["slope_px_per_um"] == pytest.approx(sign * SLOPE * 0.6, rel=0.15)
+    assert (left["axis"], top["axis"]) == ("x", "y")
+    assert tuple(left["box"]) == BOX and tuple(top["box"]) == BOX2
+    text = panel.calibration_label.text()
+    lines = text.split("<br>")
+    assert len(lines) == 3, text  # one line per edge + the shared zero line
+    sgn = "+" if sign > 0 else "-"
+    assert re.match(rf"edge 1 axis x \| \{sgn}[34]\.\d\d px/µm \| R²", lines[0]), text
+    assert re.match(rf"edge 2 axis y \| \{sgn}[23]\.\d\d px/µm \| R²", lines[1]), text
+    assert "residual" in lines[0] and "noise" in lines[1] and "µm" in lines[1]
+    assert lines[2].startswith("zero P") and "±0.80 µm" in lines[2]
+    assert "changed since the calibration" not in text
+    # both rings sit on their zero edge points
+    view = panel.live_view
+    assert view._setpoint_item.pos().x() == pytest.approx(left["e0_px"] + 0.5)
+    assert view._setpoint2_item.isVisible()
+    assert view._setpoint2_item.pos().x() == pytest.approx(288 + 32 + 0.5)
+    assert view._setpoint2_item.pos().y() == pytest.approx(top["e0_px"] + 0.5)
+    # the preview shows both edges and the fused error
+    labels = panel.readout_labels
+    qtbot.waitUntil(
+        lambda: "px" in labels["edge2"].text() and "µm" in labels["error"].text(),
+        timeout=WAIT_MS,
+    )
+    assert labels["disagreement"].text() != "—"
+    assert view._spot2_item.isVisible()
+    assert mmc.pos[P_LABEL] == pytest.approx(P0)  # P returned to where it was
+
+
+def test_zero_here_rezeroes_both_edges(
+    qtbot: QtBot, panel: SpotFocusPanel, mmc: FakeMMC
+) -> None:
+    settings = SettingsV1.instance()
+    cfg = settings.spot_focus
+    _use_diagonal_motion(settings)
+    cfg.edge_box, cfg.edge_box_2 = BOX, BOX2
+    cfg.sweep_span_um, cfg.sweep_steps, cfg.sweep_frames = 1.6, 7, 2
+    panel.refresh()
+    panel.calibrate()
+    qtbot.waitUntil(lambda: not panel._busy, timeout=WAIT_MS)
+    before = cfg.calibration
+    assert before is not None, panel.fault_label.text()
+    mmc.pos[P_LABEL] = P0 + 0.5  # the user refocused by hand
+    panel.zero()
+    qtbot.waitUntil(lambda: not panel._busy, timeout=WAIT_MS)
+    assert panel.fault_label.text() == "", panel.fault_label.text()
+    after = cfg.calibration
+    assert after is not None and len(after["edges"]) == 2
+    assert after["p0_um"] == pytest.approx(P0 + 0.5)
+    for old, new in zip(before["edges"], after["edges"], strict=True):
+        assert new["slope_px_per_um"] == old["slope_px_per_um"]  # kept
+        moved = new["e0_px"] - old["e0_px"]
+        assert moved == pytest.approx(0.5 * old["slope_px_per_um"], abs=0.5)
+    assert panel._cal is not None and len(panel._cal.edges) == 2
+
+
+def test_rig_shaped_single_edge_calibration_locks_at_negative_p(
+    qtbot: QtBot, panel: SpotFocusPanel, mmc: FakeMMC
+) -> None:
+    settings = SettingsV1.instance()
+    cfg = settings.spot_focus
+    cfg.source.fake = {**cfg.source.fake, "cal_like": _rig_cal_like()}
+    mmc.pos[P_LABEL] = RIG_P
+    cfg.calibration = _rig_saved_edge(_rig_e0())
+    cfg.edge_box = BOX2
+    panel.refresh()
+    assert isinstance(panel._cal, FocusCalibration) and len(panel._cal.edges) == 1
+    text = panel.calibration_label.text()
+    assert "edge 1 axis y" in text and "+1.92 px/µm" in text and "edge 2" not in text
+    assert "changed since the calibration" not in text
+    assert panel.zero_button.isEnabled() and panel.start_button.isEnabled()
+    assert not panel.live_view._setpoint2_item.isVisible()
+
+    panel.start()
+    qtbot.waitUntil(lambda: panel.state == "running", timeout=WAIT_MS)
+    assert panel.fault_label.text() == "", panel.fault_label.text()
+    qtbot.waitUntil(lambda: len(panel.chart) > 5, timeout=WAIT_MS)
+    assert panel.state == "running"  # no range / excursion fault at P = -45.5
+    assert abs(mmc.pos[P_LABEL] - RIG_P) < 1.0
+    assert panel.readout_labels["edge2"].text() == "—"
+    panel.stop()
+    assert panel.state == "stopped"
+
+
 def test_draw_edge_box_button_drags_a_box_to_the_worker(
     qtbot: QtBot, panel: SpotFocusPanel
 ) -> None:
@@ -423,10 +784,10 @@ def test_draw_edge_box_button_drags_a_box_to_the_worker(
     panel.draw_edge_button.click()
     assert view.draw_target == "edge" and not view.draw_roi_button.isChecked()
 
-    with patch.object(svc, "set_edge_box", wraps=svc.set_edge_box) as spy:
+    with patch.object(svc, "set_edge_boxes", wraps=svc.set_edge_boxes) as spy:
         # a drag across the left edge, in scene (sensor) pixels
         view._on_rect_drawn(QPointF(232.3, 210.6), QPointF(311.2, 269.9))
-        spy.assert_called_with(BOX)
+        spy.assert_called_with([BOX])
     assert cfg.edge_box == BOX
     assert not panel.draw_edge_button.isChecked()  # one box per click
     assert view.draw_target is None and not view.view.draw_mode
@@ -485,6 +846,8 @@ def test_start_telemetry_stop_restores_crisp(
     assert view._setpoint_item.pos().y() == pytest.approx(setpoint[1] + 0.5)
     assert panel.readout_labels["fps"].text() != "-"
     assert "px" in panel.readout_labels["edge"].text()
+    assert panel.readout_labels["edge2"].text() == "—"  # a single edge
+    assert panel.readout_labels["disagreement"].text() == "—"
     assert panel.readout_labels["contrast"].text() != "-"
     assert "edge (" in view.status_label.text()
     # The chart and the live view paint without raising (a paint error aborts Qt).
@@ -517,9 +880,14 @@ def test_start_telemetry_stop_restores_crisp(
     assert "Stop the lock" in panel.fault_label.text()
 
     sets_before_stop = len(mmc.sets)
-    with patch.object(svc, "set_edge_box", wraps=svc.set_edge_box) as box_spy:
+    with (
+        patch.object(svc, "set_edge_boxes", wraps=svc.set_edge_boxes) as box_spy,
+        patch.object(svc, "set_calibration", wraps=svc.set_calibration) as cal_spy,
+    ):
         panel.stop()
-        box_spy.assert_called_with(BOX)  # the preview measures the drawn box again
+        box_spy.assert_called_with([BOX])  # the preview measures the drawn box again
+        cal_spy.assert_called_once()  # ... with the calibration, for the error
+        assert isinstance(cal_spy.call_args[0][0], FocusCalibration)
     assert panel.state == "stopped"
     assert not spot_focus_flag.active
     assert mmc.props[(CRISP, "CRISP State")] == "Idle"  # restored
@@ -554,14 +922,15 @@ def test_calibrate_off_the_gui_thread(
     qtbot.waitUntil(lambda: not panel._busy, timeout=WAIT_MS)
     stored = cfg.calibration
     assert stored is not None, panel.fault_label.text()
-    assert stored["kind"] == "edge"
-    assert stored["slope_px_per_um"] == pytest.approx(SLOPE, rel=0.1)  # signed
-    assert stored["axis"] == "x" and stored["polarity"] == 1
-    assert stored["n_points"] == 7
-    assert stored["linear_range_um"] == pytest.approx(0.8)
+    assert stored["kind"] == "edges" and len(stored["edges"]) == 1
+    edge = stored["edges"][0]
+    assert edge["slope_px_per_um"] == pytest.approx(SLOPE, rel=0.1)  # signed
+    assert edge["axis"] == "x" and edge["polarity"] == 1
+    assert edge["n_points"] == 7
+    assert edge["linear_range_um"] == pytest.approx(0.8)
     assert stored["p0_um"] == pytest.approx(P0)
-    assert stored["e0_px"] == pytest.approx(_e0(), abs=0.5)
-    assert tuple(stored["box"]) == BOX
+    assert edge["e0_px"] == pytest.approx(_e0(), abs=0.5)
+    assert tuple(edge["box"]) == BOX
     assert panel.start_button.isEnabled() and panel.zero_button.isEnabled()
     assert mmc.pos[P_LABEL] == pytest.approx(P0)  # P returned to where it was
     assert mmc.props[(CRISP, "CRISP State")] == "Idle"
@@ -573,8 +942,9 @@ def test_calibrate_off_the_gui_thread(
     assert cfg.params.offset_um == 0.0
     ring = panel.live_view._setpoint_item
     assert ring.isVisible()
-    assert ring.pos().x() == pytest.approx(stored["e0_px"] + 0.5)
+    assert ring.pos().x() == pytest.approx(edge["e0_px"] + 0.5)
     assert ring.pos().y() == pytest.approx(210 + 30 + 0.5)
+    assert not panel.live_view._setpoint2_item.isVisible()  # one edge, one ring
 
 
 def test_zero_here_rezeroes_and_resets_the_offset(
@@ -593,14 +963,15 @@ def test_zero_here_rezeroes_and_resets_the_offset(
     assert panel.fault_label.text() == "", panel.fault_label.text()
     stored = settings.spot_focus.calibration
     assert stored is not None
+    edge = stored["edges"][0]
     assert stored["p0_um"] == pytest.approx(P0 + 0.4)
-    assert stored["e0_px"] == pytest.approx(_e0() + SLOPE * 0.4, abs=0.4)
-    assert stored["slope_px_per_um"] == SLOPE  # kept
+    assert edge["e0_px"] == pytest.approx(_e0() + SLOPE * 0.4, abs=0.4)
+    assert edge["slope_px_per_um"] == SLOPE  # kept
     assert panel.offset_spin.value() == 0.0
     assert settings.spot_focus.params.offset_um == 0.0
     assert panel._cal is not None and panel._cal.p0_um == pytest.approx(P0 + 0.4)
     assert panel.live_view._setpoint_item.pos().x() == pytest.approx(
-        stored["e0_px"] + 0.5
+        edge["e0_px"] + 0.5
     )
     assert mmc.pos[P_LABEL] == pytest.approx(P0 + 0.4)  # Zero never moves P
 
@@ -620,8 +991,8 @@ def test_lock_without_a_calibration_calibrates_then_locks(
     qtbot.waitUntil(lambda: panel.state == "running", timeout=WAIT_MS)
     assert panel.fault_label.text() == "", panel.fault_label.text()
     stored = cfg.calibration
-    assert stored is not None and stored["kind"] == "edge"
-    assert stored["slope_px_per_um"] == pytest.approx(SLOPE, rel=0.1)
+    assert stored is not None and stored["kind"] == "edges"
+    assert stored["edges"][0]["slope_px_per_um"] == pytest.approx(SLOPE, rel=0.1)
     assert stored["p0_um"] == pytest.approx(P0)  # the present P is the zero
     assert panel._cal is not None
     assert cfg.params.offset_um == 0.0  # a new zero

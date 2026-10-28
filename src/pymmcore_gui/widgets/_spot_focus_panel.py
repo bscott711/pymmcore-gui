@@ -1,13 +1,15 @@
 """Spot focus lock panel (the only O3 focus-lock mode, hosted directly in the dock).
 
 The lock (see :mod:`~pymmcore_gui.asi_z_stack.spot_focus_service`) watches one
-straight edge of the CRISP LED patch on a side camera in a worker process and
-holds piezo P by nudging it rarely. This panel
+or two straight edges of the CRISP LED patch on a side camera in a worker
+process and holds piezo P by nudging it rarely. This panel
 
 - lets the user draw the edge box across the edge that moves with focus (in the
-  live view), calibrates it (**Calibrate**: a piezo sweep around the present P,
-  on a background thread), makes the present edge position the zero (**Zero
-  here**) and sets a focus **Offset**;
+  live view) and, optionally, a second edge box across another edge (two edges
+  halve the noise and expose a lateral image shift as a disagreement),
+  calibrates them (**Calibrate**: a piezo sweep around the present P, on a
+  background thread), makes the present edge positions the zero (**Zero here**)
+  and sets a focus **Offset**;
 - locks and unlocks the loop (**Lock** / **Stop**; it runs until Stop,
   independent of any MDA; Lock with no valid calibration calibrates first);
 - runs the camera: SDK folder, Preview (which opens the full-resolution
@@ -59,14 +61,14 @@ from pymmcore_gui._qt.QtWidgets import (
 )
 from pymmcore_gui._settings import TESTING, USER_DATA_DIR, SettingsV1
 from pymmcore_gui.asi_z_stack.image_focus_events import spot_focus_flag
-from pymmcore_gui.asi_z_stack.spot_focus import snap_box
+from pymmcore_gui.asi_z_stack.spot_focus import edge_noise_um, snap_box
 from pymmcore_gui.asi_z_stack.spot_focus_service import SpotFocusService
 from pymmcore_gui.widgets._spot_live_view import SpotLiveView
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from pymmcore_gui.asi_z_stack.spot_focus import EdgeCalibration
+    from pymmcore_gui.asi_z_stack.spot_focus import FocusCalibration
 
 logger = logging.getLogger(__name__)
 
@@ -372,9 +374,10 @@ class SpotFocusPanel(QWidget):
         self._drop_preview_after_run = False  # view closed while the lock ran
         self.state = "idle"
         self._telemetry: dict | None = None
-        self._cal: EdgeCalibration | None = None
+        self._cal: FocusCalibration | None = None
         self._cal_message = ""  # why there is no calibration (old file, ...)
         self._edge_box: tuple[int, int, int, int] | None = None
+        self._edge_box2: tuple[int, int, int, int] | None = None
 
         # -- controls ------------------------------------------------------
         self.calibrate_button = QPushButton("Calibrate")
@@ -431,6 +434,25 @@ class SpotFocusPanel(QWidget):
         edge_row.addWidget(QLabel("x, y, w, h"))
         edge_row.addWidget(self.edge_box_label, 1)
 
+        self.draw_edge2_button = QPushButton("Draw edge box 2")
+        self.draw_edge2_button.setCheckable(True)
+        self.draw_edge2_button.setToolTip(
+            "Optional second edge (for example the left edge when box 1 is the top "
+            "edge): the two are fused, and a lateral image shift shows as a "
+            "disagreement"
+        )
+        self.draw_edge2_button.toggled.connect(self._toggle_draw_edge2)
+        self.clear_edge2_button = QPushButton("Clear box 2")
+        self.clear_edge2_button.setToolTip("Go back to a single edge")
+        self.clear_edge2_button.clicked.connect(lambda: self.set_edge_box2(None))
+        self.edge_box2_label = QLabel()
+        self.edge_box2_label.setTextFormat(Qt.TextFormat.PlainText)
+        edge2_row = QHBoxLayout()
+        edge2_row.addWidget(self.draw_edge2_button)
+        edge2_row.addWidget(self.clear_edge2_button)
+        edge2_row.addWidget(QLabel("x, y, w, h"))
+        edge2_row.addWidget(self.edge_box2_label, 1)
+
         self.span_spin = self._spin(
             0.2, 20.0, 0.5, 2, " µm", "Total piezo travel of the calibration sweep"
         )
@@ -462,6 +484,7 @@ class SpotFocusPanel(QWidget):
         edge_group = QGroupBox("Edge box and calibration sweep")
         edge_lay = QVBoxLayout(edge_group)
         edge_lay.addLayout(edge_row)
+        edge_lay.addLayout(edge2_row)
         edge_lay.addLayout(sweep_row)
 
         self.state_label = QLabel()
@@ -479,6 +502,8 @@ class SpotFocusPanel(QWidget):
         self.live_view.roiDrawn.connect(self._on_roi_drawn)
         self.live_view.edgeBoxDrawn.connect(self._on_edge_box_drawn)
         self.live_view.edgeDrawModeChanged.connect(self._on_edge_draw_mode)
+        self.live_view.edgeBox2Drawn.connect(self._on_edge_box2_drawn)
+        self.live_view.edge2DrawModeChanged.connect(self._on_edge2_draw_mode)
         self.live_view.windowClosed.connect(self._on_view_closed)
         self.live_view.statsChanged.connect(self._on_view_stats)
 
@@ -488,14 +513,19 @@ class SpotFocusPanel(QWidget):
         for key, text in (
             ("moves", "Moves / min"),
             ("move_ms", "Move time (mean / max)"),
-            ("edge", "Edge (px)"),
+            ("edge", "Edge 1 (px)"),
+            ("edge2", "Edge 2 (px)"),
             ("contrast", "Contrast"),
             ("fps", "Frame rate"),
+            ("disagreement", "Disagreement (µm)"),
             ("error", "Error (along)"),
         ):
             label = QLabel("-")
             self.readout_labels[key] = label
             readouts.addRow(text, label)
+        self.note_label = QLabel()
+        self.note_label.setTextFormat(Qt.TextFormat.RichText)
+        self.note_label.setWordWrap(True)
 
         # -- parameters ----------------------------------------------------
         self.param_spins: dict[str, QDoubleSpinBox] = {"offset_um": self.offset_spin}
@@ -521,6 +551,7 @@ class SpotFocusPanel(QWidget):
         layout.addWidget(camera_group)
         layout.addWidget(self.chart, 1)
         layout.addLayout(readouts)
+        layout.addWidget(self.note_label)
         layout.addWidget(params_group)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -726,20 +757,34 @@ class SpotFocusPanel(QWidget):
                 svc.state.connect(self._relay.on_state)
                 svc.moved.connect(self._relay.on_moved)
                 owner.service, owner.spec, owner.dead = svc, spec, False
-                self._send_edge_box(svc)  # the preview measures the saved box
+                self._send_preview_state(svc)  # the preview measures the saved boxes
             return svc
 
-    def _send_edge_box(self, svc: SpotFocusService | None = None) -> None:
-        """Tell the worker the saved edge box (the preview measures it)."""
+    @staticmethod
+    def _drawn_boxes(cfg: Any) -> list[tuple[int, int, int, int]]:
+        """The saved edge boxes in calibration order; none without box 1."""
+        if cfg.edge_box is None:
+            return []
+        boxes = [cfg.edge_box]
+        if cfg.edge_box_2 is not None:
+            boxes.append(cfg.edge_box_2)
+        return boxes
+
+    def _send_preview_state(self, svc: SpotFocusService | None = None) -> None:
+        """Tell the worker the saved calibration and edge boxes.
+
+        With both, the preview measures the boxes and shows the fused error.
+        """
         if svc is None:
             svc = self.service
         if svc is None:
             return
-        box = SettingsV1.instance().spot_focus.edge_box
+        cfg = SettingsV1.instance().spot_focus
         try:
-            svc.set_edge_box(box)
+            svc.set_calibration(cfg.calibration_status()[0])
+            svc.set_edge_boxes(self._drawn_boxes(cfg))
         except Exception:
-            logger.warning("spot focus set_edge_box failed", exc_info=True)
+            logger.warning("spot focus set_edge_boxes failed", exc_info=True)
 
     def shutdown(self) -> None:
         """Stop the loop (restoring CRISP) and end the worker process."""
@@ -794,29 +839,42 @@ class SpotFocusPanel(QWidget):
         if self._cal is None and not cfg.calibration:
             self._cal_message = ""
         self._edge_box = cfg.edge_box
+        self._edge_box2 = cfg.edge_box_2
         self.live_view.set_edge_box(self._edge_box)
+        self.live_view.set_edge_box2(self._edge_box2)
         self._show_edge_box_text()
         self._place_zero_marker()
         self._refresh_calibration()
         self._update_enabled()
 
     def _show_edge_box_text(self) -> None:
-        box = self._edge_box
+        box, box2 = self._edge_box, self._edge_box2
         self.edge_box_label.setText(
             "none" if box is None else ", ".join(str(int(v)) for v in box)
         )
+        self.edge_box2_label.setText(
+            "none (optional)" if box2 is None else ", ".join(str(int(v)) for v in box2)
+        )
+
+    @staticmethod
+    def _zero_point(edge: Any) -> tuple[float, float]:
+        """The zero edge point ``(x, y)`` of a calibrated edge, sensor px."""
+        x, y, w, h = edge.box
+        if edge.axis == "x":
+            return (edge.e0_px, y + h / 2)
+        return (x + w / 2, edge.e0_px)
 
     def _place_zero_marker(self) -> None:
-        """Put the live view's ring at the zero edge point of the calibration."""
+        """Put the live view's rings at the zero edge points of the calibration."""
         cal = self._cal
         if cal is None:
             self.live_view.set_setpoint(None)
+            self.live_view.set_secondary_setpoint(None)
             return
-        x, y, w, h = cal.box
-        if cal.axis == "x":
-            self.live_view.set_setpoint((cal.e0_px, y + h / 2))
-        else:
-            self.live_view.set_setpoint((x + w / 2, cal.e0_px))
+        self.live_view.set_setpoint(self._zero_point(cal.edges[0]))
+        self.live_view.set_secondary_setpoint(
+            self._zero_point(cal.edges[1]) if len(cal.edges) > 1 else None
+        )
 
     def _refresh_calibration(self) -> None:
         cal = self._cal
@@ -825,19 +883,36 @@ class SpotFocusPanel(QWidget):
                 _colored(self._cal_message or "not calibrated", ATTENTION_COLOR)
             )
             return
-        slope = cal.slope_px_per_um
-        noise_um = cal.noise_px / abs(slope) if slope else float("nan")
-        text = html.escape(
-            f"edge axis {cal.axis} | {slope:+.2f} px/µm | R² {cal.r2:.3f} | "
-            f"residual {cal.residual_px:.2f} px | ±{cal.linear_range_um:.2f} µm | "
-            f"noise {noise_um:.3f} µm | zero P {cal.p0_um:.3f} µm | {cal.created}"
+        lines = [
+            f"edge {i} axis {e.axis} | {e.slope_px_per_um:+.2f} px/µm | "
+            f"R² {e.r2:.3f} | residual {e.residual_px:.2f} px | "
+            f"noise {edge_noise_um(e):.3f} µm"
+            for i, e in enumerate(cal.edges, 1)
+        ]
+        lines.append(
+            f"zero P {cal.p0_um:.3f} µm | ±{cal.linear_range_um:.2f} µm | {cal.created}"
         )
+        text = "<br>".join(html.escape(line) for line in lines)
         notes = list(cal.warnings)
-        if self._edge_box is not None and snap_box(self._edge_box) != tuple(cal.box):
-            notes.append("edge box changed since the calibration; recalibrate")
+        drawn = [snap_box(b) for b in self._drawn_boxes_now()]
+        if drawn and drawn != [tuple(b) for b in cal.boxes]:
+            notes.append(
+                "edge boxes changed since the calibration; recalibrate"
+                if len(drawn) > 1 or len(cal.edges) > 1
+                else "edge box changed since the calibration; recalibrate"
+            )
         if notes:
             text += "<br>" + _colored("; ".join(notes), ATTENTION_COLOR)
         self.calibration_label.setText(text)
+
+    def _drawn_boxes_now(self) -> list[tuple[int, int, int, int]]:
+        """The boxes drawn now (box 1, then box 2 if any); none without box 1."""
+        if self._edge_box is None:
+            return []
+        boxes = [self._edge_box]
+        if self._edge_box2 is not None:
+            boxes.append(self._edge_box2)
+        return boxes
 
     def _write(self) -> None:
         self._flush_timer.start()
@@ -1052,6 +1127,24 @@ class SpotFocusPanel(QWidget):
         else:
             self._start_preview()  # the box is drawn on the live image
 
+    def _toggle_draw_edge2(self, on: bool) -> None:
+        """The Draw edge box 2 button: put the live view in that draw mode."""
+        self.live_view.set_edge2_draw_mode(on)
+        if not on:
+            return
+        if self.service is not None and (
+            self.preview_button.isChecked() or self.state == "running"
+        ):
+            self._show_live_view()
+        else:
+            self._start_preview()  # the box is drawn on the live image
+
+    def _on_edge2_draw_mode(self, on: bool) -> None:
+        """The view left (or entered) draw box 2 mode: keep the button in step."""
+        self.draw_edge2_button.blockSignals(True)
+        self.draw_edge2_button.setChecked(on)
+        self.draw_edge2_button.blockSignals(False)
+
     def _on_edge_draw_mode(self, on: bool) -> None:
         """The view left (or entered) draw mode: keep the button in step."""
         self.draw_edge_button.blockSignals(True)
@@ -1080,8 +1173,35 @@ class SpotFocusPanel(QWidget):
         self._refresh_calibration()
         if self.fault_label.text() and NEED_BOX_TEXT in self.fault_label.text():
             self.fault_label.setText("")
+        self._update_enabled()
         if self.state != "running":
-            self._send_edge_box()
+            self._send_preview_state()
+
+    def _on_edge_box2_drawn(self, x: int, y: int, w: int, h: int) -> None:
+        if self._busy or self.state == "running":
+            self.fault_label.setText(
+                _colored("Stop the lock before moving the edge box.", ATTENTION_COLOR)
+            )
+            return
+        self.set_edge_box2((x, y, w, h))
+
+    def set_edge_box2(self, box: tuple[int, int, int, int] | None) -> None:
+        """Use *box* ``(x, y, w, h)`` (sensor px) as the second edge box.
+
+        ``None`` clears it (a single edge again). It is saved, drawn on the
+        live view and sent to the worker with the first box.
+        """
+        SettingsV1.instance().spot_focus.edge_box_2 = box
+        self._write()
+        self._edge_box2 = box
+        self.live_view.set_edge_box2(box)
+        if box is None:
+            self.live_view.set_secondary_point(None)
+        self._show_edge_box_text()
+        self._refresh_calibration()
+        self._update_enabled()
+        if self.state != "running":
+            self._send_preview_state()
 
     # -- camera info -----------------------------------------------------
 
@@ -1270,6 +1390,8 @@ class SpotFocusPanel(QWidget):
         self.calibrate_button.setEnabled(idle)
         self.zero_button.setEnabled(idle and self._cal is not None)
         self.draw_edge_button.setEnabled(idle)
+        self.draw_edge2_button.setEnabled(idle)
+        self.clear_edge2_button.setEnabled(idle and self._edge_box2 is not None)
         if self._cal is None:
             self.start_button.setToolTip(
                 "Calibrates first (focus on the cells, draw an edge box), then locks"
@@ -1303,8 +1425,8 @@ class SpotFocusPanel(QWidget):
             return
         cfg = SettingsV1.instance().spot_focus
         cal = cfg.calibration_status()[0]
-        box = cfg.edge_box
-        if cal is None and box is None:
+        boxes = self._drawn_boxes(cfg)
+        if cal is None and not boxes:
             self.fault_label.setText(_colored(NEED_BOX_TEXT, ATTENTION_COLOR))
             return
         params = cfg.params.to_params()
@@ -1324,10 +1446,10 @@ class SpotFocusPanel(QWidget):
             svc.set_camera(exposure_ms=exposure, gain=gain, roi=roi, channel=channel)
             use, loop = cal, params
             if use is None:
-                if box is None:
+                if not boxes:
                     raise RuntimeError(NEED_BOX_TEXT)
                 try:
-                    use = svc.calibrate(box, record_path=record, **sweep)
+                    use = svc.calibrate(boxes, record_path=record, **sweep)
                 except Exception as err:
                     logger.warning("spot focus calibrate failed", exc_info=True)
                     self._relay.calibrateFailed.emit(str(err) or type(err).__name__)
@@ -1394,8 +1516,9 @@ class SpotFocusPanel(QWidget):
             self.fault_label.text() if self.state != "fault" else ""
         )
         self._set_state("stopped")
-        # While locked the worker measured the calibration's box: show the drawn one.
-        self._send_edge_box(svc)
+        # While locked the worker measured the calibration's boxes: show the drawn
+        # ones, with the calibration for the preview error.
+        self._send_preview_state(svc)
         if self._drop_preview_after_run:
             self._drop_preview_after_run = False
             self._stop_preview()
@@ -1408,13 +1531,14 @@ class SpotFocusPanel(QWidget):
         """Sweep P around its present value and fit the edge (Calibrate button).
 
         The user has focused on the cells, so the present P becomes the zero.
-        Needs an edge box.
+        Needs an edge box; with a second box both edges are calibrated (an edge
+        that cannot be fitted is dropped with a warning).
         """
         if self._busy or self.state == "running":
             return
         cfg = SettingsV1.instance().spot_focus
-        box = cfg.edge_box
-        if box is None:
+        boxes = self._drawn_boxes(cfg)
+        if not boxes:
             self.fault_label.setText(_colored(NEED_BOX_TEXT, ATTENTION_COLOR))
             return
         sweep = self._sweep_kwargs(cfg)
@@ -1425,11 +1549,11 @@ class SpotFocusPanel(QWidget):
         self._busy = "calibrating"
         self._set_state(self.state)
 
-        def work() -> EdgeCalibration:
+        def work() -> FocusCalibration:
             svc = self._ensure_service()
             svc.wait_ready()
             svc.set_camera(exposure_ms=exposure, gain=gain, roi=roi, channel=channel)
-            return svc.calibrate(box, record_path=record, **sweep)
+            return svc.calibrate(boxes, record_path=record, **sweep)
 
         self._run_async(
             "calibrate",
@@ -1450,7 +1574,7 @@ class SpotFocusPanel(QWidget):
         self._busy = "zeroing"
         self._set_state(self.state)
 
-        def work() -> EdgeCalibration:
+        def work() -> FocusCalibration:
             svc = self._ensure_service()
             svc.wait_ready()
             svc.set_camera(exposure_ms=exposure, gain=gain, roi=roi, channel=channel)
@@ -1463,7 +1587,7 @@ class SpotFocusPanel(QWidget):
             self._relay.zeroFailed.emit,
         )
 
-    def _apply_calibration(self, cal: EdgeCalibration) -> None:
+    def _apply_calibration(self, cal: FocusCalibration) -> None:
         """Keep *cal* (a new calibration or zero): save it, reset the offset."""
         settings = SettingsV1.instance()
         settings.spot_focus.calibration = cal.to_dict()
@@ -1473,8 +1597,12 @@ class SpotFocusPanel(QWidget):
         self._place_zero_marker()
         self._refresh_calibration()
         self._update_enabled()
+        # The preview shows the error from the new calibration (the lock keeps
+        # the one it started with; Stop sends it again).
+        if self.state != "running" and self._busy != "starting":
+            self._send_preview_state()
 
-    def _on_calibrated(self, cal: EdgeCalibration) -> None:
+    def _on_calibrated(self, cal: FocusCalibration) -> None:
         self._busy = ""
         self._apply_calibration(cal)
         self._set_state(self.state)
@@ -1506,8 +1634,27 @@ class SpotFocusPanel(QWidget):
                 float(msg["p_cmd_um"]),
             )
         labels = self.readout_labels
+        edges = msg.get("edges") or []
+        edge2 = edges[1] if len(edges) > 1 else None
+        disagreement = msg.get("disagreement_um")
         labels["error"].setText("—" if along is None else f"{along:+.3f} µm")
         labels["edge"].setText("-" if edge is None else f"{edge:.2f} px")
+        labels["edge2"].setText(
+            "—"
+            if edge2 is None or edge2.get("edge_px") is None
+            else f"{edge2['edge_px']:.2f} px"
+        )
+        labels["disagreement"].setText(
+            "—" if disagreement is None else f"{disagreement:.3f}"
+        )
+        if edge2 is not None and edge2.get("x") is not None:
+            self.live_view.set_secondary_point(
+                (float(edge2["x"]), float(edge2["y"])), bool(edge2.get("ok", True))
+            )
+        else:
+            self.live_view.set_secondary_point(None)
+        note = msg.get("note") or (None if along is not None else msg.get("reason"))
+        self.note_label.setText(_colored(str(note), ATTENTION_COLOR) if note else "")
         labels["contrast"].setText("-" if contrast is None else f"{contrast:.0f}")
         labels["fps"].setText(f"{msg.get('fps') or 0.0:.1f}")
 

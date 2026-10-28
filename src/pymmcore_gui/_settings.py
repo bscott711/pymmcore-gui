@@ -32,7 +32,10 @@ if TYPE_CHECKING:
         FocusCalibration,
         LockLimits,
     )
-    from pymmcore_gui.asi_z_stack.spot_focus import EdgeCalibration, SpotLoopParams
+    from pymmcore_gui.asi_z_stack.spot_focus import (
+        FocusCalibration as SpotFocusCalibration,
+    )
+    from pymmcore_gui.asi_z_stack.spot_focus import SpotLoopParams
 
 APP_NAME = "pymmcore-gui"
 USER_DATA_DIR = Path(user_data_dir(appname=APP_NAME))
@@ -597,6 +600,7 @@ class SpotLoopParamsSettings(BaseModel):
     min_valid_fraction: float = 0.5
     max_angle_change_deg: float = 5.0
     max_edge_residual_px: float = 3.0
+    max_edge_disagreement_um: float = 0.3
     p_min_um: float | None = None
     p_max_um: float | None = None
     max_excursion_um: float = 5.0
@@ -645,9 +649,12 @@ class SpotFocusSettingsV1(BaseMMSettings):
     """CRISP LED intensity set on Start; ``None`` leaves it as it is."""
     params: SpotLoopParamsSettings = Field(default_factory=SpotLoopParamsSettings)
     calibration: dict[str, Any] | None = None
-    """``EdgeCalibration.to_dict()`` of the last calibration."""
+    """``FocusCalibration.to_dict()`` of the last calibration (a single-edge
+    ``EdgeCalibration`` dict from older versions also loads)."""
     edge_box: tuple[int, int, int, int] | None = None
     """The edge box ``(x, y, w, h)`` in sensor pixels; ``None`` until drawn."""
+    edge_box_2: tuple[int, int, int, int] | None = None
+    """The optional second edge box, same convention as ``edge_box``."""
     sweep_span_um: float = 2.0
     """Total piezo span of the calibration sweep, um."""
     sweep_steps: int = 9
@@ -655,7 +662,7 @@ class SpotFocusSettingsV1(BaseMMSettings):
     sweep_frames: int = 3
     """Frames averaged per sweep point."""
 
-    def calibration_status(self) -> "tuple[EdgeCalibration | None, str]":
+    def calibration_status(self) -> "tuple[SpotFocusCalibration | None, str]":
         """Return ``(calibration, message)``; never raises.
 
         ``message`` is empty for a valid calibration, else says why there is none
@@ -665,7 +672,7 @@ class SpotFocusSettingsV1(BaseMMSettings):
 
         return load_calibration(self.calibration)
 
-    def to_calibration(self) -> "EdgeCalibration | None":
+    def to_calibration(self) -> "SpotFocusCalibration | None":
         """Return the stored calibration, ``None`` if there is none or it is bad."""
         return self.calibration_status()[0]
 

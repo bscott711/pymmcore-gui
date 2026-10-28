@@ -1,9 +1,9 @@
 """The spot focus lock's subprocess and service, with a real spawned worker.
 
-The metric is the position of one straight edge of the LED patch inside an edge
-box. Covers the live view too: preview frames through shared memory, the edge
-overlay, live camera settings, ROI changes in sensor coordinates and the
-time-based settle.
+The metric is the position of one or two straight edges of the LED patch, each
+inside its own edge box, fused into one focus error. Covers the live view too:
+preview frames through shared memory, the edge overlay, live camera settings,
+ROI changes in sensor coordinates and the time-based settle.
 
 A ``FakeSpotSource`` (high drift rate, short runs) stands in for the camera and
 a fake mmc records every ``setPosition`` and never waits. The fake patch is
@@ -28,6 +28,7 @@ import pytest
 
 from pymmcore_gui.asi_z_stack.spot_focus import (
     EdgeCalibration,
+    FocusCalibration,
     SpotLoopParams,
     measure_edge,
 )
@@ -58,6 +59,13 @@ CAL = {
 #: Across the left edge; clear of the rounded corners and of the ghost.
 BOX = (232, 210, 80, 60)
 BOX_CENTER_Y = 240.0
+#: Across the top edge (y = 194), also clear of the corners and of the ghost.
+BOX_TOP = (288, 154, 64, 80)
+#: A diagonal image motion, so that both the left and the top edge move.
+UX, UY = 0.8, 0.6
+CAL_DIAG = {**CAL, "ux": UX, "uy": UY}
+#: A box on the dark background: no edge in it.
+BOX_EMPTY = (20, 20, 80, 60)
 
 
 class FakeMMC:
@@ -110,7 +118,20 @@ def _e0() -> float:
     return float(np.mean([f.position for f in fixes]))
 
 
-def _cal(**kw: object) -> EdgeCalibration:
+@functools.cache
+def _e0s_diag() -> tuple[float, float]:
+    """The left and top edge positions the diagonal fake shows at P0."""
+    src = make_source(_spec(cal_like=dict(CAL_DIAG)))
+    frames = [src.render(0.0) for _ in range(5)]  # type: ignore[attr-defined]
+    out = []
+    for box in (BOX, BOX_TOP):
+        fixes = [measure_edge(f, box) for f in frames]
+        assert all(f.ok for f in fixes)
+        out.append(float(np.mean([f.position for f in fixes])))
+    return out[0], out[1]
+
+
+def _edge_cal(**kw: object) -> EdgeCalibration:
     base: dict[str, Any] = {
         "box": BOX,
         "axis": "x",
@@ -127,6 +148,24 @@ def _cal(**kw: object) -> EdgeCalibration:
     }
     base.update(kw)
     return EdgeCalibration(**base)
+
+
+def _cal(**kw: object) -> FocusCalibration:
+    """A one-edge calibration of the left edge (the fake moves along x only)."""
+    edge = _edge_cal(**kw)
+    return FocusCalibration(edges=[edge], p0_um=edge.p0_um, created=edge.created)
+
+
+def _cal2(**kw: object) -> FocusCalibration:
+    """Left + top edge of the diagonal fake: they move by 0.8 and 0.6 x SLOPE."""
+    e_left, e_top = _e0s_diag()
+    left = _edge_cal(slope_px_per_um=SLOPE * UX, e0_px=e_left, **kw)
+    top = _edge_cal(
+        box=BOX_TOP, axis="y", slope_px_per_um=SLOPE * UY, e0_px=e_top, **kw
+    )
+    return FocusCalibration(
+        edges=[left, top], p0_um=left.p0_um, created="2026-10-28T00:00:00"
+    )
 
 
 def _params(**kw: object) -> SpotLoopParams:
@@ -394,14 +433,18 @@ def test_calibration_recovers_slope_sign_and_zero(sign: float, tmp_path: Path) -
         cal = svc.calibrate(
             BOX, span_um=2.0, steps=7, n_frames=3, settle_s=0.0, record_path=rec
         )
-        assert cal.slope_px_per_um == pytest.approx(sign * SLOPE, rel=0.1)
-        assert cal.r2 > 0.98
-        assert cal.e0_px == pytest.approx(_e0(), abs=0.3)
-        assert cal.p0_um == pytest.approx(P0)
-        assert (cal.axis, cal.polarity, cal.box) == ("x", 1, BOX)
+        assert len(cal.edges) == 1
+        (edge,) = cal.edges
+        assert edge.slope_px_per_um == pytest.approx(sign * SLOPE, rel=0.1)
+        assert edge.r2 > 0.98
+        assert edge.e0_px == pytest.approx(_e0(), abs=0.3)
+        assert cal.p0_um == pytest.approx(P0) and edge.p0_um == pytest.approx(P0)
+        assert (edge.axis, edge.polarity, edge.box) == ("x", 1, BOX)
+        assert cal.boxes == [BOX]
         assert cal.linear_range_um == pytest.approx(1.0)
-        assert cal.n_points == 7
-        assert cal.noise_px < 0.2
+        assert edge.n_points == 7
+        assert edge.noise_px < 0.2
+        assert cal.created
         # P is back where it started, the LED claim is gone, Live is still on.
         assert mmc.pos[P_LABEL] == pytest.approx(P0)
         assert mmc.waits >= 8  # a calibration (lock stopped) may wait
@@ -413,14 +456,15 @@ def test_calibration_recovers_slope_sign_and_zero(sign: float, tmp_path: Path) -
     with np.load(cal.record_path) as z:
         assert z["p_um"].shape == (7,) and np.all(np.diff(z["p_um"]) > 0)
         assert z["p_um"][3] == pytest.approx(P0)
-        assert z["edge_px"].shape == (7,)
+        assert z["edge_px"].shape == (7, 1)
         assert z["frames"].shape == (7, 480, 640)
-        assert tuple(z["box"]) == BOX
+        assert z["boxes"].tolist() == [list(BOX)]
+        assert z["axes"].tolist() == ["x"] and z["polarities"].tolist() == [1]
         # Each frame shows its own step: the patch moved along x.
         e = [measure_edge(f, BOX).position for f in z["frames"]]
-        assert e == pytest.approx(z["edge_px"], abs=0.5)
+        assert e == pytest.approx(z["edge_px"][:, 0], abs=0.5)
     # The calibration survives the settings round trip.
-    assert EdgeCalibration.from_dict(cal.to_dict()) == cal
+    assert FocusCalibration.from_dict(cal.to_dict()) == cal
 
 
 def test_calibration_works_while_previewing_in_an_roi() -> None:
@@ -431,9 +475,9 @@ def test_calibration_works_while_previewing_in_an_roi() -> None:
         first = _next_frame(svc, None)
         svc.set_camera(roi=(100, 80, 400, 320))  # the sweep also works in an ROI
         cal = svc.calibrate(BOX, span_um=2.0, steps=7, n_frames=3, settle_s=0.0)
-        assert cal.slope_px_per_um == pytest.approx(SLOPE, rel=0.1)
+        assert cal.edges[0].slope_px_per_um == pytest.approx(SLOPE, rel=0.1)
         # Positions are in sensor pixels, not ROI pixels.
-        assert cal.e0_px == pytest.approx(_e0(), abs=0.3)
+        assert cal.edges[0].e0_px == pytest.approx(_e0(), abs=0.3)
         assert cal.record_path == ""
         assert svc.preview_active and svc.current_state == "preview"
         assert _next_frame(svc, first.seq).seq > first.seq
@@ -444,16 +488,17 @@ def test_calibration_that_loses_the_edge_raises_and_cleans_up() -> None:
     with _service(mmc) as svc:
         assert svc.wait_ready()
         svc.start_preview()
-        real = svc._snap
+        real = svc._snap_edges
         calls: list[float] = []
 
-        def snap(n, p, box, axis, polarity, return_frame):
+        def snap(n, p, specs, return_frame):
             calls.append(p)
             if len(calls) >= 4:  # the zero and two steps are fine
-                return {"n": 0, "reason": "edge left the box", "p_um": p}
-            return real(n, p, box, axis, polarity, return_frame)
+                lost = {"n": 0, "reason": "edge left the box"}
+                return {"edges": [lost] * len(specs), "p_um": p}
+            return real(n, p, specs, return_frame)
 
-        svc._snap = snap  # type: ignore[method-assign]
+        svc._snap_edges = snap  # type: ignore[method-assign]
         with pytest.raises(ValueError, match="edge left the box: widen the box"):
             svc.calibrate(BOX, span_um=2.0, steps=7, n_frames=3, settle_s=0.0)
         assert mmc.pos[P_LABEL] == pytest.approx(P0)  # P is back
@@ -499,9 +544,15 @@ def test_zero_makes_the_present_edge_the_setpoint() -> None:
         mmc.pos[P_LABEL] = P0 + 0.4  # the user refocused by 0.4 um
         z = svc.zero(cal, n_frames=5)
         assert z.p0_um == pytest.approx(P0 + 0.4)
-        assert z.e0_px == pytest.approx(cal.e0_px + SLOPE * 0.4, abs=0.3)
-        assert z.slope_px_per_um == cal.slope_px_per_um
-        assert (z.box, z.axis, z.polarity) == (cal.box, cal.axis, cal.polarity)
+        assert z.edges[0].e0_px == pytest.approx(
+            cal.edges[0].e0_px + SLOPE * 0.4, abs=0.3
+        )
+        assert z.edges[0].slope_px_per_um == cal.edges[0].slope_px_per_um
+        assert z.boxes == cal.boxes
+        assert (z.edges[0].axis, z.edges[0].polarity) == (
+            cal.edges[0].axis,
+            cal.edges[0].polarity,
+        )
         assert z.linear_range_um == cal.linear_range_um
         assert mmc.sets == [] and mmc.waits == 0  # reads P once, moves nothing
         assert mmc.props[(CRISP, "CRISP State")] == "Idle"
@@ -881,9 +932,13 @@ def test_measure_reply_has_the_documented_fields() -> None:
         m = svc.measure(4, P0, box=BOX, return_frame=True)
         for key in (
             "p_um n edge_mean edge_sd x_mean y_mean contrast_mean angle_mean "
-            "residual_mean axis polarity reason frame roi"
+            "residual_mean axis polarity reason frame roi edges"
         ).split():
             assert key in m, key
+        # The top level mirrors the first (here only) box.
+        (first,) = m["edges"]
+        for key in ("n", "edge_mean", "edge_sd", "axis", "polarity", "reason"):
+            assert first[key] == m[key]
         assert m["n"] == 4 and m["p_um"] == P0
         assert (m["axis"], m["polarity"], m["reason"]) == ("x", 1, "")
         assert m["edge_mean"] == pytest.approx(_e0(), abs=0.3)
@@ -1141,9 +1196,9 @@ def test_no_box_means_no_overlay_and_a_box_outside_the_roi_is_not_ok() -> None:
         w.on_frame(w.source.render(0.0), 2.0, 2.0)
         assert w.last_fix.ok
         w.on_set_edge_box({"box": None})
-        assert w.last_fix is None and w.edge_box is None
+        assert w.last_fix is None and w.edge_boxes == []
         w.on_set_edge_box({"box": [1, 2, 3]})  # malformed: reported, box unchanged
-        assert w.edge_box is None
+        assert w.edge_boxes == []
         assert [m for m in _messages(pipes) if m["type"] == "error"]
     finally:
         _close(w, pipes)
@@ -1167,5 +1222,394 @@ def test_measure_uses_only_settled_frames_and_returns_one() -> None:
         (m,) = [m for m in _messages(pipes) if m["type"] == "measurement"]
         assert m["n"] == 0 and m["reason"] == "no edge box"
         assert np.isnan(m["edge_mean"])
+    finally:
+        _close(w, pipes)
+
+
+# --------------------------------------------------------------------------
+# Two edges: left + top of a patch that moves diagonally
+# --------------------------------------------------------------------------
+
+
+def _service2(mmc: FakeMMC, **spec_kw: object) -> SpotFocusService:
+    return _service(mmc, cal_like=dict(CAL_DIAG), **spec_kw)
+
+
+@pytest.mark.parametrize("sign", [1.0, -1.0])
+def test_two_box_calibration_recovers_both_slopes(sign: float, tmp_path: Path) -> None:
+    mmc = FakeMMC()
+    cal_like = {**CAL_DIAG, "slope_px_per_um": sign * SLOPE}
+    rec = tmp_path / "sweep2"
+    with _service(mmc, cal_like=cal_like) as svc:
+        assert svc.wait_ready()
+        svc.start_preview()
+        first = _next_frame(svc, None)
+        cal = svc.calibrate(
+            [BOX, BOX_TOP],
+            span_um=2.0,
+            steps=7,
+            n_frames=3,
+            settle_s=0.0,
+            record_path=rec,
+        )
+        assert isinstance(cal, FocusCalibration) and len(cal.edges) == 2
+        left, top = cal.edges
+        assert left.slope_px_per_um == pytest.approx(sign * SLOPE * UX, rel=0.1)
+        assert top.slope_px_per_um == pytest.approx(sign * SLOPE * UY, rel=0.1)
+        assert (left.axis, left.polarity, left.box) == ("x", 1, BOX)
+        assert (top.axis, top.polarity, top.box) == ("y", 1, BOX_TOP)
+        e_left, e_top = _e0s_diag()
+        assert left.e0_px == pytest.approx(e_left, abs=0.3)
+        assert top.e0_px == pytest.approx(e_top, abs=0.3)
+        assert cal.p0_um == pytest.approx(P0)
+        assert left.p0_um == pytest.approx(P0) and top.p0_um == pytest.approx(P0)
+        assert left.r2 > 0.98 and top.r2 > 0.98
+        assert cal.boxes == [BOX, BOX_TOP]
+        assert cal.linear_range_um == pytest.approx(1.0)
+        # P is back where it started, the LED claim is gone, Live is still on.
+        assert mmc.pos[P_LABEL] == pytest.approx(P0)
+        assert mmc.props[(CRISP, "CRISP State")] == "Idle"
+        assert svc.preview_active and svc.current_state == "preview"
+        assert _next_frame(svc, first.seq).seq > first.seq
+    assert FocusCalibration.from_dict(cal.to_dict()) == cal
+    # The record has per-edge arrays and the shared frames.
+    assert cal.record_path == str(tmp_path / "sweep2.npz")
+    with np.load(cal.record_path) as z:
+        assert z["p_um"].shape == (7,) and np.all(np.diff(z["p_um"]) > 0)
+        assert z["edge_px"].shape == (7, 2)
+        assert z["boxes"].tolist() == [list(BOX), list(BOX_TOP)]
+        assert z["axes"].tolist() == ["x", "y"]
+        assert z["polarities"].tolist() == [1, 1]
+        assert z["frames"].shape == (7, 480, 640)
+        assert z["e_start"].shape == (2,) and z["noise_px"].shape == (2,)
+        # Each frame shows its own step: both edges moved with it.
+        for k, box in enumerate((BOX, BOX_TOP)):
+            e = [measure_edge(f, box).position for f in z["frames"]]
+            assert e == pytest.approx(z["edge_px"][:, k], abs=0.5)
+        assert np.ptp(z["edge_px"][:, 0]) > 2.0 and np.ptp(z["edge_px"][:, 1]) > 1.5
+
+
+@pytest.mark.parametrize("bad_first", [False, True])
+def test_a_box_without_an_edge_is_dropped_with_a_warning(bad_first: bool) -> None:
+    mmc = FakeMMC()
+    boxes = [BOX_EMPTY, BOX_TOP] if bad_first else [BOX_TOP, BOX_EMPTY]
+    with _service2(mmc) as svc:
+        assert svc.wait_ready()
+        cal = svc.calibrate(boxes, span_um=2.0, steps=7, n_frames=2, settle_s=0.0)
+    assert len(cal.edges) == 1 and cal.edges[0].box == BOX_TOP
+    k = 1 if bad_first else 2
+    assert any(w.startswith(f"edge {k} dropped: ") for w in cal.warnings), cal.warnings
+    assert cal.edges[0].slope_px_per_um == pytest.approx(SLOPE * UY, rel=0.1)
+    assert mmc.pos[P_LABEL] == pytest.approx(P0)
+
+
+def test_calibration_with_no_edge_in_any_box_names_edge_1_first() -> None:
+    mmc = FakeMMC()
+    with _service2(mmc) as svc:
+        assert svc.wait_ready()
+        with pytest.raises(ValueError, match="edge not measurable"):
+            svc.calibrate([BOX_EMPTY, (400, 20, 80, 60)], steps=7, n_frames=2)
+        assert mmc.pos[P_LABEL] == pytest.approx(P0)
+        with pytest.raises(ValueError, match="one or two"):
+            svc.calibrate([BOX, BOX_TOP, BOX_EMPTY])
+
+
+def test_start_accepts_a_single_edge_calibration() -> None:
+    mmc = FakeMMC()
+    with _service(mmc) as svc:
+        svc.start(_params(), _edge_cal())
+        assert _wait(lambda: svc.current_state == "running", 5.0)
+        assert _wait(lambda: svc.last_telemetry is not None, 5.0)
+        assert svc.last_telemetry["along_um"] is not None
+        svc.stop()
+    assert mmc.sets == []
+
+
+def test_two_edge_closed_loop_holds_under_drift() -> None:
+    mmc = FakeMMC()
+    tele: list[dict] = []
+    faults: list[str] = []
+    with _service2(mmc, drift_um_per_s=DRIFT_UM_S) as svc:
+        svc.telemetry.connect(tele.append)
+        svc.fault.connect(faults.append)
+        assert svc.wait_ready()
+        svc.start(_params(max_rate_hz=RATE_CAP_HZ), _cal2())
+        time.sleep(RUN_S)
+        state = svc.current_state
+        svc.stop()
+    assert not faults, faults
+    assert state == "running"
+    late = sorted(
+        abs(t["along_um"]) for t in tele[len(tele) // 2 :] if t["along_um"] is not None
+    )
+    assert late and late[len(late) // 2] < 0.12, late
+    # P was pulled against the drift, as with one edge.
+    assert mmc.sets[-1][1] == pytest.approx(P0 - DRIFT_UM_S * RUN_S, abs=0.35)
+    assert mmc.waits == 0 and mmc.max_active == 1
+    t = tele[-1]
+    assert len(t["edges"]) == 2
+    assert all(e["ok"] and e["reason"] == "" for e in t["edges"])
+    assert t["edges"][0]["x"] == t["x"] and t["edges"][0]["edge_px"] == t["edge_px"]
+    assert t["edges"][1]["y"] == pytest.approx(194.0, abs=6.0)  # the top edge point
+    assert t["note"] == "" and t["reason"] == "" and t["ok"]
+    assert t["sigma_um"] is not None and t["sigma_um"] > 0
+    assert t["disagreement_um"] is not None and t["disagreement_um"] < 0.1
+    for e in t["edges"]:
+        assert e["along_um"] is not None and abs(e["along_um"]) < 0.3
+
+
+def test_lateral_drift_makes_the_edges_disagree_and_nothing_moves() -> None:
+    mmc = FakeMMC()
+    faults: list[str] = []
+    tele: list[dict] = []
+    # The image walks sideways: left and top edge both move, but not by what a
+    # focus change of either would do, so the two um estimates part.
+    with _service2(mmc, lateral_px_per_s=40.0) as svc:
+        svc.fault.connect(faults.append)
+        svc.telemetry.connect(tele.append)
+        assert svc.wait_ready()
+        svc.start(_params(), _cal2())
+        assert _wait(lambda: bool(faults), 8.0)
+        time.sleep(0.4)
+        n_moves = svc.stats()["n_moves"]
+    assert "edges disagree" in faults[0]
+    assert n_moves == 0 and mmc.sets == []  # P is held
+    assert any("edges disagree" in t["reason"] for t in tele)
+
+
+def test_a_lost_edge_is_a_note_and_the_lock_continues_on_the_other() -> None:
+    w, pipes = _inproc_worker(cal_like=dict(CAL_DIAG))
+    try:
+        w.on_start(
+            {
+                "params": _params(strikes=3, avg_frames=2).to_dict(),
+                "calibration": _cal2().to_dict(),
+                "p_start_um": P0,
+            }
+        )
+        good = w.source.render(0.0)
+        # The top edge is lost: its box shows only the pedestal (the part it
+        # shares with the left box is put back, so the left edge is untouched).
+        x, y, bw, bh = BOX_TOP
+        lost = good.copy()
+        lost[y : y + bh, x : x + bw] = 100
+        lost[210 : y + bh, x : BOX[0] + BOX[2]] = good[
+            210 : y + bh, x : BOX[0] + BOX[2]
+        ]
+        w.on_frame(good, 0.0, 1.0)
+        assert w.fused.note == "" and w.edge_reasons == ["", ""]
+        for k in range(8):  # far more than the 3 strikes
+            w.on_frame(lost, 1.0 + k, 2.0 + k)
+        assert w.state == "running" and not w.ctl.fault
+        assert w.fused.reason == "" and "edge 2 lost" in w.fused.note
+        assert "using edge 1" in w.fused.note
+        assert w.last_along is not None and abs(w.last_along) < 0.1
+        assert w.edge_reasons[0] == "" and "edge lost" in w.edge_reasons[1]
+        w.publish(100.0)
+        tele = [m for m in _messages(pipes) if m["type"] == "telemetry"][-1]
+        assert tele["ok"] and tele["reason"] == ""
+        assert "edge 2 lost" in tele["note"]
+        assert tele["along_um"] == pytest.approx(w.last_along)
+        e1, e2 = tele["edges"]
+        assert e1["ok"] and e1["along_um"] is not None and e1["reason"] == ""
+        assert not e2["ok"] and e2["along_um"] is None and "edge lost" in e2["reason"]
+        assert tele["disagreement_um"] is None
+        # Both edges lost is a strike: the loop faults after 3 of them.
+        blank = np.full_like(good, 100)
+        for k in range(3):
+            w.on_frame(blank, 20.0 + k, 30.0 + k)
+        assert w.state == "fault"
+        assert w.n_moves == 0 and w.p_cmd == P0
+    finally:
+        _close(w, pipes)
+
+
+def test_zero_re_zeroes_both_edges() -> None:
+    mmc = FakeMMC()
+    cal = _cal2()
+    with _service2(mmc) as svc:
+        assert svc.wait_ready()
+        mmc.pos[P_LABEL] = P0 + 0.4  # the user refocused by 0.4 um
+        z = svc.zero(cal, n_frames=5)
+        assert z.p0_um == pytest.approx(P0 + 0.4)
+        assert len(z.edges) == 2
+        for new, old, u in zip(z.edges, cal.edges, (UX, UY), strict=True):
+            assert new.p0_um == pytest.approx(P0 + 0.4)
+            assert new.e0_px == pytest.approx(old.e0_px + SLOPE * u * 0.4, abs=0.3)
+            assert new.slope_px_per_um == old.slope_px_per_um
+            assert new.box == old.box
+        assert z.boxes == cal.boxes and z.linear_range_um == cal.linear_range_um
+        assert mmc.sets == [] and mmc.waits == 0  # reads P once, moves nothing
+        assert mmc.props[(CRISP, "CRISP State")] == "Idle"
+        # The lock on the new zero holds the new P.
+        svc.start(_params(), z)
+        time.sleep(1.0)
+        svc.stop()
+        assert mmc.sets == []
+        # An edge that cannot be measured refuses the zero.
+        bad = FocusCalibration(edges=[cal.edges[0], _edge_cal(box=BOX_EMPTY)], p0_um=P0)
+        with pytest.raises(ValueError, match="edge 2: edge not measurable"):
+            svc.zero(bad, n_frames=3)
+
+
+def test_set_calibration_gives_the_preview_an_error() -> None:
+    mmc = FakeMMC()
+    cal = _cal2()
+    with _service2(mmc) as svc:
+        assert svc.wait_ready()
+        svc.start_preview()
+        svc.set_edge_boxes([BOX, BOX_TOP])
+
+        def tele_with(pred) -> bool:
+            t = svc.last_telemetry
+            return t is not None and len(t["edges"]) == 2 and pred(t)
+
+        # No calibration: the edges are measured, but there is no error.
+        assert _wait(lambda: tele_with(lambda t: t["along_um"] is None), 5.0)
+        assert all(e["along_um"] is None for e in svc.last_telemetry["edges"])
+        assert svc.last_telemetry["ok"]
+        # With one: the fused error, and a per-edge one, at the zero (about 0).
+        svc.set_calibration(cal)
+        assert _wait(lambda: tele_with(lambda t: t["along_um"] is not None), 5.0)
+        t = svc.last_telemetry
+        assert abs(t["along_um"]) < 0.1 and t["sigma_um"] > 0
+        assert all(abs(e["along_um"]) < 0.2 for e in t["edges"])
+        assert t["note"] == "" and t["reason"] == ""
+        # Other boxes than the calibration's: measured, no error.
+        svc.set_edge_boxes([BOX])
+        assert _wait(
+            lambda: (t := svc.last_telemetry) is not None
+            and len(t["edges"]) == 1
+            and t["along_um"] is None,
+            5.0,
+        )
+        svc.set_edge_boxes([BOX, BOX_TOP])
+        assert _wait(lambda: tele_with(lambda t: t["along_um"] is not None), 5.0)
+        # Clearing it removes the error again.
+        svc.set_calibration(None)
+        assert _wait(lambda: tele_with(lambda t: t["along_um"] is None), 5.0)
+        svc.set_edge_boxes([])
+        _poll_frame(svc, lambda fr: fr.spot is None)
+    assert mmc.sets == []
+
+
+def test_stop_keeps_the_calibration_for_the_preview() -> None:
+    mmc = FakeMMC()
+    with _service2(mmc) as svc:
+        assert svc.wait_ready()
+        svc.start_preview()
+        svc.start(_params(), _cal2())
+        assert _wait(lambda: svc.current_state == "running", 5.0)
+        svc.stop()
+        assert _wait(lambda: svc.current_state == "preview", 5.0)
+        svc.set_edge_boxes([BOX, BOX_TOP])  # the same boxes: error from the held cal
+        assert _wait(
+            lambda: (t := svc.last_telemetry) is not None
+            and len(t["edges"]) == 2
+            and t["along_um"] is not None,
+            5.0,
+        )
+
+
+def test_measure_with_two_boxes_returns_both_edges() -> None:
+    mmc = FakeMMC()
+    with _service2(mmc) as svc:
+        assert svc.wait_ready()
+        m = svc.measure(4, P0, box=[BOX, BOX_TOP], return_frame=True)
+        assert m["frame"].shape == (480, 640) and m["roi"] == (0, 0, 640, 480)
+        left, top = m["edges"]
+        e_left, e_top = _e0s_diag()
+        for ent, expect, axis in ((left, e_left, "x"), (top, e_top, "y")):
+            assert ent["n"] == 4 and ent["reason"] == ""
+            assert (ent["axis"], ent["polarity"]) == (axis, 1)
+            assert ent["edge_mean"] == pytest.approx(expect, abs=0.3)
+            assert 0.0 <= ent["edge_sd"] < 0.3
+            assert ent["contrast_mean"] > 300
+        assert left["x_mean"] == pytest.approx(left["edge_mean"])
+        assert top["y_mean"] == pytest.approx(top["edge_mean"])
+        # The top level mirrors the first box.
+        assert m["n"] == 4 and m["edge_mean"] == left["edge_mean"]
+        assert (m["axis"], m["polarity"]) == ("x", 1)
+        # Given axes and polarities, one per box.
+        both = svc.measure(2, box=[BOX, BOX_TOP], axis=["x", "y"], polarity=[1, 1])
+        assert [e["n"] for e in both["edges"]] == [2, 2]
+        with pytest.raises(ValueError):
+            svc.measure(2, box=[BOX, BOX_TOP], axis="x")
+        # A box with no edge gives up on its own and the other still completes.
+        t0 = time.monotonic()
+        part = svc.measure(3, box=[BOX, BOX_EMPTY])
+        assert time.monotonic() - t0 < 4.0
+        assert part["edges"][0]["n"] == 3
+        assert part["edges"][1]["n"] == 0 and part["edges"][1]["reason"]
+        assert part["n"] == 3 and part["reason"] == ""
+
+
+def test_measure_message_with_the_old_single_box_keys_still_works() -> None:
+    w, pipes = _inproc_worker()
+    try:
+        w.on_measure(
+            {"n_frames": 3, "p_um": P0, "box": list(BOX), "axis": "x", "polarity": 1}
+        )
+        (m,) = [m for m in _messages(pipes) if m["type"] == "measurement"]
+        assert m["n"] == 3 and len(m["edges"]) == 1
+        assert m["edges"][0]["edge_mean"] == pytest.approx(_e0(), abs=0.3)
+        # No boxes in the message: the preview boxes are measured.
+        w.on_set_edge_boxes({"boxes": [list(BOX), list(BOX_EMPTY)]})
+        w.on_measure({"n_frames": 2})
+        (m,) = [m for m in _messages(pipes) if m["type"] == "measurement"]
+        assert [e["n"] for e in m["edges"]] == [2, 0]
+    finally:
+        _close(w, pipes)
+
+
+def test_preview_boxes_messages_and_the_one_box_alias() -> None:
+    w, pipes = _inproc_worker(cal_like=dict(CAL_DIAG))
+    try:
+        w.preview = True
+        w.on_set_edge_boxes({"boxes": [list(BOX), list(BOX_TOP)]})
+        assert w.edge_boxes == [BOX, BOX_TOP]
+        w.on_frame(w.source.render(0.0), 1.0, 1.0)
+        assert len(w.fixes) == 2 and w.last_fix is w.fixes[0]
+        assert all(f.ok for f in w.fixes) and w.fused is None and w.last_along is None
+        assert (w.fixes[0].axis, w.fixes[1].axis) == ("x", "y")
+        w.on_set_edge_boxes({"boxes": [list(BOX)] * 3})  # too many: reported
+        assert w.edge_boxes == [BOX, BOX_TOP]
+        w.on_set_edge_box({"box": list(BOX_TOP)})  # the alias sets one box
+        assert w.edge_boxes == [BOX_TOP] and w.fixes == []
+        w.on_set_edge_boxes({"boxes": []})
+        assert w.edge_boxes == []
+        errors = [m for m in _messages(pipes) if m["type"] == "error"]
+        assert len(errors) == 1 and "at most 2" in errors[0]["message"]
+    finally:
+        _close(w, pipes)
+
+
+def test_set_calibration_in_process_and_while_running() -> None:
+    w, pipes = _inproc_worker(cal_like=dict(CAL_DIAG))
+    try:
+        w.preview = True
+        w.on_set_edge_boxes({"boxes": [list(BOX), list(BOX_TOP)]})
+        w.on_set_calibration({"calibration": _cal2().to_dict()})
+        assert w.params is None  # no params sent yet: the default ones are used
+        w.on_frame(w.source.render(0.0), 1.0, 1.0)
+        assert w.fused is not None and w.last_along == pytest.approx(0.0, abs=0.1)
+        assert w.params is None
+        # A single-edge dict (the format saved before two-edge fusion) is accepted.
+        w.on_set_calibration({"calibration": _edge_cal().to_dict()})
+        assert len(w.cal.edges) == 1
+        # Garbage is reported and the calibration kept.
+        w.on_set_calibration({"calibration": {"kind": "gauss"}})
+        assert len(w.cal.edges) == 1
+        assert [m for m in _messages(pipes) if m["type"] == "error"]
+        # While the lock runs the calibration is not swapped under the controller.
+        w.on_start(
+            {
+                "params": _params().to_dict(),
+                "calibration": _cal2().to_dict(),
+                "p_start_um": P0,
+            }
+        )
+        w.on_set_calibration({"calibration": None})
+        assert w.cal is not None and len(w.cal.edges) == 2
     finally:
         _close(w, pipes)

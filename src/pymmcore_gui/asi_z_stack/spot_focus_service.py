@@ -22,6 +22,7 @@ import math
 import threading
 import time
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any
@@ -34,7 +35,7 @@ from .spot_frame_shm import FrameBuffer, unlink_by_name
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from .spot_focus import EdgeCalibration, SpotLoopParams
+    from .spot_focus import EdgeCalibration, FocusCalibration, SpotLoopParams
     from .spot_frame_shm import LiveFrame
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,21 @@ def _edge_text(reason: str) -> str:
             "edge left the box: widen the box along the edge normal or reduce the span"
         )
     return f"edge not measurable: {reason or 'no usable frames'}"
+
+
+def _as_boxes(boxes: Sequence[Any]) -> list[tuple[int, int, int, int]]:
+    """One box ``(x, y, w, h)`` or a list of 1-2 boxes, as a list of boxes."""
+    seq = list(boxes)
+    if seq and not hasattr(seq[0], "__len__"):  # numbers: a single box
+        seq = [seq]
+    if not 1 <= len(seq) <= 2:
+        raise ValueError(f"need one or two edge boxes, got {len(seq)}")
+    out = []
+    for box in seq:
+        if len(box) != 4:
+            raise ValueError(f"an edge box is (x, y, w, h), not {box!r}")
+        out.append(tuple(int(v) for v in box))
+    return out  # type: ignore[return-value]
 
 
 class SpotFocusService:
@@ -194,10 +210,18 @@ class SpotFocusService:
     def start(
         self,
         params: SpotLoopParams,
-        calibration: EdgeCalibration,
+        calibration: FocusCalibration | EdgeCalibration,
         led_intensity: float | None = None,
     ) -> None:
-        """Set CRISP to Ready, read P once, and start the loop."""
+        """Set CRISP to Ready, read P once, and start the loop.
+
+        *calibration* is a :class:`~.spot_focus.FocusCalibration`; a single
+        :class:`~.spot_focus.EdgeCalibration` is wrapped into a one-edge one.
+        """
+        from .spot_focus import EdgeCalibration, FocusCalibration
+
+        if isinstance(calibration, EdgeCalibration):
+            calibration = FocusCalibration.from_dict(calibration.to_dict())
         if self._state == "fault" and not self._proc.is_alive():
             raise RuntimeError("spot focus worker is dead; create a new service")
         if not self.wait_ready():
@@ -306,6 +330,32 @@ class SpotFocusService:
             {
                 "type": "set_edge_box",
                 "box": None if box is None else [int(v) for v in box],
+            }
+        )
+
+    def set_edge_boxes(self, boxes: Sequence[Sequence[float]]) -> None:
+        """Set the 0-2 edge boxes the preview measures; empty removes them.
+
+        When they are the held calibration's boxes (see :meth:`set_calibration`)
+        the preview telemetry also carries the fused error ``along_um``.
+        """
+        self._send(
+            {
+                "type": "set_edge_boxes",
+                "boxes": [[int(v) for v in box] for box in boxes],
+            }
+        )
+
+    def set_calibration(self, cal: FocusCalibration | None) -> None:
+        """Hand the worker a calibration for the preview error (None clears it).
+
+        The worker also keeps the one it was started with. Ignored by the
+        worker while the lock runs.
+        """
+        self._send(
+            {
+                "type": "set_calibration",
+                "calibration": None if cal is None else cal.to_dict(),
             }
         )
 
@@ -437,21 +487,27 @@ class SpotFocusService:
 
     def calibrate(
         self,
-        box: Sequence[float],
+        boxes: Sequence[Any],
         *,
         span_um: float = 2.0,
         steps: int = 9,
         n_frames: int = 3,
-        settle_s: float = 0.1,
+        settle_s: float = 0.25,
         record_path: str | Path | None = None,
-    ) -> EdgeCalibration:
-        """Sweep P around its current value, measure the edge and fit a line.
+    ) -> FocusCalibration:
+        """Sweep P around its current value, measure one or two edges and fit them.
 
         The user has focused on the cells, so the current P is the zero (best
         focus). The sweep goes in increasing P over ``+-span_um / 2``; at each
         step the worker snaps *n_frames* fresh frames (it drops stale ones) and
-        measures the edge in *box*. P goes back to the start, the edge is
-        measured once more (a drift / hysteresis check) and the line is fitted.
+        measures the edge in every box **on the same frames**. P goes back to
+        the start, the edges are measured once more (a drift / hysteresis
+        check) and each edge is fitted on its own: its own slope and sign, zero
+        (mean of the start and end measurement), noise, angle and contrast.
+
+        An edge that cannot be measured, leaves its box or does not fit is
+        dropped with a warning ``"edge K dropped: <message>"`` (K counts the
+        boxes from 1); the calibration fails only if no edge survives.
 
         Only while the loop is stopped and no acquisition runs. Uses
         ``waitForDevice`` (this polls the Tiger, which is fine for a short,
@@ -462,37 +518,43 @@ class SpotFocusService:
 
         Parameters
         ----------
-        box : Sequence[float]
-            Edge box ``(x, y, w, h)`` in sensor pixels.
+        boxes : Sequence
+            One edge box ``(x, y, w, h)`` or a list of one or two boxes, in
+            sensor pixels. Box 1 is the main edge.
         span_um : float
             Total sweep span in um of P.
         steps : int
             Number of sweep points.
         n_frames : int
-            Good frames averaged per point (the zero measurements use twice as
-            many).
+            Good frames averaged per point (the zero measurements use
+            ``max(2 * n_frames, 10)``, which also detects axis and polarity).
         settle_s : float
             Extra pause after each piezo move, before the worker's own settle.
         record_path : str | Path | None
-            If given, save the sweep (P, edge positions, one raw frame per
-            step) there with ``numpy.savez_compressed`` (``.npz`` is appended).
+            If given, save the sweep there with ``numpy.savez_compressed``
+            (``.npz`` is appended): ``p_um``, ``edge_px`` of shape
+            ``(steps, n_boxes)`` (nan where an edge was not measured), ``boxes``,
+            ``axes``, ``polarities``, ``frames`` (one raw frame per step) and
+            ``p_c``, ``e_start``, ``e_end``, ``noise_px`` (one value per box).
 
         Returns
         -------
-        EdgeCalibration
-            Zero at the start P, signed slope, linear range ``span_um / 2``.
+        FocusCalibration
+            One or two edges with a common zero P (the start P). Its
+            ``warnings`` list the dropped edges and the edges' own warnings
+            (prefixed with the edge number when there are two boxes).
 
         Raises
         ------
         RuntimeError
             If the loop or an acquisition is running, or the worker is dead.
         ValueError
-            With a plain message if the edge cannot be measured, leaves the
-            box, or the response is not a usable line.
+            With a plain message (edge 1's first) if no edge can be measured,
+            stays in its box and gives a usable line.
         """
         import numpy as np
 
-        from .spot_focus import fit_edge_calibration, snap_box
+        from .spot_focus import FocusCalibration, fit_edge_calibration, snap_box
 
         if self._state == "running":
             raise RuntimeError("stop the loop before calibrating")
@@ -502,83 +564,125 @@ class SpotFocusService:
         if not self.wait_ready():
             raise RuntimeError("spot focus worker did not become ready")
         mmc = self._mmc
-        sbox = snap_box(box)
+        sboxes = [snap_box(b) for b in _as_boxes(boxes)]
+        nb = len(sboxes)
         p_c = float(mmc.getPosition(self._piezo))
         ps = p_c + np.linspace(-span_um / 2.0, span_um / 2.0, steps)
+        n_zero = max(2 * n_frames, 10)
         self.led_on(owner="calibrate", force_ready=True)
         resume_preview = self._preview
         if resume_preview:  # pause Live without touching the service state
             self._send({"type": "preview_stop"})
         centred = False
         try:
-            m0 = self._snap(2 * n_frames, p_c, sbox, None, None, False)
-            if m0["n"] == 0:
-                raise ValueError(_edge_text(m0.get("reason", "")))
-            axis, polarity = str(m0["axis"]), int(m0["polarity"])
-            e_start = float(m0["edge_mean"])
-            noise_px = float(m0["edge_sd"])
-            edges: list[float] = []
+            m0 = self._snap_edges(n_zero, p_c, [(b, None, None) for b in sboxes], False)
+            ent0 = m0["edges"]
+            errors: dict[int, str] = {}  # box index -> why it is dropped
+            for k, ent in enumerate(ent0):
+                if ent["n"] == 0:
+                    errors[k] = _edge_text(ent.get("reason", ""))
+            axes = [e.get("axis") for e in ent0]
+            pols = [e.get("polarity") for e in ent0]
+            alive = [k for k in range(nb) if k not in errors]
+            if not alive:
+                raise ValueError(errors[min(errors)])
+            specs = [(sboxes[k], axes[k], pols[k]) for k in alive]
+            edge_px = np.full((len(ps), nb), np.nan)
             frames: list[Any] = []
-            for p in ps:
+            for s, p in enumerate(ps):
                 mmc.setPosition(self._piezo, float(p))
                 mmc.waitForDevice(self._piezo)
                 time.sleep(settle_s)
-                m = self._snap(n_frames, float(p), sbox, axis, polarity, True)
-                if m["n"] == 0 and "left the box" in str(m.get("reason", "")):
-                    raise ValueError(_edge_text(m["reason"]))
-                edges.append(float(m["edge_mean"]) if m["n"] else float("nan"))
+                m = self._snap_edges(n_frames, float(p), specs, True)
+                for k, ent in zip(alive, m["edges"], strict=True):
+                    if ent["n"]:
+                        edge_px[s, k] = float(ent["edge_mean"])
+                    elif "left the box" in str(ent.get("reason", "")):
+                        errors.setdefault(k, _edge_text(ent["reason"]))
                 frames.append(m.get("frame"))
+                if all(k in errors for k in alive):
+                    raise ValueError(errors[min(errors)])
             mmc.setPosition(self._piezo, p_c)
             mmc.waitForDevice(self._piezo)
             time.sleep(settle_s)
-            m1 = self._snap(2 * n_frames, p_c, sbox, axis, polarity, False)
+            m1 = self._snap_edges(n_zero, p_c, specs, False)
             centred = True
-            e_end = float(m1["edge_mean"]) if m1["n"] else float("nan")
+            e_start = np.full(nb, np.nan)
+            e_end = np.full(nb, np.nan)
+            noise = np.zeros(nb)
+            for k in alive:
+                e_start[k] = float(ent0[k]["edge_mean"])
+                noise[k] = float(ent0[k]["edge_sd"])
+            for k, ent in zip(alive, m1["edges"], strict=True):
+                if ent["n"]:
+                    e_end[k] = float(ent["edge_mean"])
             warns: list[str] = []
-            if math.isfinite(e_end):
-                e0 = 0.5 * (e_start + e_end)
-            else:
-                e0 = e_start
-                warns.append("could not re-measure the edge at the start position")
             saved = self._save_record(
                 record_path,
                 p_um=ps,
-                edge_px=np.asarray(edges, dtype=float),
+                edge_px=edge_px,
                 frames=frames,
-                box=np.asarray(sbox),
-                axis=axis,
-                polarity=polarity,
+                boxes=np.asarray(sboxes),
+                axes=np.asarray([a or "" for a in axes]),
+                polarities=np.asarray([int(p or 0) for p in pols]),
                 p_c=p_c,
                 e_start=e_start,
                 e_end=e_end,
-                noise_px=noise_px,
+                noise_px=noise,
             )
             if record_path is not None and saved is None:
                 warns.append("could not save the calibration record")
-            cal = fit_edge_calibration(
-                ps.tolist(),
-                edges,
-                box=sbox,
-                axis=axis,
-                polarity=polarity,
+            fitted: dict[int, Any] = {}
+            for k in alive:
+                if k in errors:
+                    continue
+                own: list[str] = []
+                if math.isfinite(e_end[k]):
+                    e0 = 0.5 * (e_start[k] + e_end[k])
+                else:
+                    e0 = float(e_start[k])
+                    own.append("could not re-measure the edge at the start position")
+                try:
+                    edge = fit_edge_calibration(
+                        ps.tolist(),
+                        edge_px[:, k].tolist(),
+                        box=sboxes[k],
+                        axis=str(axes[k]),
+                        polarity=int(pols[k]),
+                        p0_um=p_c,
+                        e0_px=e0,
+                        noise_px=float(noise[k]),
+                        angle_deg=float(ent0[k]["angle_mean"]),
+                        contrast=float(ent0[k]["contrast_mean"]),
+                        linear_range_um=span_um / 2.0,
+                    )
+                except ValueError as exc:
+                    errors[k] = str(exc)
+                    continue
+                drift = abs(e_end[k] - e_start[k])
+                if math.isfinite(drift) and drift > max(
+                    3.0 * noise[k], 0.05 * abs(edge.slope_px_per_um)
+                ):
+                    own.append(
+                        f"the edge moved {drift:.2f} px between the start and the "
+                        "end of the sweep (drift or hysteresis)"
+                    )
+                edge.warnings.extend(own)
+                fitted[k] = edge
+            if not fitted:
+                raise ValueError(errors[min(errors)])
+            for k in sorted(errors):
+                warns.append(f"edge {k + 1} dropped: {errors[k]}")
+            for k, edge in fitted.items():
+                prefix = f"edge {k + 1}: " if nb > 1 else ""
+                warns.extend(prefix + w for w in edge.warnings)
+            return FocusCalibration(
+                edges=list(fitted.values()),
                 p0_um=p_c,
-                e0_px=e0,
-                noise_px=noise_px,
-                angle_deg=float(m0["angle_mean"]),
-                contrast=float(m0["contrast_mean"]),
-                linear_range_um=span_um / 2.0,
+                created=datetime.now().isoformat(timespec="seconds"),
+                record_path="" if saved is None else str(saved),
+                warnings=warns,
             )
-            drift = abs(e_end - e_start)
-            if math.isfinite(drift) and drift > max(
-                3.0 * noise_px, 0.05 * abs(cal.slope_px_per_um)
-            ):
-                warns.append(
-                    f"the edge moved {drift:.2f} px between the start and the end "
-                    "of the sweep (drift or hysteresis)"
-                )
-            cal.warnings.extend(warns)
-            cal.record_path = "" if saved is None else str(saved)
-            return cal
         finally:
             try:
                 mmc.setPosition(self._piezo, p_c)
@@ -590,7 +694,7 @@ class SpotFocusService:
                                 "type": "measure",
                                 "n_frames": 1,
                                 "p_um": p_c,
-                                "box": list(sbox),
+                                "boxes": [{"box": list(sboxes[0])}],
                                 "timeout_s": 0.5,
                             },
                             1,
@@ -600,34 +704,33 @@ class SpotFocusService:
                 if resume_preview:
                     self._send({"type": "preview_start"})
 
-    def zero(self, cal: EdgeCalibration, *, n_frames: int = 8) -> EdgeCalibration:
-        """Make the present edge position the zero (best focus) of *cal*.
+    def zero(self, cal: FocusCalibration, *, n_frames: int = 8) -> FocusCalibration:
+        """Make the present edge positions the zero (best focus) of *cal*.
 
-        Reads P once, measures the edge in the calibration's box with its axis
-        and polarity, and returns :func:`~.spot_focus.rezero` of it. The slope
-        and the range are kept. Only while the loop is stopped; sends no move.
+        Reads P once, measures every edge in its box with its axis and
+        polarity on the same frames, and returns :meth:`FocusCalibration.rezeroed`
+        of them. The slopes and the range are kept. Only while the loop is
+        stopped; sends no move.
 
         Parameters
         ----------
-        cal : EdgeCalibration
-            The calibration to re-zero.
+        cal : FocusCalibration
+            The calibration to re-zero (one or two edges).
         n_frames : int
             Good frames to average.
 
         Returns
         -------
-        EdgeCalibration
-            *cal* with ``e0_px`` / ``p0_um`` at the present edge and P.
+        FocusCalibration
+            *cal* with every ``e0_px`` and ``p0_um`` at the present edges and P.
 
         Raises
         ------
         RuntimeError
             If the loop is running or the worker is dead.
         ValueError
-            If the edge cannot be measured.
+            If any edge cannot be measured (the reason is in the message).
         """
-        from .spot_focus import rezero
-
         if self._state == "running":
             raise RuntimeError("stop the loop before zeroing")
         if not self.wait_ready():
@@ -635,21 +738,27 @@ class SpotFocusService:
         p = float(self._mmc.getPosition(self._piezo))
         self.led_on(owner="zero")
         try:
-            m = self._snap(n_frames, p, cal.box, cal.axis, cal.polarity, False)
+            m = self._snap_edges(
+                n_frames, p, [(e.box, e.axis, e.polarity) for e in cal.edges], False
+            )
         finally:
             self.led_off("zero")
-        if m["n"] == 0:
-            raise ValueError(_edge_text(m.get("reason", "")))
-        return rezero(cal, e0_px=float(m["edge_mean"]), p0_um=p)
+        for k, ent in enumerate(m["edges"]):
+            if ent["n"] == 0:
+                text = _edge_text(ent.get("reason", ""))
+                raise ValueError(
+                    f"edge {k + 1}: {text}" if len(cal.edges) > 1 else text
+                )
+        return cal.rezeroed([float(ent["edge_mean"]) for ent in m["edges"]], p)
 
     def measure(
         self,
         n_frames: int = 20,
         p_um: float | None = None,
         *,
-        box: Sequence[float],
-        axis: str | None = None,
-        polarity: int | None = None,
+        box: Sequence[Any],
+        axis: str | Sequence[str | None] | None = None,
+        polarity: int | Sequence[int | None] | None = None,
         return_frame: bool = False,
     ) -> dict:
         """One averaged edge measurement from the worker (loop stopped).
@@ -657,48 +766,66 @@ class SpotFocusService:
         Parameters
         ----------
         n_frames : int
-            Good frames to average; all were exposed after the request.
+            Good frames to average per box; all were exposed after the request.
         p_um : float | None
             P the fake camera should follow (a real camera ignores it).
-        box : Sequence[float]
-            Edge box ``(x, y, w, h)`` in sensor pixels.
-        axis : str | None
+        box : Sequence
+            One edge box ``(x, y, w, h)`` in sensor pixels, or a list of one or
+            two boxes, all measured on the same frames.
+        axis : str | Sequence[str | None] | None
             ``"x"`` / ``"y"`` edge normal; detected on the first good frame
-            when None.
-        polarity : int | None
-            +1 / -1 bright side; detected when None.
+            when None. A list gives one per box.
+        polarity : int | Sequence[int | None] | None
+            +1 / -1 bright side; detected when None. A list gives one per box.
         return_frame : bool
             Also return one raw full-ROI frame under ``"frame"``.
 
         Returns
         -------
         dict
-            ``p_um, n, edge_mean, edge_sd, x_mean, y_mean, contrast_mean,
-            angle_mean, residual_mean, axis, polarity, reason, roi`` (and
-            ``frame``). ``reason`` is why the last frame was bad when ``n`` is 0.
+            ``p_um, edges, roi`` (and ``frame``). ``edges`` holds, per box,
+            ``n, edge_mean, edge_sd, x_mean, y_mean, contrast_mean, angle_mean,
+            residual_mean, axis, polarity, reason``; the first box's fields are
+            repeated at the top level. ``reason`` is why the last frame was bad
+            when ``n`` is 0.
         """
         if self._state == "running":
             raise RuntimeError("stop the loop before measuring")
-        return self._snap(n_frames, p_um, box, axis, polarity, return_frame)
+        sboxes = _as_boxes(box)
 
-    def _snap(
+        def per_box(value: Any) -> list[Any]:
+            if isinstance(value, list | tuple):
+                if len(value) != len(sboxes):
+                    raise ValueError("axis / polarity need one value per box")
+                return list(value)
+            if len(sboxes) > 1 and value is not None:
+                raise ValueError("pass axis / polarity as lists for two boxes")
+            return [value] + [None] * (len(sboxes) - 1)
+
+        specs = list(zip(sboxes, per_box(axis), per_box(polarity), strict=True))
+        return self._snap_edges(n_frames, p_um, specs, return_frame)
+
+    def _snap_edges(
         self,
         n_frames: int,
         p_um: float | None,
-        box: Sequence[float],
-        axis: str | None,
-        polarity: int | None,
+        specs: Sequence[tuple[Sequence[float], str | None, int | None]],
         return_frame: bool,
     ) -> dict:
-        """Ask the worker for *n_frames* fresh edge fixes and wait for the reply."""
+        """Ask the worker for *n_frames* fresh fixes of every box; wait for the reply.
+
+        *specs* are ``(box, axis, polarity)``; axis and polarity None are
+        detected. The reply has an ``edges`` entry per spec.
+        """
         return self._request_measurement(
             {
                 "type": "measure",
                 "n_frames": int(n_frames),
                 "p_um": p_um,
-                "box": [int(v) for v in box],
-                "axis": axis,
-                "polarity": polarity,
+                "boxes": [
+                    {"box": [int(v) for v in box], "axis": axis, "polarity": pol}
+                    for box, axis, pol in specs
+                ],
                 "return_frame": return_frame,
             },
             int(n_frames),

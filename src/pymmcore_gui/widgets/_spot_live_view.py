@@ -13,11 +13,14 @@ The rig camera is a colour sensor read as raw Bayer, so by default the display
 
 Frames come from the service (:meth:`SpotFocusService.latest_frame`, a shared
 memory read) on a 30 Hz timer; the scene is repainted only when ``seq``
-changes. Overlays (sensor outline, ROI, edge box, edge cross, setpoint ring) are
-scene items with cosmetic pens, so they keep their on-screen size at any zoom.
+changes. Overlays (sensor outline, ROI, edge boxes, edge crosses, setpoint rings)
+are scene items with cosmetic pens, so they keep their on-screen size at any zoom.
 The cross marks the measured edge point (the worker's shared-buffer ``spot``),
 the ring the zero edge point, and the dashed violet rectangle the edge box the
-user drew with Draw edge box.
+user drew with Draw edge box. An optional second edge has its own dashed teal
+box (Draw edge box 2), cross and ring in other colours; the panel feeds its cross
+and ring (:meth:`SpotLiveView.set_secondary_point`,
+:meth:`SpotLiveView.set_secondary_setpoint`).
 
 See ``docs/spot_focus_lock.md``, "Live camera view and controls".
 """
@@ -83,6 +86,9 @@ BAD_COLOR = "#ff9a1f"
 SETPOINT_COLOR = "#ff4fd8"
 ROI_COLOR = "#56b4e9"
 EDGE_BOX_COLOR = "#c77dff"
+EDGE_BOX2_COLOR = "#2ec4b6"
+SPOT2_COLOR = "#00d4ff"
+SETPOINT2_COLOR = "#ffb3ec"
 
 
 # ---------------------------------------------------------------------------
@@ -356,8 +362,12 @@ class SpotLiveView(QWidget):
     roiDrawn = Signal(int, int, int, int)
     #: ``(x, y, w, h)`` drawn in Draw edge box mode (even, clamped to the sensor).
     edgeBoxDrawn = Signal(int, int, int, int)
+    #: ``(x, y, w, h)`` drawn in Draw edge box 2 mode (even, clamped to the sensor).
+    edgeBox2Drawn = Signal(int, int, int, int)
     #: Draw edge box mode was switched on or off (by the user, a drag or code).
     edgeDrawModeChanged = Signal(bool)
+    #: Draw edge box 2 mode was switched on or off.
+    edge2DrawModeChanged = Signal(bool)
     #: The window was closed by the user.
     windowClosed = Signal()
     #: ``(fps, max_value, saturated_percent)`` a few times a second.
@@ -376,8 +386,11 @@ class SpotLiveView(QWidget):
         self._buf: np.ndarray | None = None  # keeps the QImage buffer alive
         self._fit = True
         self._setpoint: tuple[float, float] | None = None
+        self._setpoint2: tuple[float, float] | None = None
         self._edge_box: tuple[int, int, int, int] | None = None
-        self._draw_target: str | None = None  # "roi" / "edge" / None
+        self._edge_box2: tuple[int, int, int, int] | None = None
+        self._spot2: tuple[float, float] | None = None
+        self._draw_target: str | None = None  # "roi" / "edge" / "edge2" / None
         self._cursor: QPointF | None = None
         self._poll_error_logged = False
         self.fps = 0.0
@@ -418,6 +431,14 @@ class SpotLiveView(QWidget):
         self._edge_box_item.setVisible(False)
         self.scene.addItem(self._edge_box_item)
 
+        self._edge_box2_item = QGraphicsRectItem()
+        pen = QPen(QColor(EDGE_BOX2_COLOR), 1.5, Qt.PenStyle.DashLine)
+        pen.setCosmetic(True)
+        self._edge_box2_item.setPen(pen)
+        self._edge_box2_item.setZValue(11)
+        self._edge_box2_item.setVisible(False)
+        self.scene.addItem(self._edge_box2_item)
+
         self._setpoint_item = QGraphicsEllipseItem(-10.0, -10.0, 20.0, 20.0)
         pen = QPen(QColor(SETPOINT_COLOR), 2)
         pen.setCosmetic(True)
@@ -428,6 +449,17 @@ class SpotLiveView(QWidget):
         self._setpoint_item.setZValue(20)
         self._setpoint_item.setVisible(False)
         self.scene.addItem(self._setpoint_item)
+
+        self._setpoint2_item = QGraphicsEllipseItem(-10.0, -10.0, 20.0, 20.0)
+        pen = QPen(QColor(SETPOINT2_COLOR), 2)
+        pen.setCosmetic(True)
+        self._setpoint2_item.setPen(pen)
+        self._setpoint2_item.setFlag(
+            QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations
+        )
+        self._setpoint2_item.setZValue(20)
+        self._setpoint2_item.setVisible(False)
+        self.scene.addItem(self._setpoint2_item)
 
         cross = QPainterPath()
         cross.moveTo(-9, 0)
@@ -442,6 +474,15 @@ class SpotLiveView(QWidget):
         self._spot_item.setZValue(21)
         self._spot_item.setVisible(False)
         self.scene.addItem(self._spot_item)
+
+        self._spot2_item = QGraphicsPathItem(cross)
+        self._spot2_item.setPen(QPen(QColor(SPOT2_COLOR), 2))
+        self._spot2_item.setFlag(
+            QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations
+        )
+        self._spot2_item.setZValue(21)
+        self._spot2_item.setVisible(False)
+        self.scene.addItem(self._spot2_item)
 
         self.view = _View(self.scene)
         self.view.cursorMoved.connect(self._on_cursor)
@@ -473,6 +514,15 @@ class SpotLiveView(QWidget):
         self.draw_edge_button.toggled.connect(
             lambda on: self._on_draw_toggled("edge", on)
         )
+        self.draw_edge2_button = QPushButton("Draw edge box 2")
+        self.draw_edge2_button.setCheckable(True)
+        self.draw_edge2_button.setToolTip(
+            "Drag a rectangle across a second edge (optional); a lateral image "
+            "shift then shows as the two edges disagreeing"
+        )
+        self.draw_edge2_button.toggled.connect(
+            lambda on: self._on_draw_toggled("edge2", on)
+        )
         self.auto_levels = QCheckBox("Auto levels")
         self.auto_levels.setToolTip(
             "Stretch the display from the frame's min to its max (linear). "
@@ -495,6 +545,7 @@ class SpotLiveView(QWidget):
             self.one_to_one_button,
             self.draw_roi_button,
             self.draw_edge_button,
+            self.draw_edge2_button,
             self.auto_levels,
             self.bayer_grey,
         ):
@@ -580,26 +631,74 @@ class SpotLiveView(QWidget):
         self._edge_box_item.setVisible(True)
 
     @property
+    def edge_box2(self) -> tuple[int, int, int, int] | None:
+        """The second edge box on show, ``(x, y, w, h)`` in sensor px, or ``None``."""
+        return self._edge_box2
+
+    def set_edge_box2(self, box: tuple[int, int, int, int] | None) -> None:
+        """Show the second edge box ``(x, y, w, h)`` (sensor px), or hide it."""
+        if box is None:
+            self._edge_box2 = None
+            self._edge_box2_item.setVisible(False)
+            return
+        x, y, w, h = (int(v) for v in box)
+        self._edge_box2 = (x, y, w, h)
+        self._edge_box2_item.setRect(QRectF(x, y, w, h))
+        self._edge_box2_item.setVisible(True)
+
+    def set_secondary_point(
+        self, xy: tuple[float, float] | None, ok: bool = True
+    ) -> None:
+        """Mark the second edge's measured point (sensor px), or hide the cross.
+
+        *ok* colours the cross like the first one (own colour, else orange).
+        """
+        self._spot2 = None if xy is None else (float(xy[0]), float(xy[1]))
+        if self._spot2 is None:
+            self._spot2_item.setVisible(False)
+            return
+        self._spot2_item.setPos(self._spot2[0] + 0.5, self._spot2[1] + 0.5)
+        color = SPOT2_COLOR if ok else BAD_COLOR
+        self._spot2_item.setPen(QPen(QColor(color), 2))
+        self._spot2_item.setVisible(True)
+
+    def set_secondary_setpoint(self, xy: tuple[float, float] | None) -> None:
+        """Mark the second edge's zero point (sensor px), or hide its ring."""
+        self._setpoint2 = xy
+        self._place_setpoint()
+
+    @property
     def draw_target(self) -> str | None:
-        """What a drag draws: ``"roi"``, ``"edge"`` or ``None`` (pan)."""
+        """What a drag draws: ``"roi"``, ``"edge"``, ``"edge2"`` or ``None`` (pan)."""
         return self._draw_target
+
+    def set_edge2_draw_mode(self, on: bool) -> None:
+        """Enter or leave Draw edge box 2 mode (the drag emits ``edgeBox2Drawn``)."""
+        self.draw_edge2_button.setChecked(bool(on))
 
     def set_edge_draw_mode(self, on: bool) -> None:
         """Enter or leave Draw edge box mode (the drag emits ``edgeBoxDrawn``)."""
         self.draw_edge_button.setChecked(bool(on))
 
     def _on_draw_toggled(self, target: str, on: bool) -> None:
-        """Keep the two Draw buttons exclusive and the view's mode in step."""
+        """Keep the Draw buttons exclusive and the view's mode in step."""
+        buttons = {
+            "roi": self.draw_roi_button,
+            "edge": self.draw_edge_button,
+            "edge2": self.draw_edge2_button,
+        }
         if on:
-            other = self.draw_edge_button if target == "roi" else self.draw_roi_button
-            if other.isChecked():
-                other.setChecked(False)  # re-enters here with on=False
+            for name, other in buttons.items():
+                if name != target and other.isChecked():
+                    other.setChecked(False)  # re-enters here with on=False
             self._draw_target = target
         elif self._draw_target == target:
             self._draw_target = None
         self.view.set_draw_mode(self._draw_target is not None)
         if target == "edge":
             self.edgeDrawModeChanged.emit(on)
+        elif target == "edge2":
+            self.edge2DrawModeChanged.emit(on)
 
     def clear(self) -> None:
         """Forget the image and overlays (the camera went away)."""
@@ -608,6 +707,7 @@ class SpotLiveView(QWidget):
         self._last_seq = None
         self._pixmap_item.setPixmap(QPixmap())
         self._spot_item.setVisible(False)
+        self._spot2_item.setVisible(False)
         self._roi_item.setVisible(False)
         self.status_label.setText("Waiting for the camera...")
         self.cursor_label.setText("")
@@ -631,6 +731,7 @@ class SpotLiveView(QWidget):
         self._timer.stop()
         self.draw_roi_button.setChecked(False)
         self.draw_edge_button.setChecked(False)
+        self.draw_edge2_button.setChecked(False)
         super().closeEvent(event)
         self.windowClosed.emit()
 
@@ -732,12 +833,15 @@ class SpotLiveView(QWidget):
             self._spot_item.setVisible(True)
 
     def _place_setpoint(self) -> None:
-        sp = self._setpoint
-        if sp is None:
-            self._setpoint_item.setVisible(False)
-            return
-        self._setpoint_item.setPos(sp[0] + 0.5, sp[1] + 0.5)
-        self._setpoint_item.setVisible(True)
+        for sp, item in (
+            (self._setpoint, self._setpoint_item),
+            (self._setpoint2, self._setpoint2_item),
+        ):
+            if sp is None:
+                item.setVisible(False)
+            else:
+                item.setPos(sp[0] + 0.5, sp[1] + 0.5)
+                item.setVisible(True)
 
     def _set_status(self, stale: bool = False) -> None:
         frame = self._frame
@@ -846,18 +950,22 @@ class SpotLiveView(QWidget):
         )
 
     # ------------------------------------------------------------------
-    # Draw ROI / Draw edge box
+    # Draw ROI / Draw edge box / Draw edge box 2
     # ------------------------------------------------------------------
 
     def _on_rect_drawn(self, p0: QPointF, p1: QPointF) -> None:
         if self._sensor is None:
             return
-        if self._draw_target == "edge":
+        if self._draw_target in ("edge", "edge2"):
             box = snap_edge_box((p0.x(), p0.y()), (p1.x(), p1.y()), self._sensor)
             if box is None:  # a click or a sliver: stay in Draw mode
                 return
-            self.draw_edge_button.setChecked(False)
-            self.edgeBoxDrawn.emit(*box)
+            if self._draw_target == "edge":
+                self.draw_edge_button.setChecked(False)
+                self.edgeBoxDrawn.emit(*box)
+            else:
+                self.draw_edge2_button.setChecked(False)
+                self.edgeBox2Drawn.emit(*box)
             return
         roi = snap_roi((p0.x(), p0.y()), (p1.x(), p1.y()), self._sensor)
         if roi is None:  # a click or a sliver: stay in Draw mode

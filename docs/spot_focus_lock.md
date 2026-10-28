@@ -11,17 +11,18 @@ O2/O3 and a pickoff dichroic sends it to an AmScope MD310C-BS (Sony IMX123
 colour sensor, USB 2.0, ToupTek OEM). On that camera the LED shows up as a
 bright, roughly square **patch**. A focus drift of O3 moves the patch along one
 fixed direction. The loop measures the position of one straight **edge** of the
-patch and moves piezo P (`PiezoStage:P:34`) to bring the edge back to where it
-was when the sample was in focus. The method follows Nguyen et al. 2025,
-Biomed. Opt. Express 16(3):1216. Their code has no licence, so nothing here is
-copied from it.
+patch, or of two edges fused into one number, and moves piezo P
+(`PiezoStage:P:34`) to bring the edge back to where it was when the sample was
+in focus. The method follows Nguyen et al. 2025, Biomed. Opt. Express
+16(3):1216. Their code has no licence, so nothing here is copied from it.
 
-> **Rig-unverified.** No real LED-patch frame, no P sweep and no saved spot
-> calibration existed when this was written. All numbers below (patch size,
-> ghost position, tail level, noise) come from one screenshot. The synthetic
-> renderer (`spot_synthetic.py`) and `FakeSpotSource` were modelled on that
-> screenshot, so every test passes against a model, not against the rig. Work
-> through the rig test plan at the end before trusting the lock.
+> **Mostly rig-unverified.** The patch size, ghost position, tail level and
+> noise below come from one screenshot, and the synthetic renderer
+> (`spot_synthetic.py`) and `FakeSpotSource` were modelled on it, so every test
+> passes against a model, not against the rig. The first real P sweep
+> (2026-10-28) is summarised in "First rig results"; the closed lock and the
+> second edge have not been run on the rig yet. Work through the rig test plan
+> at the end before trusting the lock.
 
 ## Rules
 
@@ -37,9 +38,9 @@ copied from it.
   readback**. It never polls the Tiger.
 - Moves are rare: a dead band, at most `max_rate_hz` moves per second
   (default 2), and averaging over several frames.
-- On a fault (edge lost, saturated, edge rotated or not straight, range limit,
-  worker died) the loop stops sending moves and reports. It never searches for
-  the edge and never moves P back.
+- On a fault (edge lost, saturated, edge rotated or not straight, the two
+  edges disagree, range limit, worker died) the loop stops sending moves and
+  reports. It never searches for the edge and never moves P back.
 - No scipy. The code uses numpy only, plus the stdlib `multiprocessing` (spawn
   context, for Windows).
 - **Calibration exception.** `SpotFocusService.calibrate` is the one place that
@@ -136,6 +137,49 @@ Measured on synthetic data: bias below 0.05 sensor px on noise-free sub-pixel
 shifts; single-frame SD 0.004 px at 0.4 counts of noise and 0.012 px at 2
 counts; 0.47 ms median for a full 2048x1536 frame.
 
+### Optional second edge and fusion
+
+The user may draw a second edge box on a different edge of the patch (for
+example box 1 on the top edge, box 2 on the left edge). Each box is measured
+with `measure_edge` and calibrated on its own, with its own signed slope, from
+the same snapped frames. The two position errors in um are then fused into one
+number.
+
+- **`FocusCalibration`** holds one or two `EdgeCalibration` entries (`edges`),
+  the shared zero P `p0_um`, `created`, `record_path`, `warnings` and
+  `kind="edges"`. Properties: `boxes` and `linear_range_um` (the smallest
+  range over the edges). `rezeroed(e0_px, p0_um)` takes one zero edge value
+  per edge.
+- **`edge_noise_um(e)`** is the per-edge noise used for weighting:
+  `max(e.noise_px, e.residual_px, 0.02) / |e.slope_px_per_um|`. The line-fit
+  residual is included because it contains the repeatability that the static
+  noise misses.
+- **`fuse_edges(fixes, cal, params) -> FusedError`** checks each edge with
+  `check_fix`. A good edge gives `a_i = edge_error(fix_i, edge_i, 0)`.
+  - Two good edges: if `D = |a1 - a2|` is above
+    `max(max_edge_disagreement_um, 4 * sqrt(n1^2 + n2^2))` (limit default 0.3
+    um, `n_i` from `edge_noise_um`), the result is a bad measurement with
+    reason `"edges disagree by D um (lateral drift or a changed image)"`. That
+    is a strike and no move. Otherwise the result is the inverse-variance
+    mean, with `sigma_um = 1 / sqrt(w1 + w2)`.
+  - One good edge of two: the loop uses it, with the note
+    `"edge K lost (<reason>); using edge J"` (1-based). That is not a strike.
+  - No good edge: the reason of edge 1, a strike, and `along_um` is None.
+  - `offset_um` is subtracted once, at the end. `FusedError` carries
+    `along_um`, `sigma_um`, `used` (which edges passed `check_fix`),
+    `per_edge_um` (raw, no offset), `disagreement_um`, `reason` and `note`.
+  - A one-edge calibration gives the same result as the old single-edge path.
+
+Why two edges:
+
+- **Lower noise.** On the first rig sweep, fusing the top and left edges
+  (inverse variance, residuals almost uncorrelated) gives 0.024 um against
+  0.048 um for the top edge alone, about 2x better.
+- **A health check.** A focus change moves both edges consistently with their
+  calibrated slopes. A lateral image shift (beam walk) moves the left edge
+  (along x) but not the top edge (along y), so the two um estimates disagree
+  and the loop stops moving instead of following the walk.
+
 ## Calibration and zero
 
 The workflow is CRISPy-style: the user focuses on the cells by eye, then
@@ -143,63 +187,84 @@ presses **Calibrate**. That P is best focus and becomes the zero (setpoint).
 
 ```python
 SpotFocusService.calibrate(
-    box, *, span_um=2.0, steps=9, n_frames=3, settle_s=0.1, record_path=None
-) -> EdgeCalibration
+    boxes, *, span_um=2.0, steps=9, n_frames=3, settle_s=0.25,
+    record_path=None,
+) -> FocusCalibration
 ```
 
-It runs off the GUI thread. The box is snapped with `snap_box` and the snapped
-box is stored in the calibration, so it can differ from the drawn box by less
-than 2 px.
+It runs off the GUI thread. `boxes` is one box or a list of one or two boxes.
+Each box is snapped with `snap_box` and the snapped box is stored in its edge
+calibration, so it can differ from the drawn box by less than 2 px.
 
 1. Refuse (`RuntimeError`) if the lock is running or an MDA runs. Read
    `p_c = getPosition(P)`. Turn the LED on (owner "calibrate"). Pause the Live
    preview and remember it (the worker gets `preview_stop`, the service still
    counts the preview as on).
-2. Measure at `p_c` with `2 * n_frames` snapped frames: `e_start`, `noise_px`
-   (SD), and the detected axis, polarity, angle and contrast. If the fix is not
-   ok, fail with `ValueError("edge not measurable: <reason>")` (wrong box, LED
-   off...).
+2. Measure at `p_c` with `max(2 * n_frames, 10)` snapped frames. Per box this
+   gives `e_start`, `noise_px` (SD) and the detected axis, polarity, angle and
+   contrast. A box whose fix is not ok (wrong box, LED off...) is dropped with
+   the warning `"edge K dropped: edge not measurable: <reason>"` (K is the
+   1-based box number as passed).
 3. Sweep `p_c + linspace(-span/2, +span/2, steps)` in increasing order. At each
-   step: `setPosition`, `waitForDevice`, sleep `settle_s`, then `measure` with
-   `n_frames`, the detected axis and polarity, and one frame returned. The
-   worker drops stale frames until its time-based settle passes, so every
-   frame used was exposed after the move. That is the "snap". The live view
-   shows the frames that were measured.
-4. Go back to `p_c`, wait, measure again with `2 * n_frames`: `e_end`. Warn if
-   `|e_end - e_start| > max(3 * noise_px, 0.05 * |slope| um)` (hysteresis or
-   drift). If this re-measure fails, `e0 = e_start` and a warning is added.
-5. Fit with `fit_edge_calibration`: a least-squares line
-   `edge = e_c + s (p - p_c)`. The stored zero is
-   `e0_px = (e_start + e_end) / 2` at `p0_um = p_c`; `slope_px_per_um` is
-   signed. `linear_range_um` is half the span.
+   step: `setPosition`, `waitForDevice`, sleep `settle_s` (default 0.25 s),
+   then `measure` with `n_frames`, the detected axis and polarity, and one
+   frame returned. **One snap per step measures all surviving boxes from the
+   same frames.** The worker drops stale frames until its time-based settle
+   passes, so every frame used was exposed after the move. That is the "snap".
+   The live view shows the frames that were measured. A box that reports "edge
+   left the box" at a step is dropped. If every box has left its box the
+   sweep aborts early.
+4. Go back to `p_c`, wait, measure again with `max(2 * n_frames, 10)` frames:
+   `e_end`. Warn if `|e_end - e_start| > max(3 * noise_px, 0.05 * |slope| um)`
+   (hysteresis or drift). If this re-measure fails for an edge, its
+   `e0 = e_start` and a warning is added.
+5. Fit **each edge separately** with `fit_edge_calibration`: a least-squares
+   line `edge = e_c + s (p - p_c)`. The stored zero is
+   `e0_px = (e_start + e_end) / 2` at the shared `p0_um = p_c`;
+   `slope_px_per_um` is signed and can differ in sign and size between edges.
+   `linear_range_um` is half the span.
    - Errors (`ValueError`, plain message): fewer than 5 good points; `|s|`
      below 0.3 px/um ("edge barely moves; wrong edge or span too small"); R2
      below 0.95 ("not linear; reduce the span"); non-monotonic steps; the edge
      left the box at some step ("edge left the box: widen the box along the
      edge normal or reduce the span").
+   - **An edge whose fit raises is dropped with a warning**
+     (`"edge K dropped: <message>"`) and the calibration continues with the
+     other edge. The call fails only if no edge survives; the error is then
+     the message of the lowest-numbered edge.
    - Warnings (kept and shown): R2 below 0.98, `|s|` below 1 px/um (noise in
-     um will be large), hysteresis, sweep points dropped, a record that could
-     not be written.
+     um will be large), hysteresis, sweep points dropped, dropped edges, a
+     record that could not be written. With two boxes the per-edge warnings
+     are prefixed with "edge K:" in the calibration's `warnings`.
 6. If `record_path` is given, save `np.savez_compressed` (`.npz` is appended if
-   missing, the parent folder is created) with `p_um`, `edge_px`, `frames`
-   (one raw frame per step, zeros for a failed step), `box`, `axis`,
-   `polarity`, `p_c`, `e_start`, `e_end` and `noise_px`. It is written before
-   the fit, so a failed fit still leaves a record. A write error is logged and
-   added to the warnings, not raised. The panel writes
-   `USER_DATA_DIR / "spot_calibration_<timestamp>.npz"`.
+   missing, the parent folder is created). The arrays are per edge:
+   - `p_um` (steps), `edge_px` (steps x n_boxes, NaN where not measured),
+     `boxes` (n x 4), `axes` (n, empty string if the box was dropped at the
+     zero), `polarities` (n, 0 if dropped), `frames` (steps x h x w, one raw
+     frame per step shared by both edges, zeros for a failed step), `p_c`,
+     `e_start` (n), `e_end` (n) and `noise_px` (n).
+   - The old scalar keys `box`, `axis` and `polarity` are gone.
+
+   It is written before the fit, so a failed fit still leaves a record. A
+   write error is logged and added to the warnings, not raised. The panel
+   writes `USER_DATA_DIR / "spot_calibration_<timestamp>.npz"`.
 7. Always, even after a failure: `setPosition(p_c)`, `waitForDevice`, release
    the LED claim, restore the preview. Camera settings are untouched.
 
-The calibration holds: box, axis, polarity, signed slope (px/um), R2, residual,
-`linear_range_um` (half the span), noise, reference angle and contrast, zero
-edge `e0_px`, zero P `p0_um`, the sweep points, warnings and the creation time.
+Each edge calibration holds: box, axis, polarity, signed slope (px/um), R2,
+residual, `linear_range_um` (half the span), noise, reference angle and
+contrast, zero edge `e0_px` and its own warnings. The `FocusCalibration` adds
+the shared zero P `p0_um`, the record path, the calibration warnings and the
+creation time.
 
 **Zero here** (`zero(cal, n_frames=8)`) works only while stopped. It reads P
-once, takes a short LED claim (owner "zero"), measures the edge with the
-calibration's box, axis and polarity, and returns
-`rezero(cal, e0_px=edge, p0_um=P)`: same slope, new setpoint. It moves nothing
-and waits on nothing. The panel resets the offset to 0. Use it after
-refocusing by eye without redoing the sweep.
+once, takes a short LED claim (owner "zero"), measures every edge with its
+calibration box, axis and polarity, and returns `cal.rezeroed(e0s, P)`: same
+slopes, new setpoint for every edge at the current P. It moves nothing and
+waits on nothing. If any edge cannot be measured it raises `ValueError`
+(`edge K: edge not measurable: ...` when the calibration has two edges). The
+panel resets the offset to 0. Use it after refocusing by eye without redoing
+the sweep.
 
 **Offset (um)** shifts the lock setpoint along the focus axis, like CRISPy's
 lock offset. It is live, persisted with the loop params, and reset to 0 by Zero
@@ -214,16 +279,24 @@ locks and the panel shows the error.
 ### Persistence and old calibrations
 
 The calibration is stored in `SpotFocusSettingsV1.calibration` as
-`EdgeCalibration.to_dict()` with `"kind": "edge"` (lists for `box` and
-`sweep`, so it round-trips through JSON). Settings added for the edge workflow:
-`edge_box` (`x, y, w, h` or `None`), `sweep_span_um` (2.0), `sweep_steps` (9),
-`sweep_frames` (3). `SpotFocusSettingsV1.calibration_status()` returns the
-`load_calibration` result and `to_calibration()` returns its first element.
+`FocusCalibration.to_dict()` with `"kind": "edges"` (lists for the boxes and
+sweeps, so it round-trips through JSON). Settings added for the edge workflow:
+`edge_box` and `edge_box_2` (`x, y, w, h` or `None`; box 2 is optional),
+`sweep_span_um` (2.0), `sweep_steps` (9), `sweep_frames` (3), and the loop
+parameter `max_edge_disagreement_um` (0.3).
+`SpotFocusSettingsV1.calibration_status()` returns the `load_calibration`
+result and `to_calibration()` returns its first element.
 
-`load_calibration(d) -> (EdgeCalibration | None, message)` never raises:
+`load_calibration(d) -> (FocusCalibration | None, message)` never raises:
 
 - `None` or `{}` gives `(None, "no spot calibration yet; press Calibrate")`.
-- An old Gaussian calibration (no `kind`), garbage, or a malformed dict gives
+- A new `"edges"` dict loads as one or two edges. **An old single `"edge"`
+  dict (`EdgeCalibration.to_dict()`, `"kind": "edge"`) loads as a one-edge
+  `FocusCalibration`**, with `p0_um`, `created`, `record_path` and `warnings`
+  taken from it. The rig's existing calibration (slope 1.919 px/um) keeps
+  working this way.
+- An old Gaussian calibration (no `kind`), garbage, a malformed dict, or an
+  edge count other than 1 or 2 gives
   `(None, "old spot calibration ignored; recalibrate")`.
 
 The panel shows that message and never crashes its constructor. Unknown keys in
@@ -236,6 +309,10 @@ old params are ignored (`SpotLoopParams.from_dict`, settings `extra="ignore"`).
   **Moving P by `-error` returns the edge to the zero plus offset.** Check: at
   `P = p0 + offset` the edge is at `e0 + s * offset`, so the error is 0. The
   slope is signed, so no separate direction is needed.
+- **Two edges.** With two edges the error fed to the loop is the fused one from
+  `fuse_edges` (see "Optional second edge and fusion"), with `offset_um`
+  applied once. A disagreement between the edges is a bad frame (a strike); a
+  single lost edge is only a note and the loop continues on the other one.
 - **Averaging.** `avg_frames` good frames (default 4; at 100 ms exposure 8
   frames took 0.8 s). The window is cleared after each decision, after each
   move and when `offset_um` changes, and frames are ignored until the
@@ -265,9 +342,10 @@ old params are ignored (`SpotLoopParams.from_dict`, settings `extra="ignore"`).
     feature changed";
   - `residual_px > max_edge_residual_px` (3): "edge not straight".
 
-  A bad frame is a strike and is not averaged. `strikes` (5) in a row set a
-  fault; a good frame resets the count. Transient bad frames below that count
-  are simply skipped.
+  With two edges `fuse_edges` runs `check_fix` on each edge and adds the
+  disagreement check. A bad frame is a strike and is not averaged. `strikes`
+  (5) in a row set a fault; a good frame resets the count. Transient bad
+  frames below that count are simply skipped.
 - **Fault.** No more moves; P is held where it is (never moved back, never
   searched). The worker keeps measuring and publishing, so the panel shows why.
   If the worker dies, the service emits `fault("worker died")`. **Recovery is
@@ -294,7 +372,19 @@ old params are ignored (`SpotLoopParams.from_dict`, settings `extra="ignore"`).
 - `EdgeCalibration` (dataclass, `to_dict` / `from_dict`). `from_dict` raises
   `ValueError` on a wrong `kind`, missing keys, a zero or non-finite slope, or
   a malformed box, axis or polarity.
-- `load_calibration(d) -> tuple[EdgeCalibration | None, str]`: never raises.
+- `FocusCalibration` (dataclass: `edges` (1 or 2 `EdgeCalibration`), `p0_um`,
+  `created`, `record_path`, `warnings`, `kind="edges"`; properties `boxes` and
+  `linear_range_um`; `to_dict`, `from_dict`, `rezeroed(e0_px, p0_um)`).
+  `from_dict` accepts an `"edges"` dict and a single `"edge"` dict (wrapped as
+  one edge) and raises `ValueError` otherwise or when the edge count is not 1
+  or 2. `rezeroed` takes one `e0_px` per edge (`ValueError` on a count
+  mismatch).
+- `load_calibration(d) -> tuple[FocusCalibration | None, str]`: never raises.
+- `edge_noise_um(e) -> float`, `FusedError` (frozen dataclass: `along_um`,
+  `sigma_um`, `used`, `per_edge_um`, `disagreement_um`, `reason`, `note`) and
+  `fuse_edges(fixes, cal, params) -> FusedError`, as described under "Optional
+  second edge and fusion". `fuse_edges` raises `ValueError` if the number of
+  fixes differs from the number of edges.
 - `fit_edge_calibration` drops non-finite edge values (counted toward the
   "at least 5" error, otherwise a "sweep point(s) dropped" warning). The
   service itself raises the "edge left the box" error when a sweep step
@@ -318,6 +408,8 @@ old params are ignored (`SpotLoopParams.from_dict`, settings `extra="ignore"`).
   - frame checks: `min_contrast` 10.0, `max_saturated_frac` 0.002,
     `min_valid_fraction` 0.5, `max_angle_change_deg` 5.0,
     `max_edge_residual_px` 3.0;
+  - two edges: `max_edge_disagreement_um` 0.3 (the fusion uses the larger of
+    this and `4 * sqrt(n1^2 + n2^2)`);
   - range: `max_excursion_um` 5.0 (from the start P); `p_min_um` and
     `p_max_um` None (no absolute bound unless set or read at Start).
 - `SpotFocusController(params, p_start_um, *, linear_range_um=None)`:
@@ -402,19 +494,27 @@ pickle it. It uses a `multiprocessing` Pipe; every message is a dict with a
 
 Main to worker:
 
-- `start`: `params`, `calibration` (an `EdgeCalibration` dict), `p_start_um`.
-  A malformed or old calibration becomes a worker fault `bad calibration: ...`
-  (the worker does not crash).
-- `stop`.
+- `start`: `params`, `calibration` (a `FocusCalibration` dict, or a single-edge
+  dict), `p_start_um`. A malformed or old calibration becomes a worker fault
+  `bad calibration: ...` (the worker does not crash).
+- `stop`. The worker keeps its calibration for the preview.
 - `update_params`: `params`. A changed `offset_um` also clears the averaging
   window.
 - `set_camera`: `exposure_ms`, `gain`, `channel`, `roi`.
-- `set_edge_box`: `box` or None. It is the preview overlay box, measured at up
-  to 5 Hz in preview. A malformed box gives an `error` message and leaves the
-  box unchanged. When not running, it clears the fix and overlay at once.
-- `measure`: `n_frames`, `p_um`, `box`, `axis` (or None), `polarity` (or
-  None), `return_frame`, and an optional `timeout_s`. A `box` of None falls
-  back to the preview edge box; with neither, the reply has `n = 0` and reason
+- `set_calibration`: `calibration` (dict or None). It is held for the preview,
+  so the worker can compute the fused error without a lock. Ignored (and
+  logged) while running, since the controller was built from the start
+  calibration. A bad dict gives an `error` message and keeps the old one.
+- `set_edge_boxes`: `boxes`, a list of zero to two `(x, y, w, h)`. These are
+  the preview overlay boxes, measured at up to 5 Hz in preview. More than two
+  boxes or a malformed box gives an `error` message and leaves the boxes
+  unchanged. When not running, it clears the fixes and overlay at once.
+  `set_edge_box` (`box` or None) is kept as an alias for one box or none.
+- `measure`: `n_frames`, `p_um`, `boxes` (a list of `{"box", "axis",
+  "polarity"}` entries; `axis` and `polarity` may be None), `return_frame`,
+  and an optional `timeout_s`. The old `box`, `axis` and `polarity` keys still
+  work and make one entry. With neither, it falls back to the preview boxes;
+  with no boxes at all, the reply has `edges == []`, `n = 0` and reason
   `"no edge box"`.
 - `moved`: `seq`, `ok`, `dt_ms`.
 - `preview_start`, `preview_stop`.
@@ -428,38 +528,58 @@ Worker to main:
   exists (so with no edge box there is no telemetry). Fields: `t`, `edge_px`,
   `x`, `y`, `along_um`, `contrast`, `angle_deg`, `residual_px`,
   `valid_fraction`, `fps`, `p_cmd_um`, `n_moves`, `ok`, `reason`, `max_value`,
-  `saturated_frac`. `along_um` is None unless the worker holds a calibration
-  whose box is the measured box (always true while running). `ok` is true when
-  the fix is ok and `check_fix` has no complaint; `reason` is the `check_fix`
-  reason.
-- `measurement`: the reply to `measure`. Fields: `p_um`, `n`, `edge_mean`,
-  `edge_sd` (ddof 1; 0.0 for n = 1; NaN for n = 0), `x_mean`, `y_mean`,
-  `contrast_mean`, `angle_mean`, `residual_mean`, `axis`, `polarity`,
-  `reason`, `roi`, and `frame`. `reason` is the last bad reason when `n == 0`,
-  else empty (`"no frames from camera"` if nothing settled at all). `frame` is
-  the last good frame (full ROI, raw dtype), only if `return_frame` was set
-  and a good frame exists.
+  `saturated_frac`, and the two-edge fields below. The top-level `edge_px`,
+  `x`, `y`, `contrast`, `angle_deg`, `residual_px` and `valid_fraction` are
+  those of edge 1.
+  - `along_um` is the **fused** error with the offset applied, or None when
+    unusable (no matching calibration, or a bad measurement). In preview it is
+    computed only when the worker holds a calibration (from `start` or
+    `set_calibration`) and the preview boxes equal its boxes after `snap_box`
+    (same count and order).
+  - `sigma_um`: the fused noise estimate, None when not available.
+  - `disagreement_um`: `|a1 - a2|`, None unless two edges are both good.
+  - `note`: for example `"edge 2 lost (<reason>); using edge 1"`.
+  - `edges`: a list with one entry per box, each `{edge_px, x, y, ok, reason,
+    along_um}`. `along_um` is that edge's own error (no offset), None when the
+    frame is not fused or that edge is bad.
+  - `ok` is true when the fused error exists (`along_um is not None`); without
+    a calibration it is true when the fix is ok and `check_fix` has no
+    complaint. `reason` is the fused reason, else the edge-1 reason.
+- `measurement`: the reply to `measure`. Fields: `p_um`, `edges`, `roi` and
+  `frame`, plus the first entry's fields repeated at the top level. Each entry
+  of `edges` has `n`, `edge_mean`, `edge_sd` (ddof 1; 0.0 for n = 1; NaN for
+  n = 0), `x_mean`, `y_mean`, `contrast_mean`, `angle_mean`, `residual_mean`,
+  `axis`, `polarity` and `reason`. `reason` is the last bad reason when
+  `n == 0`, else empty (`"no frames from camera"` if nothing settled at all).
+  `frame` is the last frame with any good box (full ROI, raw dtype), only if
+  `return_frame` was set.
 - `fault`: `reason`.
 - `status`: `state` (idle, preview, running, stopped, fault).
 - `error`: `message`, `traceback`.
 
 Behaviour:
 
-- Which box is measured: while running, the calibration's box (with its axis
-  and polarity). In preview, the edge box (the calibration's axis and polarity
-  are used only if the snapped edge box equals the calibration's box, else they
-  are auto-detected). In `measure`, the request's box. With no box there is no
-  fix, no overlay and no telemetry.
+- Which boxes are measured: while running, the calibration's boxes (with their
+  axes and polarities). In preview, the edge boxes (the calibration's axis and
+  polarity are used only if the snapped box equals the calibration's box, else
+  they are auto-detected). In `measure`, the request's boxes. With no box
+  there is no fix, no overlay and no telemetry.
+- Every frame measures all boxes, then `fuse_edges` gives either a bad
+  measurement (`ctl.bad(reason)`, a strike) or a good one (`ctl.good()`, and
+  the fused `along_um` goes into the averaging window). The controller's
+  `linear_range_um` is the calibration's (the smallest edge range).
 - The worker tells its source the commanded P (`set_actuator_um`) when it sends
   a move, so the fake closes the loop.
 - `measure` snaps: it ignores frames until the settle passes, writes every
   settled frame to the live view buffer (good or not, so a failing box is
-  still visible), averages the good ones, and detects axis and polarity once.
-  With no good frame so far it gives up after `n + 6` settled bad frames
-  instead of waiting for the full deadline.
-- The shared-memory `spot` field carries the edge overlay point
+  still visible), averages the good ones per box, and detects axis and polarity
+  once per box. It ends when every box has `n` good frames or at the deadline.
+  A box with no good frame after `n + 6` settled frames is given up on
+  individually (the other boxes continue), instead of waiting for the full
+  deadline.
+- The shared-memory `spot` field carries the edge-1 overlay point
   `(fix.x, fix.y)`. `lateral_px` and `amplitude` no longer exist in
-  telemetry.
+  telemetry. The second cross in the live view is fed from telemetry `edges`.
 
 ### `spot_focus_service.py`: main process, Qt-free (psygnal signals)
 
@@ -486,16 +606,24 @@ SpotFocusService(
   limits).
 - `stop()` sends `stop` and lets go of the lock's claim on the LED. It never
   moves P. It returns to `preview` if preview was on, else `stopped`.
-- `calibrate(box, *, span_um=2.0, steps=9, n_frames=3, settle_s=0.1,
-  record_path=None) -> EdgeCalibration`: see the calibration section. Only
-  with the lock stopped and no MDA running.
-- `zero(cal, *, n_frames=8) -> EdgeCalibration`: re-zero at the current P and
-  edge, only while stopped.
-- `set_edge_box(box | None)`: edge box for the preview overlay.
+  - `calibration` is a `FocusCalibration`. An `EdgeCalibration` is also
+    accepted and wrapped as a one-edge calibration.
+- `calibrate(boxes, *, span_um=2.0, steps=9, n_frames=3, settle_s=0.25,
+  record_path=None) -> FocusCalibration`: see the calibration section. `boxes`
+  is one box or a list of one or two. Only with the lock stopped and no MDA
+  running.
+- `zero(cal, *, n_frames=8) -> FocusCalibration`: re-zero every edge at the
+  current P, only while stopped.
+- `set_calibration(cal | None)`: gives the worker a calibration for the preview,
+  so the fused error is computed (and charted) before Lock. See "Worker".
+- `set_edge_boxes(boxes)`: the list of zero to two edge boxes for the preview
+  overlay. `set_edge_box(box | None)` is kept as the one-box form.
 - `measure(n_frames=20, p_um=None, *, box, axis=None, polarity=None,
-  return_frame=False) -> dict`: refuses while the lock runs. Raises
-  `RuntimeError` ("worker is dead" or "did not answer") instead of a bare
-  `queue.Empty`.
+  return_frame=False) -> dict`: `box` is one box or a list of two, and `axis`
+  and `polarity` are scalars (one box) or per-box lists. Refuses while the lock
+  runs. Raises `RuntimeError` ("worker is dead" or "did not answer") instead of
+  a bare `queue.Empty`, and `ValueError` for a scalar axis with two boxes or a
+  list of the wrong length.
 - CRISP LED (the LED is lit only in CRISP State Ready / Lock / Dither..., off
   in Idle, the power-up state):
   - `led_on(intensity=None, *, owner="manual", force_ready=False)` remembers
@@ -552,6 +680,13 @@ Files:
     `load_calibration` with old, malformed and empty dicts.
   - `edge_error` sign convention and offset; `check_fix` (rotated, not
     straight).
+  - Two edges: `FocusCalibration` round trip, a single `"edge"` dict wrapped
+    as one edge (rig-shaped dict), `edge_noise_um`, `fuse_edges` (inverse
+    variance mean, sigma drops by sqrt 2 for equal edges, offset subtracted
+    once, disagreement is a bad measurement, one bad edge gives a note, both
+    bad gives a strike with the reason of edge 1), and synthetic cases:
+    diagonal motion gives agreeing estimates, a lateral move gives a
+    disagreement, the two-edge loop converges and stops on a lateral shift.
   - Controller: dead band, step clamp, rate cap, range and excursion faults,
     outside-linear-range sign-only step, anti-windup, strikes. With the sign
     flipped, the controller diverges.
@@ -578,13 +713,24 @@ Files:
     gain and channel.
   - `stop` restores the CRISP state; shutdown and orphan handling; settle
     formula.
+  - Two edges: two-box calibration recovers both slopes (both signs) and the
+    per-edge npz arrays; a box without an edge is dropped with a warning and
+    no edge in any box names edge 1; a single-edge calibration still starts;
+    the two-edge loop holds under drift; lateral drift makes the edges
+    disagree and nothing moves; a lost edge is a note and the lock continues
+    on the other; `zero` re-zeroes both edges; `set_calibration` gives the
+    preview an error and `stop` keeps it; `measure` with two boxes and with
+    the old single-box keys; the preview box messages.
 - `test_spot_focus_widget.py`: settings (defaults, round trip, old and
   malformed calibrations, old `mode: image` files) and the Spot panel (buttons
-  Calibrate / Zero here / Lock / Stop, offset, edge box, sweep spins, camera,
-  LED, ROI, a lock run, Calibrate and Zero here off the GUI thread, Lock
-  without a calibration) and its dock action.
+  Calibrate / Zero here / Lock / Stop, offset, edge boxes 1 and 2, sweep spins,
+  camera, LED, ROI, a lock run, Calibrate and Zero here off the GUI thread,
+  Lock without a calibration, two-box calibration with both slope signs, the
+  rig-shaped single-edge calibration, the telemetry note, the preview error
+  after Calibrate) and its dock action.
 - `test_spot_live_view.py`: the live view (zoom, ROI and edge-box drawing,
-  overlays, levels).
+  the second box, the edge2 draw mode, the second cross and ring, overlays,
+  levels).
 - `test_spot_frame_shm.py`: the shared-memory frame buffer (seqlock, no torn
   frames).
 - `test_spot_tracking.py` covers the separate centroid tracker
@@ -660,8 +806,9 @@ at full frame, 31 fps at a 640x480 ROI. Exposure runs 0.105 ms to 15 s, gain
   frame), `channel` (`"red"` by default, or `"sum"`), `bayer` (`"RGGB"`),
   `led_intensity` (None leaves the CRISP value alone).
 - `params`: the `SpotLoopParams` fields, including `offset_um`.
-- `calibration`, `edge_box`, `sweep_span_um`, `sweep_steps`, `sweep_frames` as
-  described above.
+- `calibration`, `edge_box`, `edge_box_2`, `sweep_span_um`, `sweep_steps`,
+  `sweep_frames` as described above. `params` also holds
+  `max_edge_disagreement_um`.
 
 ### GUI
 
@@ -672,14 +819,17 @@ at full frame, 31 fps at a 640x480 ROI. Exposure runs 0.105 ms to 15 s, gain
     panel is idle, because Lock without a calibration calibrates first.
   - **Offset (um)** spin (-5 to 5): live, persisted, reset to 0 by Zero here
     and Calibrate.
-  - State, fault and calibration labels. The calibration label shows axis,
-    signed slope (px/um), R2, residual, range, noise in um, zero P and the
-    created time. A second line in the attention colour shows the warnings, and
-    "edge box changed since the calibration; recalibrate" when the saved box
-    snaps to a different box than the calibration's.
+  - State, fault and calibration labels. The calibration label has one line
+    per edge (axis, signed slope px/um, R2, residual, noise in um from
+    `edge_noise_um`), then the shared zero P, range and created time. A line in
+    the attention colour shows the warnings (for example "edge 2 dropped:
+    ..."), and "edge box changed since the calibration; recalibrate" when a
+    saved box snaps to a different box than the calibration's (checked for
+    both boxes).
   - Group **Edge box and calibration sweep**: a **Draw edge box** toggle and
-    the saved box as x, y, w, h ("none" until drawn), then spins for span (um),
-    steps and frames per step.
+    the saved box as x, y, w, h ("none" until drawn); **Draw edge box 2** and
+    **Clear box 2** with box 2 shown as x, y, w, h or "none (optional)"; then
+    spins for span (um), steps and frames per step.
   - Group **Camera**:
     - SDK folder: a line edit plus Browse, saved to
       `spot_focus.source.sdk_dir`.
@@ -697,28 +847,38 @@ at full frame, 31 fps at a 640x480 ROI. Exposure runs 0.105 ms to 15 s, gain
     - Readouts: fps, max value, % saturated.
     - Camera errors show in the panel's fault label.
   - A strip chart.
-  - Readouts: Moves / min, Move time (mean / max), Edge (px), Contrast, Frame
-    rate, Error (along). The error shows a dash when `along_um` is None, else
-    the error in um.
+  - Readouts: Moves / min, Move time (mean / max), Edge 1 (px), Edge 2 (px)
+    (a dash when there is no second edge), Disagreement (um), Contrast, Frame
+    rate, Error (along). The error is the fused one and shows a dash when
+    `along_um` is None, else the error in um. A note line shows the telemetry
+    `note` or `reason`, for example "edge 2 lost; using edge 1".
   - Group **Parameters**: Deadband, Kp, Ki, Max step, Max rate, Min contrast
     (counts), Min valid rows (fraction), Max angle change (degrees) and Max
     edge residual (px). `avg_frames` and `max_saturated_frac` have no spin.
 - Panel behaviour:
   - **Calibrate** needs a saved edge box, else the fault label says "Draw an
-    edge box across the edge that moves with focus". It runs the sweep on a
-    thread. On success it saves the calibration, resets the offset to 0 and
-    moves the setpoint ring to the zero edge point. A failure shows
-    "Calibration failed: ...".
+    edge box across the edge that moves with focus". It passes `[box1]` or
+    `[box1, box2]` to the service and runs the sweep on a thread. On success it
+    saves the calibration, resets the offset to 0 and moves the setpoint ring
+    (one per edge) to the zero edge point. A failure shows "Calibration
+    failed: ...".
   - **Zero here** is enabled with a valid calibration and the lock stopped. A
     failure shows "Zero failed: ...".
+  - After a Calibrate, a Zero here, loading the settings at service start, and
+    Stop, the panel calls `svc.set_calibration(cal)` and
+    `svc.set_edge_boxes(boxes)`, so the preview shows the fused error (and the
+    chart fills) before Lock.
+  - **Draw edge box 2** and **Clear box 2** work like the box 1 button; box 2
+    is optional and is saved in `spot_focus.edge_box_2`. The panel advises
+    drawing it across a different edge, wide along its normal.
   - **Draw edge box** puts the live view in edge-box draw mode, shows the
     window and starts Preview if it is not on. The panel tells the user to
     draw the box wide along the edge normal (about 14 x the edge sigma). The
     box is saved in `spot_focus.edge_box` and sent to the worker with
     `set_edge_box` (also when the service is created, and again after Stop).
-  - While the lock runs, Zero here, Calibrate and Draw edge box are disabled,
-    and a box drawn then is refused ("Stop the lock before moving the edge
-    box.").
+  - While the lock runs, Zero here, Calibrate and the Draw edge box buttons
+    are disabled, and a box drawn then is refused ("Stop the lock before
+    moving the edge box.").
   - An old or malformed saved calibration shows its message and never crashes
     the constructor.
 - **Live view** (`widgets/_spot_live_view.py`), a separate resizable top-level
@@ -734,22 +894,28 @@ at full frame, 31 fps at a 640x480 ROI. Exposure runs 0.105 ms to 15 s, gain
     cancels the 2x2 colour mosaic (otherwise it aliases into a Moire grid at
     fractional zoom). The pixel readout and the edge measurement use the raw
     values. Turn it off for a mono camera or to inspect the raw mosaic.
-  - **Draw ROI** and **Draw edge box** buttons are mutually exclusive draw
-    modes (`draw_target` is `"roi"`, `"edge"` or None).
+  - **Draw ROI**, **Draw edge box** and **Draw edge box 2** buttons are mutually
+    exclusive draw modes (`draw_target` is `"roi"`, `"edge"`, `"edge2"` or
+    None).
     - Draw ROI: dragging a rectangle (snapped to even ints, clamped to the
       sensor) emits `roiDrawn(x, y, w, h)`. The panel fills its ROI spins and
       applies them.
     - Draw edge box: the same drag (minimum 16 px) emits
       `edgeBoxDrawn(x, y, w, h)`. The panel stores the box and sends it to the
       worker.
+    - Draw edge box 2: the same drag emits `edgeBox2Drawn(x, y, w, h)`.
     - A valid drag turns its button off (one box per click); a click or a
       sliver keeps the mode. The panel can switch the mode with
       `set_edge_draw_mode(on)` and follows it through `edgeDrawModeChanged`.
   - Overlays: the sensor outline, the current ROI, the edge box (dashed
     violet), the edge point (a cross at the box centre on the measured edge)
-    and the zero edge point (a ring). The edge box is user data: frames and
-    `clear()` do not remove it. The status text reads "edge (x, y)", plus
-    "(not ok)" for a failed fix.
+    and the zero edge point (a ring). For the optional second edge there is a
+    second dashed box in its own colour (`set_edge_box2(box | None)`), a
+    second cross (`set_secondary_point(xy | None)`, fed by the panel from
+    telemetry `edges[1]`) and a second ring (`set_secondary_setpoint(xy |
+    None)`). The edge boxes are user data: frames and `clear()` do not remove
+    them. The status text reads "edge (x, y)", plus "(not ok)" for a failed
+    fix.
   - Levels are linear. The fixed range is 0 to 2^bits-1, with an **Auto
     levels** option (min to max). Auto levels is display only; the measurement
     always uses raw counts.
@@ -757,6 +923,38 @@ at full frame, 31 fps at a 640x480 ROI. Exposure runs 0.105 ms to 15 s, gain
   - A 30 Hz timer polls `latest_frame` and repaints only on a new `seq`.
   - Closing the window stops preview. If the lock is running, the preview is
     switched off after Stop instead.
+
+## First rig results (2026-10-28)
+
+The first P sweep on the rig (a 9-step, +-1 um calibration on the top edge,
+saved as an npz) was analysed offline. The lock itself has not been run yet.
+
+- **Top edge** (box 762, 590, 176, 114): +1.92 px/um, R2 0.993, residual 0.106
+  px. The box takes in the rounded top-left corner of the patch, so the line
+  straightness is 2.1 px and the angle -5.9 degrees.
+- **Left edge:** +2.10 px/um, R2 0.9986, residual 0.027 um, monotonic. It is
+  blurrier (10-90 % width 25-28 px against 13-15 px for the top edge) and
+  curved.
+- **Right edge:** only +0.76 px/um (noisier in um). **Bottom edge:** does not
+  respond (slope -0.25, not monotonic).
+- **The motion is not a rigid shift.** The left, right, top and bottom edges
+  move by different amounts and both x and y change; the patch also shrinks.
+  That is why each edge gets its own slope, and why a lateral shift can be told
+  from a focus change.
+- **Noise.** The strip chart range of +-0.15 um is consistent with about 0.05
+  um of single-frame noise (3 sigma). It is not a bug: the chart autoscales
+  with a minimum of +-0.05 um. The `noise_px` stored in the calibration (6
+  static frames, 0.017 um) understates the single-frame noise during a sweep.
+- **Range fault, fixed.** The first Lock faulted because
+  `p_min_um` / `p_max_um` defaulted to 0..150 um while piezo P sits at about
+  -45.5 um on this rig. They now default to None; the excursion limit is the
+  main guard, and the service reads the piezo `Position` limits at Start only
+  if they contain the start P. Fault messages print the range and the start P.
+- **Advice.** Move box 1 off the rounded corner: a clean top box (about x
+  850-970) has noise 0.022 um and straightness 0.8 px, although its slope is
+  lower (+1.53 px/um). Put box 2 across the left edge, wide along x. Fusing
+  the two gives the lowest noise (0.024 um against 0.048 um for the saved top
+  box alone) and the lateral-drift check.
 
 ## Rig test plan (GO / NO-GO)
 
@@ -768,18 +966,40 @@ Do these in order. Stop at the first NO-GO and fix it before going on.
    - GO: the edge visibly moves. Otherwise try another edge.
 2. **Draw the edge box** across that edge: about 60 % of the edge length, about
    2x the expected travel plus a margin on each side along the normal, ghost
-   out. With P still, the cross should sit on the edge and stay still (noise
-   below 0.2 px).
-3. **Calibrate.** Focus on the cells by eye (OPM image), then press Calibrate
+   out. Keep the rounded corner out of the box (on the top edge, start at about
+   x 850). With P still, the cross should sit on the edge and stay still
+   (noise below 0.2 px).
+3. **Draw edge box 2 (optional).** Press Draw edge box 2 and draw across a
+   second edge that moves, for example the left edge, wide along x. The second
+   cross should sit on that edge and stay still.
+   - GO: both crosses are steady. Otherwise Clear box 2 and use one edge.
+4. **Calibrate.** Focus on the cells by eye (OPM image), then press Calibrate
    (default +-1 um, 9 steps).
-   - GO: `|slope| >= 1 px/um`, R2 `>= 0.98`, residual below 0.3 px, no "left
-     the box", no hysteresis warning.
-   - NO-GO: shrink the span, move or enlarge the box, or pick another edge.
-4. **Lock** with offset 0. Set the offset to +0.3 um and back to 0.
+   - GO: for each edge `|slope| >= 1 px/um`, R2 `>= 0.98`, residual below 0.3
+     px, no "left the box", no hysteresis warning. With two boxes the label
+     shows one line per edge and no "edge 2 dropped" warning.
+   - NO-GO: shrink the span, move or enlarge the box, or pick another edge. If
+     only box 2 is dropped, the lock still works on edge 1, but fix box 2
+     before relying on the disagreement check.
+5. **Preview error.** Without locking, with the calibration loaded, check that
+   the chart and the Error readout are live (the worker holds the calibration
+   in preview), and jog P by hand by +-0.3 um.
+   - GO: the Error follows the jog with the right sign, and the two edge
+     readouts move together.
+6. **Lock** with offset 0. Set the offset to +0.3 um and back to 0.
    - GO: P follows within 2-3 s with at most 3 moves and settles inside the
      dead band.
    - Check that the cells stay sharp over 30 min with moves/min low (below 10).
-5. **Fault drills.**
+7. **Disagreement readout (two edges).** Lateral beam walk cannot be produced
+   safely on the rig, so check the readout instead.
+   - While locked, the Disagreement (um) readout stays below 0.1 um.
+   - Cover one edge region (for example block the light so box 2 loses its
+     edge): the lock continues on the other edge, the note line says "edge 2
+     lost; using edge 1", and P keeps being held. Uncover it and the note
+     disappears.
+   - GO: both behaviours as described. NO-GO: any move toward a wrong target
+     while one edge is covered, or a persistent disagreement above 0.3 um.
+8. **Fault drills.**
    - LED off: fault "edge lost" after 5 bad frames, P held.
    - Exposure doubled: no move (the contrast changes, the edge position does
      not).
