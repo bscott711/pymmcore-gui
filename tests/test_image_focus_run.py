@@ -117,7 +117,9 @@ def _image_settings(
         n_points=7,
         date="2026-10-26T00:00:00",
     )
-    return ImageFocusSettingsV1(
+    # ``mode`` is narrowed to "spot" in the settings; model_construct skips that
+    # validation so the (UI-unreachable) image lock keeps its coverage.
+    return ImageFocusSettingsV1.model_construct(
         mode="image",
         box=FocusBoxSettings(camera="cam0", preset="488nm", slice_index=0, rect=RECT)
         if box
@@ -769,7 +771,7 @@ def test_calibrate_run_steps_the_piezo_fits_and_restores(
 
     seq = build_calibration_sequence(_base_sequence(), BOX)
     # settings mode "crisp": a calibration is chosen by its metadata alone
-    cfg = ImageFocusSettingsV1(mode="crisp")
+    cfg = ImageFocusSettingsV1.model_construct(mode="crisp")
     _core, engine, pool, rig, run = _rig_engine(cfg, seq, start=False)
     assert run.mode == "calibrate" and run.active
     seen_z: list[float] = []

@@ -1,4 +1,4 @@
-"""The spot-focus-lock subprocess: camera, spot measurement and the controller.
+"""The spot-focus-lock subprocess: camera, edge measurement and the controller.
 
 Everything that touches the camera SDK runs here, in its own OS process, so a
 vendor-driver crash or stall cannot take down the GUI and the Tiger serial
@@ -13,14 +13,15 @@ code itself uses neither Qt nor pymmcore and creates no QApplication).
 Wire protocol: two one-way :func:`multiprocessing.Pipe` s (commands in, events
 out; see :class:`Link`); every message is a ``dict`` with a ``"type"``.
 Main to worker: ``start``, ``stop``, ``preview_start``, ``preview_stop``,
-``update_params``, ``set_camera``, ``measure``, ``moved``, ``shutdown``.
-Worker to main: ``ready``, ``move``, ``telemetry``, ``camera``, ``fault``,
-``status``, ``measurement``, ``error``.
+``update_params``, ``set_camera``, ``set_edge_box``, ``measure``, ``moved``,
+``shutdown``. Worker to main: ``ready``, ``move``, ``telemetry``, ``camera``,
+``fault``, ``status``, ``measurement``, ``error``.
 
-Frames never travel on the pipe: while previewing, running or measuring every
-frame goes to a shared-memory slot (:mod:`.spot_frame_shm`) whose name is in
-the ``ready`` info. **All spot positions are in sensor pixels**: the ROI offset
-is added to every fit, so a calibration survives ROI changes.
+Frames never travel on the pipe (except the one raw frame a ``measure`` with
+``return_frame`` returns): while previewing, running or measuring every frame
+goes to a shared-memory slot (:mod:`.spot_frame_shm`) whose name is in the
+``ready`` info. **All edge positions are in sensor pixels**: the ROI offset is
+passed to the measurement, so a calibration survives ROI changes.
 
 The loop exits on ``shutdown`` or when the pipe closes (the parent died), so no
 orphan process is left behind.
@@ -33,7 +34,6 @@ stalls as soon as the main process reads late, and the loop then misses
 
 from __future__ import annotations
 
-import dataclasses
 import logging
 import math
 import threading
@@ -59,7 +59,7 @@ MOVE_ACK_TIMEOUT_S = 10.0
 NO_FRAME_TIMEOUT_S = 3.0
 #: Telemetry period.
 TELEMETRY_PERIOD_S = 0.1
-#: In preview the spot is fitted for the overlay at most this often (5 Hz).
+#: In preview the edge is measured for the overlay at most this often (5 Hz).
 PREVIEW_FIT_PERIOD_S = 0.2
 #: A fit older than this is not drawn on a newer frame.
 SPOT_MAX_AGE_S = 0.5
@@ -234,9 +234,9 @@ def _params_from(obj: Any) -> Any:
 
 
 def _cal_from(obj: Any) -> Any:
-    from .spot_focus import SpotCalibration
+    from .spot_focus import EdgeCalibration
 
-    return obj if isinstance(obj, SpotCalibration) else SpotCalibration.from_dict(obj)
+    return obj if isinstance(obj, EdgeCalibration) else EdgeCalibration.from_dict(obj)
 
 
 class _Worker:
@@ -246,11 +246,11 @@ class _Worker:
         self.conn = conn
         self.outbox = _Outbox(conn, self._broken)
         spec = dict(source_spec)
-        #: ``locate_spot`` options (roi_half, channel, bayer, saturation); not
-        #: a source argument, so split off before ``make_source``.
+        #: ``measure_edge`` options (channel, bayer, saturation); not a source
+        #: argument, so split off before ``make_source``.
         self.analysis: dict[str, Any] = dict(spec.pop("analysis", {}) or {})
         #: Saturation ceiling from the camera's bit depth (12-bit data arrives in
-        #: uint16); None falls back to the dtype maximum in ``locate_spot``.
+        #: uint16); None falls back to the dtype maximum in ``measure_edge``.
         self.saturation: int | None = None
         self.spec = spec
         self.source: Any = None
@@ -279,11 +279,14 @@ class _Worker:
         self.last_ts: float | None = None
         self.last_frame_wall = time.monotonic()
         self.fps = 0.0
+        #: The edge box of the preview overlay (sensor px), set by the panel.
+        self.edge_box: tuple[int, int, int, int] | None = None
         self.last_fix: Any = None
         self.fix_time = -math.inf
         self.t_fit = -math.inf
         self.last_along: float | None = None
-        self.last_lateral: float | None = None
+        #: Why the newest fix is unusable for control ("" when fine).
+        self.last_reason = ""
         self.last_max = 0
         self.last_sat_frac = 0.0
         self.t_telemetry = 0.0
@@ -358,22 +361,67 @@ class _Worker:
 
     # -- measurement ------------------------------------------------------
 
-    def locate(self, frame: Any, roi: Any, min_amplitude: float = 0.0) -> Any:
-        """Fit the spot; the result is in sensor pixels (the ROI offset added)."""
-        from .spot_focus import locate_spot
+    def edge(
+        self,
+        frame: Any,
+        roi: Any,
+        box: Any,
+        axis: str | None = None,
+        polarity: int | None = None,
+    ) -> Any:
+        """Measure the edge in *box*; the result is in sensor pixels."""
+        from .spot_focus import measure_edge
 
-        fix = locate_spot(
+        limits: dict[str, Any] = {}
+        if self.params is not None:
+            limits = {
+                "max_saturated_frac": self.params.max_saturated_frac,
+                "min_contrast": self.params.min_contrast,
+                "min_valid_fraction": self.params.min_valid_fraction,
+            }
+        return measure_edge(
             frame,
-            roi_half=int(self.analysis.get("roi_half", 50)),
+            box,
+            roi_offset=(int(roi[0]), int(roi[1])),
             channel=self.analysis.get("channel", "sum"),
             bayer=self.analysis.get("bayer", "RGGB"),
+            axis=axis,
+            polarity=polarity,
             saturation=self.analysis.get("saturation", self.saturation),
-            min_amplitude=min_amplitude,
+            **limits,
         )
-        ox, oy = roi[0], roi[1]
-        if ox or oy:
-            fix = dataclasses.replace(fix, x=fix.x + ox, y=fix.y + oy)
-        return fix
+
+    def measure_current(self, frame: Any, roi: Any, now: float) -> None:
+        """Measure the live edge (calibration box while running, else the preview box).
+
+        Sets ``last_fix``, ``last_along`` and ``last_reason``; with no box
+        there is nothing to measure and no overlay.
+        """
+        from .spot_focus import check_fix, edge_error, snap_box
+
+        cal, params = self.cal, self.params
+        box = cal.box if (self.running and cal is not None) else self.edge_box
+        if box is None:
+            self.last_fix = None
+            self.last_along = None
+            self.last_reason = ""
+            return
+        # Axis and polarity are the calibration's when this is its box.
+        mine = cal is not None and snap_box(box) == tuple(cal.box)
+        fix = self.edge(
+            frame,
+            roi,
+            box,
+            cal.axis if mine else None,
+            cal.polarity if mine else None,
+        )
+        self.last_fix, self.fix_time = fix, now
+        self.last_along = None
+        self.last_reason = "" if fix.ok else (fix.reason or "edge lost")
+        if mine and params is not None:
+            self.last_reason = check_fix(fix, cal, params)
+            if fix.ok:
+                self.last_along = edge_error(fix, cal, params.offset_um)
 
     def frame_roi(self, frame: Any) -> tuple[int, int, int, int] | None:
         """The sensor ROI of *frame*, or None if it is stale.
@@ -450,6 +498,8 @@ class _Worker:
             self.on_update_params(msg)
         elif kind == "set_camera":
             self.on_set_camera(msg)
+        elif kind == "set_edge_box":
+            self.on_set_edge_box(msg)
         elif kind == "measure":
             self.on_measure(msg)
         elif kind == "moved":
@@ -459,23 +509,49 @@ class _Worker:
         from .spot_focus import SpotFocusController
 
         self.params = _params_from(msg["params"])
-        self.cal = _cal_from(msg["calibration"])
+        try:
+            self.cal = _cal_from(msg["calibration"])
+        except ValueError as exc:
+            self.fault(f"bad calibration: {exc}")
+            return
         p_start = float(msg["p_start_um"])
-        self.ctl = SpotFocusController(self.params, p_start)
+        self.ctl = SpotFocusController(
+            self.params, p_start, linear_range_um=self.cal.linear_range_um
+        )
         self.p_cmd = p_start
         self.n_moves = 0
         self.window.clear()
         self.inflight = None
-        self.last_along = self.last_lateral = None
+        self.last_along = None
         self.source.set_actuator_um(p_start)
         self.last_frame_wall = time.monotonic()
         self.running = True
         self.set_state("running")
 
     def on_update_params(self, msg: dict) -> None:
+        old = self.params
         self.params = _params_from(msg["params"])
         if self.ctl is not None:
             self.ctl.params = self.params
+        if old is not None and old.offset_um != self.params.offset_um:
+            self.window.clear()  # errors averaged so far used the old offset
+
+    def on_set_edge_box(self, msg: dict) -> None:
+        """Set (or clear) the preview edge box; ``None`` removes the overlay."""
+        box = msg.get("box")
+        try:
+            new = None if box is None else tuple(int(v) for v in box)
+            if new is not None and len(new) != 4:
+                raise ValueError(f"box must be (x, y, w, h), not {box!r}")
+        except (TypeError, ValueError) as exc:
+            self.error(f"set_edge_box: {exc}")
+            return
+        self.edge_box = new
+        if not self.running:
+            self.last_fix = None
+            self.last_along = None
+            self.last_reason = ""
+            self.t_fit = -math.inf
 
     def on_set_camera(self, msg: dict) -> None:
         """Apply exposure, gain, channel and ROI now; an ROI of zeros is full frame."""
@@ -516,7 +592,8 @@ class _Worker:
         self.arm_settle()
         self.window.clear()
         self.last_fix = None
-        self.last_along = self.last_lateral = None
+        self.last_along = None
+        self.last_reason = ""
         self.t_fit = -math.inf
         info.pop("shm", None)
         self.send({"type": "camera", "info": info})
@@ -532,19 +609,33 @@ class _Worker:
         self.arm_settle()
 
     def on_measure(self, msg: dict) -> None:
-        """Average *n_frames* fresh spot fixes at P = *p_um* (loop stopped)."""
+        """Average *n_frames* fresh edge fixes at P = *p_um* (loop stopped).
+
+        Only frames that pass the settle are used (they were exposed after the
+        request, a "snap") and only those go to the shared buffer, so the live
+        view shows what was measured. *axis* / *polarity* (None = detect on the
+        first good frame) are then held for the rest of the measurement.
+        """
         import numpy as np
 
         n = max(1, int(msg.get("n_frames", 10)))
         p_um = msg.get("p_um")
+        box = msg.get("box")
+        if box is None:
+            box = self.edge_box
+        axis = msg.get("axis")
+        polarity = msg.get("polarity")
+        want_frame = bool(msg.get("return_frame", False))
         if p_um is not None:
             self.source.set_actuator_um(float(p_um))
         t0 = time.monotonic()
         self.arm_settle(t0)
-        xs: list[float] = []
-        ys: list[float] = []
-        amps: list[float] = []
+        # Per good frame: edge, x, y, contrast, angle, residual.
+        rows: list[tuple[float, ...]] = []
+        reason = "" if box is not None else "no edge box"
+        kept: Any = None
         seen: float | None = None
+        bad_run = 0  # settled frames in a row with no edge
         frame_s = max(
             1.0 / self.fps if self.fps > 0 else 0.1, self.exposure_ms / 1000.0
         )
@@ -554,7 +645,13 @@ class _Worker:
             + 5.0
         )
         deadline = t0 + float(msg.get("timeout_s", default_timeout))
-        while len(xs) < n and time.monotonic() < deadline and not self.exit:
+        while (
+            box is not None
+            and len(rows) < n
+            and (rows or bad_run < n + SETTLE_MIN_FRAMES + 2)  # no edge: give up
+            and time.monotonic() < deadline
+            and not self.exit
+        ):
             got = self.source.latest(FRAME_WAIT_S)
             if got is None:
                 continue
@@ -566,56 +663,79 @@ class _Worker:
             roi = self.frame_roi(frame)
             if roi is None:
                 continue
-            usable = self.settle.frame(now)
-            fix = self.locate(frame, roi)
+            if not self.settle.frame(now):
+                continue
+            fix = self.edge(frame, roi, box, axis, polarity)
             self.last_fix, self.fix_time = fix, now
+            self.last_along = None
+            self.last_reason = "" if fix.ok else fix.reason
             self.write_frame(frame, ts, roi, now)
-            if usable and fix.ok:
-                xs.append(fix.x)
-                ys.append(fix.y)
-                amps.append(fix.amplitude)
-        a = lambda v: np.asarray(v, dtype=float)  # noqa: E731
-        reply: dict[str, Any] = {"type": "measurement", "p_um": p_um, "n": len(xs)}
-        for name, vals in (("x", xs), ("y", ys), ("amplitude", amps)):
-            reply[f"{name}_mean"] = float(a(vals).mean()) if vals else math.nan
-            reply[f"{name}_sd"] = float(a(vals).std()) if vals else math.nan
+            if not fix.ok:
+                reason = fix.reason
+                bad_run += 1
+                continue
+            bad_run = 0
+            if axis is None:
+                axis, polarity = fix.axis, fix.polarity
+            rows.append(
+                (
+                    fix.position,
+                    fix.x,
+                    fix.y,
+                    fix.contrast,
+                    fix.angle_deg,
+                    fix.residual_px,
+                )
+            )
+            if want_frame:
+                kept = np.array(frame)
+        if not rows and not reason:
+            reason = "no frames from camera"
+        data = np.asarray(rows, dtype=float).reshape(len(rows), 6)
+        mean = data.mean(axis=0) if rows else np.full(6, math.nan)
+        sd = float(data[:, 0].std(ddof=1)) if len(rows) > 1 else 0.0
+        reply: dict[str, Any] = {
+            "type": "measurement",
+            "p_um": p_um,
+            "n": len(rows),
+            "edge_mean": float(mean[0]),
+            "edge_sd": sd if rows else math.nan,
+            "x_mean": float(mean[1]),
+            "y_mean": float(mean[2]),
+            "contrast_mean": float(mean[3]),
+            "angle_mean": float(mean[4]),
+            "residual_mean": float(mean[5]),
+            "axis": axis,
+            "polarity": polarity,
+            "reason": "" if rows else reason,
+            "roi": tuple(self.roi),
+        }
+        if kept is not None:
+            reply["frame"] = kept
         self.send(reply)
 
     # -- per-frame --------------------------------------------------------
 
     def on_frame(self, frame: Any, ts: float, now: float) -> None:
-        """Handle one new frame: overlay fit, shared buffer, then control."""
-        from .spot_focus import focus_error
-
+        """Handle one new frame: overlay, shared buffer, then control."""
         if not (self.running or self.preview):
             return  # idle: frames are drained, not processed
         roi = self.frame_roi(frame)
         if roi is None:
             return  # stale frame from before an ROI change
         usable = self.settle.frame(now)
-        # While running the spot is fitted every frame; in preview at <= 5 Hz.
+        # While running the edge is measured every frame; in preview at <= 5 Hz.
         if self.running or now - self.t_fit >= PREVIEW_FIT_PERIOD_S:
             self.t_fit = now
-            min_amp = self.params.min_amplitude if self.params is not None else 0.0
-            fix = self.locate(frame, roi, min_amplitude=min_amp)
-            self.last_fix, self.fix_time = fix, now
-            if self.cal is not None and fix.ok:
-                self.last_along, self.last_lateral = focus_error(fix, self.cal)
-            else:
-                self.last_along = self.last_lateral = None
+            self.measure_current(frame, roi, now)
         self.write_frame(frame, ts, roi, now)
         if not self.running:
             return
-        fix = self.last_fix
-        if not usable:
+        if not usable or self.last_fix is None:
             return
         ctl, params = self.ctl, self.params
-        if fix.saturated:
-            ctl.bad("saturated")
-        elif not fix.ok:
-            ctl.bad(fix.reason or "spot lost")
-        elif abs(self.last_lateral) > params.lateral_limit_px:
-            ctl.bad("lateral drift")
+        if self.last_reason or self.last_along is None:
+            ctl.bad(self.last_reason or "edge lost")
         else:
             ctl.good()
             self.window.append(self.last_along)
@@ -657,16 +777,19 @@ class _Worker:
                 {
                     "type": "telemetry",
                     "t": now,
+                    "edge_px": fix.position,
                     "x": fix.x,
                     "y": fix.y,
                     "along_um": self.last_along,
-                    "lateral_px": self.last_lateral,
-                    "amplitude": fix.amplitude,
+                    "contrast": fix.contrast,
+                    "angle_deg": fix.angle_deg,
+                    "residual_px": fix.residual_px,
+                    "valid_fraction": fix.valid_fraction,
                     "fps": self.fps,
                     "p_cmd_um": self.p_cmd if self.ctl is None else self.ctl.p_cmd_um,
                     "n_moves": 0 if self.ctl is None else self.ctl.n_moves,
-                    "ok": bool(fix.ok),
-                    "reason": fix.reason,
+                    "ok": bool(fix.ok and not self.last_reason),
+                    "reason": self.last_reason,
                     "max_value": self.last_max,
                     "saturated_frac": self.last_sat_frac,
                 }

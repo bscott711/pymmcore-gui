@@ -98,12 +98,11 @@ def test_focus_offset_bad_offsets_entry_degrades_gracefully() -> None:
 
 def test_image_focus_settings_roundtrip() -> None:
     s = SettingsV1()
-    assert s.image_focus.mode == "crisp"
+    assert s.image_focus.mode == "spot"
     assert s.image_focus.box is None
     assert s.image_focus.calibrations == {}
     assert s.image_focus.end_of_run == "restore"
 
-    s.image_focus.mode = "image"
     s.image_focus.end_of_run = "stay"
     s.image_focus.loop_gain = 0.4
     s.image_focus.box = _settings.FocusBoxSettings(
@@ -121,7 +120,7 @@ def test_image_focus_settings_roundtrip() -> None:
     }
 
     s2 = SettingsV1.model_validate_json(s.model_dump_json())
-    assert s2.image_focus.mode == "image"
+    assert s2.image_focus.mode == "spot"
     assert s2.image_focus.end_of_run == "stay"
     assert s2.image_focus.box == s.image_focus.box
     assert s2.image_focus.calibrations == s.image_focus.calibrations
@@ -141,5 +140,5 @@ def test_settings_without_image_focus_still_load() -> None:
     old = '{"version": "1.0", "focus": {"enabled": true}}'
     s = SettingsV1.model_validate_json(old)
     assert s.focus.enabled is True
-    assert s.image_focus.mode == "crisp"
+    assert s.image_focus.mode == "spot"
     assert s.image_focus.to_limits().max_strikes == 3

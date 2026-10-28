@@ -11,7 +11,7 @@ thread** (the engine's ``exec_event`` / ``setup_sequence`` /
 widgets must hop threads itself: ``connect(slot, thread="main")`` delivers
 nothing unless psygnal's emission queue is being drained, so the UI forwards
 each signal to a ``pyqtSignal`` on a GUI-thread ``QObject`` (see
-``ImageFocusWidget``). A slot that raises is swallowed and logged by the
+the Spot focus panel's relay). A slot that raises is swallowed and logged by the
 emitting side, so a broken panel cannot stall an acquisition.
 """
 

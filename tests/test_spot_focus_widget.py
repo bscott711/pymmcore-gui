@@ -1,14 +1,20 @@
 """The spot focus lock's settings and panel, with a real spawned worker.
 
 A ``FakeSpotSource`` stands in for the camera and a fake mmc records every
-``setPosition``. Fixtures are self-contained (isolated settings, a bare
-``CMMCorePlus``), so this runs with ``--noconftest`` like
-``test_image_focus_widget.py``.
+``setPosition``. The fake LED patch is centred at (320, 240) and is 96 px wide, so
+its left edge is at x = 272 and moves along x by ``SLOPE`` px per um of P; the
+edge box ``BOX`` lies across that edge.
+
+Run WITHOUT ``--noconftest`` and with ``QT_QPA_PLATFORM=offscreen``: with both
+PyQt6 and PySide6 installed, pytest-qt otherwise picks PySide6 and
+``qtbot.addWidget`` fails ("Need to pass a QWidget").
 """
 
 from __future__ import annotations
 
+import functools
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -17,13 +23,18 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import useq
-from pymmcore_plus import CMMCorePlus
 
 from pymmcore_gui import _settings
+from pymmcore_gui._qt.QtCore import QPointF
+from pymmcore_gui._qt.QtWidgets import QWidget
 from pymmcore_gui._settings import (
     CalibrationRecord,
     FocusBoxSettings,
     SettingsV1,
+)
+from pymmcore_gui.actions.widget_actions import (
+    SpotFocusScrollArea,
+    create_image_focus_widget,
 )
 from pymmcore_gui.asi_z_stack.common import HardwareConstants
 from pymmcore_gui.asi_z_stack.image_focus_events import (
@@ -31,9 +42,14 @@ from pymmcore_gui.asi_z_stack.image_focus_events import (
     spot_focus_flag,
 )
 from pymmcore_gui.asi_z_stack.image_focus_run import ImageFocusRun
+from pymmcore_gui.asi_z_stack.spot_focus import EdgeCalibration, measure_edge
 from pymmcore_gui.asi_z_stack.spot_focus_service import SpotFocusService
-from pymmcore_gui.widgets._image_focus_widget import ImageFocusWidget
-from pymmcore_gui.widgets._spot_focus_panel import SpotFocusPanel, source_spec
+from pymmcore_gui.asi_z_stack.toupcam_source import make_source
+from pymmcore_gui.widgets._spot_focus_panel import (
+    NEED_BOX_TEXT,
+    SpotFocusPanel,
+    source_spec,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -43,16 +59,18 @@ if TYPE_CHECKING:
 P_LABEL = "PiezoStage:P:34"
 CRISP = "CRISP"
 P0 = 50.0
-UX, UY = 0.8, 0.6
-SLOPE = 10.0
-CAL = {
+SLOPE = 5.0  # the fake's true image motion along x, px per um of P
+#: What the fake camera is built from (its true image motion).
+CAL_LIKE = {
     "x0": 320.0,
     "y0": 240.0,
-    "ux": UX,
-    "uy": UY,
+    "ux": 1.0,
+    "uy": 0.0,
     "slope_px_per_um": SLOPE,
     "p0_um": P0,
 }
+#: Across the left edge of the fake patch; clear of its corners and the ghost.
+BOX = (232, 210, 80, 60)
 WAIT_MS = 30_000  # a spawned worker needs a few seconds to import
 
 
@@ -92,7 +110,11 @@ def _isolated_settings() -> Iterator[SettingsV1]:
     """Fresh default settings pointing at a fake camera (no disk writes)."""
     fresh = SettingsV1()
     fresh.spot_focus.source.kind = "fake"
-    fresh.spot_focus.source.fake = {"cal_like": dict(CAL), "noise": 2.0, "fps": 50.0}
+    fresh.spot_focus.source.fake = {
+        "cal_like": dict(CAL_LIKE),
+        "noise": 2.0,
+        "fps": 50.0,
+    }
     fresh.spot_focus.params.avg_frames = 4
     fresh.spot_focus.params.max_rate_hz = 5.0
     fresh.spot_focus.params.strikes = 3
@@ -139,8 +161,40 @@ def panel(qtbot: QtBot, mmc: FakeMMC) -> Iterator[SpotFocusPanel]:
     widget.shutdown()
 
 
+@functools.cache
+def _e0() -> float:
+    """The edge position the fake shows at P0, as the metric measures it."""
+    src = make_source(
+        {"kind": "fake", "cal_like": dict(CAL_LIKE), "noise": 2.0, "fps": 50.0}
+    )
+    fixes = [measure_edge(src.render(0.0), BOX) for _ in range(5)]  # type: ignore[attr-defined]
+    assert all(f.ok for f in fixes)
+    return float(sum(f.position for f in fixes) / len(fixes))
+
+
+def _edge_cal() -> EdgeCalibration:
+    """A saved edge calibration that matches the fake camera."""
+    return EdgeCalibration(
+        box=BOX,
+        axis="x",
+        polarity=1,
+        slope_px_per_um=SLOPE,
+        e0_px=_e0(),
+        p0_um=P0,
+        r2=0.999,
+        residual_px=0.05,
+        linear_range_um=1.0,
+        noise_px=0.02,
+        angle_deg=0.0,
+        contrast=700.0,
+        n_points=9,
+        created="2026-10-28T00:00:00",
+    )
+
+
 def _calibrated(settings: SettingsV1) -> None:
-    settings.spot_focus.calibration = dict(CAL)
+    settings.spot_focus.calibration = _edge_cal().to_dict()
+    settings.spot_focus.edge_box = BOX
 
 
 # ---------------------------------------------------------------------------
@@ -150,29 +204,69 @@ def _calibrated(settings: SettingsV1) -> None:
 
 def test_spot_settings_defaults_and_roundtrip() -> None:
     s = SettingsV1()
-    assert s.image_focus.mode == "crisp"
+    assert s.image_focus.mode == "spot"
     cfg = s.spot_focus
     assert (cfg.channel, cfg.source.kind) == ("red", "toupcam")
     assert cfg.calibration is None
     assert cfg.to_calibration() is None
-    assert cfg.params.to_params().deadband_um == pytest.approx(0.03)
+    assert cfg.calibration_status()[0] is None
+    assert cfg.edge_box is None
+    assert (cfg.sweep_span_um, cfg.sweep_steps, cfg.sweep_frames) == (2.0, 9, 3)
+    params = cfg.params.to_params()
+    assert params.deadband_um == pytest.approx(0.03)
+    assert params.avg_frames == 4
+    assert params.offset_um == 0.0
+    assert not hasattr(params, "lateral_limit_px")
 
-    s.image_focus.mode = "spot"
     cfg.channel = "sum"
     cfg.roi = (10, 20, 300, 200)
     cfg.led_intensity = 40.0
     cfg.params.kp = 0.3
-    cfg.calibration = dict(CAL)
+    cfg.params.offset_um = 0.25
+    cfg.params.min_contrast = 25.0
+    cfg.calibration = _edge_cal().to_dict()
+    cfg.edge_box = BOX
+    cfg.sweep_span_um, cfg.sweep_steps, cfg.sweep_frames = 1.5, 7, 2
     s2 = SettingsV1.model_validate_json(s.model_dump_json())
-    assert s2.image_focus.mode == "spot"
     assert s2.spot_focus == s.spot_focus
     assert s2.spot_focus.roi == (10, 20, 300, 200)
-    assert s2.spot_focus.to_calibration().slope_px_per_um == SLOPE  # type: ignore[union-attr]
-    assert s2.spot_focus.params.to_params().kp == pytest.approx(0.3)
+    assert s2.spot_focus.edge_box == BOX
+    assert (s2.spot_focus.sweep_span_um, s2.spot_focus.sweep_steps) == (1.5, 7)
+    cal = s2.spot_focus.to_calibration()
+    assert cal is not None and cal.slope_px_per_um == SLOPE
+    assert s2.spot_focus.calibration_status()[1] == ""
+    p2 = s2.spot_focus.params.to_params()
+    assert (p2.kp, p2.offset_um, p2.min_contrast) == (0.3, 0.25, 25.0)
+
+
+def test_old_calibration_in_settings_is_ignored_not_raised() -> None:
+    cfg = SettingsV1().spot_focus
+    # The Gaussian-spot calibration this replaced, and plain garbage.
+    for stored in (
+        {
+            "x0": 320.0,
+            "y0": 240.0,
+            "ux": 0.8,
+            "uy": 0.6,
+            "slope_px_per_um": 10.0,
+            "p0_um": P0,
+        },
+        {"kind": "edge", "slope_px_per_um": "steep"},
+        {"nonsense": 1},
+    ):
+        cfg.calibration = stored
+        cal, message = cfg.calibration_status()
+        assert cal is None
+        assert "old spot calibration ignored" in message
+        assert cfg.to_calibration() is None
 
 
 def test_old_settings_files_still_load() -> None:
-    """A file written before the spot lock (no ``spot_focus``) loads with defaults."""
+    """A file written before the spot lock (no ``spot_focus``) loads with defaults.
+
+    An old ``image_focus.mode`` ("crisp" / "image" / "off") is dropped with a
+    RuntimeWarning and gives "spot".
+    """
     old = {
         "version": "1.0",
         "image_focus": {
@@ -186,8 +280,10 @@ def test_old_settings_files_still_load() -> None:
             },
         },
     }
-    s = SettingsV1.model_validate(old)
-    assert s.image_focus.mode == "image"
+    with pytest.warns(RuntimeWarning):
+        cleaned = _settings._good_data_only(SettingsV1, old)
+    s = SettingsV1.model_validate(cleaned)
+    assert s.image_focus.mode == "spot"
     assert s.image_focus.loop_gain == 0.4
     assert s.spot_focus.calibration is None
     assert s.spot_focus.channel == "red"
@@ -195,7 +291,7 @@ def test_old_settings_files_still_load() -> None:
     bad = {"image_focus": {"mode": "image"}, "spot_focus": {"channel": "purple"}}
     with pytest.warns(RuntimeWarning):
         cleaned = _settings._good_data_only(SettingsV1, bad)
-    assert cleaned["image_focus"] == {"mode": "image"}
+    assert cleaned["image_focus"] == {}
     assert cleaned.get("spot_focus", {}) == {}
 
 
@@ -209,7 +305,7 @@ def test_source_spec_from_settings() -> None:
         "analysis": {"channel": "red", "bayer": "RGGB"},
     }
     cfg.source.kind = "fake"
-    cfg.source.fake = {"cal_like": dict(CAL)}
+    cfg.source.fake = {"cal_like": dict(CAL_LIKE)}
     assert source_spec(cfg)["kind"] == "fake"
 
 
@@ -218,12 +314,131 @@ def test_source_spec_from_settings() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_start_needs_a_calibration(panel: SpotFocusPanel) -> None:
-    assert not panel.start_button.isEnabled()
-    assert panel.calibrate_button.isEnabled()
-    panel.start()
+def test_buttons_and_readouts_are_the_edge_workflow(panel: SpotFocusPanel) -> None:
+    assert panel.calibrate_button.text() == "Calibrate"
+    assert "Focus on the cells first" in panel.calibrate_button.toolTip()
+    assert panel.zero_button.text() == "Zero here"
+    assert panel.start_button.text() == "Lock"
+    assert panel.stop_button.text() == "Stop"
+    assert panel.draw_edge_button.text() == "Draw edge box"
+    assert not hasattr(panel, "modeForced")
+    assert list(panel.readout_labels) == [
+        "moves",
+        "move_ms",
+        "edge",
+        "contrast",
+        "fps",
+        "error",
+    ]
+    assert "lateral" not in panel.readout_labels
+    # Nothing calibrated yet: Lock and Calibrate try (and ask for a box), Zero waits.
+    assert panel.start_button.isEnabled() and panel.calibrate_button.isEnabled()
+    assert not panel.zero_button.isEnabled() and not panel.stop_button.isEnabled()
+    assert "not calibrated" in panel.calibration_label.text()
+    assert panel.edge_box_label.text() == "none"
+    assert panel.offset_spin.value() == 0.0
+    assert (panel.span_spin.value(), panel.steps_spin.value()) == (2.0, 9)
+    assert panel.frames_spin.value() == 3
+    for field in ("min_contrast", "max_angle_change_deg", "max_edge_residual_px"):
+        assert field in panel.param_spins
+
+
+def test_lock_and_calibrate_need_an_edge_box(panel: SpotFocusPanel) -> None:
+    panel.calibrate()
+    assert NEED_BOX_TEXT in panel.fault_label.text()
+    assert panel._busy == ""
     assert panel.service is None  # lazy: nothing was created
+    panel.fault_label.setText("")
+    panel.start()
+    assert NEED_BOX_TEXT in panel.fault_label.text()
+    assert panel.service is None
     assert panel.state == "idle"
+    assert panel.start_button.isEnabled()
+
+
+def test_old_calibration_in_settings_does_not_crash_the_panel(
+    qtbot: QtBot, mmc: FakeMMC
+) -> None:
+    settings = SettingsV1.instance()
+    for stored in (
+        {
+            "x0": 320.0,
+            "y0": 240.0,
+            "ux": 0.8,
+            "uy": 0.6,
+            "slope_px_per_um": 10.0,
+            "p0_um": P0,
+        },
+        {"kind": "edge"},
+    ):
+        settings.spot_focus.calibration = stored
+        widget = SpotFocusPanel(mmc, service_factory=_factory(mmc))
+        qtbot.addWidget(widget)
+        try:
+            assert "old spot calibration ignored" in widget.calibration_label.text()
+            assert widget._cal is None
+            assert not widget.zero_button.isEnabled()
+            assert not widget.live_view._setpoint_item.isVisible()
+        finally:
+            widget.shutdown()
+
+
+def test_drawing_an_edge_box_saves_it_and_shows_the_overlay(
+    qtbot: QtBot, panel: SpotFocusPanel
+) -> None:
+    cfg = SettingsV1.instance().spot_focus
+    view = panel.live_view
+    assert not view._edge_box_item.isVisible()
+    view.edgeBoxDrawn.emit(*BOX)
+    assert cfg.edge_box == BOX
+    assert panel.edge_box_label.text() == "232, 210, 80, 60"
+    assert view.edge_box == BOX
+    assert view._edge_box_item.isVisible()
+    r = view._edge_box_item.rect()
+    assert (r.x(), r.y(), r.width(), r.height()) == BOX
+    assert panel.service is None  # nothing to tell yet; it is sent on creation
+    # a fresh refresh (an app restart) shows the saved box again
+    view.set_edge_box(None)
+    panel.refresh()
+    assert view.edge_box == BOX and view._edge_box_item.isVisible()
+    panel.set_edge_box(None)
+    assert cfg.edge_box is None and not view._edge_box_item.isVisible()
+    assert panel.edge_box_label.text() == "none"
+
+
+def test_draw_edge_box_button_drags_a_box_to_the_worker(
+    qtbot: QtBot, panel: SpotFocusPanel
+) -> None:
+    svc = _preview_on(qtbot, panel)
+    view = panel.live_view
+    cfg = SettingsV1.instance().spot_focus
+    assert view.draw_target is None
+    panel.draw_edge_button.click()
+    assert panel.draw_edge_button.isChecked()
+    assert view.draw_target == "edge" and view.view.draw_mode
+    assert view.draw_edge_button.isChecked()
+    # Draw ROI and Draw edge box are exclusive
+    view.draw_roi_button.setChecked(True)
+    assert view.draw_target == "roi" and not panel.draw_edge_button.isChecked()
+    panel.draw_edge_button.click()
+    assert view.draw_target == "edge" and not view.draw_roi_button.isChecked()
+
+    with patch.object(svc, "set_edge_box", wraps=svc.set_edge_box) as spy:
+        # a drag across the left edge, in scene (sensor) pixels
+        view._on_rect_drawn(QPointF(232.3, 210.6), QPointF(311.2, 269.9))
+        spy.assert_called_with(BOX)
+    assert cfg.edge_box == BOX
+    assert not panel.draw_edge_button.isChecked()  # one box per click
+    assert view.draw_target is None and not view.view.draw_mode
+    assert view._edge_box_item.isVisible()
+    # The preview now measures it: the cross lands on the patch's left edge.
+    qtbot.waitUntil(
+        lambda: view.frame is not None
+        and view.frame.spot is not None
+        and abs(view.frame.spot[0] - _e0()) < 2
+        and abs(view.frame.spot[1] - 240) < 2,
+        timeout=WAIT_MS,
+    )
 
 
 def test_start_telemetry_stop_restores_crisp(
@@ -234,16 +449,19 @@ def test_start_telemetry_stop_restores_crisp(
     panel.refresh()
     assert panel.service is None
     assert panel.start_button.isEnabled()
+    assert panel.zero_button.isEnabled()
     assert not panel.stop_button.isEnabled()
+    assert "px/µm" in panel.calibration_label.text()
 
     panel.start()
     assert not panel.start_button.isEnabled()
-    assert settings.image_focus.mode == "spot"
     qtbot.waitUntil(lambda: panel.state == "running", timeout=WAIT_MS)
     assert mmc.props[(CRISP, "CRISP State")] == "Ready"
     assert spot_focus_flag.active
-    # Calibrate is only for a stopped loop.
+    # Calibrate and Zero are only for a stopped loop.
     assert not panel.calibrate_button.isEnabled()
+    assert not panel.zero_button.isEnabled()
+    assert not panel.draw_edge_button.isEnabled()
     assert panel.stop_button.isEnabled()
 
     qtbot.waitUntil(lambda: len(panel.chart) > 5, timeout=WAIT_MS)
@@ -258,13 +476,17 @@ def test_start_telemetry_stop_restores_crisp(
     frame = view.frame
     assert frame is not None
     assert frame.spot is not None
-    setpoint = (CAL["x0"], CAL["y0"])
-    # The fake spot sits at the setpoint, so the cross and the ring coincide.
+    setpoint = (_e0(), 240.0)  # the zero edge point: (e0, box_y + h / 2)
+    # The fake edge sits at the zero, so the cross and the ring coincide.
     assert abs(frame.spot[0] - setpoint[0]) < 3
     assert abs(frame.spot[1] - setpoint[1]) < 3
     assert view._setpoint_item.isVisible()
     assert view._setpoint_item.pos().x() == pytest.approx(setpoint[0] + 0.5)
+    assert view._setpoint_item.pos().y() == pytest.approx(setpoint[1] + 0.5)
     assert panel.readout_labels["fps"].text() != "-"
+    assert "px" in panel.readout_labels["edge"].text()
+    assert panel.readout_labels["contrast"].text() != "-"
+    assert "edge (" in view.status_label.text()
     # The chart and the live view paint without raising (a paint error aborts Qt).
     panel.resize(500, 800)
     pixmap = panel.grab()
@@ -281,14 +503,29 @@ def test_start_telemetry_stop_restores_crisp(
     # Editing a parameter while running reaches the settings (and the worker).
     panel.param_spins["deadband_um"].setValue(0.05)
     assert settings.spot_focus.params.deadband_um == pytest.approx(0.05)
+    # So does the offset: persisted, and sent to the running loop at once.
+    svc = panel.service
+    assert svc is not None
+    with patch.object(svc, "update_params", wraps=svc.update_params) as spy:
+        panel.offset_spin.setValue(0.3)
+        spy.assert_called_once()
+        assert spy.call_args[0][0].offset_um == pytest.approx(0.3)
+    assert settings.spot_focus.params.offset_um == pytest.approx(0.3)
+    # A box drawn while the lock runs is refused (the lock keeps its own).
+    view.edgeBoxDrawn.emit(0, 0, 40, 40)
+    assert settings.spot_focus.edge_box == BOX
+    assert "Stop the lock" in panel.fault_label.text()
 
     sets_before_stop = len(mmc.sets)
-    panel.stop()
+    with patch.object(svc, "set_edge_box", wraps=svc.set_edge_box) as box_spy:
+        panel.stop()
+        box_spy.assert_called_with(BOX)  # the preview measures the drawn box again
     assert panel.state == "stopped"
     assert not spot_focus_flag.active
     assert mmc.props[(CRISP, "CRISP State")] == "Idle"  # restored
     assert panel.calibrate_button.isEnabled()
     assert panel.start_button.isEnabled()
+    assert panel.zero_button.isEnabled()
     qtbot.wait(300)
     assert len(mmc.sets) - sets_before_stop <= 1  # at most one in flight
 
@@ -296,19 +533,120 @@ def test_start_telemetry_stop_restores_crisp(
 def test_calibrate_off_the_gui_thread(
     qtbot: QtBot, panel: SpotFocusPanel, mmc: FakeMMC
 ) -> None:
+    settings = SettingsV1.instance()
+    cfg = settings.spot_focus
+    cfg.edge_box = BOX
+    panel.refresh()
+    # The sweep spins are persisted and drive the sweep.
+    panel.span_spin.setValue(1.6)
+    panel.steps_spin.setValue(7)
+    panel.frames_spin.setValue(2)
+    assert (cfg.sweep_span_um, cfg.sweep_steps, cfg.sweep_frames) == (1.6, 7, 2)
+    panel.offset_spin.setValue(0.4)
+    assert cfg.params.offset_um == pytest.approx(0.4)
+    assert panel._record_path() is None  # nothing is written to disk under pytest
+
     panel.calibrate()
     assert panel._busy == "calibrating"
     assert not panel.calibrate_button.isEnabled()
     assert not panel.start_button.isEnabled()
+    assert not panel.zero_button.isEnabled()
     qtbot.waitUntil(lambda: not panel._busy, timeout=WAIT_MS)
-    stored = SettingsV1.instance().spot_focus.calibration
+    stored = cfg.calibration
     assert stored is not None, panel.fault_label.text()
-    assert stored["slope_px_per_um"] == pytest.approx(SLOPE, rel=0.1)
-    assert (stored["ux"], stored["uy"]) == pytest.approx((UX, UY), abs=0.05)
-    assert panel.start_button.isEnabled()
+    assert stored["kind"] == "edge"
+    assert stored["slope_px_per_um"] == pytest.approx(SLOPE, rel=0.1)  # signed
+    assert stored["axis"] == "x" and stored["polarity"] == 1
+    assert stored["n_points"] == 7
+    assert stored["linear_range_um"] == pytest.approx(0.8)
+    assert stored["p0_um"] == pytest.approx(P0)
+    assert stored["e0_px"] == pytest.approx(_e0(), abs=0.5)
+    assert tuple(stored["box"]) == BOX
+    assert panel.start_button.isEnabled() and panel.zero_button.isEnabled()
     assert mmc.pos[P_LABEL] == pytest.approx(P0)  # P returned to where it was
     assert mmc.props[(CRISP, "CRISP State")] == "Idle"
-    assert "px/µm" in panel.calibration_label.text()
+    text = panel.calibration_label.text()
+    assert "px/µm" in text and "R²" in text and "zero P" in text
+    assert re.search(r"\+[45]\.\d\d px/µm", text), text  # the right sign
+    # a new zero: the offset is back to 0 and the ring sits on the zero edge point
+    assert panel.offset_spin.value() == 0.0
+    assert cfg.params.offset_um == 0.0
+    ring = panel.live_view._setpoint_item
+    assert ring.isVisible()
+    assert ring.pos().x() == pytest.approx(stored["e0_px"] + 0.5)
+    assert ring.pos().y() == pytest.approx(210 + 30 + 0.5)
+
+
+def test_zero_here_rezeroes_and_resets_the_offset(
+    qtbot: QtBot, panel: SpotFocusPanel, mmc: FakeMMC
+) -> None:
+    settings = SettingsV1.instance()
+    _calibrated(settings)
+    panel.refresh()
+    panel.offset_spin.setValue(0.3)
+    # The user refocused by hand: P is 0.4 um higher, so the fake edge moved.
+    mmc.pos[P_LABEL] = P0 + 0.4
+    panel.zero()
+    assert panel._busy == "zeroing"
+    assert not panel.zero_button.isEnabled() and not panel.start_button.isEnabled()
+    qtbot.waitUntil(lambda: not panel._busy, timeout=WAIT_MS)
+    assert panel.fault_label.text() == "", panel.fault_label.text()
+    stored = settings.spot_focus.calibration
+    assert stored is not None
+    assert stored["p0_um"] == pytest.approx(P0 + 0.4)
+    assert stored["e0_px"] == pytest.approx(_e0() + SLOPE * 0.4, abs=0.4)
+    assert stored["slope_px_per_um"] == SLOPE  # kept
+    assert panel.offset_spin.value() == 0.0
+    assert settings.spot_focus.params.offset_um == 0.0
+    assert panel._cal is not None and panel._cal.p0_um == pytest.approx(P0 + 0.4)
+    assert panel.live_view._setpoint_item.pos().x() == pytest.approx(
+        stored["e0_px"] + 0.5
+    )
+    assert mmc.pos[P_LABEL] == pytest.approx(P0 + 0.4)  # Zero never moves P
+
+
+def test_lock_without_a_calibration_calibrates_then_locks(
+    qtbot: QtBot, panel: SpotFocusPanel, mmc: FakeMMC
+) -> None:
+    settings = SettingsV1.instance()
+    cfg = settings.spot_focus
+    cfg.edge_box = BOX
+    cfg.sweep_span_um, cfg.sweep_steps, cfg.sweep_frames = 1.2, 7, 2
+    cfg.params.offset_um = 0.2
+    panel.refresh()
+    assert panel._cal is None
+    assert panel.start_button.isEnabled()
+    panel.start()
+    qtbot.waitUntil(lambda: panel.state == "running", timeout=WAIT_MS)
+    assert panel.fault_label.text() == "", panel.fault_label.text()
+    stored = cfg.calibration
+    assert stored is not None and stored["kind"] == "edge"
+    assert stored["slope_px_per_um"] == pytest.approx(SLOPE, rel=0.1)
+    assert stored["p0_um"] == pytest.approx(P0)  # the present P is the zero
+    assert panel._cal is not None
+    assert cfg.params.offset_um == 0.0  # a new zero
+    assert mmc.props[(CRISP, "CRISP State")] == "Ready"
+    assert spot_focus_flag.active
+    qtbot.waitUntil(lambda: len(panel.chart) > 3, timeout=WAIT_MS)
+    panel.stop()
+    assert panel.state == "stopped"
+    assert mmc.props[(CRISP, "CRISP State")] == "Idle"
+
+
+def test_failed_calibration_inside_lock_is_reported_and_nothing_locks(
+    qtbot: QtBot, panel: SpotFocusPanel, mmc: FakeMMC
+) -> None:
+    cfg = SettingsV1.instance().spot_focus
+    cfg.edge_box = (0, 0, 32, 32)  # a corner of the dark background: no edge
+    panel.refresh()
+    panel.start()
+    qtbot.waitUntil(lambda: not panel._busy, timeout=WAIT_MS)
+    assert "Calibration failed" in panel.fault_label.text()
+    assert panel.state != "running"
+    assert cfg.calibration is None
+    assert not spot_focus_flag.active
+    assert mmc.props[(CRISP, "CRISP State")] == "Idle"
+    assert panel.start_button.isEnabled()
 
 
 def test_start_failure_is_reported(qtbot: QtBot, mmc: FakeMMC) -> None:
@@ -328,12 +666,13 @@ def test_start_failure_is_reported(qtbot: QtBot, mmc: FakeMMC) -> None:
 
 
 # ---------------------------------------------------------------------------
-# dock: mode and mutual exclusion with the image lock
+# dock: the panel is hosted directly (Spot is the only mode)
 # ---------------------------------------------------------------------------
 
 
 def _image_cfg() -> _settings.ImageFocusSettingsV1:
-    cfg = _settings.ImageFocusSettingsV1(mode="image")
+    # "image" is no longer a settings value; build the legacy state directly.
+    cfg = _settings.ImageFocusSettingsV1.model_construct(mode="image")
     cfg.box = FocusBoxSettings(
         camera="Camera-1", preset="488nm", slice_index=1, rect=(100, 60, 40, 30)
     )
@@ -403,39 +742,17 @@ def test_spot_mode_does_not_arm_image_lock() -> None:
     assert run.mode == "off"
 
 
-def test_dock_spot_radio_and_exclusion(qtbot: QtBot, mmc: FakeMMC) -> None:
-    settings = SettingsV1.instance()
-    widget = ImageFocusWidget(CMMCorePlus())
-    qtbot.addWidget(widget)
-    widget.spot_panel._factory = _factory(mmc)
-    assert set(widget.mode_buttons) == {"crisp", "image", "spot", "off"}
-    assert widget.spot_panel.isHidden()
-
-    widget.mode_buttons["spot"].setChecked(True)
-    assert settings.image_focus.mode == "spot"
-    assert not widget.spot_panel.isHidden()
-
-    _calibrated(settings)
-    widget.spot_panel.refresh()
-    widget.spot_panel.start()
-    qtbot.waitUntil(lambda: widget.spot_panel.state == "running", timeout=WAIT_MS)
-    assert mmc.props[(CRISP, "CRISP State")] == "Ready"
-
-    # Choosing Image while spot runs stops spot first and restores CRISP.
-    widget.mode_buttons["image"].setChecked(True)
-    assert settings.image_focus.mode == "image"
-    assert widget.spot_panel.state == "stopped"
-    assert not spot_focus_flag.active
-    assert mmc.props[(CRISP, "CRISP State")] == "Idle"
-    assert widget.spot_panel.isHidden()
-
-    # Start from a different mode switches the dock to Spot.
-    widget.spot_panel.start()
-    qtbot.waitUntil(lambda: widget.spot_panel.state == "running", timeout=WAIT_MS)
-    assert settings.image_focus.mode == "spot"
-    assert widget.mode_buttons["spot"].isChecked()
-    widget.spot_panel.shutdown()
-    assert mmc.props[(CRISP, "CRISP State")] == "Idle"
+def test_dock_hosts_the_spot_panel_directly(qtbot: QtBot) -> None:
+    parent = QWidget()
+    qtbot.addWidget(parent)
+    widget = create_image_focus_widget(parent)
+    assert isinstance(widget, SpotFocusScrollArea)
+    panel = widget.spot_panel
+    assert isinstance(panel, SpotFocusPanel)
+    assert widget.widget() is panel  # no mode radio, no wrapper
+    assert not hasattr(widget, "mode_buttons")
+    assert panel.start_button.text() == "Lock"
+    panel.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -712,8 +1029,8 @@ def test_setpoint_ring_is_in_sensor_pixels_with_a_roi(
     """With a ROI set the ring and cross keep sensor coordinates (the ROI offset
     is in the frame, not in the markers)."""
     settings = SettingsV1.instance()
-    settings.spot_focus.calibration = dict(CAL)
-    settings.spot_focus.roi = (200, 150, 300, 200)  # contains (320, 240)
+    _calibrated(settings)
+    settings.spot_focus.roi = (200, 150, 300, 200)  # contains the box and the patch
     panel.refresh()
     _preview_on(qtbot, panel)
     view = panel.live_view
@@ -721,7 +1038,7 @@ def test_setpoint_ring_is_in_sensor_pixels_with_a_roi(
         lambda: view.frame is not None and view.frame.spot is not None, timeout=WAIT_MS
     )
     assert tuple(view.frame.roi) == (200, 150, 300, 200)  # type: ignore[union-attr]
-    assert view._setpoint_item.pos().x() == pytest.approx(CAL["x0"] + 0.5)
-    assert view._setpoint_item.pos().y() == pytest.approx(CAL["y0"] + 0.5)
+    assert view._setpoint_item.pos().x() == pytest.approx(_e0() + 0.5)
+    assert view._setpoint_item.pos().y() == pytest.approx(240.0 + 0.5)
     spot = view.frame.spot  # type: ignore[union-attr]
-    assert abs(spot[0] - CAL["x0"]) < 3 and abs(spot[1] - CAL["y0"]) < 3
+    assert abs(spot[0] - _e0()) < 3 and abs(spot[1] - 240.0) < 3

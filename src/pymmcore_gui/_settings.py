@@ -32,7 +32,7 @@ if TYPE_CHECKING:
         FocusCalibration,
         LockLimits,
     )
-    from pymmcore_gui.asi_z_stack.spot_focus import SpotCalibration, SpotLoopParams
+    from pymmcore_gui.asi_z_stack.spot_focus import EdgeCalibration, SpotLoopParams
 
 APP_NAME = "pymmcore-gui"
 USER_DATA_DIR = Path(user_data_dir(appname=APP_NAME))
@@ -509,7 +509,7 @@ class CalibrationRecord(BaseModel):
 
 
 class ImageFocusSettingsV1(BaseMMSettings):
-    """Image-based focus lock (an alternative to CRISP) configuration.
+    """Image-based focus lock configuration (legacy; Spot is the only mode).
 
     Per volume, the row-intensity profile inside ``box`` is compared with a
     reference and the piezo is moved to cancel the measured row shift (see
@@ -517,10 +517,9 @@ class ImageFocusSettingsV1(BaseMMSettings):
     :class:`~pymmcore_gui.asi_z_stack.image_focus.LockLimits`.
     """
 
-    mode: Literal["crisp", "image", "spot", "off"] = "crisp"
-    """Which focus hold runs. ``"image"`` is read per sequence; ``"spot"`` is the
-    standalone spot lock (:class:`SpotFocusSettingsV1`), which the image lock
-    ignores."""
+    mode: Literal["spot"] = "spot"
+    """The focus hold: ``"spot"``, the standalone spot lock
+    (:class:`SpotFocusSettingsV1`), is the only one exposed."""
     box: FocusBoxSettings | None = None
     """The measurement box; ``None`` until the user draws one."""
     calibrations: dict[str, CalibrationRecord] = Field(default_factory=dict)
@@ -591,9 +590,13 @@ class SpotLoopParamsSettings(BaseModel):
     deadband_um: float = 0.03
     max_step_um: float = 0.5
     max_rate_hz: float = 2.0
-    avg_frames: int = 8
-    lateral_limit_px: float = 8.0
-    min_amplitude: float = 20.0
+    avg_frames: int = 4
+    offset_um: float = 0.0
+    min_contrast: float = 10.0
+    max_saturated_frac: float = 0.002
+    min_valid_fraction: float = 0.5
+    max_angle_change_deg: float = 5.0
+    max_edge_residual_px: float = 3.0
     p_min_um: float = 0.0
     p_max_um: float = 150.0
     max_excursion_um: float = 5.0
@@ -627,15 +630,29 @@ class SpotFocusSettingsV1(BaseMMSettings):
     """CRISP LED intensity set on Start; ``None`` leaves it as it is."""
     params: SpotLoopParamsSettings = Field(default_factory=SpotLoopParamsSettings)
     calibration: dict[str, Any] | None = None
-    """``SpotCalibration.to_dict()`` of the last calibration."""
+    """``EdgeCalibration.to_dict()`` of the last calibration."""
+    edge_box: tuple[int, int, int, int] | None = None
+    """The edge box ``(x, y, w, h)`` in sensor pixels; ``None`` until drawn."""
+    sweep_span_um: float = 2.0
+    """Total piezo span of the calibration sweep, um."""
+    sweep_steps: int = 9
+    """Number of points of the calibration sweep."""
+    sweep_frames: int = 3
+    """Frames averaged per sweep point."""
 
-    def to_calibration(self) -> "SpotCalibration | None":
-        """Return the stored calibration, ``None`` if there is none."""
-        if not self.calibration:
-            return None
-        from pymmcore_gui.asi_z_stack.spot_focus import SpotCalibration
+    def calibration_status(self) -> "tuple[EdgeCalibration | None, str]":
+        """Return ``(calibration, message)``; never raises.
 
-        return SpotCalibration.from_dict(self.calibration)
+        ``message`` is empty for a valid calibration, else says why there is none
+        (nothing stored yet, or an old / malformed calibration ignored).
+        """
+        from pymmcore_gui.asi_z_stack.spot_focus import load_calibration
+
+        return load_calibration(self.calibration)
+
+    def to_calibration(self) -> "EdgeCalibration | None":
+        """Return the stored calibration, ``None`` if there is none or it is bad."""
+        return self.calibration_status()[0]
 
 
 class SnapshotSettingsV1(BaseMMSettings):

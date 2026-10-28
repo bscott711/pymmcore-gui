@@ -6,8 +6,9 @@ Used inside the camera worker subprocess only. Both sources follow the
 - :class:`ToupcamSource` -- the AmScope MD310C-BS (ToupTek OEM) through the
   vendor's ctypes wrapper. The wrapper is **not bundled**: it is loaded from
   ``sdk_dir`` or ``$TOUPCAM_SDK_DIR`` when :meth:`ToupcamSource.open` runs.
-- :class:`FakeSpotSource` -- renders a Gaussian spot that follows the commanded
-  piezo position plus drift, so the whole loop can be tested without hardware.
+- :class:`FakeSpotSource` -- renders the CRISP LED patch (soft rounded square,
+  tail, ghost, noise) following the commanded piezo position plus drift, so the
+  whole loop can be tested without hardware.
 - :func:`make_source` -- build either from a plain dict (picklable for spawn).
 """
 
@@ -23,6 +24,8 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import numpy as np
+
+from pymmcore_gui.asi_z_stack.spot_synthetic import add_noise, render_led_patch
 
 logger = logging.getLogger(__name__)
 
@@ -346,18 +349,23 @@ class ToupcamSource:
 
 
 class FakeSpotSource:
-    """A simulated spot camera that closes the loop with the piezo.
+    """A simulated LED-patch camera that closes the loop with the piezo.
 
-    The spot is a Gaussian at ``x0 + ux*slope*(drift(t) + p - p0)`` (and the
-    matching y), so a controller that moves P by ``-along_um`` pulls it back to
-    the setpoint. *cal_like* is a plain dict with ``x0, y0, ux, uy,
-    slope_px_per_um`` and ``p0_um`` (a ``SpotCalibration.to_dict()`` works).
-    ``lateral_px_per_s`` drifts the spot perpendicular to ``u``, which focus
-    cannot cancel. Drift accrues from :meth:`open`. ``shape`` is the full
-    sensor ``(rows, cols)``; the spot is placed in sensor pixels and the ROI
-    crops the rendered frames, as on the real camera. The spot's amplitude
-    scales with exposure (relative to 10 ms) and gain (relative to 100 %), so
-    exposure and gain behave like a camera's in the live view.
+    Renders the CRISP LED patch (:func:`render_led_patch`: a rounded square
+    with a soft edge, texture, a faint tail and a dim ghost) whose centre is at
+    ``(x0, y0) + (ux, uy) * slope * (drift(t) + p - p0)``, so a controller that
+    moves P by ``-along_um`` pulls an edge back to its zero. *cal_like* is a
+    plain dict with ``x0, y0, ux, uy, slope_px_per_um`` and ``p0_um``: the
+    fake's *true* image motion and its best-focus P. The edge blur grows with
+    ``|P - p0|`` (``blur_px_per_um``), symmetric, so the 50 % point only moves
+    with the slope. The ghost moves ``ghost_motion`` times as far as the patch.
+    ``lateral_px_per_s`` drifts the patch perpendicular to ``u``. Drift accrues
+    from :meth:`open`. ``shape`` is the full sensor ``(rows, cols)``; the patch
+    is placed in sensor pixels and the ROI crops the rendered frames, as on the
+    real camera. The brightness scales with exposure (relative to 10 ms), gain
+    (relative to 100 %) and :meth:`set_level`. ``amplitude`` is the patch level
+    above the camera pedestal (capped at 40 % of full scale for 8-bit).
+    ``sigma_px`` belongs to the retired Gaussian spot and is ignored.
     """
 
     def __init__(
@@ -372,18 +380,42 @@ class FakeSpotSource:
         seed: int = 0,
         fps: float = 50.0,
         bits: int = 16,
+        patch_px: float = 96.0,
+        blur_px_per_um: float = 1.0,
+        ghost: float = 0.3,
+        tail: float = 0.04,
+        hot_pixels: int = 0,
+        ghost_motion: float = -0.5,
     ) -> None:
         self.cal = dict(cal_like)
         self.drift_um_per_s = drift_um_per_s
         self.noise = noise
-        self.amplitude = amplitude
-        self.sigma_px = sigma_px
+        self.sigma_px = sigma_px  # unused: kept for old settings / specs
         self.shape = (int(shape[0]), int(shape[1]))
         self.lateral_px_per_s = lateral_px_per_s
         self.fps = fps
         self.bits = int(bits)
+        self.patch_px = float(patch_px)
+        self.blur_px_per_um = float(blur_px_per_um)
+        self.ghost = float(ghost)
+        self.tail = float(tail)
+        self.ghost_motion = float(ghost_motion)
         self.offset = 100.0 if self.bits > 8 else 10.0  # camera pedestal, counts
+        top = float((1 << self.bits) - 1)
+        self.amplitude = float(
+            amplitude if self.bits > 8 else min(amplitude, 0.4 * top)
+        )
+        self._seed = int(seed)
         self._rng = np.random.default_rng(seed)
+        self._level = 1.0
+        self._hot: list[tuple[int, int]] = []
+        if hot_pixels > 0:  # static, like real hot pixels
+            hrng = np.random.default_rng(self._seed + 1)
+            rows, cols = self.shape
+            self._hot = [
+                (int(hrng.integers(0, rows)), int(hrng.integers(0, cols)))
+                for _ in range(int(hot_pixels))
+            ]
         self._p = float(self.cal.get("p0_um", 0.0))
         self._t0: float | None = None
         self._next = 0.0
@@ -393,39 +425,56 @@ class FakeSpotSource:
 
     # -- model -------------------------------------------------------------
 
-    def spot_position(self, t_s: float) -> tuple[float, float]:
-        """Return the true (x, y) of the spot ``t_s`` seconds after open()."""
+    def _displacement(self, t_s: float) -> tuple[float, float]:
+        """Return the patch displacement (dx, dy) from its nominal centre."""
         c = self.cal
         along = (
             self.drift_um_per_s * t_s + self._p - float(c.get("p0_um", 0.0))
         ) * float(c["slope_px_per_um"])
         lateral = self.lateral_px_per_s * t_s
         ux, uy = float(c["ux"]), float(c["uy"])
-        return (
-            float(c["x0"]) + ux * along - uy * lateral,
-            float(c["y0"]) + uy * along + ux * lateral,
-        )
+        return ux * along - uy * lateral, uy * along + ux * lateral
+
+    def spot_position(self, t_s: float) -> tuple[float, float]:
+        """Return the true patch centre ``(x, y)`` ``t_s`` seconds after open()."""
+        dx, dy = self._displacement(t_s)
+        return float(self.cal["x0"]) + dx, float(self.cal["y0"]) + dy
+
+    def set_level(self, scale: float) -> None:
+        """Scale the patch brightness (0 = LED off); for tests, not the worker."""
+        self._level = float(scale)
 
     def render(self, t_s: float) -> np.ndarray:
-        """Render the (ROI-cropped) uint16 frame at time *t_s* after open()."""
-        sx, sy = self.spot_position(t_s)
-        rows, cols = self.shape
-        img = np.full((rows, cols), self.offset, dtype=np.float64)
-        s = self.sigma_px
-        scale = (self._exposure_ms / 10.0) * (self._gain / 100.0)
-        r0, r1 = max(int(sy - 6 * s), 0), min(int(sy + 6 * s) + 2, rows)
-        c0, c1 = max(int(sx - 6 * s), 0), min(int(sx + 6 * s) + 2, cols)
-        if r1 > r0 and c1 > c0:
-            gy = np.exp(-((np.arange(r0, r1) - sy) ** 2) / (2 * s**2))
-            gx = np.exp(-((np.arange(c0, c1) - sx) ** 2) / (2 * s**2))
-            img[r0:r1, c0:c1] += self.amplitude * scale * np.outer(gy, gx)
-        if self.noise > 0:
-            img += self._rng.normal(0.0, self.noise, img.shape)
+        """Render the (ROI-cropped) integer frame at time *t_s* after open()."""
+        c = self.cal
+        dx, dy = self._displacement(t_s)
+        x0, y0 = float(c["x0"]), float(c["y0"])
+        dp = self._p + self.drift_um_per_s * t_s - float(c.get("p0_um", 0.0))
+        size = (self.patch_px, round(self.patch_px * 0.96))
+        ghost_center = (
+            x0 + (-0.11 * size[0]) + self.ghost_motion * dx,
+            y0 + 1.35 * size[1] + self.ghost_motion * dy,
+        )
+        scale = (self._exposure_ms / 10.0) * (self._gain / 100.0) * self._level
+        img = render_led_patch(
+            self.shape,
+            (x0 + dx, y0 + dy),
+            size=size,
+            edge_sigma=2.0 + self.blur_px_per_um * abs(dp),
+            level=self.amplitude * scale,
+            background=self.offset,
+            tail=self.tail,
+            ghost=self.ghost,
+            ghost_center=ghost_center,
+            seed=self._seed,
+        )
+        top = float((1 << self.bits) - 1)
+        for r, col in self._hot:
+            img[r, col] = 0.7 * top
         x, y, w, h = self._roi
-        img = img[y : y + h, x : x + w]
-        top = (1 << self.bits) - 1
-        dtype = np.uint8 if self.bits <= 8 else np.uint16
-        return np.clip(np.rint(img), 0, top).astype(dtype)
+        return add_noise(
+            img[y : y + h, x : x + w], noise=self.noise, rng=self._rng, bits=self.bits
+        )
 
     # -- FrameSource -------------------------------------------------------
 
@@ -501,7 +550,7 @@ class FakeSpotSource:
         }
 
     def set_actuator_um(self, p: float) -> None:
-        """Set the piezo P the spot follows."""
+        """Set the piezo P the patch follows."""
         self._p = float(p)
 
 

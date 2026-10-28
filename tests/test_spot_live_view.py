@@ -1,7 +1,10 @@
 """The spot camera live view: native-resolution drawing, ROI drawing, navigation.
 
-No camera, worker or MM install: frames are built in the test. Runs with
-``--noconftest`` like ``test_spot_focus_widget.py``.
+No camera, worker or MM install: frames are built in the test.
+
+Run WITHOUT ``--noconftest`` and with ``QT_QPA_PLATFORM=offscreen``: with both
+PyQt6 and PySide6 installed, pytest-qt otherwise picks PySide6 and
+``qtbot.addWidget`` fails ("Need to pass a QWidget").
 """
 
 from __future__ import annotations
@@ -15,9 +18,12 @@ from pymmcore_gui._qt.QtCore import QPoint, QPointF, Qt
 from pymmcore_gui._qt.QtGui import QPainter
 from pymmcore_gui.asi_z_stack.spot_frame_shm import LiveFrame
 from pymmcore_gui.widgets._spot_live_view import (
+    EDGE_BOX_COLOR,
+    ROI_COLOR,
     SpotLiveView,
     bayer_to_grey,
     frame_to_qimage,
+    snap_edge_box,
     snap_roi,
 )
 
@@ -109,6 +115,23 @@ def test_snap_roi_is_even_and_clamped() -> None:
     assert snap_roi((10, 10), (12, 12), SENSOR) is None
     assert snap_roi((10, 10), (500, 12), SENSOR) is None
     x, y, w, h = snap_roi((7.7, 9.1), (333.3, 444.4), SENSOR)  # type: ignore[misc]
+    assert all(v % 2 == 0 for v in (x, y, w, h))
+
+
+def test_snap_edge_box_is_even_clamped_and_at_least_16() -> None:
+    assert snap_edge_box((232.3, 210.6), (311.2, 269.9), SENSOR) == (232, 210, 80, 60)
+    # same snapping as the ROI: backwards, past the sensor edge
+    assert snap_edge_box((3000, 2000), (1900.4, 1400.0), SENSOR) == (
+        1900,
+        1400,
+        148,
+        136,
+    )
+    # between the ROI minimum (8) and the edge box minimum (16): a ROI, no box
+    assert snap_roi((10, 10), (22, 22), SENSOR) == (10, 10, 12, 12)
+    assert snap_edge_box((10, 10), (22, 22), SENSOR) is None
+    assert snap_edge_box((10, 10), (500, 20), SENSOR) is None
+    x, y, w, h = snap_edge_box((7.7, 9.1), (333.3, 444.4), SENSOR)  # type: ignore[misc]
     assert all(v % 2 == 0 for v in (x, y, w, h))
 
 
@@ -243,6 +266,43 @@ def test_overlays_follow_the_frame(view: SpotLiveView) -> None:
     view.set_setpoint(None)
     assert not view._setpoint_item.isVisible()
     assert not view.grab().isNull()  # paints without raising
+
+
+def test_edge_box_overlay_is_dashed_and_distinct_from_the_roi(
+    view: SpotLiveView,
+) -> None:
+    assert not view._edge_box_item.isVisible()
+    assert view.edge_box is None
+    view.set_edge_box((232, 210, 80, 60))
+    assert view._edge_box_item.isVisible()
+    assert view.edge_box == (232, 210, 80, 60)
+    r = view._edge_box_item.rect()
+    assert (r.x(), r.y(), r.width(), r.height()) == (232, 210, 80, 60)
+    pen = view._edge_box_item.pen()
+    assert pen.style() == Qt.PenStyle.DashLine and pen.isCosmetic()
+    assert pen.color().name() == EDGE_BOX_COLOR
+    assert EDGE_BOX_COLOR != ROI_COLOR
+    assert view._roi_item.pen().color().name() == ROI_COLOR
+    assert view._edge_box_item is not view._roi_item
+
+    # it is the user's box, not frame data: frames and clear() leave it alone
+    view.show_frame(make_frame(roi=(64, 32, 400, 300)))
+    assert view._edge_box_item.isVisible() and view._roi_item.isVisible()
+    r = view._roi_item.rect()
+    assert (r.x(), r.y(), r.width(), r.height()) == (64, 32, 400, 300)
+    view.clear()
+    assert view._edge_box_item.isVisible()
+    assert not view.grab().isNull()  # paints without raising
+    view.set_edge_box(None)
+    assert not view._edge_box_item.isVisible() and view.edge_box is None
+
+
+def test_status_text_says_edge(view: SpotLiveView) -> None:
+    view.show_frame(make_frame(spot=(150.5, 100.0)))
+    text = view.status_label.text()
+    assert "edge (150.5, 100.0)" in text and "spot" not in text
+    view.show_frame(make_frame(seq=2, spot=(150.5, 100.0), spot_ok=False))
+    assert "edge (150.5, 100.0) (not ok)" in view.status_label.text()
 
 
 def test_pixel_readout_and_status(view: SpotLiveView) -> None:
@@ -398,6 +458,81 @@ def test_draw_roi_ignores_a_click(qtbot: QtBot, view: SpotLiveView) -> None:
     _drag(view, qtbot, QPointF(500.0, 500.0), QPointF(502.0, 502.0))
     assert got == []
     assert view.draw_roi_button.isChecked()  # still armed
+
+
+def test_draw_edge_box_emits_even_clamped_values_not_a_roi(
+    qtbot: QtBot, view: SpotLiveView
+) -> None:
+    view.show_frame(make_frame())
+    view.fit()
+    rois: list[tuple] = []
+    view.roiDrawn.connect(lambda *a: rois.append(a))
+    modes: list[bool] = []
+    view.edgeDrawModeChanged.connect(modes.append)
+    assert view.draw_target is None
+    view.set_edge_draw_mode(True)  # the panel's way in
+    assert view.draw_edge_button.isChecked()
+    assert view.draw_target == "edge" and view.view.draw_mode
+    assert not view.draw_roi_button.isChecked()
+    with qtbot.waitSignal(view.edgeBoxDrawn, timeout=2000) as sig:
+        _drag(view, qtbot, QPointF(401.0, 301.0), QPointF(2200.0, 1700.0))
+    x, y, w, h = sig.args
+    assert all(v % 2 == 0 for v in (x, y, w, h))
+    assert (x, y) == (pytest.approx(400, abs=4), pytest.approx(300, abs=4))
+    assert x + w == SENSOR[0] and y + h == SENSOR[1]  # clamped to the sensor
+    assert rois == []  # a different signal from Draw ROI
+    assert not view.draw_edge_button.isChecked()  # one box per click
+    assert view.draw_target is None and not view.view.draw_mode
+    assert modes == [True, False]
+
+
+def test_draw_edge_box_ignores_a_click_and_a_sliver(
+    qtbot: QtBot, view: SpotLiveView
+) -> None:
+    view.show_frame(make_frame())
+    view.fit()
+    got: list[tuple] = []
+    view.edgeBoxDrawn.connect(lambda *a: got.append(a))
+    view.draw_edge_button.setChecked(True)
+    _drag(view, qtbot, QPointF(500.0, 500.0), QPointF(502.0, 502.0))
+    assert got == []
+    # wide but only a few px high: a sliver (the 8 to 16 px band is covered by
+    # test_snap_edge_box_is_even_clamped_and_at_least_16 at exact coordinates)
+    _drag(view, qtbot, QPointF(500.0, 500.0), QPointF(900.0, 504.0))
+    assert got == []
+    assert view.draw_edge_button.isChecked()  # still armed
+
+
+def test_draw_roi_and_edge_box_modes_are_exclusive(
+    qtbot: QtBot, view: SpotLiveView
+) -> None:
+    view.show_frame(make_frame())
+    view.fit()
+    view.draw_roi_button.setChecked(True)
+    assert view.draw_target == "roi"
+    view.draw_edge_button.setChecked(True)
+    assert view.draw_target == "edge" and not view.draw_roi_button.isChecked()
+    assert view.view.draw_mode
+    view.draw_roi_button.setChecked(True)
+    assert view.draw_target == "roi" and not view.draw_edge_button.isChecked()
+    # Draw ROI still emits roiDrawn only
+    boxes: list[tuple] = []
+    view.edgeBoxDrawn.connect(lambda *a: boxes.append(a))
+    with qtbot.waitSignal(view.roiDrawn, timeout=2000):
+        _drag(view, qtbot, QPointF(401.0, 301.0), QPointF(900.0, 700.0))
+    assert boxes == []
+    assert view.draw_target is None and not view.view.draw_mode
+    # turning the armed mode off returns to panning
+    view.draw_edge_button.setChecked(True)
+    view.draw_edge_button.setChecked(False)
+    assert view.draw_target is None and not view.view.draw_mode
+
+
+def test_closing_the_window_leaves_draw_modes(qtbot: QtBot, view: SpotLiveView) -> None:
+    view.draw_edge_button.setChecked(True)
+    with qtbot.waitSignal(view.windowClosed, timeout=1000):
+        view.close()
+    assert not view.draw_edge_button.isChecked() and view.draw_target is None
 
 
 # ---------------------------------------------------------------------------

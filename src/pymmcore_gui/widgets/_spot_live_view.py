@@ -13,8 +13,11 @@ The rig camera is a colour sensor read as raw Bayer, so by default the display
 
 Frames come from the service (:meth:`SpotFocusService.latest_frame`, a shared
 memory read) on a 30 Hz timer; the scene is repainted only when ``seq``
-changes. Overlays (sensor outline, ROI, spot cross, setpoint ring) are scene
-items with cosmetic pens, so they keep their on-screen size at any zoom.
+changes. Overlays (sensor outline, ROI, edge box, edge cross, setpoint ring) are
+scene items with cosmetic pens, so they keep their on-screen size at any zoom.
+The cross marks the measured edge point (the worker's shared-buffer ``spot``),
+the ring the zero edge point, and the dashed violet rectangle the edge box the
+user drew with Draw edge box.
 
 See ``docs/spot_focus_lock.md``, "Live camera view and controls".
 """
@@ -65,6 +68,8 @@ logger = logging.getLogger(__name__)
 POLL_MS = 33
 #: Smallest rectangle a Draw ROI drag may produce, sensor px.
 MIN_ROI_PX = 8
+#: Smallest edge box a drag may produce, sensor px (the metric's minimum).
+MIN_EDGE_BOX_PX = 16
 #: Zoom limits, view pixels per image pixel.
 MIN_ZOOM = 0.02
 MAX_ZOOM = 128.0
@@ -77,6 +82,7 @@ OK_COLOR = "#3df25a"
 BAD_COLOR = "#ff9a1f"
 SETPOINT_COLOR = "#ff4fd8"
 ROI_COLOR = "#56b4e9"
+EDGE_BOX_COLOR = "#c77dff"
 
 
 # ---------------------------------------------------------------------------
@@ -88,11 +94,13 @@ def snap_roi(
     p0: tuple[float, float],
     p1: tuple[float, float],
     sensor: tuple[int, int],
+    min_px: int = MIN_ROI_PX,
 ) -> tuple[int, int, int, int] | None:
     """The ROI ``(x, y, w, h)`` for a drag from *p0* to *p1* (sensor px).
 
     The rectangle is clamped to the sensor, then snapped outwards to even
-    integers. Returns ``None`` when it is smaller than :data:`MIN_ROI_PX`.
+    integers. Returns ``None`` when it is smaller than *min_px* (default
+    :data:`MIN_ROI_PX`) in either direction.
     """
     sw, sh = (int(sensor[0]) // 2 * 2, int(sensor[1]) // 2 * 2)
 
@@ -104,9 +112,23 @@ def snap_roi(
 
     x0, x1 = span(p0[0], p1[0], sw)
     y0, y1 = span(p0[1], p1[1], sh)
-    if x1 - x0 < MIN_ROI_PX or y1 - y0 < MIN_ROI_PX:
+    if x1 - x0 < min_px or y1 - y0 < min_px:
         return None
     return x0, y0, x1 - x0, y1 - y0
+
+
+def snap_edge_box(
+    p0: tuple[float, float],
+    p1: tuple[float, float],
+    sensor: tuple[int, int],
+) -> tuple[int, int, int, int] | None:
+    """The edge box ``(x, y, w, h)`` for a drag from *p0* to *p1* (sensor px).
+
+    Clamped to the sensor and snapped to even integers like :func:`snap_roi`;
+    ``None`` when it is smaller than :data:`MIN_EDGE_BOX_PX` in either
+    direction (the edge metric needs at least that much).
+    """
+    return snap_roi(p0, p1, sensor, MIN_EDGE_BOX_PX)
 
 
 def bayer_to_grey(image: np.ndarray) -> np.ndarray:
@@ -332,6 +354,10 @@ class SpotLiveView(QWidget):
 
     #: ``(x, y, w, h)`` drawn in Draw ROI mode (even, clamped to the sensor).
     roiDrawn = Signal(int, int, int, int)
+    #: ``(x, y, w, h)`` drawn in Draw edge box mode (even, clamped to the sensor).
+    edgeBoxDrawn = Signal(int, int, int, int)
+    #: Draw edge box mode was switched on or off (by the user, a drag or code).
+    edgeDrawModeChanged = Signal(bool)
     #: The window was closed by the user.
     windowClosed = Signal()
     #: ``(fps, max_value, saturated_percent)`` a few times a second.
@@ -350,6 +376,8 @@ class SpotLiveView(QWidget):
         self._buf: np.ndarray | None = None  # keeps the QImage buffer alive
         self._fit = True
         self._setpoint: tuple[float, float] | None = None
+        self._edge_box: tuple[int, int, int, int] | None = None
+        self._draw_target: str | None = None  # "roi" / "edge" / None
         self._cursor: QPointF | None = None
         self._poll_error_logged = False
         self.fps = 0.0
@@ -381,6 +409,14 @@ class SpotLiveView(QWidget):
         self._roi_item.setZValue(10)
         self._roi_item.setVisible(False)
         self.scene.addItem(self._roi_item)
+
+        self._edge_box_item = QGraphicsRectItem()
+        pen = QPen(QColor(EDGE_BOX_COLOR), 1.5, Qt.PenStyle.DashLine)
+        pen.setCosmetic(True)
+        self._edge_box_item.setPen(pen)
+        self._edge_box_item.setZValue(11)
+        self._edge_box_item.setVisible(False)
+        self.scene.addItem(self._edge_box_item)
 
         self._setpoint_item = QGraphicsEllipseItem(-10.0, -10.0, 20.0, 20.0)
         pen = QPen(QColor(SETPOINT_COLOR), 2)
@@ -425,7 +461,18 @@ class SpotLiveView(QWidget):
         self.draw_roi_button.setToolTip(
             "Drag a rectangle on the image to set the camera ROI"
         )
-        self.draw_roi_button.toggled.connect(self.view.set_draw_mode)
+        self.draw_roi_button.toggled.connect(
+            lambda on: self._on_draw_toggled("roi", on)
+        )
+        self.draw_edge_button = QPushButton("Draw edge box")
+        self.draw_edge_button.setCheckable(True)
+        self.draw_edge_button.setToolTip(
+            "Drag a rectangle across the edge of the LED patch that moves with "
+            "focus (wide along the edge normal, about 60% of the edge length)"
+        )
+        self.draw_edge_button.toggled.connect(
+            lambda on: self._on_draw_toggled("edge", on)
+        )
         self.auto_levels = QCheckBox("Auto levels")
         self.auto_levels.setToolTip(
             "Stretch the display from the frame's min to its max (linear). "
@@ -447,6 +494,7 @@ class SpotLiveView(QWidget):
             self.fit_button,
             self.one_to_one_button,
             self.draw_roi_button,
+            self.draw_edge_button,
             self.auto_levels,
             self.bayer_grey,
         ):
@@ -511,9 +559,47 @@ class SpotLiveView(QWidget):
         self._poll_error_logged = False
 
     def set_setpoint(self, xy: tuple[float, float] | None) -> None:
-        """Mark the calibrated setpoint (sensor px), or hide the ring."""
+        """Mark the zero edge point (sensor px), or hide the ring."""
         self._setpoint = xy
         self._place_setpoint()
+
+    @property
+    def edge_box(self) -> tuple[int, int, int, int] | None:
+        """The edge box on show, ``(x, y, w, h)`` in sensor px, or ``None``."""
+        return self._edge_box
+
+    def set_edge_box(self, box: tuple[int, int, int, int] | None) -> None:
+        """Show the edge box ``(x, y, w, h)`` (sensor px) as a dashed rectangle."""
+        if box is None:
+            self._edge_box = None
+            self._edge_box_item.setVisible(False)
+            return
+        x, y, w, h = (int(v) for v in box)
+        self._edge_box = (x, y, w, h)
+        self._edge_box_item.setRect(QRectF(x, y, w, h))
+        self._edge_box_item.setVisible(True)
+
+    @property
+    def draw_target(self) -> str | None:
+        """What a drag draws: ``"roi"``, ``"edge"`` or ``None`` (pan)."""
+        return self._draw_target
+
+    def set_edge_draw_mode(self, on: bool) -> None:
+        """Enter or leave Draw edge box mode (the drag emits ``edgeBoxDrawn``)."""
+        self.draw_edge_button.setChecked(bool(on))
+
+    def _on_draw_toggled(self, target: str, on: bool) -> None:
+        """Keep the two Draw buttons exclusive and the view's mode in step."""
+        if on:
+            other = self.draw_edge_button if target == "roi" else self.draw_roi_button
+            if other.isChecked():
+                other.setChecked(False)  # re-enters here with on=False
+            self._draw_target = target
+        elif self._draw_target == target:
+            self._draw_target = None
+        self.view.set_draw_mode(self._draw_target is not None)
+        if target == "edge":
+            self.edgeDrawModeChanged.emit(on)
 
     def clear(self) -> None:
         """Forget the image and overlays (the camera went away)."""
@@ -544,6 +630,7 @@ class SpotLiveView(QWidget):
         """Tell the owner; the window is reused, not destroyed."""
         self._timer.stop()
         self.draw_roi_button.setChecked(False)
+        self.draw_edge_button.setChecked(False)
         super().closeEvent(event)
         self.windowClosed.emit()
 
@@ -666,7 +753,7 @@ class SpotLiveView(QWidget):
         ]
         if frame.spot is not None:
             parts.append(
-                f"spot ({frame.spot[0]:.1f}, {frame.spot[1]:.1f})"
+                f"edge ({frame.spot[0]:.1f}, {frame.spot[1]:.1f})"
                 + ("" if frame.spot_ok else " (not ok)")
             )
         text = "  |  ".join(parts)
@@ -759,11 +846,18 @@ class SpotLiveView(QWidget):
         )
 
     # ------------------------------------------------------------------
-    # Draw ROI
+    # Draw ROI / Draw edge box
     # ------------------------------------------------------------------
 
     def _on_rect_drawn(self, p0: QPointF, p1: QPointF) -> None:
         if self._sensor is None:
+            return
+        if self._draw_target == "edge":
+            box = snap_edge_box((p0.x(), p0.y()), (p1.x(), p1.y()), self._sensor)
+            if box is None:  # a click or a sliver: stay in Draw mode
+                return
+            self.draw_edge_button.setChecked(False)
+            self.edgeBoxDrawn.emit(*box)
             return
         roi = snap_roi((p0.x(), p0.y()), (p1.x(), p1.y()), self._sensor)
         if roi is None:  # a click or a sliver: stay in Draw mode

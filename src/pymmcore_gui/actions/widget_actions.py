@@ -8,14 +8,13 @@ from typing import TYPE_CHECKING, Annotated, TypeVar, cast
 from pymmcore_plus import CMMCorePlus
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction
-from PyQt6.QtWidgets import QDialog, QWidget
+from PyQt6.QtWidgets import QDialog, QScrollArea, QWidget
 from PyQt6Ads import CDockWidget, DockWidgetArea, SideBarLocation
 
 from ._action_info import ActionKey, WidgetActionInfo, _ensure_isinstance
 
 if TYPE_CHECKING:
     import pymmcore_widgets as pmmw
-    import useq
     from PyQt6.QtCore import QObject
 
     from pymmcore_gui._main_window import MicroManagerGUI
@@ -191,24 +190,30 @@ def create_crisp_widget(parent: QWidget) -> QWidget:
     return CrispWidget(parent=parent, mmcore=_get_core(parent))
 
 
+class SpotFocusScrollArea(QScrollArea):
+    """Scroll area hosting the (tall) Spot focus lock panel in a dock."""
+
+    def __init__(self, panel: QWidget, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("SpotFocusScrollArea")
+        self.setWidgetResizable(True)
+        self._panel = panel
+        self.setWidget(panel)
+
+    @property
+    def spot_panel(self) -> QWidget:
+        """The hosted ``SpotFocusPanel``."""
+        return self._panel
+
+
 def create_image_focus_widget(parent: QWidget) -> QWidget:
-    """Create the image-based focus lock panel (source, box, calibration, status)."""
-    from pymmcore_gui.widgets._image_focus_widget import ImageFocusWidget
+    """Create the Spot focus lock panel (the only O3 focus-lock mode)."""
+    from pymmcore_gui.widgets._spot_focus_panel import SpotFocusPanel
 
-    def base_sequence() -> useq.MDASequence:
-        # What a calibration is built from: the channels and z plan being set up.
-        window = _get_mm_main_window(parent)
-        try:
-            mda = window.get_widget(WidgetAction.MDA_WIDGET, create=False)  # type: ignore[union-attr]
-        except (AttributeError, KeyError):
-            raise ValueError(
-                "Open the MDA window and set up the acquisition first."
-            ) from None
-        return mda.value()
-
-    return ImageFocusWidget(  # type: ignore[return-value]
-        _get_core(parent), parent, sequence_source=base_sequence
-    )
+    # PySide6-typed widget (pymmcore_gui._qt) vs this module's PyQt6 QWidget;
+    # the bindings are duck-type compatible at runtime.
+    panel = SpotFocusPanel(_get_core(parent))
+    return SpotFocusScrollArea(panel, parent)  # type: ignore[arg-type]
 
 
 def create_spectral_channel_config(parent: QWidget) -> QWidget:
@@ -372,7 +377,7 @@ show_crisp = WidgetActionInfo(
 
 show_image_focus = WidgetActionInfo(
     key=WidgetAction.IMAGE_FOCUS,
-    text="Image Focus Lock",
+    text="Spot Focus Lock",
     icon="mdi:image-filter-center-focus",
     create_widget=create_image_focus_widget,
     dock_area=DockWidgetArea.RightDockWidgetArea,

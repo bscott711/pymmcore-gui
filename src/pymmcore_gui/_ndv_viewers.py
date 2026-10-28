@@ -22,7 +22,6 @@ from pymmcore_gui.asi_z_stack.camera_worker_service import (
     CameraWorkerService,
     CameraWorkerServiceState,
 )
-from pymmcore_gui.asi_z_stack.image_focus_events import CALIBRATION_METADATA_KEY
 from pymmcore_gui.widgets.image_preview._pygfx_preview import PygfxPreview
 
 if TYPE_CHECKING:
@@ -720,13 +719,6 @@ class NDVViewersManager(QObject):
         self._own_handler = None
         self._mda_camera_handlers.clear()
         self._mda_camera_viewers.clear()
-
-        if CALIBRATION_METADATA_KEY in sequence.metadata:
-            # An image-focus calibration sweep: its frames are throwaway, so no
-            # viewer. Dropping the handlers above (and the active viewer) also
-            # stops _on_frame_ready writing them into the previous run's store.
-            self._active_mda_viewer = None
-            return
 
         labels = self._get_physical_camera_labels()
         if len(labels) > 1:
