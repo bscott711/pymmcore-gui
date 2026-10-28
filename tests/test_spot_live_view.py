@@ -16,6 +16,7 @@ from pymmcore_gui._qt.QtGui import QPainter
 from pymmcore_gui.asi_z_stack.spot_frame_shm import LiveFrame
 from pymmcore_gui.widgets._spot_live_view import (
     SpotLiveView,
+    bayer_to_grey,
     frame_to_qimage,
     snap_roi,
 )
@@ -130,6 +131,68 @@ def test_qimage_formats_and_levels() -> None:
     assert flat.pixelColor(0, 0).red() == 0  # constant frame: no divide by zero
 
 
+def _rggb_mosaic(
+    h: int, w: int, dtype: type = np.uint8, blob: bool = False, top: int = 255
+) -> np.ndarray:
+    """A synthetic RGGB mosaic: colour gains tiled, optionally under a blob."""
+    # sites (0,0) (0,1) (1,0) (1,1), like the rig's 118 / 167 / 167 / 58 under white
+    gains = np.tile(np.array([[118.0, 167.0], [167.0, 58.0]]) / 255.0, (h // 2, w // 2))
+    if blob:
+        yy, xx = np.mgrid[0:h, 0:w]
+        gains = gains * np.exp(
+            -(((xx - w / 2) / (w / 6)) ** 2 + ((yy - h / 2) / (h / 6)) ** 2) / 2
+        )
+    return np.rint(gains * top).astype(dtype)
+
+
+def _sublattice_means(a: np.ndarray) -> list[float]:
+    return [float(a[i::2, j::2].mean()) for i in (0, 1) for j in (0, 1)]
+
+
+@pytest.mark.parametrize("dtype,top", [(np.uint8, 255), (np.uint16, 65535)])
+def test_bayer_to_grey_flat_colour_is_constant(dtype: type, top: int) -> None:
+    mosaic = _rggb_mosaic(32, 48, dtype, top=top)
+    out = bayer_to_grey(mosaic)
+    assert out.shape == mosaic.shape and out.dtype == mosaic.dtype
+    inner = out[2:-2, 2:-2].astype(np.float64)
+    assert inner.std() < 1e-9  # the 2x2 cell is gone
+    # R:G:B = 1:2:1 weighting of the same cell
+    assert inner.mean() == pytest.approx(mosaic.mean(), abs=top / 255)
+    assert mosaic[2:-2, 2:-2].astype(np.float64).std() > 0.1 * top / 4  # was a mosaic
+
+
+@pytest.mark.parametrize("dtype,top", [(np.uint8, 255), (np.uint16, 65535)])
+def test_bayer_to_grey_kills_nyquist_power(dtype: type, top: int) -> None:
+    mosaic = _rggb_mosaic(192, 256, dtype, blob=True, top=top)
+    out = bayer_to_grey(mosaic)
+    assert out.shape == mosaic.shape and out.dtype == mosaic.dtype
+    h, w = mosaic.shape
+
+    def nyquist_power(a: np.ndarray) -> list[float]:
+        f = np.abs(np.fft.fft2(a.astype(np.float64))) ** 2
+        return [float(f[h // 2, w // 2]), float(f[h // 2, 0]), float(f[0, w // 2])]
+
+    before, after = nyquist_power(mosaic), nyquist_power(out)
+    assert before[0] > 0  # the CFA put energy at (h/2, w/2)
+    for b, a in zip(before, after, strict=True):
+        assert a <= 0.01 * max(b, 1.0)
+    assert after[0] < 1e-3 * before[0]
+
+
+def test_bayer_to_grey_is_fast_enough_and_rejects_3d() -> None:
+    import time
+
+    img = _rggb_mosaic(1536, 2048)
+    bayer_to_grey(img)  # warm up
+    t0 = time.perf_counter()
+    for _ in range(5):
+        bayer_to_grey(img)
+    per_frame = (time.perf_counter() - t0) / 5
+    assert per_frame < 0.25  # generous; ~10-20 ms measured, 12 fps needs < 80 ms
+    with pytest.raises(ValueError):
+        bayer_to_grey(np.zeros((2, 2, 3), np.uint8))
+
+
 # ---------------------------------------------------------------------------
 # drawing
 # ---------------------------------------------------------------------------
@@ -144,7 +207,12 @@ def test_roi_frame_drawn_at_offset_and_native_size(view: SpotLiveView) -> None:
     assert view.sensor == SENSOR
     rect = view.scene.sceneRect()
     assert (rect.width(), rect.height()) == SENSOR
-    # no smoothing: zoomed pixels stay hard-edged
+    # the sensor was fitted to the window (zoom < 1): resampled smoothly ...
+    assert view.zoom < 1.0
+    assert view.view.renderHints() & QPainter.RenderHint.SmoothPixmapTransform
+    assert item.transformationMode() == Qt.TransformationMode.SmoothTransformation
+    # ... but at 1:1 the pixels stay hard-edged
+    view.one_to_one()
     assert not (view.view.renderHints() & QPainter.RenderHint.SmoothPixmapTransform)
     assert item.transformationMode() == Qt.TransformationMode.FastTransformation
 
@@ -223,6 +291,7 @@ def test_stats_signal(qtbot: QtBot, view: SpotLiveView) -> None:
 
 
 def test_auto_levels_rebuilds_the_pixmap(view: SpotLiveView) -> None:
+    view.bayer_grey.setChecked(False)  # this test is about raw levels
     view.show_frame(make_frame(roi=(0, 0, 8, 8), fill=40))
     before = view.pixmap_item.pixmap().toImage().pixelColor(0, 0).red()
     assert before == 40  # fixed levels: 0..255 untouched
@@ -233,6 +302,67 @@ def test_auto_levels_rebuilds_the_pixmap(view: SpotLiveView) -> None:
     img = view.pixmap_item.pixmap().toImage()
     assert img.pixelColor(0, 0).red() == 0
     assert img.pixelColor(1, 1).red() == 255
+
+
+def _mosaic_frame(roi: tuple[int, int, int, int] = (0, 0, 64, 48)) -> LiveFrame:
+    x, y, w, h = roi
+    frame = make_frame(roi=roi, fill=0)
+    frame.image[:] = _rggb_mosaic(h, w)
+    return frame
+
+
+def test_bayer_to_grey_checkbox_controls_the_pixmap(view: SpotLiveView) -> None:
+    assert view.bayer_grey.isChecked()  # the rig sensor is colour: default on
+    frame = _mosaic_frame()
+    view.show_frame(frame)
+    img = view.pixmap_item.pixmap().toImage()
+    assert (img.width(), img.height()) == (64, 48)  # still native size
+    grey = np.array(
+        [[img.pixelColor(x, y).red() for x in range(64)] for y in range(48)]
+    )
+    inner = grey[2:-2, 2:-2]
+    means = _sublattice_means(inner)
+    assert max(means) - min(means) < 1.0  # no period-2 checker left
+    # the raw values (pixel readout) are untouched
+    assert view.pixel_at(0, 0) == int(frame.image[0, 0])
+    assert view.frame is not None and np.array_equal(
+        view.frame.image, _rggb_mosaic(48, 64)
+    )
+
+    view.bayer_grey.setChecked(False)  # re-runs _redraw: raw mosaic shown
+    img = view.pixmap_item.pixmap().toImage()
+    raw = np.array([[img.pixelColor(x, y).red() for x in range(64)] for y in range(48)])
+    assert np.array_equal(raw, frame.image)
+    means = _sublattice_means(raw[2:-2, 2:-2])
+    assert max(means) - min(means) > 50
+
+
+def test_resampling_follows_the_zoom(view: SpotLiveView) -> None:
+    smooth = QPainter.RenderHint.SmoothPixmapTransform
+    view.show_frame(make_frame())  # full 2048x1536 sensor in 900x700
+    view.fit()
+    assert view.zoom < 1.0
+    assert view.view.renderHints() & smooth
+    assert (
+        view.pixmap_item.transformationMode()
+        == Qt.TransformationMode.SmoothTransformation
+    )
+
+    view.one_to_one()
+    assert not (view.view.renderHints() & smooth)
+    assert (
+        view.pixmap_item.transformationMode()
+        == Qt.TransformationMode.FastTransformation
+    )
+
+    view.view.zoom_by(0.5)  # wheel out below 100%: smooth again
+    assert view.view.renderHints() & smooth
+    view.view.zoom_by(8.0)  # wheel in past 100%: crisp pixels
+    assert not (view.view.renderHints() & smooth)
+    assert (
+        view.pixmap_item.transformationMode()
+        == Qt.TransformationMode.FastTransformation
+    )
 
 
 # ---------------------------------------------------------------------------

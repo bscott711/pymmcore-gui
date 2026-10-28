@@ -4,8 +4,12 @@ The user aligns the laser spot, places the ROI and sets the exposure with this
 window, so it shows the camera at **full resolution**: a
 :class:`~pymmcore_gui._qt.QtWidgets.QGraphicsView` whose scene is the sensor,
 with each frame drawn as a pixmap item at its ROI offset, one image pixel per
-scene unit. Nothing is downsampled; when zoomed in, pixels are drawn
-nearest-neighbour (``SmoothPixmapTransform`` off).
+scene unit. Nothing is downsampled by us; at 100% and above pixels are drawn
+nearest-neighbour (``SmoothPixmapTransform`` off), below 100% the view
+resamples smoothly (bilinear) so a fine pattern does not alias into Moire.
+The rig camera is a colour sensor read as raw Bayer, so by default the display
+(only) averages each 2x2 colour cell with a ``[1, 2, 1]`` binomial filter
+(:func:`bayer_to_grey`); the pixel readout and spot detection stay raw.
 
 Frames come from the service (:meth:`SpotFocusService.latest_frame`, a shared
 memory read) on a 30 Hz timer; the scene is repainted only when ``seq``
@@ -103,6 +107,46 @@ def snap_roi(
     if x1 - x0 < MIN_ROI_PX or y1 - y0 < MIN_ROI_PX:
         return None
     return x0, y0, x1 - x0, y1 - y0
+
+
+def bayer_to_grey(image: np.ndarray) -> np.ndarray:
+    """Collapse a raw Bayer mosaic to grey for display, same shape and dtype.
+
+    Applies the separable binomial filter ``[1, 2, 1] / 4`` along rows and
+    columns (the 3x3 kernel ``[[1, 2, 1], [2, 4, 2], [1, 2, 1]] / 16``) with
+    edge-replicated borders and rounds back to the input dtype. The kernel has
+    zero response on the Nyquist row and column, so it removes a 2x2 colour
+    filter modulation exactly for every Bayer order, is centred (no half-pixel
+    shift) and weights each output pixel R:G:B as 1:2:1.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        2-D raw frame (``uint8``, ``uint16`` or any other real dtype).
+
+    Returns
+    -------
+    np.ndarray
+        The filtered frame, same shape and dtype as *image*.
+    """
+    img = np.asarray(image)
+    if img.ndim != 2:
+        raise ValueError(f"expected a 2-D frame, got shape {img.shape}")
+    if img.dtype.kind == "u" and img.dtype.itemsize <= 2:
+        # 16 * max fits uint16 for 8-bit data, uint32 for 16-bit data
+        work = np.uint16 if img.dtype.itemsize == 1 else np.uint32
+        p: Any = np.pad(img, 1, mode="edge").astype(work)
+        h = p[:, :-2] + 2 * p[:, 1:-1] + p[:, 2:]
+        v = h[:-2] + 2 * h[1:-1] + h[2:]
+        out: np.ndarray = ((v + 8) >> 4).astype(img.dtype)
+        return out
+    q: Any = np.pad(img, 1, mode="edge").astype(np.float32)
+    g = q[:, :-2] + 2 * q[:, 1:-1] + q[:, 2:]
+    w = (g[:-2] + 2 * g[1:-1] + g[2:]) / np.float32(16)
+    if img.dtype.kind in "ui":
+        w = np.rint(w)
+    res: np.ndarray = w.astype(img.dtype)
+    return res
 
 
 def frame_to_qimage(
@@ -388,6 +432,15 @@ class SpotLiveView(QWidget):
             "Off: fixed 0 to full scale."
         )
         self.auto_levels.toggled.connect(lambda _: self._redraw())
+        self.bayer_grey = QCheckBox("Bayer to grey")
+        self.bayer_grey.setChecked(True)
+        self.bayer_grey.setToolTip(
+            "Average each 2x2 colour (Bayer) cell for display so the colour mosaic "
+            "does not show as a grid. Pixel readout and spot detection still use "
+            "the raw sensor values. Turn off for a mono camera or to see the raw "
+            "mosaic."
+        )
+        self.bayer_grey.toggled.connect(lambda _: self._redraw())
         self.zoom_label = QLabel("")
         bar = QHBoxLayout()
         for w in (
@@ -395,6 +448,7 @@ class SpotLiveView(QWidget):
             self.one_to_one_button,
             self.draw_roi_button,
             self.auto_levels,
+            self.bayer_grey,
         ):
             bar.addWidget(w)
         bar.addStretch()
@@ -552,8 +606,11 @@ class SpotLiveView(QWidget):
         frame = self._frame
         if frame is None:
             return
+        image = frame.image
+        if self.bayer_grey.isChecked():
+            image = bayer_to_grey(image)  # display only; frame.image stays raw
         qimg, self._buf = frame_to_qimage(
-            frame.image, int(frame.bits), self.auto_levels.isChecked()
+            image, int(frame.bits), self.auto_levels.isChecked()
         )
         roi_x, roi_y = int(frame.roi[0]), int(frame.roi[1])
         self._pixmap_item.setPixmap(QPixmap.fromImage(qimg))
@@ -687,7 +744,19 @@ class SpotLiveView(QWidget):
 
     def _update_zoom_label(self) -> None:
         dpr = max(self.devicePixelRatioF(), 1.0)
-        self.zoom_label.setText(f"{self.zoom * dpr * 100:.0f}%")
+        device_zoom = self.zoom * dpr
+        self.zoom_label.setText(f"{device_zoom * 100:.0f}%")
+        self._update_resampling(device_zoom)
+
+    def _update_resampling(self, device_zoom: float) -> None:
+        """Smooth (bilinear) below 100% device zoom, nearest-neighbour otherwise."""
+        smooth = device_zoom < 1.0 - 1e-6  # 1:1 under a dpr scale rounds to ~1
+        self.view.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, smooth)
+        self._pixmap_item.setTransformationMode(
+            Qt.TransformationMode.SmoothTransformation
+            if smooth
+            else Qt.TransformationMode.FastTransformation
+        )
 
     # ------------------------------------------------------------------
     # Draw ROI

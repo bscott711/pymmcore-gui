@@ -208,7 +208,15 @@ frames.
   - Camera errors show in the panel's fault label.
 - **Live view** (`widgets/_spot_live_view.py`), a separate resizable top-level window titled "Spot camera":
   - It is a QGraphicsView whose scene is the sensor. Each frame is drawn at native resolution at its ROI offset.
-  - Wheel zooms around the cursor, left-drag pans, and there are **Fit** and **1:1** buttons. Smooth scaling is off.
+  - Wheel zooms around the cursor, left-drag pans, and there are **Fit** and
+    **1:1** buttons. Pixels are nearest-neighbour at 100% and above; below
+    100% the view resamples smoothly (bilinear).
+  - **Bayer to grey** (default on): the camera is a colour sensor read as raw
+    Bayer, so for display only each pixel is replaced by the
+    `[1, 2, 1] x [1, 2, 1] / 16` average of its 3x3 neighbourhood, which
+    cancels the 2x2 colour mosaic (otherwise it aliases into a Moire grid at
+    fractional zoom). The pixel readout and spot detection use the raw
+    values. Turn it off for a mono camera or to inspect the raw mosaic.
   - **Draw ROI** mode: dragging a rectangle (snapped to even ints, clamped to the sensor) emits
     `roiDrawn(x, y, w, h)`. The panel fills its ROI spins and applies them.
   - Overlays: the sensor outline, the current ROI, the spot (a cross) and the calibrated setpoint (a circle).
