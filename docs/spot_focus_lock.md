@@ -251,9 +251,14 @@ old params are ignored (`SpotLoopParams.from_dict`, settings `extra="ignore"`).
   edge is still inside the box, so the loop walks back without any search.
 - **Anti-windup.** The integral only accumulates when the step is not clamped
   and the error is inside the linear range.
-- **Range.** A target outside [`p_min_um`, `p_max_um`] or more than
-  `max_excursion_um` (5) from the lock's start P sets a fault and no move is
-  sent.
+- **Range.** A target more than `max_excursion_um` (5) from the lock's start P
+  sets a fault and no move is sent; this is the primary guard, since the real
+  piezo P can be negative (about -45 um on the rig). `p_min_um` / `p_max_um`
+  are optional absolute bounds (None = unknown, not checked). On Start the
+  service reads the piezo's `Position` property limits once, if the device
+  exposes them and they contain the start P, and fills the bounds; a missing
+  or unreadable limit never faults. A fault names the target, the range and
+  the start P.
 - **Per-frame checks** (`check_fix(fix, cal, params)`, empty string when fine):
   - the fix is not ok (edge lost, saturated, left the box, outside the ROI);
   - `|angle - cal.angle_deg| > max_angle_change_deg` (5): "edge rotated; the
@@ -313,8 +318,8 @@ old params are ignored (`SpotLoopParams.from_dict`, settings `extra="ignore"`).
   - frame checks: `min_contrast` 10.0, `max_saturated_frac` 0.002,
     `min_valid_fraction` 0.5, `max_angle_change_deg` 5.0,
     `max_edge_residual_px` 3.0;
-  - range: `p_min_um` 0.0, `p_max_um` 150.0, `max_excursion_um` 5.0 (from the
-    start P).
+  - range: `max_excursion_um` 5.0 (from the start P); `p_min_um` and
+    `p_max_um` None (no absolute bound unless set or read at Start).
 - `SpotFocusController(params, p_start_um, *, linear_range_um=None)`:
   `update(along_um, now_s) -> float | None` returns the new target P or None;
   `bad(reason)` counts a strike; `good()` resets it. Properties: `p_cmd_um`,

@@ -597,10 +597,25 @@ class SpotLoopParamsSettings(BaseModel):
     min_valid_fraction: float = 0.5
     max_angle_change_deg: float = 5.0
     max_edge_residual_px: float = 3.0
-    p_min_um: float = 0.0
-    p_max_um: float = 150.0
+    p_min_um: float | None = None
+    p_max_um: float | None = None
     max_excursion_um: float = 5.0
     strikes: int = 5
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_legacy_range(cls, data: Any) -> Any:
+        """Files written with the old 0..150 um default load as "no range".
+
+        The real piezo P runs negative, so that default faulted a healthy lock.
+        """
+        if (
+            isinstance(data, dict)
+            and data.get("p_min_um") == 0.0
+            and data.get("p_max_um") == 150.0
+        ):
+            data = {**data, "p_min_um": None, "p_max_um": None}
+        return data
 
     def to_params(self) -> "SpotLoopParams":
         """Return the numpy-only parameters the spot loop works with."""

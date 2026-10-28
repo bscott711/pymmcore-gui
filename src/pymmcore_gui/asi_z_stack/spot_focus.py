@@ -714,8 +714,10 @@ class SpotLoopParams:
     min_valid_fraction: float = 0.5
     max_angle_change_deg: float = 5.0
     max_edge_residual_px: float = 3.0
-    p_min_um: float = 0.0
-    p_max_um: float = 150.0
+    p_min_um: float | None = None
+    """Lowest allowed absolute P; None = no absolute lower bound known."""
+    p_max_um: float | None = None
+    """Highest allowed absolute P; None = no absolute upper bound known."""
     max_excursion_um: float = 5.0
     """Largest allowed distance of the commanded P from the start P."""
     strikes: int = 5
@@ -742,7 +744,8 @@ class SpotFocusController:
     and the error is inside the calibrated linear range. Beyond the linear
     range the sign of the error is still right, so the step is a full
     ``-sign(e) * max_step_um`` (no search needed). A target outside the piezo
-    range or further than ``max_excursion_um`` from the start sets
+    range (only the bounds that are set) or further than ``max_excursion_um``
+    from the start sets
     :attr:`fault` instead of moving, and after a fault :meth:`update` never
     returns a target again.
 
@@ -814,13 +817,20 @@ class SpotFocusController:
             if step == raw:  # anti-windup: only integrate unclamped steps
                 self._integral = integral
         target = self._p_cmd + step
-        if not p.p_min_um <= target <= p.p_max_um:
-            self._fault = f"range limit: target {target:.2f} um outside piezo range"
+        lo, hi = p.p_min_um, p.p_max_um
+        if (lo is not None and target < lo) or (hi is not None and target > hi):
+            lo_t = "-inf" if lo is None else f"{lo:g}"
+            hi_t = "inf" if hi is None else f"{hi:g}"
+            self._fault = (
+                f"range limit: target {target:.2f} um outside piezo range "
+                f"[{lo_t}, {hi_t}] um (start P {self.p_start_um:.2f} um)"
+            )
             return None
         if abs(target - self.p_start_um) > p.max_excursion_um:
             self._fault = (
                 f"range limit: target {target:.2f} um is more than "
-                f"{p.max_excursion_um:g} um from the start"
+                f"{p.max_excursion_um:g} um from the start P "
+                f"{self.p_start_um:.2f} um"
             )
             return None
         self._p_cmd = target

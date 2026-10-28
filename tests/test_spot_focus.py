@@ -615,6 +615,7 @@ def test_range_fault_and_excursion_fault():
     near = SpotFocusController(SpotLoopParams(p_min_um=0.0, max_step_um=0.5), 0.2)
     assert near.update(+1.0, 0.0) is None
     assert near.fault and "range" in near.fault
+    assert "[0, inf]" in near.fault and "start P 0.20 um" in near.fault
     assert near.update(-1.0, 10.0) is None  # stays dead after a fault
     assert near.n_moves == 0
 
@@ -627,6 +628,41 @@ def test_range_fault_and_excursion_fault():
     assert far.fault and "start" in far.fault
     assert far.p_cmd_um <= 51.0 + 1e-9
     assert far.n_moves == 2  # 0.5 + 0.5, the third would exceed 1 um
+
+
+def test_negative_start_p_is_not_a_range_fault():
+    # Regression: the rig's piezo P is about -45.5 um; the old 0..150 default
+    # faulted the first correction with "outside piezo range".
+    p = SpotLoopParams(deadband_um=0.0, kp=1.0, ki=0.0)
+    assert p.p_min_um is None and p.p_max_um is None
+    ctrl = SpotFocusController(p, -45.5)
+    assert ctrl.update(+0.02, 0.0) == pytest.approx(-45.52)
+    assert ctrl.fault is None and ctrl.n_moves == 1
+
+
+def test_excursion_fault_names_the_start_p():
+    p = SpotLoopParams(max_excursion_um=1.0, max_step_um=0.5, ki=0.0)
+    ctrl = SpotFocusController(p, -45.5)
+    t = 0.0
+    while ctrl.fault is None and t < 100:
+        ctrl.update(-5.0, t)
+        t += 1.0
+    assert ctrl.fault is not None
+    assert "target -44.00 um" in ctrl.fault  # the third step
+    assert "more than 1 um from the start P -45.50 um" in ctrl.fault
+
+
+def test_explicit_limits_fault_with_the_range_in_the_message():
+    p = SpotLoopParams(p_min_um=-100.0, p_max_um=0.0, max_excursion_um=500.0)
+    ctrl = SpotFocusController(p, -99.8)
+    assert ctrl.update(+1.0, 0.0) is None  # -99.8 - 0.5 = -100.3 < -100
+    assert ctrl.fault is not None
+    assert "[-100" in ctrl.fault and "start P -99.80 um" in ctrl.fault
+    # Only the set bound is checked.
+    half = SpotFocusController(SpotLoopParams(p_max_um=-45.0), -45.5)
+    assert half.update(-1.0, 0.0) == pytest.approx(-45.0)  # a +0.5 step
+    assert half.update(-1.0, 1.0) is None
+    assert "[-inf, -45]" in (half.fault or "")
 
 
 def test_strikes_and_good_reset():

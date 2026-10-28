@@ -21,6 +21,7 @@ import logging
 import math
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any
@@ -202,6 +203,7 @@ class SpotFocusService:
         if not self.wait_ready():
             raise RuntimeError("spot focus worker did not become ready")
         p_start = float(self._mmc.getPosition(self._piezo))
+        params = self._with_travel_limits(params, p_start)
         self.led_on(led_intensity, owner="lock", force_ready=True)
         self._last_fault = None
         self._moves.clear()
@@ -214,6 +216,48 @@ class SpotFocusService:
                 "p_start_um": p_start,
             }
         )
+
+    def _with_travel_limits(
+        self, params: SpotLoopParams, p_start: float
+    ) -> SpotLoopParams:
+        """Fill missing absolute P limits from the device, once, at start.
+
+        Only when *params* has neither bound. Reads the ``Position`` property
+        limits if the piezo exposes them (a one-time read, like ``getPosition``;
+        nothing is polled while locked). Any failure, a missing property or a
+        range that does not contain *p_start* leaves the bounds at None: a
+        missing limit source never faults the lock, and the excursion limit
+        from the start P remains the guard.
+        """
+        if params.p_min_um is not None or params.p_max_um is not None:
+            return params
+        mmc, label = self._mmc, self._piezo
+        try:
+            for prop in ("Position", "Position(um)"):
+                if not (
+                    mmc.hasProperty(label, prop) and mmc.hasPropertyLimits(label, prop)
+                ):
+                    continue
+                lo = float(mmc.getPropertyLowerLimit(label, prop))
+                hi = float(mmc.getPropertyUpperLimit(label, prop))
+                if math.isfinite(lo) and math.isfinite(hi) and lo <= p_start <= hi:
+                    logger.info(
+                        "Spot focus: using %s.%s limits [%g, %g] um (start P %.2f um).",
+                        label,
+                        prop,
+                        lo,
+                        hi,
+                        p_start,
+                    )
+                    return replace(params, p_min_um=lo, p_max_um=hi)
+        except Exception:
+            logger.debug("Could not read the piezo limits.", exc_info=True)
+        logger.info(
+            "Spot focus: no piezo travel limits found; guarding by the "
+            "excursion limit from the start P %.2f um.",
+            p_start,
+        )
+        return params
 
     def stop(self) -> None:
         """Stop the loop and restore CRISP. Never moves P.

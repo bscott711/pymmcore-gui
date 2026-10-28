@@ -267,6 +267,67 @@ def test_run_ends_stopped_and_worker_exits(closed_loop: dict) -> None:
     assert _wait(lambda: _gone(closed_loop["proc"]), 5.0)
 
 
+def test_lock_at_a_negative_p_moves_without_a_range_fault() -> None:
+    # Regression: the rig's P is about -45.5 um; the old 0..150 um default
+    # faulted the first correction with "range limit ... outside piezo range".
+    p_start = -45.5
+    mmc = FakeMMC()
+    mmc.pos[P_LABEL] = p_start
+    cal_like = {**CAL, "p0_um": p_start}
+    faults: list[str] = []
+    with _service(mmc, cal_like=cal_like, drift_um_per_s=DRIFT_UM_S) as svc:
+        svc.fault.connect(faults.append)
+        assert svc.wait_ready()
+        svc.start(_params(), _cal(p0_um=p_start))
+        assert _wait(lambda: len(mmc.sets) >= 3 or bool(faults), 8.0)
+        state = svc.current_state
+        svc.stop()
+    assert not faults, faults
+    assert state == "running"
+    assert len(mmc.sets) >= 3
+    assert all(p_start - 5.0 <= t < p_start for _, t in mmc.sets)
+
+
+class _LimitMMC:
+    def __init__(self, lo: float, hi: float, *, broken: bool = False) -> None:
+        self.lo, self.hi, self.broken = lo, hi, broken
+
+    def hasProperty(self, label: str, prop: str) -> bool:
+        if self.broken:
+            raise RuntimeError("no such device")
+        return prop == "Position"
+
+    def hasPropertyLimits(self, label: str, prop: str) -> bool:
+        return True
+
+    def getPropertyLowerLimit(self, label: str, prop: str) -> float:
+        return self.lo
+
+    def getPropertyUpperLimit(self, label: str, prop: str) -> float:
+        return self.hi
+
+
+@pytest.mark.parametrize(
+    ("mmc", "expect"),
+    [
+        (_LimitMMC(-100.0, 0.0), (-100.0, 0.0)),
+        (_LimitMMC(0.0, 150.0), (None, None)),  # would exclude the start P
+        (_LimitMMC(-100.0, 0.0, broken=True), (None, None)),
+        (FakeMMC(), (None, None)),  # no limit API at all
+    ],
+)
+def test_service_reads_limits_once_and_never_excludes_the_start_p(
+    mmc: Any, expect: tuple
+) -> None:
+    me = types.SimpleNamespace(_mmc=mmc, _piezo=P_LABEL)
+    out = SpotFocusService._with_travel_limits(me, SpotLoopParams(), -45.5)  # type: ignore[arg-type]
+    assert (out.p_min_um, out.p_max_um) == expect
+    # Explicit limits are never overridden.
+    own = SpotLoopParams(p_min_um=-60.0, p_max_um=-30.0)
+    kept = SpotFocusService._with_travel_limits(me, own, -45.5)  # type: ignore[arg-type]
+    assert kept is own
+
+
 def test_killing_the_worker_faults_and_stops_moves() -> None:
     mmc = FakeMMC()
     faults: list[str] = []
@@ -665,6 +726,24 @@ def _next_frame(svc: SpotFocusService, last: int | None, timeout: float = 8.0):
     return out[0]
 
 
+def _poll_frame(svc: SpotFocusService, ok, timeout: float = 5.0):
+    """The newest frame once it satisfies *ok*.
+
+    ``latest_frame`` is None whenever the writer holds the slot for the whole
+    read (documented), so a bare ``svc.latest_frame().spot`` is a race.
+    """
+    out: list = []
+
+    def got() -> bool:
+        f = svc.latest_frame()
+        if f is not None and ok(f):
+            out.append(f)
+        return bool(out)
+
+    assert _wait(got, timeout, 0.005), "no matching frame"
+    return out[0]
+
+
 def test_ready_info_carries_the_camera_contract() -> None:
     mmc = FakeMMC()
     with _service(mmc) as svc:
@@ -714,26 +793,27 @@ def test_preview_delivers_frames_and_the_overlay_sits_on_the_edge() -> None:
         assert f.max_value == int(f.image.max()) > 800
         # No edge box, no overlay.
         assert all(fr.spot is None for fr in frames)
-        # With a box the overlay is the edge point, in sensor pixels.
+        # With a box the overlay is the edge point, in sensor pixels. A read
+        # may return None while the writer holds the slot, so poll for a frame.
         svc.set_edge_box(BOX)
-        assert _wait(lambda: (svc.latest_frame().spot is not None), 5.0)
-        x, y = svc.latest_frame().spot
+        spot_frame = _poll_frame(svc, lambda fr: fr.spot is not None)
+        x, y = spot_frame.spot
         assert x == pytest.approx(EDGE_X, abs=1.0)
         assert y == pytest.approx(BOX_CENTER_Y, abs=1.0)
-        assert svc.latest_frame().spot_ok
+        assert spot_frame.spot_ok
         assert svc.current_state == "preview"
         assert "preview" in states
         assert _wait(lambda: svc.last_telemetry is not None, 5.0)
         assert svc.last_telemetry["edge_px"] == pytest.approx(EDGE_X, abs=1.0)
         # Clearing the box removes the overlay again.
         svc.set_edge_box(None)
-        assert _wait(lambda: svc.latest_frame().spot is None, 5.0)
+        _poll_frame(svc, lambda fr: fr.spot is None)
         # Off: the worker stops writing.
         svc.stop_preview()
         assert svc.preview_active is False
         assert _wait(lambda: svc.current_state == "idle", 5.0)
         time.sleep(0.3)
-        last = svc.latest_frame().seq
+        last = _poll_frame(svc, lambda fr: True).seq
         time.sleep(0.4)
         assert svc.latest_frame(last) is None
 
@@ -790,7 +870,7 @@ def test_roi_change_moves_the_frame_roi_and_keeps_sensor_coordinates() -> None:
             lambda: (f := svc.latest_frame()) is not None and f.roi == (0, 0, 640, 480),
             8.0,
         )
-        assert svc.latest_frame().image.shape == (480, 640)
+        assert _poll_frame(svc, lambda fr: True).image.shape == (480, 640)
         assert svc.camera_info["roi"] == (0, 0, 640, 480)
 
 
@@ -830,7 +910,7 @@ def test_exposure_gain_and_channel_apply_live() -> None:
         assert _wait(lambda: svc.camera_info["exposure_ms"] == 40.0, 5.0)
         assert svc.camera_info["gain"] == 200
         assert svc.camera_info["channel"] == "red"
-        assert _wait(lambda: svc.latest_frame().max_value > 3 * before.max_value, 5.0)
+        _poll_frame(svc, lambda fr: fr.max_value > 3 * before.max_value)
         # Limits are the camera's: out-of-range requests are clamped.
         svc.set_camera(exposure_ms=1e9, gain=1)
         assert _wait(lambda: svc.camera_info["exposure_ms"] == 15000.0, 5.0)
