@@ -405,6 +405,35 @@ def test_timer_polls_and_repaints_only_new_frames(
     )
 
 
+def test_polling_can_be_switched_off_while_visible(view: SpotLiveView) -> None:
+    assert view.polling and view._timer.isActive()
+    view.set_polling(False)
+    assert not view.polling and not view._timer.isActive()
+    view.hide()
+    view.show()  # showing does not restart a disabled timer
+    assert not view._timer.isActive()
+    view.set_polling(True)
+    assert view._timer.isActive()
+    view.hide()
+    assert not view._timer.isActive()
+
+
+def test_view_can_be_a_child_and_a_window_again(qtbot: QtBot) -> None:
+    from pymmcore_gui._qt.QtWidgets import QVBoxLayout, QWidget
+
+    host = QWidget()
+    qtbot.addWidget(host)  # owns the view below
+    view = SpotLiveView()
+    QVBoxLayout(host).addWidget(view)  # docked: a child of the host
+    host.show()
+    assert not view.isWindow() and view.window() is host
+    assert view._timer.isActive()
+    zoom_before = view.zoom
+    view.setParent(host, Qt.WindowType.Window)  # floated again, same scene
+    view.show()
+    assert view.isWindow() and view.zoom == pytest.approx(zoom_before)
+
+
 def test_stats_signal(qtbot: QtBot, view: SpotLiveView) -> None:
     with qtbot.waitSignal(view.statsChanged, timeout=1000) as sig:
         view.show_frame(make_frame(fill=200))

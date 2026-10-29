@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Annotated, TypeVar, cast
 from pymmcore_plus import CMMCorePlus
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction
-from PyQt6.QtWidgets import QDialog, QScrollArea, QWidget
+from PyQt6.QtWidgets import QDialog, QFrame, QScrollArea, QWidget
 from PyQt6Ads import CDockWidget, DockWidgetArea, SideBarLocation
 
 from ._action_info import ActionKey, WidgetActionInfo, _ensure_isinstance
@@ -191,11 +191,17 @@ def create_crisp_widget(parent: QWidget) -> QWidget:
 
 
 class SpotFocusScrollArea(QScrollArea):
-    """Scroll area hosting the (tall) Spot focus lock panel in a dock."""
+    """Hosts the Spot focus lock panel in a dock.
+
+    The panel scrolls its own controls under a fixed live view, so this area only
+    steps in (scroll bars as needed, no frame) when the dock is smaller than the
+    panel's minimum size.
+    """
 
     def __init__(self, panel: QWidget, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("SpotFocusScrollArea")
+        self.setFrameShape(QFrame.Shape.NoFrame)
         self.setWidgetResizable(True)
         self._panel = panel
         self.setWidget(panel)

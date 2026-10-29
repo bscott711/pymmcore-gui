@@ -347,7 +347,11 @@ class _View(QGraphicsView):
 
 
 class SpotLiveView(QWidget):
-    """The "Spot camera" window: full-resolution live view with overlays.
+    """The "Spot camera" view: full-resolution live image with overlays.
+
+    It starts as a top-level window; its owner may re-parent it as a child
+    (docked) and back. The poll timer runs while the view is visible and
+    polling is enabled (:meth:`set_polling`, on by default).
 
     Parameters
     ----------
@@ -355,7 +359,7 @@ class SpotLiveView(QWidget):
         Anything with ``latest_frame(last_seq) -> LiveFrame | None``; set later
         with :meth:`set_service`.
     parent : QWidget | None
-        Owner (the window stays top-level).
+        Owner (the view starts top-level).
     """
 
     #: ``(x, y, w, h)`` drawn in Draw ROI mode (even, clamped to the sensor).
@@ -368,7 +372,7 @@ class SpotLiveView(QWidget):
     edgeDrawModeChanged = Signal(bool)
     #: Draw edge box 2 mode was switched on or off.
     edge2DrawModeChanged = Signal(bool)
-    #: The window was closed by the user.
+    #: The view was closed (by the user, when it is its own window).
     windowClosed = Signal()
     #: ``(fps, max_value, saturated_percent)`` a few times a second.
     statsChanged = Signal(float, int, float)
@@ -393,6 +397,7 @@ class SpotLiveView(QWidget):
         self._draw_target: str | None = None  # "roi" / "edge" / "edge2" / None
         self._cursor: QPointF | None = None
         self._poll_error_logged = False
+        self._polling = True
         self.fps = 0.0
         self._fps_mark: tuple[int, float] | None = None
         self._last_new = 0.0
@@ -539,19 +544,23 @@ class SpotLiveView(QWidget):
         )
         self.bayer_grey.toggled.connect(lambda _: self._redraw())
         self.zoom_label = QLabel("")
-        bar = QHBoxLayout()
+        # Two rows: the view also lives in a narrow dock, where one row of all the
+        # controls would force the dock wide.
+        draw_bar = QHBoxLayout()
         for w in (
             self.fit_button,
             self.one_to_one_button,
             self.draw_roi_button,
             self.draw_edge_button,
             self.draw_edge2_button,
-            self.auto_levels,
-            self.bayer_grey,
         ):
-            bar.addWidget(w)
-        bar.addStretch()
-        bar.addWidget(self.zoom_label)
+            draw_bar.addWidget(w)
+        draw_bar.addStretch()
+        display_bar = QHBoxLayout()
+        display_bar.addWidget(self.auto_levels)
+        display_bar.addWidget(self.bayer_grey)
+        display_bar.addStretch()
+        display_bar.addWidget(self.zoom_label)
 
         self.status_label = QLabel("Waiting for the camera...")
         self.status_label.setTextFormat(Qt.TextFormat.PlainText)
@@ -560,7 +569,8 @@ class SpotLiveView(QWidget):
         self.cursor_label.setMinimumWidth(10)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
-        layout.addLayout(bar)
+        layout.addLayout(draw_bar)
+        layout.addLayout(display_bar)
         layout.addWidget(self.view, 1)
         layout.addWidget(self.cursor_label)
         layout.addWidget(self.status_label)
@@ -601,6 +611,19 @@ class SpotLiveView(QWidget):
     def fit_mode(self) -> bool:
         """Whether the view re-fits the sensor when the window is resized."""
         return self._fit
+
+    @property
+    def polling(self) -> bool:
+        """Whether polling is enabled (it still needs the view to be visible)."""
+        return self._polling
+
+    def set_polling(self, on: bool) -> None:
+        """Enable or disable the poll timer (it only ticks while visible)."""
+        self._polling = bool(on)
+        if self._polling and self.isVisible():
+            self._timer.start()
+        else:
+            self._timer.stop()
 
     def set_service(self, service: Any | None) -> None:
         """Poll *service* for frames (``None`` stops polling and keeps the image)."""
@@ -717,9 +740,10 @@ class SpotLiveView(QWidget):
     # ------------------------------------------------------------------
 
     def showEvent(self, event: Any) -> None:
-        """Start polling."""
+        """Start polling (if enabled)."""
         super().showEvent(event)
-        self._timer.start()
+        if self._polling:
+            self._timer.start()
 
     def hideEvent(self, event: Any) -> None:
         """Stop polling."""
@@ -727,7 +751,7 @@ class SpotLiveView(QWidget):
         super().hideEvent(event)
 
     def closeEvent(self, event: Any) -> None:
-        """Tell the owner; the window is reused, not destroyed."""
+        """Tell the owner; the view is reused, not destroyed."""
         self._timer.stop()
         self.draw_roi_button.setChecked(False)
         self.draw_edge_button.setChecked(False)

@@ -25,7 +25,7 @@ import pytest
 import useq
 
 from pymmcore_gui import _settings
-from pymmcore_gui._qt.QtCore import QPointF
+from pymmcore_gui._qt.QtCore import QPointF, Qt
 from pymmcore_gui._qt.QtWidgets import QWidget
 from pymmcore_gui._settings import (
     CalibrationRecord,
@@ -166,6 +166,7 @@ def _factory(mmc: FakeMMC):
 def panel(qtbot: QtBot, mmc: FakeMMC) -> Iterator[SpotFocusPanel]:
     widget = SpotFocusPanel(mmc, service_factory=_factory(mmc))
     qtbot.addWidget(widget)
+    widget.show()  # the docked live view only polls while the panel is visible
     yield widget
     widget.shutdown()
 
@@ -828,9 +829,9 @@ def test_start_telemetry_stop_restores_crisp(
     qtbot.waitUntil(lambda: len(panel.chart) > 5, timeout=WAIT_MS)
     # The lock streams frames whether or not a window is open: open it now,
     # while the lock runs, and it fills with frames at the sensor offset.
-    assert not panel.live_view.isVisible()
+    assert not panel.live_view.polling
     panel.preview_button.click()
-    assert panel.live_view.isVisible()
+    assert panel.live_view.polling and panel.live_view.isVisible()
     assert panel.preview_button.isChecked()
     qtbot.waitUntil(lambda: panel.live_view.frame is not None, timeout=WAIT_MS)
     view = panel.live_view
@@ -1220,26 +1221,106 @@ def test_preview_opens_a_full_resolution_live_view(
     # No calibration: the ring is hidden. Calibrating shows it.
     assert not view._setpoint_item.isVisible()
 
-    # Preview off stops the stream and hides the window.
+    # Preview off stops the stream and polling; the docked view keeps its space.
     panel.preview_button.click()
     assert not panel.preview_button.isChecked()
-    assert not view.isVisible()
+    assert view.isVisible()
+    assert not view.polling and not view._timer.isActive()
+    assert view.frame is None  # cleared
     assert not svc.preview_active
 
 
-def test_closing_the_live_view_turns_preview_off(
+def test_view_is_docked_above_the_controls_by_default(
     qtbot: QtBot, panel: SpotFocusPanel
 ) -> None:
+    view = panel.live_view
+    assert not view.isWindow()
+    assert view.window() is panel.window()  # not its own top-level window
+    assert panel.splitter.indexOf(view) == 0
+    assert panel.splitter.orientation() == Qt.Orientation.Vertical
+    assert view.minimumHeight() >= 240
+    assert not panel.view_floating
+    assert not panel.pop_out_button.isChecked()
+    assert panel.pop_out_button.text() == "Pop out"
+    assert view.isVisible()  # the space is kept even before Preview
+    assert not view.polling and not view._timer.isActive()
+    assert all(s > 0 for s in panel.splitter.sizes())
+
+
+def test_pop_out_and_dock_back_keep_the_index_and_the_scene(
+    qtbot: QtBot, panel: SpotFocusPanel
+) -> None:
+    view = panel.live_view
+    scene = view.scene
+    index = panel.splitter.indexOf(view)
+    panel.pop_out_button.click()
+    assert view.isWindow() and view.isVisible()
+    assert panel.view_floating and panel.pop_out_button.isChecked()
+    assert panel.pop_out_button.text() == "Dock"
+    assert view.window() is view
+    assert view.scene is scene
+    assert panel.splitter.indexOf(view) == -1
+    assert panel.splitter.count() == 1
+    assert view.parentWidget() is panel  # owned by the panel: deleted with it
+
+    panel.pop_out_button.click()  # dock again
+    assert not view.isWindow() and view.isVisible()
+    assert not panel.view_floating and not panel.pop_out_button.isChecked()
+    assert panel.pop_out_button.text() == "Pop out"
+    assert panel.splitter.indexOf(view) == index
+    assert panel.splitter.count() == 2
+    assert view.scene is scene
+    # The code path works too, and a repeat is a no-op.
+    panel.set_view_floating(True)
+    panel.set_view_floating(True)
+    assert panel.pop_out_button.isChecked() and view.isWindow()
+    panel.set_view_floating(False)
+    assert panel.splitter.indexOf(view) == index
+
+
+def test_polling_follows_preview_docked_and_floating(
+    qtbot: QtBot, panel: SpotFocusPanel
+) -> None:
+    view = panel.live_view
     svc = _preview_on(qtbot, panel)
-    panel.live_view.close()
-    assert not panel.preview_button.isChecked()
-    assert not svc.preview_active
-    # ... and Preview opens it again.
+    assert view.polling and view._timer.isActive()
+    panel.pop_out_button.click()
+    assert view._timer.isActive()  # still polling while floating
+    seq = view.frame.seq  # type: ignore[union-attr]
+    qtbot.waitUntil(lambda: view.frame.seq > seq, timeout=WAIT_MS)  # type: ignore[union-attr]
+    panel.pop_out_button.click()
+    assert view._timer.isActive()  # ... and docked again
+    panel.preview_button.click()  # off
+    assert not view._timer.isActive() and not svc.preview_active
+    # Preview off while floating hides the window and keeps polling off.
+    panel.pop_out_button.click()
+    assert view.isWindow() and view.isVisible() and not view._timer.isActive()
     panel.preview_button.click()
-    qtbot.waitUntil(
-        lambda: panel.live_view.isVisible() and svc.preview_active, timeout=WAIT_MS
-    )
-    assert panel.preview_button.isChecked()
+    qtbot.waitUntil(lambda: panel.live_view.frame is not None, timeout=WAIT_MS)
+    assert view._timer.isActive()
+    panel.preview_button.click()  # off
+    assert not view.isVisible() and not view._timer.isActive()
+    panel.pop_out_button.click()  # dock it back
+    assert view.isVisible() and not view._timer.isActive()
+
+
+def test_closing_the_floating_view_docks_it_and_keeps_preview(
+    qtbot: QtBot, panel: SpotFocusPanel
+) -> None:
+    view = panel.live_view
+    svc = _preview_on(qtbot, panel)
+    panel.pop_out_button.click()
+    assert view.isWindow()
+    with qtbot.waitSignal(view.windowClosed, timeout=1000):  # still emitted
+        view.close()
+    qtbot.waitUntil(lambda: not view.isWindow(), timeout=2000)
+    assert view.isVisible()
+    assert panel.splitter.indexOf(view) == 0
+    assert not panel.pop_out_button.isChecked()
+    assert panel.preview_button.isChecked()  # closing a window is not Preview off
+    assert svc.preview_active and view._timer.isActive()
+    seq = view.frame.seq  # type: ignore[union-attr]
+    qtbot.waitUntil(lambda: view.frame.seq > seq, timeout=WAIT_MS)  # type: ignore[union-attr]
 
 
 def test_closing_the_view_while_the_lock_runs_keeps_it_running(
@@ -1259,11 +1340,70 @@ def test_closing_the_view_while_the_lock_runs_keeps_it_running(
     assert panel.preview_button.isChecked()
     assert panel.state == "running"
 
+    panel.pop_out_button.click()
     panel.live_view.close()
+    qtbot.waitUntil(lambda: not panel.live_view.isWindow(), timeout=2000)
     assert panel.state == "running"
     assert svc.current_state == "running"
+    assert panel.preview_button.isChecked()
     panel.stop()
-    assert not svc.preview_active  # the closed view's stream stops with the lock
+    assert panel.state == "stopped"
+    assert panel.preview_button.isChecked()  # the preview was never switched off
+
+
+def test_draw_buttons_still_emit_the_edge_boxes_when_docked(
+    qtbot: QtBot, panel: SpotFocusPanel
+) -> None:
+    view = panel.live_view
+    assert not view.isWindow()
+    got: list[tuple] = []
+    got2: list[tuple] = []
+    view.edgeBoxDrawn.connect(lambda *a: got.append(a))
+    view.edgeBox2Drawn.connect(lambda *a: got2.append(a))
+    view._set_sensor((640, 480))  # the drag is clamped to the sensor
+    a, b = QPointF(232.0, 210.0), QPointF(312.0, 270.0)
+    view.draw_edge_button.setChecked(True)
+    assert view.draw_target == "edge" and panel.draw_edge_button.isChecked()
+    view.view.rectDrawn.emit(a, b)  # what a mouse drag on the image emits
+    assert len(got) == 1 and got2 == []
+    assert SettingsV1.instance().spot_focus.edge_box == tuple(got[0])
+    assert not panel.draw_edge_button.isChecked() and view.draw_target is None
+    view.draw_edge2_button.setChecked(True)
+    assert view.draw_target == "edge2" and panel.draw_edge2_button.isChecked()
+    view.view.rectDrawn.emit(a, b)
+    assert len(got2) == 1
+    assert SettingsV1.instance().spot_focus.edge_box_2 == tuple(got2[0])
+
+
+def test_shutdown_leaves_no_floating_window(qtbot: QtBot, mmc: FakeMMC) -> None:
+    widget = SpotFocusPanel(mmc, service_factory=_factory(mmc))
+    qtbot.addWidget(widget)
+    widget.show()
+    view = widget.live_view
+    widget.set_view_floating(True)
+    assert view.isVisible()
+    widget.shutdown()
+    assert not view.isVisible()  # hidden at once, deleted with the panel
+    assert not view.polling
+    widget.hide()
+    widget.show()
+    assert not view.isVisible()  # a shut-down panel does not bring it back
+
+
+def test_floating_view_goes_with_the_panel_when_hidden(
+    qtbot: QtBot, panel: SpotFocusPanel
+) -> None:
+    view = panel.live_view
+    panel.set_view_floating(True)
+    assert view.isVisible()
+    panel.hide()  # a closed dock or another tab
+    assert not view.isVisible()
+    panel.show()
+    assert view.isWindow() and view.isVisible()
+    panel.set_view_floating(False)
+    panel.hide()
+    panel.show()
+    assert not view.isWindow() and view.isVisible()
 
 
 def test_exposure_gain_channel_apply_live_and_are_saved(
@@ -1374,13 +1514,14 @@ def test_camera_error_is_shown_and_preview_can_be_retried(
 
     widget = SpotFocusPanel(mmc, service_factory=flaky)
     qtbot.addWidget(widget)
+    widget.show()
     try:
         widget.preview_button.click()
         qtbot.waitUntil(lambda: not widget._preview_busy, timeout=WAIT_MS)
         assert "SDK folder not found" in widget.fault_label.text()
         assert not widget.preview_button.isChecked()
         assert widget.preview_button.isEnabled()
-        assert not widget.live_view.isVisible()
+        assert not widget.live_view.polling
         # Fix the folder, press Preview again.
         widget.sdk_edit.setText("/fixed")
         widget.sdk_edit.editingFinished.emit()

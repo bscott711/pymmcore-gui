@@ -12,8 +12,9 @@ process and holds piezo P by nudging it rarely. This panel
   and sets a focus **Offset**;
 - locks and unlocks the loop (**Lock** / **Stop**; it runs until Stop,
   independent of any MDA; Lock with no valid calibration calibrates first);
-- runs the camera: SDK folder, Preview (which opens the full-resolution
-  :class:`~pymmcore_gui.widgets._spot_live_view.SpotLiveView`), exposure, gain,
+- runs the camera: SDK folder, Preview (which streams into the full-resolution
+  :class:`~pymmcore_gui.widgets._spot_live_view.SpotLiveView`, docked above the
+  controls or popped out into its own window), exposure, gain,
   channel and ROI, all applied live;
 - shows a strip chart of the focus error and the commanded piezo over the last
   five minutes, and move statistics;
@@ -40,7 +41,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from pymmcore_gui._qt.QtCore import QObject, QPointF, QRectF, Qt, QTimer, Signal
+from pymmcore_gui._qt.QtCore import (
+    QObject,
+    QPointF,
+    QRectF,
+    QSize,
+    Qt,
+    QTimer,
+    Signal,
+)
 from pymmcore_gui._qt.QtGui import QColor, QPainter, QPen
 from pymmcore_gui._qt.QtWidgets import (
     QApplication,
@@ -48,14 +57,17 @@ from pymmcore_gui._qt.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSpinBox,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -88,6 +100,10 @@ _OPEN_TIMEOUT_S = 30.0
 #: LED intensity, %, when the settings hold none.
 DEFAULT_LED_PCT = 50.0
 _NO_CRISP = "no CRISP device (focus.crisp_label)"
+#: Smallest height of the docked live view, px.
+_VIEW_MIN_H = 240
+#: Initial splitter sizes (live view, controls), a ratio before the first layout.
+_SPLIT_SIZES = (380, 420)
 
 # (settings field, label, min, max, step, decimals, suffix, tooltip)
 _PARAMS: tuple[tuple[str, str, float, float, float, int, str, str], ...] = (
@@ -371,7 +387,6 @@ class SpotFocusPanel(QWidget):
         self._busy = ""  # "starting" / "calibrating" / "zeroing" while a thread works
         self._preview_busy = False  # a thread is opening the camera
         self._sensor: tuple[int, int] | None = None  # known once the camera is open
-        self._drop_preview_after_run = False  # view closed while the lock ran
         self.state = "idle"
         self._telemetry: dict | None = None
         self._cal: FocusCalibration | None = None
@@ -504,8 +519,14 @@ class SpotFocusPanel(QWidget):
         self.live_view.edgeDrawModeChanged.connect(self._on_edge_draw_mode)
         self.live_view.edgeBox2Drawn.connect(self._on_edge_box2_drawn)
         self.live_view.edge2DrawModeChanged.connect(self._on_edge2_draw_mode)
-        self.live_view.windowClosed.connect(self._on_view_closed)
+        # Queued: the close handler re-parents the view, which must not happen
+        # inside its own closeEvent (Qt hides the widget right after that).
+        self.live_view.windowClosed.connect(
+            self._on_view_closed, Qt.ConnectionType.QueuedConnection
+        )
         self.live_view.statsChanged.connect(self._on_view_stats)
+        self.live_view.setMinimumHeight(_VIEW_MIN_H)
+        self.live_view.set_polling(False)  # Preview turns it on
 
         # -- readouts ------------------------------------------------------
         self.readout_labels: dict[str, QLabel] = {}
@@ -553,9 +574,25 @@ class SpotFocusPanel(QWidget):
         layout.addLayout(readouts)
         layout.addWidget(self.note_label)
         layout.addWidget(params_group)
+        # The live view sits above the controls and does not scroll with them.
+        controls = QScrollArea()
+        controls.setFrameShape(QFrame.Shape.NoFrame)
+        controls.setWidgetResizable(True)
+        controls.setWidget(box)
+        self.splitter = QSplitter(Qt.Orientation.Vertical)
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.addWidget(self.live_view)  # re-parents it: docked
+        self.splitter.addWidget(controls)
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setSizes(list(_SPLIT_SIZES))
+        self._view_index = 0  # where the view goes back to
+        self._split_sizes = list(_SPLIT_SIZES)
+        self._float_size = QSize(900, 700)  # the popped-out window's size
+        self._float_hidden = False  # the floating view is hidden with the panel
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(box)
+        outer.addWidget(self.splitter)
 
         # -- timers, relay -------------------------------------------------
         self._flush_timer = QTimer(self)
@@ -613,16 +650,20 @@ class SpotFocusPanel(QWidget):
         self.preview_button = QPushButton("Preview")
         self.preview_button.setCheckable(True)
         self.preview_button.setToolTip(
-            "Stream the camera into the Spot camera window (full resolution)"
+            "Stream the camera into the Spot camera view (full resolution)"
         )
         self.preview_button.clicked.connect(self.set_preview)
-        self.show_view_button = QPushButton("Show view")
-        self.show_view_button.setToolTip("Bring the Spot camera window to the front")
-        self.show_view_button.clicked.connect(self._show_live_view)
+        self.pop_out_button = QPushButton("Pop out")
+        self.pop_out_button.setCheckable(True)
+        self.pop_out_button.setToolTip(
+            "Float the Spot camera view as its own window; click again (or close "
+            "the window) to dock it back above the controls"
+        )
+        self.pop_out_button.toggled.connect(self.set_view_floating)
         self.camera_readout = QLabel("-")
         preview_row = QHBoxLayout()
         preview_row.addWidget(self.preview_button)
-        preview_row.addWidget(self.show_view_button)
+        preview_row.addWidget(self.pop_out_button)
         preview_row.addWidget(self.camera_readout, 1)
 
         self.led_button = QPushButton("LED")
@@ -789,7 +830,9 @@ class SpotFocusPanel(QWidget):
     def shutdown(self) -> None:
         """Stop the loop (restoring CRISP) and end the worker process."""
         self.live_view.set_service(None)
-        self.live_view.hide()
+        self.live_view.set_polling(False)
+        if self.live_view.isWindow():
+            self.live_view.hide()  # no orphan window; it is deleted with the panel
         self.preview_button.setChecked(False)
         self._owner.shutdown()
         self._set_state("idle")
@@ -1251,7 +1294,6 @@ class SpotFocusPanel(QWidget):
         if self.state == "running" and self.service is not None:
             # The lock already streams frames; only the window is missing.
             self.preview_button.setChecked(True)
-            self._drop_preview_after_run = False
             self._show_live_view()
             return
         cfg = SettingsV1.instance().spot_focus
@@ -1333,26 +1375,91 @@ class SpotFocusPanel(QWidget):
                 self._report_crisp(svc)
             except Exception:
                 logger.warning("spot focus stop_preview failed", exc_info=True)
-        self.live_view.hide()  # hide(), not close(): no windowClosed echo
+        self.live_view.set_polling(False)
         self.live_view.clear()
+        if self.live_view.isWindow():
+            # hide(), not close(): no windowClosed echo. A docked view keeps its
+            # space (cleared, not polled) so the layout does not jump.
+            self.live_view.hide()
         self.camera_readout.setText("-")
 
     def _show_live_view(self) -> None:
+        """Make the image visible (raise the floating window, or show the view)."""
         svc = self.service
         if svc is None:
             return
-        self.live_view.set_service(svc)
-        self.live_view.show()
-        self.live_view.raise_()
-        self.live_view.activateWindow()
+        view = self.live_view
+        view.set_service(svc)
+        view.set_polling(True)
+        view.show()
+        if view.isWindow():
+            view.raise_()
+            view.activateWindow()
+
+    @property
+    def view_floating(self) -> bool:
+        """Whether the live view is popped out into its own window."""
+        return self.live_view.isWindow()
+
+    def set_view_floating(self, floating: bool) -> None:
+        """Pop the live view out into its own window, or dock it back.
+
+        Docked (the default) it sits in the splitter above the controls. The
+        scene and zoom are kept either way. The choice is not persisted.
+
+        Parameters
+        ----------
+        floating : bool
+            ``True`` to float the view, ``False`` to dock it again.
+        """
+        view = self.live_view
+        floating = bool(floating)
+        if floating != view.isWindow():
+            if floating:
+                self._split_sizes = self.splitter.sizes()
+                self._view_index = max(self.splitter.indexOf(view), 0)
+                # A window owned by the panel: stays above the app, goes with it.
+                view.setParent(self, Qt.WindowType.Window)
+                view.resize(self._float_size)
+                view.show()
+                view.raise_()
+                view.activateWindow()
+            else:
+                self._float_size = view.size()
+                self._float_hidden = False
+                self.splitter.insertWidget(self._view_index, view)
+                view.show()
+                if all(s > 0 for s in self._split_sizes):
+                    self.splitter.setSizes(self._split_sizes)
+        self.pop_out_button.blockSignals(True)
+        self.pop_out_button.setChecked(floating)
+        self.pop_out_button.blockSignals(False)
+        self.pop_out_button.setText("Dock" if floating else "Pop out")
 
     def _on_view_closed(self) -> None:
-        """The user closed the Spot camera window."""
-        if self.state == "running" or self._busy == "starting":
-            self.preview_button.setChecked(False)
-            self._drop_preview_after_run = True  # stop streaming after Stop
-            return
-        self._stop_preview()
+        """The floating window was closed: dock the view again.
+
+        Preview keeps running; closing a window is not a request to stop the camera.
+        """
+        self.set_view_floating(False)
+        if self.live_view.isHidden():  # closed while docked: keep its space
+            self.live_view.show()
+
+    def hideEvent(self, event: Any) -> None:
+        """Hide a floating live view with the panel (a closed dock, a tab switch)."""
+        super().hideEvent(event)
+        view = self.live_view
+        if view.isWindow() and view.isVisible():
+            view.hide()
+            self._float_hidden = True
+
+    def showEvent(self, event: Any) -> None:
+        """Bring back a floating live view that went away with the panel."""
+        super().showEvent(event)
+        if self._float_hidden:
+            self._float_hidden = False
+            if self.live_view.isWindow():
+                self.live_view.show()
 
     def _on_view_stats(self, fps: float, max_value: int, saturated_pct: float) -> None:
         sat = f"{saturated_pct:.2f}% saturated"
@@ -1488,7 +1595,7 @@ class SpotFocusPanel(QWidget):
         svc = self.service
         if svc is not None:
             self.live_view.set_service(svc)
-            if self.live_view.isVisible():
+            if self.live_view.polling:  # the view was on: Preview stays checked
                 self.preview_button.setChecked(True)
         # The service's own state signals may have beaten us here.
         self._set_state(svc.current_state if svc is not None else "idle")
@@ -1519,9 +1626,6 @@ class SpotFocusPanel(QWidget):
         # While locked the worker measured the calibration's boxes: show the drawn
         # ones, with the calibration for the preview error.
         self._send_preview_state(svc)
-        if self._drop_preview_after_run:
-            self._drop_preview_after_run = False
-            self._stop_preview()
 
     # ------------------------------------------------------------------
     # calibrate
