@@ -145,6 +145,9 @@ def _edge_cal(**kw: object) -> EdgeCalibration:
         "contrast": 700.0,
         "n_points": 9,
         "created": "2026-10-28T00:00:00",
+        # e0 comes from measure_edge's default detector, so the calibration is
+        # one made with it (and the default detector setting then matches).
+        "detector": "gaussderiv",
     }
     base.update(kw)
     return EdgeCalibration(**base)
@@ -491,12 +494,12 @@ def test_calibration_that_loses_the_edge_raises_and_cleans_up() -> None:
         real = svc._snap_edges
         calls: list[float] = []
 
-        def snap(n, p, specs, return_frame):
+        def snap(n, p, specs, return_frame, detectors=None):
             calls.append(p)
             if len(calls) >= 4:  # the zero and two steps are fine
                 lost = {"n": 0, "reason": "edge left the box"}
                 return {"edges": [lost] * len(specs), "p_um": p}
-            return real(n, p, specs, return_frame)
+            return real(n, p, specs, return_frame, detectors)
 
         svc._snap_edges = snap  # type: ignore[method-assign]
         with pytest.raises(ValueError, match="edge left the box: widen the box"):
@@ -1374,7 +1377,12 @@ def test_lateral_drift_makes_the_edges_disagree_and_nothing_moves() -> None:
         n_moves = svc.stats()["n_moves"]
     assert "edges disagree" in faults[0]
     assert n_moves == 0 and mmc.sets == []  # P is held
-    assert any("edges disagree" in t["reason"] for t in tele)
+    # Telemetry goes out at most every 0.1 s and not after the fault, while the
+    # strikes that raise the fault take only a few frames: the disagreeing frames
+    # may never get a telemetry message (this used to be asserted and flaked
+    # under load). What is guaranteed: no message ever called such a frame ok.
+    limit = _params().max_edge_disagreement_um
+    assert not any(t["ok"] and (t["disagreement_um"] or 0.0) > limit for t in tele)
 
 
 def test_a_held_frame_reports_held_edge_and_never_faults() -> None:
@@ -1654,3 +1662,205 @@ def test_set_calibration_in_process_and_while_running() -> None:
         assert w.cal is not None and len(w.cal.edges) == 2
     finally:
         _close(w, pipes)
+
+
+# ---------------------------------------------------------------------------
+# Selectable edge detector: one source of truth at measure time
+# ---------------------------------------------------------------------------
+
+
+def test_calibration_stores_the_detector_setting() -> None:
+    mmc = FakeMMC()
+    with _service(mmc) as svc:
+        assert svc.wait_ready()
+        assert svc.detector_setting == ("gaussderiv", 6.0)  # the default
+        svc.start_preview()
+        cal = svc.calibrate(BOX, span_um=2.0, steps=5, n_frames=2, settle_s=0.0)
+        (edge,) = cal.edges
+        assert (edge.detector, edge.detector_sigma_px) == ("gaussderiv", 6.0)
+        assert edge.box_normal_px == BOX[2]
+        assert 3.0 < edge.edge_width_px < 12.0  # the fake edge has sigma 2 px
+        assert edge.e0_px == pytest.approx(_e0(), abs=0.3)
+        # Changing the setting changes what the next calibration is made with.
+        svc.set_camera(detector="halfmax")
+        assert svc.detector_setting == ("halfmax", 6.0)
+        cal2 = svc.calibrate(BOX, span_um=2.0, steps=5, n_frames=2, settle_s=0.0)
+        assert cal2.edges[0].detector == "halfmax"
+        svc.set_camera(detector="gaussderiv", detector_sigma_px=8.0)
+        cal3 = svc.calibrate(BOX, span_um=2.0, steps=5, n_frames=2, settle_s=0.0)
+        assert (cal3.edges[0].detector, cal3.edges[0].detector_sigma_px) == (
+            "gaussderiv",
+            8.0,
+        )
+        # It survives the settings round trip.
+        again = FocusCalibration.from_dict(cal3.to_dict())
+        assert again == cal3 and again.edges[0].detector_sigma_px == 8.0
+        with pytest.raises(ValueError, match="detector"):
+            svc.set_camera(detector="sobel")
+        assert svc.detector_setting == ("gaussderiv", 8.0)  # unchanged
+
+
+def test_calibration_from_the_analysis_setting() -> None:
+    mmc = FakeMMC()
+    analysis = {"detector": "halfmax", "detector_sigma_px": 4.0}
+    with _service(mmc, analysis=analysis) as svc:
+        assert svc.wait_ready()
+        assert svc.detector_setting == ("halfmax", 4.0)
+        assert svc.camera_info["detector"] == "halfmax"
+        svc.start_preview()
+        cal = svc.calibrate(BOX, span_um=2.0, steps=5, n_frames=2, settle_s=0.0)
+        assert (cal.edges[0].detector, cal.edges[0].detector_sigma_px) == (
+            "halfmax",
+            4.0,
+        )
+
+
+def test_lock_refuses_a_calibration_made_with_another_detector() -> None:
+    mmc = FakeMMC()
+    with _service(mmc) as svc:
+        assert svc.wait_ready()
+        with pytest.raises(
+            RuntimeError,
+            match="calibrated with halfmax; the detector setting is gaussderiv: "
+            "recalibrate",
+        ):
+            svc.start(_params(), _cal(detector="halfmax"))
+        assert svc.current_state != "running" and mmc.sets == []
+        # a different gaussderiv width is a mismatch too
+        with pytest.raises(RuntimeError, match="sigma 3 px.*sigma 6 px.*recalibrate"):
+            svc.start(_params(), _cal(detector_sigma_px=3.0))
+        # the matching one starts
+        svc.start(_params(), _cal())
+        assert _wait(lambda: svc.current_state == "running", 5.0)
+        svc.stop()
+    assert mmc.sets == []
+
+
+def test_worker_start_faults_on_a_detector_mismatch() -> None:
+    w, pipes = _inproc_worker()
+    try:
+        w.on_start(
+            {
+                "params": _params().to_dict(),
+                "calibration": _cal(detector="halfmax").to_dict(),
+                "p_start_um": P0,
+            }
+        )
+        assert w.state == "fault" and not w.running
+        (f,) = [m for m in _messages(pipes) if m["type"] == "fault"]
+        assert f["reason"] == (
+            "calibrated with halfmax; the detector setting is gaussderiv: recalibrate"
+        )
+    finally:
+        _close(w, pipes)
+
+
+def test_a_running_lock_measures_with_the_calibration_detector() -> None:
+    w, pipes = _inproc_worker(analysis={"detector": "halfmax"})
+    try:
+        w.on_start(
+            {
+                "params": _params(strikes=50).to_dict(),
+                "calibration": _cal(detector="halfmax").to_dict(),
+                "p_start_um": P0,
+            }
+        )
+        assert w.running
+        w.on_frame(w.source.render(0.0), 1.0, 1.0)
+        assert [f.detector for f in w.fixes] == ["halfmax"]
+        # The setting changes under the running lock: the lock keeps its detector.
+        w.on_set_camera({"detector": "gaussderiv"})
+        assert w.detector_setting == ("gaussderiv", 6.0) and w.running
+        w.on_frame(w.source.render(0.0), 2.0, 2.0)
+        assert [f.detector for f in w.fixes] == ["halfmax"]
+        assert w.fixes[0].ok
+    finally:
+        _close(w, pipes)
+
+
+def test_the_preview_marker_follows_the_calibration_then_the_setting() -> None:
+    w, pipes = _inproc_worker()
+    try:
+        w.preview = True
+        w.on_set_edge_boxes({"boxes": [list(BOX)]})
+        # No calibration: the setting (gaussderiv by default).
+        w.on_frame(w.source.render(0.0), 1.0, 1.0)
+        assert w.fixes[0].detector == "gaussderiv"
+        # A held halfmax calibration for these boxes: its detector wins.
+        w.on_set_calibration({"calibration": _cal(detector="halfmax").to_dict()})
+        w.on_frame(w.source.render(0.0), 2.0, 2.0)
+        assert w.fixes[0].detector == "halfmax" and w.last_along is not None
+        # Other preview boxes than the calibration: no error, the setting.
+        w.on_set_edge_boxes({"boxes": [list(BOX_TOP)]})
+        w.on_frame(w.source.render(0.0), 3.0, 3.0)
+        assert w.fixes[0].detector == "gaussderiv" and w.last_along is None
+        # The setting changes: a calibrated marker does not.
+        w.on_set_edge_boxes({"boxes": [list(BOX)]})
+        w.on_set_camera({"detector": "halfmax", "detector_sigma_px": 6.0})
+        w.on_set_calibration({"calibration": _cal().to_dict()})  # gaussderiv one
+        w.on_frame(w.source.render(0.0), 4.0, 4.0)
+        assert w.fixes[0].detector == "gaussderiv"
+    finally:
+        _close(w, pipes)
+
+
+def test_measure_uses_the_detector_given_per_box_else_the_setting() -> None:
+    w, pipes = _inproc_worker()
+    try:
+        w.on_measure(
+            {
+                "n_frames": 2,
+                "p_um": P0,
+                "boxes": [
+                    {"box": list(BOX), "axis": "x", "polarity": 1},
+                    {
+                        "box": list(BOX),
+                        "axis": "x",
+                        "polarity": 1,
+                        "detector": "halfmax",
+                        "detector_sigma_px": 6.0,
+                    },
+                ],
+            }
+        )
+        (m,) = [m for m in _messages(pipes) if m["type"] == "measurement"]
+        assert [e["detector"] for e in m["edges"]] == ["gaussderiv", "halfmax"]
+        assert [e["detector_sigma_px"] for e in m["edges"]] == [6.0, 6.0]
+        assert all(e["n"] == 2 and e["edge_width_mean"] > 0 for e in m["edges"])
+        # both locate the same edge of the symmetric fake
+        a, b = m["edges"]
+        assert a["edge_mean"] == pytest.approx(b["edge_mean"], abs=0.5)
+    finally:
+        _close(w, pipes)
+
+
+def test_set_camera_rejects_a_bad_detector_in_the_worker() -> None:
+    w, pipes = _inproc_worker()
+    try:
+        w.on_set_camera({"detector": "sobel"})
+        assert w.detector_setting == ("gaussderiv", 6.0)
+        errors = [m for m in _messages(pipes) if m["type"] == "error"]
+        assert len(errors) == 1 and "detector" in errors[0]["message"]
+        w.on_set_camera({"detector": "halfmax", "detector_sigma_px": 9.0})
+        assert w.detector_setting == ("halfmax", 9.0)
+    finally:
+        _close(w, pipes)
+
+
+def test_zero_measures_with_the_detector_of_the_calibration() -> None:
+    mmc = FakeMMC()
+    cal = _cal(detector="halfmax")  # the setting is gaussderiv: a stale calibration
+    with _service(mmc) as svc:
+        assert svc.wait_ready()
+        real = svc._snap_edges
+        seen: list[Any] = []
+
+        def snap(n, p, specs, return_frame, detectors=None):
+            seen.append(detectors)
+            return real(n, p, specs, return_frame, detectors)
+
+        svc._snap_edges = snap  # type: ignore[method-assign]
+        z = svc.zero(cal, n_frames=3)
+        assert seen == [[("halfmax", 6.0)]]
+        assert (z.edges[0].detector, z.edges[0].detector_sigma_px) == ("halfmax", 6.0)
+        assert z.edges[0].slope_px_per_um == cal.edges[0].slope_px_per_um

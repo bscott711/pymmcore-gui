@@ -657,6 +657,12 @@ class SpotFocusSettingsV1(BaseMMSettings):
     """The edge box ``(x, y, w, h)`` in sensor pixels; ``None`` until drawn."""
     edge_box_2: tuple[int, int, int, int] | None = None
     """The optional second edge box, same convention as ``edge_box``."""
+    detector: Literal["gaussderiv", "halfmax"] = "gaussderiv"
+    """How the edge point is found in each row (``measure_edge``). A calibration
+    is only valid for the detector it was made with; the stored one wins for
+    measurements it applies to and Lock refuses on a mismatch."""
+    detector_sigma_px: float = Field(default=6.0, ge=2.0, le=12.0)
+    """Width of the ``gaussderiv`` filter in sensor px (ignored by ``halfmax``)."""
     sweep_span_um: float = 2.0
     """Total piezo span of the calibration sweep, um."""
     sweep_steps: int = 9

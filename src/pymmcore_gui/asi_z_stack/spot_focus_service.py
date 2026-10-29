@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 
 from psygnal import Signal
 
+from .spot_focus import DEFAULT_DETECTOR, DEFAULT_SIGMA_PX, EDGE_DETECTORS
 from .spot_focus_worker import launch_worker
 from .spot_frame_shm import FrameBuffer, unlink_by_name
 
@@ -124,6 +125,13 @@ class SpotFocusService:
         self._led = led_intensity
         self._ready_timeout = ready_timeout_s
         self._spec = dict(source_spec or DEFAULT_SOURCE_SPEC)
+        analysis = self._spec.get("analysis") or {}
+        #: The detector setting (what the worker uses where no calibration
+        #: applies), mirrored here for the mismatch check of :meth:`start`.
+        self._detector: str = str(analysis.get("detector", DEFAULT_DETECTOR))
+        self._detector_sigma_px = float(
+            analysis.get("detector_sigma_px", DEFAULT_SIGMA_PX)
+        )
 
         self._lock = threading.Lock()
         #: The GUI thread and the reader thread (``moved`` replies) both send.
@@ -187,6 +195,16 @@ class SpotFocusService:
         return dict(self._info)
 
     @property
+    def detector_setting(self) -> tuple[str, float]:
+        """The edge detector setting and its ``gaussderiv`` width (sensor px).
+
+        Set by ``set_camera(detector=...)`` or the spec's ``analysis``. New
+        calibrations are measured with it; a lock needs a calibration made with
+        the same one (:func:`~.spot_focus.detector_mismatch`).
+        """
+        return self._detector, self._detector_sigma_px
+
+    @property
     def worker_pid(self) -> int | None:
         """The worker process id."""
         return self._proc.pid
@@ -217,11 +235,21 @@ class SpotFocusService:
 
         *calibration* is a :class:`~.spot_focus.FocusCalibration`; a single
         :class:`~.spot_focus.EdgeCalibration` is wrapped into a one-edge one.
+
+        Raises
+        ------
+        RuntimeError
+            If the calibration was made with another edge detector than the
+            setting ("calibrated with halfmax; the detector setting is
+            gaussderiv: recalibrate"), or the worker is dead or not ready.
         """
-        from .spot_focus import EdgeCalibration, FocusCalibration
+        from .spot_focus import EdgeCalibration, FocusCalibration, detector_mismatch
 
         if isinstance(calibration, EdgeCalibration):
             calibration = FocusCalibration.from_dict(calibration.to_dict())
+        why = detector_mismatch(calibration, *self.detector_setting)
+        if why:
+            raise RuntimeError(why)
         if self._state == "fault" and not self._proc.is_alive():
             raise RuntimeError("spot focus worker is dead; create a new service")
         if not self.wait_ready():
@@ -365,12 +393,33 @@ class SpotFocusService:
         gain: int | None = None,
         roi: tuple[int, int, int, int] | None = None,
         channel: str | None = None,
+        detector: str | None = None,
+        detector_sigma_px: float | None = None,
     ) -> None:
-        """Set exposure, gain, ROI and channel on the worker's camera, live.
+        """Set exposure, gain, ROI, channel and edge detector on the worker, live.
 
         *roi* is ``(x, y, w, h)`` in sensor pixels; ``(0, 0, 0, 0)`` is full
-        frame. *channel* is ``"sum"`` or ``"red"``. ``None`` leaves a value.
+        frame. *channel* is ``"sum"`` or ``"red"``. *detector* is
+        ``"gaussderiv"`` or ``"halfmax"`` with the ``gaussderiv`` width
+        *detector_sigma_px* (sensor px; the present one if None): the setting
+        for measurements no calibration applies to and for new calibrations.
+        ``None`` leaves a value.
+
+        Raises
+        ------
+        ValueError
+            For an unknown *detector* or a non-positive *detector_sigma_px*.
         """
+        if detector is not None:
+            if detector not in EDGE_DETECTORS:
+                raise ValueError(
+                    f"detector must be one of {EDGE_DETECTORS}, not {detector!r}"
+                )
+            if detector_sigma_px is None:
+                detector_sigma_px = self._detector_sigma_px
+            if not (math.isfinite(detector_sigma_px) and detector_sigma_px > 0):
+                raise ValueError(f"bad detector_sigma_px {detector_sigma_px!r}")
+            self._detector, self._detector_sigma_px = detector, float(detector_sigma_px)
         self._send(
             {
                 "type": "set_camera",
@@ -378,6 +427,8 @@ class SpotFocusService:
                 "gain": gain,
                 "roi": None if roi is None else tuple(int(v) for v in roi),
                 "channel": channel,
+                "detector": detector,
+                "detector_sigma_px": detector_sigma_px,
             }
         )
 
@@ -566,6 +617,9 @@ class SpotFocusService:
         mmc = self._mmc
         sboxes = [snap_box(b) for b in _as_boxes(boxes)]
         nb = len(sboxes)
+        # Every measurement of the sweep (and so the stored calibration) uses the
+        # detector setting as it is now.
+        det = self.detector_setting
         p_c = float(mmc.getPosition(self._piezo))
         ps = p_c + np.linspace(-span_um / 2.0, span_um / 2.0, steps)
         n_zero = max(2 * n_frames, 10)
@@ -575,7 +629,9 @@ class SpotFocusService:
             self._send({"type": "preview_stop"})
         centred = False
         try:
-            m0 = self._snap_edges(n_zero, p_c, [(b, None, None) for b in sboxes], False)
+            m0 = self._snap_edges(
+                n_zero, p_c, [(b, None, None) for b in sboxes], False, [det] * nb
+            )
             ent0 = m0["edges"]
             errors: dict[int, str] = {}  # box index -> why it is dropped
             for k, ent in enumerate(ent0):
@@ -587,13 +643,14 @@ class SpotFocusService:
             if not alive:
                 raise ValueError(errors[min(errors)])
             specs = [(sboxes[k], axes[k], pols[k]) for k in alive]
+            spec_dets = [det] * len(alive)
             edge_px = np.full((len(ps), nb), np.nan)
             frames: list[Any] = []
             for s, p in enumerate(ps):
                 mmc.setPosition(self._piezo, float(p))
                 mmc.waitForDevice(self._piezo)
                 time.sleep(settle_s)
-                m = self._snap_edges(n_frames, float(p), specs, True)
+                m = self._snap_edges(n_frames, float(p), specs, True, spec_dets)
                 for k, ent in zip(alive, m["edges"], strict=True):
                     if ent["n"]:
                         edge_px[s, k] = float(ent["edge_mean"])
@@ -605,7 +662,7 @@ class SpotFocusService:
             mmc.setPosition(self._piezo, p_c)
             mmc.waitForDevice(self._piezo)
             time.sleep(settle_s)
-            m1 = self._snap_edges(n_zero, p_c, specs, False)
+            m1 = self._snap_edges(n_zero, p_c, specs, False, spec_dets)
             centred = True
             e_start = np.full(nb, np.nan)
             e_end = np.full(nb, np.nan)
@@ -655,6 +712,9 @@ class SpotFocusService:
                         angle_deg=float(ent0[k]["angle_mean"]),
                         contrast=float(ent0[k]["contrast_mean"]),
                         linear_range_um=span_um / 2.0,
+                        detector=det[0],
+                        detector_sigma_px=det[1],
+                        edge_width_px=float(ent0[k].get("edge_width_mean", math.nan)),
                     )
                 except ValueError as exc:
                     errors[k] = str(exc)
@@ -739,7 +799,11 @@ class SpotFocusService:
         self.led_on(owner="zero")
         try:
             m = self._snap_edges(
-                n_frames, p, [(e.box, e.axis, e.polarity) for e in cal.edges], False
+                n_frames,
+                p,
+                [(e.box, e.axis, e.polarity) for e in cal.edges],
+                False,
+                [(e.detector, e.detector_sigma_px) for e in cal.edges],
             )
         finally:
             self.led_off("zero")
@@ -811,20 +875,34 @@ class SpotFocusService:
         p_um: float | None,
         specs: Sequence[tuple[Sequence[float], str | None, int | None]],
         return_frame: bool,
+        detectors: Sequence[tuple[str, float]] | None = None,
     ) -> dict:
         """Ask the worker for *n_frames* fresh fixes of every box; wait for the reply.
 
         *specs* are ``(box, axis, polarity)``; axis and polarity None are
-        detected. The reply has an ``edges`` entry per spec.
+        detected. *detectors* gives ``(detector, sigma_px)`` per spec (a
+        calibration's own); None uses the worker's detector setting. The reply
+        has an ``edges`` entry per spec, naming the detector it was measured
+        with.
         """
+        extra: list[dict[str, Any]] = (
+            [{} for _ in specs]
+            if detectors is None
+            else [{"detector": d, "detector_sigma_px": s} for d, s in detectors]
+        )
         return self._request_measurement(
             {
                 "type": "measure",
                 "n_frames": int(n_frames),
                 "p_um": p_um,
                 "boxes": [
-                    {"box": [int(v) for v in box], "axis": axis, "polarity": pol}
-                    for box, axis, pol in specs
+                    {
+                        "box": [int(v) for v in box],
+                        "axis": axis,
+                        "polarity": pol,
+                        **more,
+                    }
+                    for (box, axis, pol), more in zip(specs, extra, strict=True)
                 ],
                 "return_frame": return_frame,
             },

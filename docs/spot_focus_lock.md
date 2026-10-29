@@ -50,14 +50,78 @@ in focus. The method follows Nguyen et al. 2025, Biomed. Opt. Express
   for volumes. A calibration is a short, user-started, bounded procedure on an
   otherwise idle serial line. `zero` and `measure` do not wait on the Tiger.
 
+## How the edge point is picked
+
+The cross on the live view is a position the code computes from the edge box,
+in four steps. The notebook
+[`notebooks/spot_edge_detection.ipynb`](notebooks/spot_edge_detection.ipynb)
+shows each step on the rig sweeps (or on a synthetic patch if they are not
+there) with plots, the box-width effect and the detector comparison.
+
+1. **Grey image.** The box is cut out of the raw frame and every 2x2 Bayer cell
+   is averaged into one grey value (one binned pixel is two sensor pixels), so
+   the colour mosaic does not matter.
+2. **One edge point per row.** The rows run along the edge, so each row crosses
+   it once. The detector setting says how that point is found, to a fraction of
+   a pixel:
+   - **Gaussian derivative** (`gaussderiv`, the default): the point where the
+     brightness rises fastest across the edge, the peak of a Gaussian-derivative
+     filter. It uses no brightness levels, so it does not matter how much dark
+     and bright the box holds on either side. The filter width is the
+     **detector width** setting, `detector_sigma_px` (default 6 sensor px,
+     range 2 to 12): about the blur of the edge itself (its 10-90 % width
+     divided by 2.5). Wider averages more noise but blurs a sharp edge.
+   - **Half-max** (`halfmax`, the original method): the point where the
+     brightness reaches half way between the dark level and the bright level.
+     Each level is the median of the outer 15 % of the box on that side, so the
+     box must reach onto flat ground on both sides.
+3. **Straight line.** A robust line is fitted through the row points
+   (outliers are dropped). Where it crosses the middle row of the box is the
+   edge position. Its tilt is the edge angle, and the scatter about it is the
+   straightness (more than 3 px is refused as "edge not straight").
+4. **Cross and ring.** The cross is drawn at that position on the middle row of
+   the box. The ring marks the calibration zero, the position the same edge had
+   at best focus. The focus error is `(position - zero) / slope`.
+
+The cross can look "inside" the edge you see. An auto-levelled display shows an
+edge where the brightness has risen by only about 5 %, which on the rig is
+10-14 px outside the 50 % point. Nothing is wrong: focus only uses changes of
+the position. The two detectors sit within about a pixel of each other (the
+steepest point is not exactly the 50 % point on an asymmetric edge), which is
+why a zero and a slope only hold for the detector they were measured with.
+
+**Box guidance.**
+
+- Draw the box across the edge **at least 4x the edge width** for `halfmax`
+  (about 60 px for a sharp top edge, 90 px for a soft left edge on the rig) and
+  about 2x for `gaussderiv`. The panel measures the 10-90 % width of the edge
+  and warns when the box is narrower than that.
+- Put the edge near the **middle** of the box, with room for the travel and
+  some flat ground beyond it.
+- Along the edge, stay on the **straight part**: away from the rounded
+  corners, the ghost and any bend. Rows on a corner bend the line and raise the
+  straightness.
+
+A narrow box biases `halfmax`: its dark and bright levels are measured on the
+ramp, so the half-way level moves with the edge. In the 2026-10-28 rig data
+the left edge gave a slope of 1.0 px/um in a 24 px box and 1.75 px/um in a 90
+px box with `halfmax`, against 1.2 and 1.57 with `gaussderiv`, and noise 0.078
+to 0.033 um against 0.050 to 0.033 um. Sobel, Prewitt and Scharr filters were
+tried as detectors and are **not used**: their 3-column difference is flat on a
+7-14 px ramp, so the position jumps from row to row (1.5 to 2x noisier on the
+real residual, 3 to 6x with injected pixel noise). On the rig frames
+`gaussderiv` gave 0.028 um (top edge) and 0.039 um (left edge) of noise about
+the sweep line against 0.033 and 0.075 um for `halfmax`.
+
 ## Metric: a straight edge of the LED patch
 
 The metric is one signed number: the position, in sensor pixels, of a straight
 edge of the patch that moves with focus. The user draws a small **edge box**
-across that edge. Inside the box the code finds, row by row, where the
-brightness crosses half way between the dark outside and the bright inside,
-fits a straight line through the crossings, and reports where the line crosses
-the box centre. No search, sub-pixel, and the sign tells which way focus moved.
+across that edge. Inside the box the code finds, row by row, one edge point
+(the steepest rise with the Gaussian-derivative detector, the half-way
+brightness crossing with `halfmax`), fits a straight line through the points,
+and reports where the line crosses the box centre. No search, sub-pixel, and
+the sign tells which way focus moved.
 
 `measure_edge(frame, box, ...)` takes a raw 2-D frame (uint8 or uint16, RGGB
 Bayer or mono), its sensor offset `roi_offset=(rx, ry)` and the box
@@ -79,16 +143,26 @@ Bayer or mono), its sensor offset `roi_offset=(rx, ry)` and the box
    mean |d/dx| is at least the mean |d/dy|, else `"y"`. `polarity=+1` when the
    bright side is at larger coordinates along the normal, else -1. Calibration
    stores both; later measurements reuse them.
-5. Arrange rows along the edge and columns along the normal. Smooth each row
-   with `[1, 2, 1] / 4` along the normal.
+5. Arrange rows along the edge and columns along the normal, dark side first.
+   Smooth each row with `[1, 2, 1] / 4` along the normal (this smoothed copy
+   gives the levels and the `halfmax` crossings; `gaussderiv` works on the
+   unsmoothed grey).
 6. Levels: `low` is the median of the outer 15 % of columns on the dark side,
    `high` the same on the bright side. If `contrast = high - low` is below
    `min_contrast` (default 10 counts), not ok: `"edge lost (contrast c < min)"`.
-7. Threshold `low + 0.5 * contrast`. Per row, scan from the dark side to the
-   first column at or above the threshold and interpolate linearly with the
-   previous column. Rows without a crossing are invalid; fewer than
-   `min_valid_fraction` (default 0.5) valid rows gives
-   `"edge lost (no crossing in most rows)"`.
+   Both detectors use this contrast test.
+7. One edge point per row, by `detector`:
+   - `"halfmax"`: threshold `low + 0.5 * contrast`. Scan from the dark side to
+     the first column at or above the threshold and interpolate linearly with
+     the previous column.
+   - `"gaussderiv"` (default): correlate the grey image with a Gaussian along
+     the edge and the derivative of a Gaussian along the normal, both of width
+     `sigma_px / 2` binned px. In each row take the column of the maximum
+     response, refined by a parabola through its three samples. Rows whose peak
+     is below a quarter of the median peak are invalid.
+
+   Rows without a point are invalid; fewer than `min_valid_fraction` (default
+   0.5) valid rows gives `"edge lost (no crossing in most rows)"`.
 8. Robust line fit `c(r) = a + b (r - r_c)` through the valid crossings: three
    rounds of least squares, keeping points within `max(3 * 1.4826 * MAD, 0.5)`
    binned pixels. `a` is the edge position at the box centre,
@@ -99,9 +173,11 @@ Bayer or mono), its sensor offset `roi_offset=(rx, ry)` and the box
 10. The result is an `EdgeFix`: `position` (sensor px along the normal), the
     overlay point `x, y` (the edge point at the box centre), `axis`,
     `polarity`, `contrast`, `low`, `high`, `angle_deg`, `residual_px`,
-    `valid_fraction`, `saturated_frac`, `peak`, `ok`, `reason`. A failed fix
-    still carries finite numbers (position and x, y default to the box
-    centre).
+    `valid_fraction`, `saturated_frac`, `peak`, `ok`, `reason`, `detector` and
+    `sigma_px` (what was used) and `edge_width_px` (the 10-90 % width of the
+    row-averaged, tilt-corrected edge profile in sensor px, nan when it cannot
+    be measured). A failed fix still carries finite numbers (position and x, y
+    default to the box centre).
 
 ### Why it is robust
 
@@ -112,30 +188,38 @@ Bayer or mono), its sensor offset `roi_offset=(rx, ry)` and the box
 - **Texture inside the patch.** It moves with the patch, so it is a constant
   offset; the line fit averages 50-150 rows.
 - **Defocus blur.** Symmetric blur widens the edge but does not move its 50 %
-  point, so the measured motion is the directional shift.
-- **Exposure, LED level, gain.** The threshold is half way between the measured
-  low and high levels, so the 50 % point does not change.
+  point or its steepest point, so the measured motion is the directional shift.
+- **Exposure, LED level, gain.** `halfmax` puts its threshold half way between
+  the measured low and high levels, so the 50 % point does not change;
+  `gaussderiv` looks for the steepest rise, which does not depend on the level
+  at all.
 - **Display Auto levels.** It never touches raw data.
 - **Hot pixels, texture blotches.** Rejected by the robust line fit.
 
-**Texture offset note.** With strong texture and a soft edge, the global
-half-way level puts the measured 50 % point a few pixels off the geometric edge
-(in the synthetic full-scale frame with 15 % texture and edge sigma 12 px: 2-3
-px; with no texture: 0.003 px). This offset is a property of the patch, it
-moves with the patch (a 2.4 px shift is measured to within 0.2 px), and so it
-only affects the absolute edge value, not focus control, which works from
-differences.
+**Texture offset note (`halfmax`).** With strong texture and a soft edge, the
+global half-way level puts the measured 50 % point a few pixels off the
+geometric edge (in the synthetic full-scale frame with 15 % texture and edge
+sigma 12 px: 2-3 px; with no texture: 0.003 px). This offset is a property of
+the patch, it moves with the patch (a 2.4 px shift is measured to within 0.2
+px), and so it only affects the absolute edge value, not focus control, which
+works from differences.
 
-**Box-width guidance.** The levels come from the outer 15 % of the box on each
-side along the normal, so each side needs about 4 sigma of flat plateau outside
-those bands. Draw the box about **14 x the edge sigma** wide along the normal,
-and at least about 2x the expected travel plus a margin on each side. Along the
-edge, about 60 % of the edge length is plenty. Keep the ghost and the patch
-corners out of the box.
+**Box-width guidance.** With `halfmax` the levels come from the outer 15 % of
+the box on each side along the normal, so each side needs about 4 sigma of flat
+plateau outside those bands: draw the box about **14 x the edge sigma** wide
+along the normal (at least 4x the 10-90 % width, which the panel shows), and at
+least about 2x the expected travel plus a margin on each side. `gaussderiv`
+uses no levels, so about 2x the 10-90 % width is enough, but the edge still has
+to stay inside the box over the whole travel. Put the edge near the middle.
+Along the edge, about 60 % of the edge length is plenty, on the straight part.
+Keep the ghost and the patch corners out of the box. See "How the edge point is
+picked".
 
-Measured on synthetic data: bias below 0.05 sensor px on noise-free sub-pixel
-shifts; single-frame SD 0.004 px at 0.4 counts of noise and 0.012 px at 2
-counts; 0.47 ms median for a full 2048x1536 frame.
+Measured on synthetic data (`halfmax`): bias below 0.05 sensor px on noise-free
+sub-pixel shifts; single-frame SD 0.004 px at 0.4 counts of noise and 0.012 px
+at 2 counts; 0.47 ms median for a full 2048x1536 frame. `gaussderiv` takes
+about 0.5 ms for an 80 x 60 px box against 0.3 ms for `halfmax`, and gives the
+same sub-pixel accuracy within 0.05 px on the same synthetic cases.
 
 ### Optional second edge and fusion
 
@@ -215,8 +299,10 @@ calibration, so it can differ from the drawn box by less than 2 px.
    `p_c = getPosition(P)`. Turn the LED on (owner "calibrate"). Pause the Live
    preview and remember it (the worker gets `preview_stop`, the service still
    counts the preview as on).
-2. Measure at `p_c` with `max(2 * n_frames, 10)` snapped frames. Per box this
-   gives `e_start`, `noise_px` (SD) and the detected axis, polarity, angle and
+2. Measure at `p_c` with `max(2 * n_frames, 10)` snapped frames, with the
+   **detector setting** (`detector`, `detector_sigma_px`; every measurement of
+   the calibration uses it). Per box this gives `e_start`, `noise_px` (SD),
+   the mean `edge_width_px` and the detected axis, polarity, angle and
    contrast. A box whose fix is not ok (wrong box, LED off...) is dropped with
    the warning `"edge K dropped: edge not measurable: <reason>"` (K is the
    1-based box number as passed).
@@ -237,7 +323,8 @@ calibration, so it can differ from the drawn box by less than 2 px.
    line `edge = e_c + s (p - p_c)`. The stored zero is
    `e0_px = (e_start + e_end) / 2` at the shared `p0_um = p_c`;
    `slope_px_per_um` is signed and can differ in sign and size between edges.
-   `linear_range_um` is half the span.
+   `linear_range_um` is half the span. The detector, its width, the mean edge
+   width and the snapped box's size across the edge are stored with the edge.
    - Errors (`ValueError`, plain message): fewer than 5 good points; `|s|`
      below 0.3 px/um ("edge barely moves; wrong edge or span too small"); R2
      below 0.95 ("not linear; reduce the span"); non-monotonic steps; the edge
@@ -268,9 +355,23 @@ calibration, so it can differ from the drawn box by less than 2 px.
 
 Each edge calibration holds: box, axis, polarity, signed slope (px/um), R2,
 residual, `linear_range_um` (half the span), noise, reference angle and
-contrast, zero edge `e0_px` and its own warnings. The `FocusCalibration` adds
-the shared zero P `p0_um`, the record path, the calibration warnings and the
-creation time.
+contrast, zero edge `e0_px`, its own warnings and the edge detector it was
+measured with (`detector`, `detector_sigma_px`, `edge_width_px`,
+`box_normal_px`). The `FocusCalibration` adds the shared zero P `p0_um`, the
+record path, the calibration warnings and the creation time.
+
+**A calibration is only valid for the detector it was made with.** The zero and
+the slope of `halfmax` and `gaussderiv` differ (the steepest point sits up to
+about a pixel from the 50 % point), so a measurement with the wrong one would
+be off by a fixed offset. A running or preview measurement therefore uses the
+detector stored in the calibration. If the detector setting (or, for
+`gaussderiv`, its width) differs from the one the calibration was made with,
+`detector_mismatch(cal, detector, sigma_px)` returns a message such as
+"calibrated with halfmax; the detector setting is gaussderiv: recalibrate",
+the panel shows it with Lock disabled, and `SpotFocusService.start` raises
+`RuntimeError` (a worker given such a pair faults the same way). Zero here
+keeps the calibration's detector. Change the setting, then press Calibrate
+again; the new sweep is made with the new detector.
 
 **Zero here** (`zero(cal, n_frames=8)`) works only while stopped. It reads P
 once, takes a short LED claim (owner "zero"), measures every edge with its
@@ -297,8 +398,11 @@ The calibration is stored in `SpotFocusSettingsV1.calibration` as
 `FocusCalibration.to_dict()` with `"kind": "edges"` (lists for the boxes and
 sweeps, so it round-trips through JSON). Settings added for the edge workflow:
 `edge_box` and `edge_box_2` (`x, y, w, h` or `None`; box 2 is optional),
-`sweep_span_um` (2.0), `sweep_steps` (9), `sweep_frames` (3), and the loop
-parameters `max_edge_disagreement_um` (1.0) and `hold_band_um` (0.15).
+`sweep_span_um` (2.0), `sweep_steps` (9), `sweep_frames` (3), the loop
+parameters `max_edge_disagreement_um` (1.0) and `hold_band_um` (0.15), and the
+edge detector settings `detector` (`"gaussderiv"` or `"halfmax"`, default
+`"gaussderiv"`) and `detector_sigma_px` (the `gaussderiv` width in sensor px,
+default 6.0, range 2 to 12).
 `SpotFocusSettingsV1.calibration_status()` returns the `load_calibration`
 result and `to_calibration()` returns its first element.
 
@@ -310,6 +414,13 @@ result and `to_calibration()` returns its first element.
   `FocusCalibration`**, with `p0_um`, `created`, `record_path` and `warnings`
   taken from it. The rig's existing calibration (slope 1.919 px/um) keeps
   working this way.
+- A calibration saved before the detector was selectable has no `detector`
+  key and loads as **`halfmax`** (its `detector_sigma_px` is 6.0, `edge_width_px`
+  unknown). **The rig's existing calibration is such a one**, so with the new
+  default (`gaussderiv`) Lock is refused with the mismatch message until you
+  either recalibrate (the new sweep is then made with `gaussderiv`) or set the
+  detector to `halfmax` in the panel. An unknown detector string is a
+  malformed dict.
 - An old Gaussian calibration (no `kind`), garbage, a malformed dict, or an
   edge count other than 1 or 2 gives
   `(None, "old spot calibration ignored; recalibrate")`.
@@ -385,12 +496,23 @@ old params are ignored (`SpotLoopParams.from_dict`, settings `extra="ignore"`).
       frame, box, *, roi_offset=(0, 0), channel="sum", bayer="RGGB",
       axis=None, polarity=None, saturation=None, max_saturated_frac=0.002,
       min_contrast=10.0, min_valid_fraction=0.5,
+      detector="gaussderiv", sigma_px=6.0,
   ) -> EdgeFix
   ```
 
-- `EdgeCalibration` (dataclass, `to_dict` / `from_dict`). `from_dict` raises
-  `ValueError` on a wrong `kind`, missing keys, a zero or non-finite slope, or
-  a malformed box, axis or polarity.
+  `detector` is one of `EDGE_DETECTORS = ("gaussderiv", "halfmax")` and
+  `sigma_px` is the `gaussderiv` width in sensor px (ignored by `halfmax`);
+  both raise `ValueError` when invalid. Constants: `DEFAULT_DETECTOR`,
+  `DEFAULT_SIGMA_PX` (6.0), `SIGMA_PX_RANGE` (2 to 12) and
+  `EDGE_DETECTOR_LABELS` (panel names). `detector_mismatch` is described under
+  "Calibration and zero".
+
+- `EdgeCalibration` (dataclass, `to_dict` / `from_dict`), with the fields
+  `detector` (default `"halfmax"`, so an old dict loads as halfmax),
+  `detector_sigma_px` (6.0), `edge_width_px` (nan when unknown, `None` in JSON,
+  not part of `==`) and `box_normal_px` (0 when unknown). `from_dict` raises
+  `ValueError` on a wrong `kind`, missing keys, a zero or non-finite slope, an
+  unknown detector, or a malformed box, axis or polarity.
 - `FocusCalibration` (dataclass: `edges` (1 or 2 `EdgeCalibration`), `p0_um`,
   `created`, `record_path`, `warnings`, `kind="edges"`; properties `boxes` and
   `linear_range_um`; `to_dict`, `from_dict`, `rezeroed(e0_px, p0_um)`).
@@ -414,6 +536,7 @@ old params are ignored (`SpotLoopParams.from_dict`, settings `extra="ignore"`).
       p_um, edge_px, *, box, axis, polarity, p0_um, e0_px=None,
       noise_px=0.0, angle_deg=0.0, contrast=0.0, linear_range_um=None,
       min_slope_px_per_um=0.3, min_r2=0.95,
+      detector="halfmax", detector_sigma_px=6.0, edge_width_px=nan,
   ) -> EdgeCalibration
   ```
 
@@ -516,11 +639,16 @@ Main to worker:
 
 - `start`: `params`, `calibration` (a `FocusCalibration` dict, or a single-edge
   dict), `p_start_um`. A malformed or old calibration becomes a worker fault
-  `bad calibration: ...` (the worker does not crash).
+  `bad calibration: ...` (the worker does not crash). A calibration made with
+  another detector than the worker's detector setting is a fault with the
+  `detector_mismatch` text.
 - `stop`. The worker keeps its calibration for the preview.
 - `update_params`: `params`. A changed `offset_um` also clears the averaging
   window.
-- `set_camera`: `exposure_ms`, `gain`, `channel`, `roi`.
+- `set_camera`: `exposure_ms`, `gain`, `channel`, `roi`, `detector`,
+  `detector_sigma_px`. An unknown detector or a width out of range gives an
+  `error` message and changes nothing. The setting is read once at `start`
+  from the `analysis` entries of the source spec too.
 - `set_calibration`: `calibration` (dict or None). It is held for the preview,
   so the worker can compute the fused error without a lock. Ignored (and
   logged) while running, since the controller was built from the start
@@ -531,7 +659,8 @@ Main to worker:
   unchanged. When not running, it clears the fixes and overlay at once.
   `set_edge_box` (`box` or None) is kept as an alias for one box or none.
 - `measure`: `n_frames`, `p_um`, `boxes` (a list of `{"box", "axis",
-  "polarity"}` entries; `axis` and `polarity` may be None), `return_frame`,
+  "polarity"}` entries, plus optional `"detector"` and `"detector_sigma_px"`
+  that default to the setting; `axis` and `polarity` may be None), `return_frame`,
   and an optional `timeout_s`. The old `box`, `axis` and `polarity` keys still
   work and make one entry. With neither, it falls back to the preview boxes;
   with no boxes at all, the reply has `edges == []`, `n = 0` and reason
@@ -573,7 +702,8 @@ Worker to main:
   `frame`, plus the first entry's fields repeated at the top level. Each entry
   of `edges` has `n`, `edge_mean`, `edge_sd` (ddof 1; 0.0 for n = 1; NaN for
   n = 0), `x_mean`, `y_mean`, `contrast_mean`, `angle_mean`, `residual_mean`,
-  `axis`, `polarity` and `reason`. `reason` is the last bad reason when
+  `axis`, `polarity`, `edge_width_mean`, `detector`, `detector_sigma_px` and
+  `reason`. `reason` is the last bad reason when
   `n == 0`, else empty (`"no frames from camera"` if nothing settled at all).
   `frame` is the last frame with any good box (full ROI, raw dtype), only if
   `return_frame` was set.
@@ -583,6 +713,10 @@ Worker to main:
 
 Behaviour:
 
+- Which detector measures: a calibration that applies (a running lock, or a
+  preview on the calibration's own boxes) uses its own detector and width;
+  otherwise (no calibration, boxes that are not the calibration's, a new
+  sweep) the detector setting is used.
 - Which boxes are measured: while running, the calibration's boxes (with their
   axes and polarities). In preview, the edge boxes (the calibration's axis and
   polarity are used only if the snapped box equals the calibration's box, else
@@ -623,6 +757,8 @@ SpotFocusService(
 - Properties: `current_state`, `preview_active`, `camera_info`, `info`,
   `last_telemetry`, `worker_pid`; `wait_ready(timeout_s=None)`.
 - `start(params, calibration, led_intensity=None)`
+  - Raises `RuntimeError` first, before anything is sent, if the calibration
+    does not match the detector setting (`detector_mismatch`).
   - Reads P once with `getPosition`, calls `led_on(owner="lock",
     force_ready=True)` (CRISP to Ready, previous state remembered), then sends
     `start`.
@@ -713,6 +849,11 @@ Files:
     diagonal motion gives agreeing estimates, a lateral move gives a
     disagreement, the two-edge loop converges, stops on a lateral shift when
     neither edge is at target, and holds through one when an edge is.
+  - Detectors: `halfmax` pinned to the original method (golden values), the
+    same sub-pixel accuracy for `gaussderiv` on sharp, soft and shifted edges,
+    a linear sweep, insensitivity to the box width, the width setting, edge
+    width, unknown detector or width, the calibration round trip and old dicts
+    loading as `halfmax`, `rezero` keeping the detector, `detector_mismatch`.
   - Controller: dead band, step clamp, rate cap, range and excursion faults,
     outside-linear-range sign-only step, anti-windup, strikes. With the sign
     flipped, the controller diverges.
@@ -729,8 +870,12 @@ Files:
     and writes a record; a calibration that loses the edge mid-sweep or finds
     no edge raises the documented text and cleans up. Calibrate, zero and
     measure refuse while running; calibrate refuses during an MDA.
-  - `zero` re-zeroes without moves or waits; an offset change moves the held P
-    and back.
+  - `zero` re-zeroes without moves or waits (with the calibration's own
+    detector); an offset change moves the held P and back.
+  - Detector: a calibration stores the setting; Lock refuses on a mismatch
+    (service and worker); a running lock keeps the calibration's detector; the
+    preview marker follows the calibration when it applies; per-box detector in
+    `measure`; a bad detector in `set_camera` is an error.
   - LED off or exposure change: fault on edge loss, and no move when only the
     contrast changes.
   - A bad calibration dict faults the worker without killing it.
@@ -821,7 +966,9 @@ at full frame, 31 fps at a 640x480 ROI. Exposure runs 0.105 ms to 15 s, gain
 - `start_preview()` and `stop_preview()`; `preview_active`.
 - `latest_frame(last_seq=None) -> LiveFrame | None`.
 - `camera_info`: the ready info, kept current by `set_camera`.
-- `set_camera(exposure_ms=None, gain=None, roi=None, channel=None)`.
+- `set_camera(exposure_ms=None, gain=None, roi=None, channel=None,
+  detector=None, detector_sigma_px=None)`. The detector setting is also
+  `detector_setting -> (name, sigma_px)`; an unknown name raises `ValueError`.
 - `stop()` returns to `preview` if preview was on.
 - Calibrate pauses the preview while it runs and restores it afterwards.
 
@@ -836,6 +983,11 @@ at full frame, 31 fps at a 640x480 ROI. Exposure runs 0.105 ms to 15 s, gain
 - `calibration`, `edge_box`, `edge_box_2`, `sweep_span_um`, `sweep_steps`,
   `sweep_frames` as described above. `params` also holds
   `max_edge_disagreement_um` (1.0) and `hold_band_um` (0.15).
+- `detector` (`"gaussderiv"` default, or `"halfmax"`) and `detector_sigma_px`
+  (6.0, 2 to 12): how the edge point is picked, see "How the edge point is
+  picked". Used for new calibrations and for a preview with no matching
+  calibration; a calibration that applies always measures with its own
+  detector (see "Calibration and zero").
 
 ### GUI
 
@@ -851,7 +1003,12 @@ at full frame, 31 fps at a 640x480 ROI. Exposure runs 0.105 ms to 15 s, gain
     and Calibrate.
   - State, fault and calibration labels. The calibration label has one line
     per edge (axis, signed slope px/um, R2, residual, noise in um from
-    `edge_noise_um`), then the shared zero P, range and created time. A line in
+    `edge_noise_um`), then the detector the calibration was made with, the
+    shared zero P, range and created time. A detector mismatch is shown in
+    the attention colour and Lock is disabled with the message as its
+    tooltip; a box narrower than 4x (`halfmax`) or 2x (`gaussderiv`) the
+    measured edge width adds a note "box K is narrow for this edge (...):
+    widen it across the edge". A line in
     the attention colour shows the warnings (for example "edge 2 dropped:
     ..."), and "edge box changed since the calibration; recalibrate" when a
     saved box snaps to a different box than the calibration's (checked for
@@ -876,6 +1033,10 @@ at full frame, 31 fps at a 640x480 ROI. Exposure runs 0.105 ms to 15 s, gain
       (focus.crisp_label)".
     - Exposure (ms), gain and channel (red or sum). Each applies live and is
       saved.
+    - **Edge detector** (Gaussian derivative or Half-max) and **Detector
+      width** (px, used by the Gaussian derivative). They apply live and are
+      saved. Changing the detector does not recalibrate: see "A calibration is
+      only valid for the detector it was made with".
     - ROI x, y, w, h, with **Apply ROI** and **Full frame**.
     - Readouts: fps, max value, % saturated.
     - Camera errors show in the panel's fault label.
@@ -976,6 +1137,9 @@ at full frame, 31 fps at a 640x480 ROI. Exposure runs 0.105 ms to 15 s, gain
 
 The first P sweep on the rig (a 9-step, +-1 um calibration on the top edge,
 saved as an npz) was analysed offline. The lock itself has not been run yet.
+All of these numbers, and the saved calibration, are `halfmax` (the only
+detector then); a later offline comparison on the same frames is in "How the
+edge point is picked" and the notebook.
 
 - **Top edge** (box 762, 590, 176, 114): +1.92 px/um, R2 0.993, residual 0.106
   px. The box takes in the rounded top-left corner of the patch, so the line
@@ -1022,7 +1186,10 @@ Do these in order. Stop at the first NO-GO and fix it before going on.
    cross should sit on that edge and stay still.
    - GO: both crosses are steady. Otherwise Clear box 2 and use one edge.
 4. **Calibrate.** Focus on the cells by eye (OPM image), then press Calibrate
-   (default +-1 um, 9 steps).
+   (default +-1 um, 9 steps). Check first that the detector setting is the one
+   you want (default Gaussian derivative); a calibration saved before the
+   detector setting existed is `halfmax` and needs a recalibration (or the
+   `halfmax` setting) before Lock is enabled.
    - GO: for each edge `|slope| >= 1 px/um`, R2 `>= 0.98`, residual below 0.3
      px, no "left the box", no hysteresis warning. With two boxes the label
      shows one line per edge and no "edge 2 dropped" warning.

@@ -248,17 +248,24 @@ def _cal_from(obj: Any) -> Any:
 
 
 def _edge_summary(
-    rows: list[tuple[float, ...]], axis: Any, polarity: Any, reason: str
+    rows: list[tuple[float, ...]],
+    axis: Any,
+    polarity: Any,
+    reason: str,
+    detector: str = "",
+    sigma_px: float = math.nan,
 ) -> dict[str, Any]:
     """Mean and SD of the good fixes of one box, in the ``measurement`` layout.
 
-    *rows* hold, per good frame: edge, x, y, contrast, angle, residual.
+    *rows* hold, per good frame: edge, x, y, contrast, angle, residual, edge
+    width. *detector* and *sigma_px* are what the box was measured with.
     """
     import numpy as np
 
-    data = np.asarray(rows, dtype=float).reshape(len(rows), 6)
-    mean = data.mean(axis=0) if rows else np.full(6, math.nan)
+    data = np.asarray(rows, dtype=float).reshape(len(rows), 7)
+    mean = data.mean(axis=0) if rows else np.full(7, math.nan)
     sd = float(data[:, 0].std(ddof=1)) if len(rows) > 1 else 0.0
+    widths = data[np.isfinite(data[:, 6]), 6]
     return {
         "n": len(rows),
         "edge_mean": float(mean[0]),
@@ -268,6 +275,9 @@ def _edge_summary(
         "contrast_mean": float(mean[3]),
         "angle_mean": float(mean[4]),
         "residual_mean": float(mean[5]),
+        "edge_width_mean": float(widths.mean()) if widths.size else math.nan,
+        "detector": detector,
+        "detector_sigma_px": sigma_px,
         "axis": axis,
         "polarity": polarity,
         "reason": "" if rows else (reason or "no frames from camera"),
@@ -281,8 +291,9 @@ class _Worker:
         self.conn = conn
         self.outbox = _Outbox(conn, self._broken)
         spec = dict(source_spec)
-        #: ``measure_edge`` options (channel, bayer, saturation); not a source
-        #: argument, so split off before ``make_source``.
+        #: ``measure_edge`` options (channel, bayer, saturation, detector,
+        #: detector_sigma_px); not a source argument, so split off before
+        #: ``make_source``.
         self.analysis: dict[str, Any] = dict(spec.pop("analysis", {}) or {})
         #: Saturation ceiling from the camera's bit depth (12-bit data arrives in
         #: uint16); None falls back to the dtype maximum in ``measure_edge``.
@@ -390,8 +401,20 @@ class _Worker:
             exposure_range_ms=tuple(exp_range()) if exp_range else None,
             gain_range=tuple(gain_range()) if gain_range else None,
             channel=self.analysis.get("channel", "sum"),
+            detector=self.detector_setting[0],
+            detector_sigma_px=self.detector_setting[1],
         )
         return info
+
+    @property
+    def detector_setting(self) -> tuple[str, float]:
+        """The detector and ``gaussderiv`` width of the settings (not a calibration)."""
+        from .spot_focus import DEFAULT_DETECTOR, DEFAULT_SIGMA_PX
+
+        return (
+            str(self.analysis.get("detector", DEFAULT_DETECTOR)),
+            float(self.analysis.get("detector_sigma_px", DEFAULT_SIGMA_PX)),
+        )
 
     def arm_settle(self, now: float | None = None) -> None:
         """Ignore frames until the camera has caught up with a change."""
@@ -412,10 +435,16 @@ class _Worker:
         box: Any,
         axis: str | None = None,
         polarity: int | None = None,
+        detector: tuple[str, float] | None = None,
     ) -> Any:
-        """Measure the edge in *box*; the result is in sensor pixels."""
+        """Measure the edge in *box*; the result is in sensor pixels.
+
+        *detector* is ``(name, sigma_px)``: the one of the calibration the box
+        belongs to. None uses the detector setting (no calibration applies).
+        """
         from .spot_focus import measure_edge
 
+        det, sigma = detector if detector is not None else self.detector_setting
         limits: dict[str, Any] = {}
         if self.params is not None:
             limits = {
@@ -432,6 +461,8 @@ class _Worker:
             axis=axis,
             polarity=polarity,
             saturation=self.analysis.get("saturation", self.saturation),
+            detector=det,
+            sigma_px=sigma,
             **limits,
         )
 
@@ -518,9 +549,16 @@ class _Worker:
             if fuse
             else [(None, None)] * len(boxes)
         )
+        # A calibration is only valid for the detector it was made with, so its
+        # boxes are measured with that one, whatever the setting says now.
+        dets: list[tuple[str, float] | None] = (
+            [(e.detector, e.detector_sigma_px) for e in cal.edges]
+            if fuse
+            else [None] * len(boxes)
+        )
         fixes = [
-            self.edge(frame, roi, box, axis, polarity)
-            for box, (axis, polarity) in zip(boxes, specs, strict=True)
+            self.edge(frame, roi, box, axis, polarity, det)
+            for box, (axis, polarity), det in zip(boxes, specs, dets, strict=True)
         ]
         fused = None
         params = self.params if self.params is not None else SpotLoopParams()
@@ -623,6 +661,12 @@ class _Worker:
         except ValueError as exc:
             self.fault(f"bad calibration: {exc}")
             return
+        from .spot_focus import detector_mismatch
+
+        why = detector_mismatch(self.cal, *self.detector_setting)
+        if why:
+            self.fault(why)
+            return
         p_start = float(msg["p_start_um"])
         self.ctl = SpotFocusController(
             self.params, p_start, linear_range_um=self.cal.linear_range_um
@@ -692,7 +736,12 @@ class _Worker:
         self.t_fit = -math.inf
 
     def on_set_camera(self, msg: dict) -> None:
-        """Apply exposure, gain, channel and ROI now; an ROI of zeros is full frame."""
+        """Apply exposure, gain, channel, detector and ROI now.
+
+        An ROI of zeros is full frame. ``detector`` (with ``detector_sigma_px``)
+        is the setting used wherever no calibration applies; a running lock and
+        a held calibration keep measuring with the calibration's own.
+        """
         changed = False
         try:
             if msg.get("channel") is not None:
@@ -703,6 +752,21 @@ class _Worker:
                     )
                 if self.analysis.get("channel", "sum") != channel:
                     self.analysis["channel"] = channel
+                    changed = True
+            if msg.get("detector") is not None:
+                from .spot_focus import EDGE_DETECTORS
+
+                detector = str(msg["detector"])
+                if detector not in EDGE_DETECTORS:
+                    raise ValueError(
+                        f"detector must be one of {EDGE_DETECTORS}, not {detector!r}"
+                    )
+                sigma = float(msg.get("detector_sigma_px") or self.detector_setting[1])
+                if not (math.isfinite(sigma) and sigma > 0):
+                    raise ValueError(f"detector_sigma_px must be positive, not {sigma}")
+                if (detector, sigma) != self.detector_setting:
+                    self.analysis["detector"] = detector
+                    self.analysis["detector_sigma_px"] = sigma
                     changed = True
             if msg.get("exposure_ms") is not None:
                 self.source.set_exposure_ms(float(msg["exposure_ms"]))
@@ -749,7 +813,9 @@ class _Worker:
 
         ``boxes`` is a list of ``{"box", "axis", "polarity"}`` (the old single
         ``box`` / ``axis`` / ``polarity`` keys make one entry; neither means the
-        preview boxes). All boxes are measured on the same frames. Only frames
+        preview boxes), each optionally with ``"detector"`` and
+        ``"detector_sigma_px"`` (a calibration's own; the detector setting
+        otherwise). All boxes are measured on the same frames. Only frames
         that pass the settle are used (they were exposed after the request, a
         "snap") and only those go to the shared buffer, so the live view shows
         what was measured. A box's *axis* / *polarity* (None = detect on its
@@ -784,12 +850,18 @@ class _Worker:
         boxes = [d["box"] for d in raw]
         axes = [d.get("axis") for d in raw]
         pols = [d.get("polarity") for d in raw]
+        dets = [
+            (str(d["detector"]), float(d["detector_sigma_px"]))
+            if d.get("detector")
+            else self.detector_setting
+            for d in raw
+        ]
         want_frame = bool(msg.get("return_frame", False))
         if p_um is not None:
             self.source.set_actuator_um(float(p_um))
         t0 = time.monotonic()
         self.arm_settle(t0)
-        # Per box and good frame: edge, x, y, contrast, angle, residual.
+        # Per box and good frame: edge, x, y, contrast, angle, residual, width.
         rows: list[list[tuple[float, ...]]] = [[] for _ in boxes]
         reasons = ["" for _ in boxes]
         kept: Any = None
@@ -830,7 +902,7 @@ class _Worker:
             if not self.settle.frame(now):
                 continue
             fixes = [
-                self.edge(frame, roi, box, axes[i], pols[i])
+                self.edge(frame, roi, box, axes[i], pols[i], dets[i])
                 for i, box in enumerate(boxes)
             ]
             self.set_fixes(fixes, now)
@@ -853,12 +925,13 @@ class _Worker:
                         fix.contrast,
                         fix.angle_deg,
                         fix.residual_px,
+                        fix.edge_width_px,
                     )
                 )
                 if want_frame:
                     kept = np.array(frame)
         entries = [
-            _edge_summary(rows[i], axes[i], pols[i], reasons[i])
+            _edge_summary(rows[i], axes[i], pols[i], reasons[i], *dets[i])
             for i in range(len(boxes))
         ]
         head = entries[0] if entries else _edge_summary([], None, None, "no edge box")

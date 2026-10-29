@@ -29,6 +29,7 @@ moving the piezo by **-along_um** returns the edge to the zero (plus offset).
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime
@@ -44,6 +45,19 @@ _RED_SITE = {"RGGB": (0, 0), "BGGR": (1, 1), "GRBG": (0, 1), "GBRG": (1, 0)}
 _BAND = 0.15  # outer fraction of the box (along the normal) used for the levels
 _OLD_CAL_MSG = "old spot calibration ignored; recalibrate"
 _NO_CAL_MSG = "no spot calibration yet; press Calibrate"
+
+#: The edge detectors :func:`measure_edge` knows; the first is the default.
+EDGE_DETECTORS = ("gaussderiv", "halfmax")
+#: Short human labels for the panel's detector combo.
+EDGE_DETECTOR_LABELS = {
+    "gaussderiv": "Gaussian derivative",
+    "halfmax": "Half-max (50 %)",
+}
+DEFAULT_DETECTOR = EDGE_DETECTORS[0]
+DEFAULT_SIGMA_PX = 6.0
+"""Default width of the ``gaussderiv`` detector, in sensor px."""
+SIGMA_PX_RANGE = (2.0, 12.0)
+"""Allowed ``detector_sigma_px`` in the settings (sensor px)."""
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +99,14 @@ class EdgeFix:
     """False if the fix must not be used for control."""
     reason: str = ""
     """Why ``ok`` is False; empty when ok."""
+    detector: str = ""
+    """The edge detector that produced this fix (see :data:`EDGE_DETECTORS`)."""
+    sigma_px: float = DEFAULT_SIGMA_PX
+    """The ``gaussderiv`` width used, in sensor px (unused by ``halfmax``)."""
+    edge_width_px: float = math.nan
+    """10-90 % width of the row-averaged, tilt-corrected edge profile in sensor
+    px; nan when it cannot be measured. A box much narrower than a few times
+    this does not hold the whole edge."""
 
 
 def snap_box(box: Sequence[float], *, min_size: int = 16) -> tuple[int, int, int, int]:
@@ -118,6 +140,8 @@ def _failed(
     box: tuple[int, int, int, int],
     axis: str,
     polarity: int,
+    detector: str = "",
+    sigma_px: float = DEFAULT_SIGMA_PX,
     **info: float,
 ) -> EdgeFix:
     """Build a not-ok :class:`EdgeFix` that still has finite numbers."""
@@ -133,6 +157,7 @@ def _failed(
         "valid_fraction": 0.0,
         "saturated_frac": 0.0,
         "peak": 0.0,
+        "edge_width_px": math.nan,
     }
     vals.update(info)
     return EdgeFix(
@@ -142,8 +167,114 @@ def _failed(
         polarity=polarity,
         ok=False,
         reason=reason,
+        detector=detector,
+        sigma_px=sigma_px,
         **vals,
     )
+
+
+@functools.lru_cache(maxsize=16)
+def _gauss_kernels(sigma: float) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``(gauss, deriv)`` kernels of width *sigma* binned px (cached).
+
+    ``gauss`` sums to 1; ``deriv`` is the derivative of that Gaussian, scaled so
+    that a unit ramp gives response 1 (a positive peak where the signal rises).
+    """
+    r = max(1, math.ceil(4.0 * sigma))
+    x = np.arange(-r, r + 1, dtype=np.float64)
+    g = np.exp(-0.5 * (x / sigma) ** 2)
+    g /= g.sum()
+    d = x * g / sigma**2
+    g.flags.writeable = False
+    d.flags.writeable = False
+    return g, d
+
+
+def _correlate(a: np.ndarray, k: np.ndarray, axis: int) -> np.ndarray:
+    """Correlate *a* with the odd-length kernel *k* along *axis* (edge-padded)."""
+    r = k.size // 2
+    pad = [(0, 0), (0, 0)]
+    pad[axis] = (r, r)
+    p = np.pad(a, pad, mode="edge")
+    n = a.shape[axis]
+    out = np.zeros(a.shape, dtype=np.float64)
+    for m in range(k.size):
+        out += k[m] * (p[m : m + n] if axis == 0 else p[:, m : m + n])
+    return out
+
+
+_NO_ROWS = (np.zeros(0, dtype=np.intp), np.zeros(0, dtype=np.float64))
+
+
+def _cross_halfmax(
+    sm: np.ndarray, low: float, contrast: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """First half-way crossing of every row, linearly interpolated.
+
+    Returns the rows that have one and the crossing in column index units.
+    """
+    n_rows = sm.shape[0]
+    threshold = low + 0.5 * contrast
+    above = sm >= threshold
+    first = above.argmax(axis=1)
+    has = above[np.arange(n_rows), first] & (first >= 1)
+    rows = np.nonzero(has)[0]
+    i1 = first[rows]
+    v0, v1 = sm[rows, i1 - 1], sm[rows, i1]
+    return rows, (i1 - 1) + (threshold - v0) / (v1 - v0)
+
+
+def _cross_gaussderiv(s: np.ndarray, sigma_bin: float) -> tuple[np.ndarray, np.ndarray]:
+    """Per-row sub-pixel maximum of the Gaussian-derivative edge response.
+
+    The grey image *s* (dark side first) is smoothed along the edge by a
+    Gaussian and differentiated along the normal by the derivative of a
+    Gaussian, both of width *sigma_bin* binned px. The position of each row's
+    maximum is refined by a parabola through its three samples. Rows whose peak
+    is below a quarter of the median peak are dropped.
+    """
+    n_rows, n_cols = s.shape
+    lo, hi = 2, n_cols - 3
+    if hi <= lo:
+        return _NO_ROWS
+    g, dg = _gauss_kernels(sigma_bin)
+    grad = _correlate(_correlate(s, g, 0), dg, 1)
+    j = lo + grad[:, lo : hi + 1].argmax(axis=1)
+    ar = np.arange(n_rows)
+    gm, g0, gp = grad[ar, j - 1], grad[ar, j], grad[ar, j + 1]
+    den = gm - 2.0 * g0 + gp
+    with np.errstate(divide="ignore", invalid="ignore"):
+        d = np.where(den < 0, 0.5 * (gm - gp) / den, 0.0)
+    d = np.clip(d, -1.0, 1.0)
+    rows = np.nonzero(g0 > 0.25 * np.median(g0))[0]
+    return rows, (j + d)[rows]
+
+
+def _edge_width_px(
+    s: np.ndarray, low: float, high: float, b: float, off_a: float
+) -> float:
+    """10-90 % width of the tilt-corrected, row-averaged edge profile (sensor px).
+
+    Every row is shifted by the fitted tilt *b* (columns per row) before the
+    rows are averaged, so a tilted edge is not smeared. Returns nan when the
+    profile never reaches 10 % and 90 % of the way from *low* to *high*.
+    """
+    n_rows, n_cols = s.shape
+    r = np.arange(n_rows, dtype=np.float64) - (n_rows - off_a) / 2.0
+    pos = np.clip(np.arange(n_cols)[None, :] + b * r[:, None], 0.0, n_cols - 1.0)
+    i0 = np.minimum(pos.astype(np.intp), n_cols - 2)
+    frac = pos - i0
+    ar = np.arange(n_rows)[:, None]
+    prof = ((1.0 - frac) * s[ar, i0] + frac * s[ar, i0 + 1]).mean(axis=0)
+    norm = (prof - low) / (high - low)
+    out = []
+    for level in (0.1, 0.9):
+        above = norm >= level
+        i = int(above.argmax())
+        if not above[i] or i < 1:
+            return math.nan
+        out.append((i - 1) + (level - norm[i - 1]) / (norm[i] - norm[i - 1]))
+    return 2.0 * (out[1] - out[0]) if out[1] > out[0] else math.nan
 
 
 def measure_edge(
@@ -159,16 +290,26 @@ def measure_edge(
     max_saturated_frac: float = 0.002,
     min_contrast: float = 10.0,
     min_valid_fraction: float = 0.5,
+    detector: str = DEFAULT_DETECTOR,
+    sigma_px: float = DEFAULT_SIGMA_PX,
 ) -> EdgeFix:
     """Measure the sub-pixel position of one straight edge inside a box.
 
     The box is cropped, reduced to a half-resolution grey image aligned to the
     2x2 Bayer cell (which removes the colour mosaic), and for every row along
-    the edge the first crossing of the half-way level (between the dark and
-    the bright side) is found by linear interpolation. A robust straight-line
-    fit through the crossings gives the position at the box centre. Half-way
-    levels make the result independent of exposure, gain and LED power, and a
-    symmetric defocus blur widens the edge without moving its 50 % point.
+    the edge one edge point is found (see *detector*). A robust straight-line
+    fit through those points gives the position at the box centre. Both
+    detectors are independent of exposure, gain and LED power, and a
+    symmetric defocus blur widens the edge without moving it.
+
+    ``"halfmax"`` takes the first crossing of the half-way level (between the
+    dark and the bright side), linearly interpolated; the levels come from the
+    outer bands of the box, so the box must be wide enough along the normal to
+    hold the whole edge. ``"gaussderiv"`` (the default) takes the maximum of
+    the edge response of a Gaussian-derivative filter along the normal (with a
+    Gaussian along the edge), refined by a parabola; it needs no level and is
+    less sensitive to the box width. A calibration is only valid for the
+    detector it was made with (zero and slope differ by about a pixel).
 
     Parameters
     ----------
@@ -198,12 +339,26 @@ def measure_edge(
         Bright minus dark level (raw counts) below this -> "edge lost".
     min_valid_fraction : float
         Fewer rows with a crossing than this -> "edge lost".
+    detector : str
+        ``"gaussderiv"`` or ``"halfmax"`` (see :data:`EDGE_DETECTORS`).
+    sigma_px : float
+        Width of the ``gaussderiv`` filter in sensor px (it is applied at
+        half resolution, so the kernel sigma is ``sigma_px / 2`` binned px).
+        Ignored by ``halfmax``.
 
     Returns
     -------
     EdgeFix
         ``ok`` False with a ``reason`` when the box lies outside the frame, the
         box is saturated, the edge is missing or has walked to the box border.
+        Carries the *detector* and *sigma_px* used and the measured
+        ``edge_width_px``.
+
+    Raises
+    ------
+    ValueError
+        For a wrong frame shape, channel, bayer pattern, axis, detector or
+        ``sigma_px``.
     """
     arr = np.asarray(frame)
     if arr.ndim != 2:
@@ -214,6 +369,10 @@ def measure_edge(
         raise ValueError(f"Unknown Bayer pattern {bayer!r}")
     if axis not in (None, "x", "y"):
         raise ValueError(f"axis must be 'x' or 'y', not {axis!r}")
+    if detector not in EDGE_DETECTORS:
+        raise ValueError(f"detector must be one of {EDGE_DETECTORS}, not {detector!r}")
+    if not (math.isfinite(sigma_px) and sigma_px > 0):
+        raise ValueError(f"sigma_px must be positive, not {sigma_px!r}")
     sbox = snap_box(box)
     bx, by, bw, bh = sbox
     rx, ry = int(roi_offset[0]), int(roi_offset[1])
@@ -222,7 +381,12 @@ def measure_edge(
     pol0 = polarity or 1
     if bx < rx or by < ry or bx + bw > rx + fw or by + bh > ry + fh:
         return _failed(
-            "edge box outside the camera ROI", box=sbox, axis=ax0, polarity=pol0
+            "edge box outside the camera ROI",
+            box=sbox,
+            axis=ax0,
+            polarity=pol0,
+            detector=detector,
+            sigma_px=sigma_px,
         )
     crop = arr[by - ry : by - ry + bh, bx - rx : bx - rx + bw]
 
@@ -240,6 +404,8 @@ def measure_edge(
             box=sbox,
             axis=ax0,
             polarity=pol0,
+            detector=detector,
+            sigma_px=sigma_px,
             peak=peak,
             saturated_frac=sat_frac,
         )
@@ -286,15 +452,17 @@ def measure_edge(
             box=sbox,
             axis=axis,
             polarity=polarity,
+            detector=detector,
+            sigma_px=sigma_px,
             **common,
         )
 
-    # First crossing of the half-way level in every row, linearly interpolated.
-    threshold = low + 0.5 * contrast
-    above = sm >= threshold
-    first = above.argmax(axis=1)
-    has = above[np.arange(n_rows), first] & (first >= 1)
-    rows = np.nonzero(has)[0]
+    # One edge point per row: the half-way crossing of the [1 2 1] smoothed
+    # rows, or the maximum of the Gaussian-derivative response of the raw ones.
+    if detector == "halfmax":
+        rows, cross = _cross_halfmax(sm, low, contrast)
+    else:
+        rows, cross = _cross_gaussderiv(s, sigma_px / 2.0)
     valid_fraction = rows.size / n_rows
     common["valid_fraction"] = valid_fraction
     if valid_fraction < min_valid_fraction or rows.size < 3:
@@ -303,17 +471,16 @@ def measure_edge(
             box=sbox,
             axis=axis,
             polarity=polarity,
+            detector=detector,
+            sigma_px=sigma_px,
             **common,
         )
-    i1 = first[rows]
-    v0, v1 = sm[rows, i1 - 1], sm[rows, i1]
-    cross = (i1 - 1) + (threshold - v0) / (v1 - v0)
 
     # Robust line c(r) = a + b r, r = distance from the box centre row.
     r = rows.astype(np.float64) - (n_rows - off_a) / 2.0
-    keep = np.ones(r.size, dtype=bool)
+    keep: np.ndarray = np.ones(r.size, dtype=bool)
     a = b = 0.0
-    res = np.zeros(r.size)
+    res: np.ndarray = np.zeros(r.size)
     for k in range(4):
         rk, ck = r[keep], cross[keep]
         rm, cm = rk.mean(), ck.mean()
@@ -331,6 +498,7 @@ def measure_edge(
         keep = new_keep
     residual_px = 2.0 * float(np.sqrt(np.mean(res[keep] ** 2)))
     common["residual_px"] = residual_px
+    common["edge_width_px"] = _edge_width_px(s, low, high, b, off_a)
 
     a_dark_first = a  # column index with the dark side first (band test)
     if polarity < 0:  # back to the original column direction
@@ -338,7 +506,13 @@ def measure_edge(
     common["angle_deg"] = math.degrees(math.atan(b))
     if a_dark_first < band - 0.5 or a_dark_first > n_cols - band - 0.5:
         return _failed(
-            "edge left the box", box=sbox, axis=axis, polarity=polarity, **common
+            "edge left the box",
+            box=sbox,
+            axis=axis,
+            polarity=polarity,
+            detector=detector,
+            sigma_px=sigma_px,
+            **common,
         )
 
     origin = bx if axis == "x" else by
@@ -352,6 +526,8 @@ def measure_edge(
         polarity=polarity,
         ok=True,
         reason="",
+        detector=detector,
+        sigma_px=sigma_px,
         **common,
     )
 
@@ -398,13 +574,27 @@ class EdgeCalibration:
     created: str = ""
     """ISO timestamp of the fit."""
     kind: str = "edge"
+    detector: str = "halfmax"
+    """The edge detector the sweep was measured with. Calibrations saved before
+    the detector was selectable have no such key and load as ``halfmax``. The
+    zero and the slope are only valid for this detector."""
+    detector_sigma_px: float = DEFAULT_SIGMA_PX
+    """The ``gaussderiv`` width used (sensor px); unused by ``halfmax``."""
+    edge_width_px: float = field(default=math.nan, compare=False)
+    """10-90 % width of the edge at calibration time (sensor px); nan if it was
+    not measured. Not part of ``==`` (nan never equals itself)."""
+    box_normal_px: int = 0
+    """Extent of the box along the edge normal (sensor px); 0 if unknown."""
 
     def to_dict(self) -> dict[str, Any]:
-        """Return a JSON-friendly dict."""
+        """Return a JSON-friendly dict (a nan ``edge_width_px`` becomes None)."""
         d = asdict(self)
         d["box"] = [int(v) for v in self.box]
         d["sweep"] = [[float(p), float(e)] for p, e in self.sweep]
         d["warnings"] = [str(w) for w in self.warnings]
+        d["edge_width_px"] = (
+            float(self.edge_width_px) if math.isfinite(self.edge_width_px) else None
+        )
         return d
 
     @classmethod
@@ -451,6 +641,20 @@ class EdgeCalibration:
                     kw[key] = float(kw[key])
             if "n_points" in kw:
                 kw["n_points"] = int(kw["n_points"])
+            kw["detector"] = str(kw.get("detector") or "halfmax")
+            if kw["detector"] not in EDGE_DETECTORS:
+                raise ValueError(f"unknown edge detector {kw['detector']!r}")
+            kw["detector_sigma_px"] = float(
+                DEFAULT_SIGMA_PX
+                if kw.get("detector_sigma_px") is None
+                else kw["detector_sigma_px"]
+            )
+            kw["edge_width_px"] = (
+                math.nan
+                if kw.get("edge_width_px") is None
+                else float(kw["edge_width_px"])
+            )
+            kw["box_normal_px"] = int(kw.get("box_normal_px") or 0)
             cal = cls(**kw)
         except (KeyError, TypeError, AttributeError) as exc:
             raise ValueError(f"malformed edge calibration: {exc!r}") from exc
@@ -603,6 +807,45 @@ def load_calibration(
         return None, _OLD_CAL_MSG
 
 
+def detector_mismatch(
+    cal: FocusCalibration, detector: str, sigma_px: float = DEFAULT_SIGMA_PX
+) -> str:
+    """Say why *cal* is not valid for the detector setting, or "" when it is.
+
+    A zero and a slope measured with one edge detector do not hold for another
+    (the edge point moves by about a pixel), so a calibration may only be used
+    with the detector it was made with. The ``gaussderiv`` width must match too.
+
+    Parameters
+    ----------
+    cal : FocusCalibration
+        The calibration (its edges carry the detector they were made with).
+    detector : str
+        The detector in the settings.
+    sigma_px : float
+        The ``gaussderiv`` width in the settings, sensor px.
+
+    Returns
+    -------
+    str
+        "" when every edge was calibrated with this detector, else a plain
+        message such as "calibrated with halfmax; the detector setting is
+        gaussderiv: recalibrate".
+    """
+    for e in cal.edges:
+        if e.detector != detector:
+            return (
+                f"calibrated with {e.detector}; the detector setting is "
+                f"{detector}: recalibrate"
+            )
+        if detector == "gaussderiv" and abs(e.detector_sigma_px - sigma_px) > 1e-6:
+            return (
+                f"calibrated with gaussderiv sigma {e.detector_sigma_px:g} px; "
+                f"the setting is sigma {sigma_px:g} px: recalibrate"
+            )
+    return ""
+
+
 def edge_noise_um(e: EdgeCalibration) -> float:
     """Return the single-measurement noise of one edge in um of P.
 
@@ -638,6 +881,9 @@ def fit_edge_calibration(
     linear_range_um: float | None = None,
     min_slope_px_per_um: float = 0.3,
     min_r2: float = 0.95,
+    detector: str = "halfmax",
+    detector_sigma_px: float = DEFAULT_SIGMA_PX,
+    edge_width_px: float = math.nan,
 ) -> EdgeCalibration:
     """Fit edge position against piezo P with a straight line.
 
@@ -671,6 +917,13 @@ def fit_edge_calibration(
         Smaller ``|slope|`` -> "edge barely moves".
     min_r2 : float
         Smaller R2 -> "not linear".
+    detector : str
+        The edge detector *edge_px* was measured with; stored so a later
+        measurement or lock can be checked against it.
+    detector_sigma_px : float
+        The ``gaussderiv`` width used (sensor px).
+    edge_width_px : float
+        10-90 % width of the edge in sensor px, if measured.
 
     Returns
     -------
@@ -757,6 +1010,10 @@ def fit_edge_calibration(
         sweep=[(float(a), float(b)) for a, b in zip(p, e, strict=True)],
         warnings=warns,
         created=datetime.now().isoformat(timespec="seconds"),
+        detector=str(detector),
+        detector_sigma_px=float(detector_sigma_px),
+        edge_width_px=float(edge_width_px),
+        box_normal_px=int(box[2] if axis == "x" else box[3]),
     )
 
 

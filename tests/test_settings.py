@@ -162,3 +162,69 @@ def test_spot_edge_disagreement_and_hold_band_settings() -> None:
     s3 = SettingsV1.model_validate_json(old)
     assert s3.spot_focus.params.kp == 0.5
     assert s3.spot_focus.params.hold_band_um == 0.15
+
+
+def test_spot_edge_detector_settings() -> None:
+    s = SettingsV1()
+    assert s.spot_focus.detector == "gaussderiv"
+    assert s.spot_focus.detector_sigma_px == 6.0
+
+    s.spot_focus.detector = "halfmax"
+    s.spot_focus.detector_sigma_px = 8.0
+    s2 = SettingsV1.model_validate_json(s.model_dump_json())
+    assert (s2.spot_focus.detector, s2.spot_focus.detector_sigma_px) == ("halfmax", 8.0)
+
+    # a settings file from before the detector was selectable loads the defaults
+    old = '{"version": "1.0", "spot_focus": {"edge_box": [10, 10, 40, 40]}}'
+    s3 = SettingsV1.model_validate_json(old)
+    assert (s3.spot_focus.detector, s3.spot_focus.detector_sigma_px) == (
+        "gaussderiv",
+        6.0,
+    )
+
+    for bad in (
+        '{"version": "1.0", "spot_focus": {"detector": "sobel"}}',
+        '{"version": "1.0", "spot_focus": {"detector_sigma_px": 1.0}}',
+        '{"version": "1.0", "spot_focus": {"detector_sigma_px": 20.0}}',
+    ):
+        with pytest.raises(ValueError):
+            SettingsV1.model_validate_json(bad)
+
+
+def test_spot_calibration_in_settings_keeps_its_detector() -> None:
+    from pymmcore_gui.asi_z_stack.spot_focus import EdgeCalibration, FocusCalibration
+
+    edge = EdgeCalibration(
+        box=(232, 210, 80, 60),
+        axis="x",
+        polarity=1,
+        slope_px_per_um=2.0,
+        e0_px=272.0,
+        p0_um=50.0,
+        detector="gaussderiv",
+        detector_sigma_px=7.0,
+        edge_width_px=12.5,
+        box_normal_px=80,
+    )
+    cal = FocusCalibration(edges=[edge], p0_um=50.0, created="t")
+    s = SettingsV1()
+    s.spot_focus.calibration = cal.to_dict()
+    s2 = SettingsV1.model_validate_json(s.model_dump_json())
+    back = s2.spot_focus.to_calibration()
+    assert back is not None and back.edges[0] == edge
+    assert (back.edges[0].detector, back.edges[0].detector_sigma_px) == (
+        "gaussderiv",
+        7.0,
+    )
+    assert back.edges[0].edge_width_px == 12.5 and back.edges[0].box_normal_px == 80
+
+    # a calibration saved before the detector existed loads as halfmax
+    old = cal.to_dict()
+    for e in old["edges"]:
+        for k in ("detector", "detector_sigma_px", "edge_width_px", "box_normal_px"):
+            e.pop(k)
+    s3 = SettingsV1()
+    s3.spot_focus.calibration = old
+    loaded = s3.spot_focus.to_calibration()
+    assert loaded is not None and loaded.edges[0].detector == "halfmax"
+    assert s3.spot_focus.calibration_status()[1] == ""

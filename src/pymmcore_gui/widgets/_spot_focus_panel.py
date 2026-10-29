@@ -32,6 +32,7 @@ from __future__ import annotations
 import html
 import itertools
 import logging
+import math
 import threading
 import time
 from collections import deque
@@ -73,19 +74,33 @@ from pymmcore_gui._qt.QtWidgets import (
 )
 from pymmcore_gui._settings import TESTING, USER_DATA_DIR, SettingsV1
 from pymmcore_gui.asi_z_stack.image_focus_events import spot_focus_flag
-from pymmcore_gui.asi_z_stack.spot_focus import edge_noise_um, snap_box
+from pymmcore_gui.asi_z_stack.spot_focus import (
+    EDGE_DETECTOR_LABELS,
+    EDGE_DETECTORS,
+    SIGMA_PX_RANGE,
+    detector_mismatch,
+    edge_noise_um,
+    snap_box,
+)
 from pymmcore_gui.asi_z_stack.spot_focus_service import SpotFocusService
 from pymmcore_gui.widgets._spot_live_view import SpotLiveView
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from pymmcore_gui.asi_z_stack.spot_focus import FocusCalibration
+    from pymmcore_gui.asi_z_stack.spot_focus import EdgeCalibration, FocusCalibration
 
 logger = logging.getLogger(__name__)
 
 ALERT_COLOR = "#d0342c"
 ATTENTION_COLOR = "#e08a00"
+OK_COLOR = "#2e9e44"
+#: Per-edge noise (um of P) below which an edge is good (green) ...
+NOISE_GOOD_UM = 0.03
+#: ... and below which it is usable (attention); above that it is red.
+NOISE_WARN_UM = 0.06
+#: A box must be this many edge widths long across the edge, per detector.
+_BOX_WIDTH_FACTOR = {"halfmax": 4.0, "gaussderiv": 2.0}
 #: Shown when Calibrate or Lock has no edge box to measure.
 NEED_BOX_TEXT = "Draw an edge box across the edge that moves with focus"
 
@@ -218,23 +233,86 @@ def source_spec(cfg: Any) -> dict[str, Any]:
             spec["serial"] = src.serial
         if src.sdk_dir:
             spec["sdk_dir"] = src.sdk_dir
-    spec["analysis"] = {"channel": cfg.channel, "bayer": cfg.bayer}
+    spec["analysis"] = {
+        "channel": cfg.channel,
+        "bayer": cfg.bayer,
+        "detector": cfg.detector,
+        "detector_sigma_px": cfg.detector_sigma_px,
+    }
     return spec
 
 
 def _rebuild_key(spec: dict | None) -> dict | None:
-    """*spec* without the settings that change live (the analysis channel)."""
+    """*spec* without the settings that change live (channel, edge detector)."""
     if spec is None:
         return None
     key = dict(spec)
     analysis = dict(key.get("analysis") or {})
-    analysis.pop("channel", None)
+    for live in ("channel", "detector", "detector_sigma_px"):
+        analysis.pop(live, None)
     key["analysis"] = analysis
     return key
 
 
 def _colored(text: str, color: str) -> str:
     return f'<span style="color:{color}">{html.escape(text)}</span>'
+
+
+def noise_color(noise_um: float) -> str:
+    """Return the quality colour of an edge with single-measurement *noise_um*.
+
+    Parameters
+    ----------
+    noise_um : float
+        The edge's noise in um of P.
+
+    Returns
+    -------
+    str
+        Green below ``NOISE_GOOD_UM``, attention below ``NOISE_WARN_UM``, red
+        above (and for a non-finite value).
+    """
+    if not math.isfinite(noise_um) or noise_um >= NOISE_WARN_UM:
+        return ALERT_COLOR
+    return OK_COLOR if noise_um < NOISE_GOOD_UM else ATTENTION_COLOR
+
+
+def detector_text(e: EdgeCalibration) -> str:
+    """The detector *e* was calibrated with, for display ("gaussderiv 6 px")."""
+    if e.detector == "gaussderiv":
+        return f"gaussderiv {e.detector_sigma_px:g} px"
+    return e.detector
+
+
+def box_warnings(cal: FocusCalibration) -> list[str]:
+    """Say which edge boxes of *cal* are too narrow across their edge.
+
+    A box needs at least 4 edge widths along the normal for ``halfmax`` and 2
+    for ``gaussderiv``. Edges with an unknown width (old calibrations) or box
+    size are skipped.
+
+    Parameters
+    ----------
+    cal : FocusCalibration
+        The calibration.
+
+    Returns
+    -------
+    list[str]
+        One sentence per narrow box.
+    """
+    out = []
+    for i, e in enumerate(cal.edges, 1):
+        width, size = e.edge_width_px, e.box_normal_px
+        if width is None or not math.isfinite(width) or size <= 0:
+            continue
+        factor = _BOX_WIDTH_FACTOR.get(e.detector, 4.0)
+        if size < factor * width:
+            out.append(
+                f"box {i} is narrow for this edge ({size} px box, {width:.0f} px "
+                "edge): widen it across the edge"
+            )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +410,8 @@ class _Relay(QObject):
     moved = Signal(object)
     started = Signal()
     startFailed = Signal(str)
+    #: The service refused to lock (a calibration/detector mismatch); not a crash.
+    startRefused = Signal(str)
     previewStarted = Signal()
     previewFailed = Signal(str)
     calibrated = Signal(object)
@@ -566,6 +646,8 @@ class SpotFocusPanel(QWidget):
             ("error", "Error (along)"),
         ):
             label = QLabel("-")
+            if key in ("edge", "edge2"):
+                label.setTextFormat(Qt.TextFormat.RichText)  # coloured noise
             self.readout_labels[key] = label
             readouts.addRow(text, label)
         self.note_label = QLabel()
@@ -634,6 +716,7 @@ class SpotFocusPanel(QWidget):
         self._relay.state.connect(self._on_state)
         self._relay.started.connect(self._on_started)
         self._relay.startFailed.connect(self._on_start_failed)
+        self._relay.startRefused.connect(self._on_start_refused)
         self._relay.previewStarted.connect(self._on_preview_started)
         self._relay.previewFailed.connect(self._on_preview_failed)
         self._relay.calibrated.connect(self._on_calibrated)
@@ -728,6 +811,29 @@ class SpotFocusPanel(QWidget):
         )
         self.channel_combo.currentTextChanged.connect(self._set_channel)
 
+        self.detector_combo = QComboBox()
+        for name in EDGE_DETECTORS:
+            self.detector_combo.addItem(EDGE_DETECTOR_LABELS[name], name)
+        self.detector_combo.setToolTip(
+            "How the edge position is read from the image.\n"
+            "Gaussian derivative: finds the steepest point of the edge; robust to "
+            "soft edges and to the box size.\n"
+            "Half-max: the 50 % crossing, the original method; needs a box at "
+            "least 4x as wide as the edge.\n"
+            "A calibration is only valid for the detector it was made with."
+        )
+        self.detector_combo.currentIndexChanged.connect(self._set_detector)
+        self.detector_sigma_spin = self._spin(
+            SIGMA_PX_RANGE[0],
+            SIGMA_PX_RANGE[1],
+            0.5,
+            1,
+            " px",
+            "Smoothing width of the Gaussian derivative, sensor pixels (wider = "
+            "less noise, blurrier on sharp edges). Not used by half-max.",
+        )
+        self.detector_sigma_spin.valueChanged.connect(self._set_detector_sigma)
+
         self.roi_spins: dict[str, QSpinBox] = {}
         roi_row = QHBoxLayout()
         for name in ("x", "y", "w", "h"):
@@ -755,6 +861,10 @@ class SpotFocusPanel(QWidget):
         grid.addWidget(self.gain_spin, 0, 3)
         grid.addWidget(QLabel("Channel"), 0, 4)
         grid.addWidget(self.channel_combo, 0, 5)
+        grid.addWidget(QLabel("Edge detector"), 1, 0)
+        grid.addWidget(self.detector_combo, 1, 1, 1, 2)
+        grid.addWidget(QLabel("Detector width"), 1, 3)
+        grid.addWidget(self.detector_sigma_spin, 1, 4)
         grid.setColumnStretch(6, 1)
 
         group = QGroupBox("Camera")
@@ -894,6 +1004,10 @@ class SpotFocusPanel(QWidget):
             self.exposure_spin.setValue(cfg.exposure_ms)
             self.gain_spin.setValue(cfg.gain)
             self.channel_combo.setCurrentText(cfg.channel)
+            self.detector_combo.setCurrentIndex(
+                max(self.detector_combo.findData(cfg.detector), 0)
+            )
+            self.detector_sigma_spin.setValue(cfg.detector_sigma_px)
             self.sdk_edit.setText(cfg.source.sdk_dir or "")
             self._load_roi_spins(cfg.roi)
             self.span_spin.setValue(cfg.sweep_span_um)
@@ -951,16 +1065,27 @@ class SpotFocusPanel(QWidget):
             )
             return
         lines = [
-            f"edge {i} axis {e.axis} | {e.slope_px_per_um:+.2f} px/µm | "
-            f"R² {e.r2:.3f} | residual {e.residual_px:.2f} px | "
-            f"noise {edge_noise_um(e):.3f} µm"
+            html.escape(
+                f"edge {i} axis {e.axis} | {e.slope_px_per_um:+.2f} px/µm | "
+                f"R² {e.r2:.3f} | residual {e.residual_px:.2f} px | "
+            )
+            + _colored(
+                f"noise {edge_noise_um(e):.3f} µm", noise_color(edge_noise_um(e))
+            )
             for i, e in enumerate(cal.edges, 1)
         ]
+        detectors = "/".join(dict.fromkeys(detector_text(e) for e in cal.edges))
         lines.append(
-            f"zero P {cal.p0_um:.3f} µm | ±{cal.linear_range_um:.2f} µm | {cal.created}"
+            html.escape(
+                f"zero P {cal.p0_um:.3f} µm | ±{cal.linear_range_um:.2f} µm | "
+                f"detector {detectors} | {cal.created}"
+            )
         )
-        text = "<br>".join(html.escape(line) for line in lines)
+        text = "<br>".join(lines)
         notes = list(cal.warnings)
+        if why := self._mismatch_text():
+            notes.insert(0, why)
+        notes.extend(box_warnings(cal))
         drawn = [snap_box(b) for b in self._drawn_boxes_now()]
         if drawn and drawn != [tuple(b) for b in cal.boxes]:
             notes.append(
@@ -1113,6 +1238,43 @@ class SpotFocusPanel(QWidget):
         SettingsV1.instance().spot_focus.channel = value  # type: ignore[assignment]
         self._write()
         self._apply_camera(channel=value)
+
+    # -- edge detector ---------------------------------------------------
+
+    def _detector_setting(self) -> tuple[str, float]:
+        """The saved edge detector and its Gaussian width (sensor px)."""
+        cfg = SettingsV1.instance().spot_focus
+        return cfg.detector, float(cfg.detector_sigma_px)
+
+    def _mismatch_text(self) -> str:
+        """Why the calibration does not fit the detector setting ("" if it does)."""
+        if self._cal is None:
+            return ""
+        return detector_mismatch(self._cal, *self._detector_setting())
+
+    def _set_detector(self, index: int) -> None:
+        if self._loading:
+            return
+        name = self.detector_combo.itemData(index)
+        if name not in EDGE_DETECTORS:
+            return
+        SettingsV1.instance().spot_focus.detector = name
+        self._write()
+        self._detector_changed()
+
+    def _set_detector_sigma(self, value: float) -> None:
+        if self._loading:
+            return
+        SettingsV1.instance().spot_focus.detector_sigma_px = float(value)
+        self._write()
+        self._detector_changed()
+
+    def _detector_changed(self) -> None:
+        """Send the detector setting to the worker and re-check the calibration."""
+        name, sigma = self._detector_setting()
+        self._apply_camera(detector=name, detector_sigma_px=sigma)
+        self._refresh_calibration()
+        self._update_enabled()
 
     # -- SDK folder -----------------------------------------------------
 
@@ -1323,6 +1485,10 @@ class SpotFocusPanel(QWidget):
         cfg = SettingsV1.instance().spot_focus
         exposure, gain, channel = cfg.exposure_ms, cfg.gain, cfg.channel
         roi = cfg.roi or (0, 0, 0, 0)
+        det: dict[str, Any] = {
+            "detector": cfg.detector,
+            "detector_sigma_px": cfg.detector_sigma_px,
+        }
         led = self._led_value()
         self.fault_label.setText("")
         self._preview_busy = True
@@ -1338,7 +1504,9 @@ class SpotFocusPanel(QWidget):
                     raise RuntimeError("the camera could not be opened")
                 if time.monotonic() > deadline:
                     raise RuntimeError("the camera did not become ready")
-            svc.set_camera(exposure_ms=exposure, gain=gain, roi=roi, channel=channel)
+            svc.set_camera(
+                exposure_ms=exposure, gain=gain, roi=roi, channel=channel, **det
+            )
             svc.start_preview()
             try:
                 svc.led_on(led, owner="preview")
@@ -1515,15 +1683,23 @@ class SpotFocusPanel(QWidget):
     def _update_enabled(self) -> None:
         running = self.state == "running"
         idle = not self._busy and not running
+        mismatch = self._mismatch_text()
         # Lock with no valid calibration calibrates first (needs an edge box).
-        self.start_button.setEnabled(idle)
+        # A calibration made with another detector cannot be locked on.
+        self.start_button.setEnabled(idle and not mismatch)
+        self.detector_combo.setEnabled(not self._busy)
+        self.detector_sigma_spin.setEnabled(
+            not self._busy and self._detector_setting()[0] == "gaussderiv"
+        )
         self.stop_button.setEnabled(running or self.state == "fault")
         self.calibrate_button.setEnabled(idle)
         self.zero_button.setEnabled(idle and self._cal is not None)
         self.draw_edge_button.setEnabled(idle)
         self.draw_edge2_button.setEnabled(idle)
         self.clear_edge2_button.setEnabled(idle and self._edge_box2 is not None)
-        if self._cal is None:
+        if mismatch:
+            self.start_button.setToolTip(mismatch)
+        elif self._cal is None:
             self.start_button.setToolTip(
                 "Calibrates first (focus on the cells, draw an edge box), then locks"
             )
@@ -1560,11 +1736,18 @@ class SpotFocusPanel(QWidget):
         if cal is None and not boxes:
             self.fault_label.setText(_colored(NEED_BOX_TEXT, ATTENTION_COLOR))
             return
+        if why := self._mismatch_text():
+            self.fault_label.setText(_colored(why, ATTENTION_COLOR))
+            return
         params = cfg.params.to_params()
         sweep = self._sweep_kwargs(cfg)
         record = self._record_path()
         exposure, gain, led = cfg.exposure_ms, cfg.gain, self._led_value()
         roi, channel = cfg.roi or (0, 0, 0, 0), cfg.channel
+        det: dict[str, Any] = {
+            "detector": cfg.detector,
+            "detector_sigma_px": cfg.detector_sigma_px,
+        }
         self.fault_label.setText("")
         self._telemetry = None
         self.chart.clear()
@@ -1574,7 +1757,9 @@ class SpotFocusPanel(QWidget):
         def work() -> bool:
             svc = self._ensure_service()
             svc.wait_ready()
-            svc.set_camera(exposure_ms=exposure, gain=gain, roi=roi, channel=channel)
+            svc.set_camera(
+                exposure_ms=exposure, gain=gain, roi=roi, channel=channel, **det
+            )
             use, loop = cal, params
             if use is None:
                 if not boxes:
@@ -1587,7 +1772,15 @@ class SpotFocusPanel(QWidget):
                     return False
                 loop = replace(params, offset_um=0.0)  # a new zero: no offset
                 self._relay.calibrationUpdated.emit(use)
-            svc.start(loop, use, led)
+            try:
+                svc.start(loop, use, led)
+            except RuntimeError as err:
+                # A calibration/detector mismatch is a refusal to show, not a
+                # crash; anything else (a dead worker) rebuilds the service.
+                if not detector_mismatch(use, *svc.detector_setting):
+                    raise
+                self._relay.startRefused.emit(str(err))
+                return False
             self._report_crisp(svc)
             return True
 
@@ -1632,6 +1825,11 @@ class SpotFocusPanel(QWidget):
         self._owner.dead = True  # build a fresh service next time
         self._set_state("idle")
 
+    def _on_start_refused(self, message: str) -> None:
+        self._busy = ""
+        self.fault_label.setText(_colored(message, ATTENTION_COLOR))
+        self._set_state("idle")
+
     def stop(self) -> None:
         """Stop the loop and restore CRISP (the Stop button). Never moves P."""
         svc = self.service
@@ -1673,6 +1871,10 @@ class SpotFocusPanel(QWidget):
         record = self._record_path()
         exposure, gain, channel = cfg.exposure_ms, cfg.gain, cfg.channel
         roi = cfg.roi or (0, 0, 0, 0)
+        det: dict[str, Any] = {
+            "detector": cfg.detector,
+            "detector_sigma_px": cfg.detector_sigma_px,
+        }
         self.fault_label.setText("")
         self._busy = "calibrating"
         self._set_state(self.state)
@@ -1680,7 +1882,9 @@ class SpotFocusPanel(QWidget):
         def work() -> FocusCalibration:
             svc = self._ensure_service()
             svc.wait_ready()
-            svc.set_camera(exposure_ms=exposure, gain=gain, roi=roi, channel=channel)
+            svc.set_camera(
+                exposure_ms=exposure, gain=gain, roi=roi, channel=channel, **det
+            )
             return svc.calibrate(boxes, record_path=record, **sweep)
 
         self._run_async(
@@ -1766,11 +1970,11 @@ class SpotFocusPanel(QWidget):
         edge2 = edges[1] if len(edges) > 1 else None
         disagreement = msg.get("disagreement_um")
         labels["error"].setText("—" if along is None else f"{along:+.3f} µm")
-        labels["edge"].setText("-" if edge is None else f"{edge:.2f} px")
+        labels["edge"].setText("-" if edge is None else self._edge_text(0, edge))
         labels["edge2"].setText(
             "—"
             if edge2 is None or edge2.get("edge_px") is None
-            else f"{edge2['edge_px']:.2f} px"
+            else self._edge_text(1, edge2["edge_px"])
         )
         held = msg.get("held_edge")  # 0-based; the panel numbers edges from 1
         if disagreement is None:
@@ -1794,6 +1998,15 @@ class SpotFocusPanel(QWidget):
         self.note_label.setText(_colored(str(note), ATTENTION_COLOR) if note else "")
         labels["contrast"].setText("-" if contrast is None else f"{contrast:.0f}")
         labels["fps"].setText(f"{msg.get('fps') or 0.0:.1f}")
+
+    def _edge_text(self, index: int, edge_px: float) -> str:
+        """The live position of edge *index* with its calibrated noise, coloured."""
+        text = f"{edge_px:.2f} px"
+        cal = self._cal
+        if cal is None or index >= len(cal.edges):
+            return text
+        noise = edge_noise_um(cal.edges[index])
+        return f"{text} {_colored(f'(noise {noise:.3f} µm)', noise_color(noise))}"
 
     def _refresh_stats(self) -> None:
         svc = self.service

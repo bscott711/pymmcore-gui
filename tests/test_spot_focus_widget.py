@@ -17,9 +17,10 @@ import os
 import re
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 import useq
@@ -43,6 +44,9 @@ from pymmcore_gui.asi_z_stack.image_focus_events import (
 )
 from pymmcore_gui.asi_z_stack.image_focus_run import ImageFocusRun
 from pymmcore_gui.asi_z_stack.spot_focus import (
+    EDGE_DETECTOR_LABELS,
+    EDGE_DETECTORS,
+    SIGMA_PX_RANGE,
     EdgeCalibration,
     FocusCalibration,
     measure_edge,
@@ -50,9 +54,13 @@ from pymmcore_gui.asi_z_stack.spot_focus import (
 from pymmcore_gui.asi_z_stack.spot_focus_service import SpotFocusService
 from pymmcore_gui.asi_z_stack.toupcam_source import make_source
 from pymmcore_gui.widgets._spot_focus_panel import (
+    ALERT_COLOR,
     ATTENTION_COLOR,
     NEED_BOX_TEXT,
+    OK_COLOR,
     SpotFocusPanel,
+    box_warnings,
+    noise_color,
     source_spec,
 )
 
@@ -200,6 +208,9 @@ def _edge_cal() -> EdgeCalibration:
         contrast=700.0,
         n_points=9,
         created="2026-10-28T00:00:00",
+        # _e0() is measured with measure_edge's default detector.
+        detector="gaussderiv",
+        detector_sigma_px=6.0,
     )
 
 
@@ -268,7 +279,11 @@ def _rig_e0() -> float:
     src = make_source(
         {"kind": "fake", "cal_like": _rig_cal_like(), "noise": 2.0, "fps": 50.0}
     )
-    fixes = [measure_edge(src.render(0.0), BOX2) for _ in range(5)]  # type: ignore[attr-defined]
+    # An older version's saved calibration (no "detector" key) is a half-max one.
+    fixes = [
+        measure_edge(src.render(0.0), BOX2, detector="halfmax")  # type: ignore[attr-defined]
+        for _ in range(5)
+    ]
     assert all(f.ok for f in fixes)
     return float(sum(f.position for f in fixes) / len(fixes))
 
@@ -407,7 +422,12 @@ def test_source_spec_from_settings() -> None:
     assert spec == {
         "kind": "toupcam",
         "serial": "abc",
-        "analysis": {"channel": "red", "bayer": "RGGB"},
+        "analysis": {
+            "channel": "red",
+            "bayer": "RGGB",
+            "detector": "gaussderiv",
+            "detector_sigma_px": 6.0,
+        },
     }
     cfg.source.kind = "fake"
     cfg.source.fake = {"cal_like": dict(CAL_LIKE)}
@@ -811,6 +831,9 @@ def test_rig_shaped_single_edge_calibration_locks_at_negative_p(
     mmc.pos[P_LABEL] = RIG_P
     cfg.calibration = _rig_saved_edge(_rig_e0())
     cfg.edge_box = BOX2
+    # The old file loads as a half-max calibration; Lock needs that setting
+    # (under the default Gaussian derivative it is refused: recalibrate).
+    cfg.detector = "halfmax"
     panel.refresh()
     assert isinstance(panel._cal, FocusCalibration) and len(panel._cal.edges) == 1
     text = panel.calibration_label.text()
@@ -1488,6 +1511,202 @@ def test_exposure_gain_channel_apply_live_and_are_saved(
     panel.refresh()
     assert panel.channel_combo.currentText() == "sum"
     assert panel.gain_spin.value() == 300
+
+
+# ---------------------------------------------------------------------------
+# edge detector, mismatch, per-edge quality
+# ---------------------------------------------------------------------------
+
+
+def _halfmax_cal() -> FocusCalibration:
+    """The saved calibration of an older version: made with the half-max method."""
+    return FocusCalibration(
+        edges=[replace(_edge_cal(), detector="halfmax")],
+        p0_um=P0,
+        created="2026-10-28T00:00:00",
+    )
+
+
+def test_detector_controls_follow_the_settings(panel: SpotFocusPanel) -> None:
+    combo, spin = panel.detector_combo, panel.detector_sigma_spin
+    assert [combo.itemData(i) for i in range(combo.count())] == list(EDGE_DETECTORS)
+    assert [combo.itemText(i) for i in range(combo.count())] == [
+        EDGE_DETECTOR_LABELS[d] for d in EDGE_DETECTORS
+    ]
+    assert "steepest point" in combo.toolTip() and "4x" in combo.toolTip()
+    assert (spin.minimum(), spin.maximum()) == SIGMA_PX_RANGE
+    assert spin.singleStep() == 0.5
+    # the settings' defaults
+    assert combo.currentData() == "gaussderiv" and spin.value() == 6.0
+    assert spin.isEnabled()
+    # saved values show after a refresh; half-max has no width
+    cfg = SettingsV1.instance().spot_focus
+    cfg.detector, cfg.detector_sigma_px = "halfmax", 9.0
+    panel.refresh()
+    assert combo.currentData() == "halfmax" and spin.value() == 9.0
+    assert not spin.isEnabled()
+    assert cfg.detector == "halfmax" and cfg.detector_sigma_px == 9.0  # not rewritten
+
+
+def test_detector_change_is_saved_sent_live_and_put_in_the_spec(
+    qtbot: QtBot, panel: SpotFocusPanel
+) -> None:
+    svc = _preview_on(qtbot, panel)
+    cfg = SettingsV1.instance().spot_focus
+    combo, spin = panel.detector_combo, panel.detector_sigma_spin
+    with patch.object(svc, "set_camera", wraps=svc.set_camera) as spy:
+        combo.setCurrentIndex(combo.findData("halfmax"))
+        spy.assert_called_with(detector="halfmax", detector_sigma_px=6.0)
+        assert not spin.isEnabled()
+        combo.setCurrentIndex(combo.findData("gaussderiv"))
+        assert spin.isEnabled()
+        spin.setValue(8.0)
+        spy.assert_called_with(detector="gaussderiv", detector_sigma_px=8.0)
+    assert (cfg.detector, cfg.detector_sigma_px) == ("gaussderiv", 8.0)
+    assert svc.detector_setting == ("gaussderiv", 8.0)
+    analysis = source_spec(cfg)["analysis"]
+    assert analysis["detector"] == "gaussderiv" and analysis["detector_sigma_px"] == 8.0
+    # live: the worker keeps running, the service is not rebuilt
+    assert panel._owner.service is svc
+    panel.refresh()
+    assert spin.value() == 8.0 and combo.currentData() == "gaussderiv"
+
+
+def test_detector_mismatch_is_shown_and_blocks_lock(panel: SpotFocusPanel) -> None:
+    cfg = SettingsV1.instance().spot_focus
+    cfg.calibration = _halfmax_cal().to_dict()
+    cfg.edge_box = BOX
+    panel.refresh()  # setting gaussderiv, calibration halfmax
+    why = "calibrated with halfmax; the detector setting is gaussderiv: recalibrate"
+    assert not panel.start_button.isEnabled()
+    assert panel.start_button.toolTip() == why
+    text = panel.calibration_label.text()
+    assert why in text and ATTENTION_COLOR in text
+    assert "detector halfmax" in text  # what the calibration was made with
+    assert panel.calibrate_button.isEnabled()  # recalibrating is the way out
+    panel.start()  # also refuses when called directly
+    assert why in panel.fault_label.text() and panel._busy == ""
+    # switching the setting to the calibration's detector clears it
+    panel.detector_combo.setCurrentIndex(panel.detector_combo.findData("halfmax"))
+    assert panel.start_button.isEnabled()
+    assert why not in panel.calibration_label.text()
+    # a different gaussderiv width is a mismatch too
+    cfg.calibration = _focus_cal().to_dict()
+    panel.refresh()
+    panel.detector_combo.setCurrentIndex(panel.detector_combo.findData("gaussderiv"))
+    assert panel.start_button.isEnabled()
+    assert "detector gaussderiv 6 px" in panel.calibration_label.text()
+    panel.detector_sigma_spin.setValue(3.0)
+    assert not panel.start_button.isEnabled()
+    assert "sigma 6 px" in panel.start_button.toolTip()
+
+
+def test_refusal_from_the_service_start_is_shown_not_raised(
+    qtbot: QtBot, panel: SpotFocusPanel
+) -> None:
+    svc = _preview_on(qtbot, panel)
+    _calibrated(SettingsV1.instance())
+    panel.refresh()
+    assert panel.start_button.isEnabled()  # the panel's own check passes
+    # The service's idea of the setting differs (a race): its start() refuses.
+    with patch.object(
+        SpotFocusService,
+        "detector_setting",
+        new_callable=PropertyMock,
+        return_value=("halfmax", 6.0),
+    ):
+        panel.start()
+        qtbot.waitUntil(lambda: not panel._busy, timeout=WAIT_MS)
+    text = panel.fault_label.text()
+    assert "calibrated with gaussderiv; the detector setting is halfmax" in text
+    assert ATTENTION_COLOR in text
+    assert panel.state != "running" and not spot_focus_flag.active
+    assert panel._owner.service is svc and not panel._owner.dead  # no rebuild
+    assert panel.start_button.isEnabled()
+
+
+@pytest.mark.parametrize(
+    ("noise", "color"),
+    [
+        (0.0, OK_COLOR),
+        (0.0299, OK_COLOR),
+        (0.03, ATTENTION_COLOR),
+        (0.0599, ATTENTION_COLOR),
+        (0.06, ALERT_COLOR),
+        (0.2, ALERT_COLOR),
+        (float("nan"), ALERT_COLOR),
+    ],
+)
+def test_noise_colour_thresholds(noise: float, color: str) -> None:
+    assert noise_color(noise) == color
+
+
+def test_edge_quality_colours_in_the_label_and_the_live_readouts(
+    panel: SpotFocusPanel,
+) -> None:
+    # noise_um = max(noise_px, residual_px, 0.02) / |slope| with slope 5 px/um
+    good = replace(_edge_cal(), noise_px=0.1, residual_px=0.05)  # 0.02 um
+    fair = replace(_edge_cal(), noise_px=0.225, residual_px=0.05)  # 0.045 um
+    bad = replace(_edge_cal(), noise_px=0.5, residual_px=0.05)  # 0.10 um
+    panel._cal = FocusCalibration(
+        edges=[good, fair, bad], p0_um=P0, created="2026-10-28T00:00:00"
+    )
+    panel._refresh_calibration()
+    lines = panel.calibration_label.text().split("<br>")
+    shown = zip(
+        lines[:3],
+        ("0.020", "0.045", "0.100"),
+        (OK_COLOR, ATTENTION_COLOR, ALERT_COLOR),
+        strict=True,
+    )
+    for line, noise, color in shown:
+        assert f'{color}">noise {noise} µm' in line, line
+    # the live readouts carry the same colour for edge 1 and edge 2
+    edges = [
+        {"edge_px": 272.0, "x": 272.0, "y": 240.0, "ok": True},
+        {"edge_px": 194.25, "x": 320.0, "y": 194.25, "ok": True},
+    ]
+    panel._on_telemetry({"edge_px": 272.0, "along_um": 0.0, "edges": edges})
+    labels = panel.readout_labels
+    assert labels["edge"].text().startswith("272.00 px")
+    assert f'{OK_COLOR}">(noise 0.020 µm)' in labels["edge"].text()
+    assert f'{ATTENTION_COLOR}">(noise 0.045 µm)' in labels["edge2"].text()
+
+
+def test_narrow_box_warning_depends_on_the_detector() -> None:
+    def cal(detector: str, box_px: int, width: float) -> FocusCalibration:
+        edge = replace(
+            _edge_cal(), detector=detector, box_normal_px=box_px, edge_width_px=width
+        )
+        return FocusCalibration(edges=[edge], p0_um=P0, created="x")
+
+    # 38 px box, 20 px edge: narrow for both (needs 80 px for half-max, 40 gauss)
+    assert box_warnings(cal("halfmax", 38, 20.0)) == [
+        "box 1 is narrow for this edge (38 px box, 20 px edge): "
+        "widen it across the edge"
+    ]
+    assert len(box_warnings(cal("gaussderiv", 38, 20.0))) == 1
+    # 60 px box, 20 px edge: fine for gaussderiv (>= 2x), narrow for half-max (4x)
+    assert box_warnings(cal("gaussderiv", 60, 20.0)) == []
+    assert len(box_warnings(cal("halfmax", 60, 20.0))) == 1
+    # edge width unknown (nan) or box size unknown (old calibration): no warning
+    assert box_warnings(cal("halfmax", 38, float("nan"))) == []
+    assert box_warnings(cal("halfmax", 0, 20.0)) == []
+
+
+def test_narrow_box_warning_is_in_the_calibration_label(
+    panel: SpotFocusPanel,
+) -> None:
+    second = replace(_edge_cal(), box_normal_px=300, edge_width_px=10.0)
+    first = replace(_edge_cal(), box_normal_px=38, edge_width_px=20.0)
+    panel._cal = FocusCalibration(
+        edges=[first, second], p0_um=P0, created="2026-10-28T00:00:00"
+    )
+    panel._refresh_calibration()
+    text = panel.calibration_label.text()
+    assert "box 1 is narrow for this edge (38 px box, 20 px edge)" in text
+    assert "box 2 is narrow" not in text
+    assert ATTENTION_COLOR in text
 
 
 def test_apply_roi_and_full_frame(qtbot: QtBot, panel: SpotFocusPanel) -> None:

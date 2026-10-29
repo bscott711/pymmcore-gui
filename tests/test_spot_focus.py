@@ -13,6 +13,9 @@ import numpy as np
 import pytest
 
 from pymmcore_gui.asi_z_stack.spot_focus import (
+    DEFAULT_DETECTOR,
+    EDGE_DETECTOR_LABELS,
+    EDGE_DETECTORS,
     EdgeCalibration,
     EdgeFix,
     FocusCalibration,
@@ -20,6 +23,7 @@ from pymmcore_gui.asi_z_stack.spot_focus import (
     SpotFocusController,
     SpotLoopParams,
     check_fix,
+    detector_mismatch,
     edge_error,
     edge_noise_um,
     fit_edge_calibration,
@@ -1520,3 +1524,249 @@ def test_make_source_and_missing_sdk(monkeypatch, tmp_path):
         ToupcamSource().open()
     with pytest.raises(RuntimeError, match="toupcam.py"):
         ToupcamSource(sdk_dir=str(tmp_path)).open()
+
+
+# ---------------------------------------------------------------------------
+# Selectable edge detector: gaussderiv (default) and halfmax (the old one)
+# ---------------------------------------------------------------------------
+#
+# The accuracy tests above run with the default detector (gaussderiv); the
+# halfmax ones are pinned here, so both are covered.
+
+
+def _phi(z):
+    return 0.5 * (1.0 + np.vectorize(math.erf)(z / math.sqrt(2.0)))
+
+
+def _asym_edge(e=100.0, shape=(200, 400)):
+    """Soft, asymmetric edge like the rig's left edge: a ramp to a grey shoulder
+    (75 % of the level) and a second, slower rise 22 px further to the plateau."""
+    x = np.arange(shape[1], dtype=np.float64)
+    f = 2000.0 * (0.75 * _phi((x - e) / 5.0) + 0.25 * _phi((x - e - 22.0) / 9.0))
+    return np.tile(f, (shape[0], 1))
+
+
+def _asym_box(width, e=100.0):
+    bx = int(e) - width // 2
+    return (bx - bx % 2, 60, width, 60)
+
+
+def test_detector_constants():
+    assert EDGE_DETECTORS == ("gaussderiv", "halfmax")
+    assert DEFAULT_DETECTOR == EDGE_DETECTORS[0] == "gaussderiv"
+    assert set(EDGE_DETECTOR_LABELS) == set(EDGE_DETECTORS)
+
+
+def test_default_detector_is_gaussderiv_and_the_fix_names_it():
+    img = clean(CX + 0.3)
+    fix = measure_edge(img, BOX_LEFT)
+    assert (fix.detector, fix.sigma_px) == ("gaussderiv", 6.0)
+    assert fix.position == measure_edge(img, BOX_LEFT, detector="gaussderiv").position
+    assert measure_edge(img, BOX_LEFT, detector="halfmax").detector == "halfmax"
+    # a failed fix still names the detector
+    off = measure_edge(img, (0, 0, 20, 20), roi_offset=(100, 100), detector="halfmax")
+    assert not off.ok and off.detector == "halfmax"
+    assert math.isnan(off.edge_width_px)
+
+
+def test_unknown_detector_and_bad_sigma_raise():
+    with pytest.raises(ValueError, match="detector"):
+        measure_edge(clean(), BOX_LEFT, detector="sobel")
+    with pytest.raises(ValueError, match="sigma_px"):
+        measure_edge(clean(), BOX_LEFT, sigma_px=0.0)
+    with pytest.raises(ValueError, match="sigma_px"):
+        measure_edge(clean(), BOX_LEFT, sigma_px=math.nan)
+
+
+@pytest.mark.parametrize("shift", [0.0, 0.25, 0.5, 0.9, -0.6])
+def test_halfmax_pinned_subpixel_bias(shift):
+    img = clean(CX + shift, CY + shift)
+    truth = edge_positions(shift, shift)
+    for box, key, axis, pol in [
+        (BOX_LEFT, "left", "x", +1),
+        (BOX_RIGHT, "right", "x", -1),
+        (BOX_TOP, "top", "y", +1),
+        (BOX_BOTTOM, "bottom", "y", -1),
+    ]:
+        fix = measure_edge(img, box, detector="halfmax")
+        assert fix.ok, fix.reason
+        assert (fix.axis, fix.polarity) == (axis, pol)
+        assert fix.position == pytest.approx(truth[key], abs=0.05), key
+
+
+def test_halfmax_is_unchanged_from_the_released_method():
+    # Reference values taken from the code before the detector was selectable
+    # (HEAD c2d34da): the asymmetric soft edge, whose half-max depends on the box.
+    got = [
+        measure_edge(_asym_edge(), _asym_box(w), detector="halfmax").position
+        for w in (48, 64, 100, 200)
+    ]
+    assert got == pytest.approx([100.827, 101.494, 102.156, 102.194], abs=1e-3)
+
+
+@pytest.mark.parametrize("edge_sigma", [0.3, 2.0, 8.0])
+@pytest.mark.parametrize("shift", [0.0, 0.3, 0.7, -0.45])
+def test_gaussderiv_locates_sharp_and_soft_steps(edge_sigma, shift):
+    img = clean(CX + shift, CY + shift, edge_sigma=edge_sigma)
+    truth = edge_positions(shift, shift)
+    for box, key in [(BOX_LEFT, "left"), (BOX_RIGHT, "right"), (BOX_TOP, "top")]:
+        fix = measure_edge(img, box, detector="gaussderiv")
+        assert fix.ok, (key, fix.reason)
+        assert fix.position == pytest.approx(truth[key], abs=0.1), key
+
+
+def test_gaussderiv_sweep_is_monotonic_and_linear():
+    shifts = np.linspace(-1.0, 1.0, 9)
+    pos = np.array(
+        [measure_edge(clean(CX + s, edge_sigma=4.0), BOX_LEFT).position for s in shifts]
+    )
+    assert np.all(np.diff(pos) > 0)
+    slope, icpt = np.polyfit(shifts, pos, 1)
+    assert slope == pytest.approx(1.0, abs=0.02)
+    assert np.max(np.abs(pos - (slope * shifts + icpt))) < 0.02
+
+
+def test_gaussderiv_is_less_sensitive_to_the_box_width_than_halfmax():
+    pos = {
+        det: [
+            measure_edge(_asym_edge(), _asym_box(w), detector=det).position
+            for w in (48, 64, 100, 200)
+        ]
+        for det in EDGE_DETECTORS
+    }
+    spread = {det: max(v) - min(v) for det, v in pos.items()}
+    assert spread["halfmax"] > 1.0  # the levels sit on the ramp of a narrow box
+    assert spread["gaussderiv"] < 0.1
+    assert spread["gaussderiv"] < spread["halfmax"] / 10
+    # and it follows a shift of the edge 1:1 in a narrow box
+    a = measure_edge(_asym_edge(100.0), _asym_box(48), detector="gaussderiv")
+    b = measure_edge(_asym_edge(100.4), _asym_box(48), detector="gaussderiv")
+    assert b.position - a.position == pytest.approx(0.4, abs=0.03)
+
+
+def test_gaussderiv_sigma_changes_the_filter_not_the_edge():
+    img = clean(CX + 0.2, edge_sigma=3.0)
+    pos = [measure_edge(img, BOX_LEFT, sigma_px=s).position for s in (3.0, 6.0, 9.0)]
+    assert max(pos) - min(pos) < 0.1
+
+
+def test_both_detectors_report_a_lost_edge_and_an_edge_at_the_border():
+    dark = np.zeros(SHAPE)
+    for det in EDGE_DETECTORS:
+        fix = measure_edge(dark, BOX_LEFT, detector=det)
+        assert not fix.ok and "edge lost" in fix.reason, det
+        # an edge right at the box border is "edge left the box"
+        fix = measure_edge(clean(), (264, 210, 80, 60), detector=det)
+        assert fix.reason == "edge left the box", det
+
+
+def test_edge_width_is_the_10_90_width_of_the_edge():
+    # 10-90 % width of an erf edge is 2.563 sigma; the tilt is corrected first.
+    for sigma in (2.0, 8.0):
+        fix = measure_edge(clean(edge_sigma=sigma), BOX_LEFT)
+        assert fix.edge_width_px == pytest.approx(2.563 * sigma, rel=0.15, abs=1.0)
+    tilted = measure_edge(clean(angle_deg=8.0, edge_sigma=4.0), BOX_LEFT)
+    flat = measure_edge(clean(edge_sigma=4.0), BOX_LEFT)
+    assert tilted.edge_width_px == pytest.approx(flat.edge_width_px, rel=0.15)
+
+
+def test_gaussderiv_is_cheap_per_box():
+    img = clean()
+    measure_edge(img, BOX_LEFT)  # warm the kernel cache
+    t0 = time.perf_counter()
+    for _ in range(50):
+        measure_edge(img, BOX_LEFT)
+    assert (time.perf_counter() - t0) / 50 < 0.02  # ~0.5 ms; generous under load
+
+
+# -- a calibration carries its detector -------------------------------------
+
+
+def test_edge_calibration_stores_and_round_trips_the_detector():
+    p, e = _sweep(noise=0.02)
+    cal = _fit(
+        p,
+        e,
+        noise_px=0.02,
+        detector="gaussderiv",
+        detector_sigma_px=7.5,
+        edge_width_px=18.5,
+    )
+    assert (cal.detector, cal.detector_sigma_px) == ("gaussderiv", 7.5)
+    assert cal.edge_width_px == 18.5 and cal.box_normal_px == BOX_LEFT[2]
+    d = cal.to_dict()
+    assert d["detector"] == "gaussderiv" and d["detector_sigma_px"] == 7.5
+    assert d["edge_width_px"] == 18.5 and d["box_normal_px"] == BOX_LEFT[2]
+    again = EdgeCalibration.from_dict(json.loads(json.dumps(d)))
+    assert again == cal and again.edge_width_px == 18.5
+    # the normal of a y-axis edge is the box height
+    top = _fit(p, e, box=BOX_TOP, axis="y")
+    assert top.box_normal_px == BOX_TOP[3]
+
+
+def test_old_calibration_without_the_new_keys_loads_as_halfmax():
+    cal = _fit(*_sweep())
+    old = cal.to_dict()
+    for k in ("detector", "detector_sigma_px", "edge_width_px", "box_normal_px"):
+        del old[k]
+    loaded = EdgeCalibration.from_dict(old)
+    assert loaded.detector == "halfmax" and loaded.detector_sigma_px == 6.0
+    assert math.isnan(loaded.edge_width_px) and loaded.box_normal_px == 0
+    assert loaded.slope_px_per_um == cal.slope_px_per_um
+    # through the persisted forms: the two-level one and the old single-edge dict
+    focus = FocusCalibration(edges=[cal], p0_um=50.0).to_dict()
+    for e in focus["edges"]:
+        for k in ("detector", "detector_sigma_px", "edge_width_px", "box_normal_px"):
+            e.pop(k)
+    got, msg = load_calibration(focus)
+    assert msg == "" and got is not None and got.edges[0].detector == "halfmax"
+    got, msg = load_calibration(old)
+    assert msg == "" and got is not None and got.edges[0].detector == "halfmax"
+
+
+def test_calibration_nan_width_is_json_clean_and_unknown_detector_is_rejected():
+    cal = _fit(*_sweep())
+    assert math.isnan(cal.edge_width_px)
+    text = json.dumps(cal.to_dict(), allow_nan=False)  # no NaN literal
+    assert math.isnan(EdgeCalibration.from_dict(json.loads(text)).edge_width_px)
+    with pytest.raises(ValueError):
+        EdgeCalibration.from_dict(cal.to_dict() | {"detector": "sobel"})
+    assert load_calibration(cal.to_dict() | {"detector": "sobel"})[0] is None
+
+
+def test_rezero_keeps_the_detector():
+    cal = _fit(*_sweep(), detector="gaussderiv", detector_sigma_px=5.0)
+    new = rezero(cal, e0_px=280.5, p0_um=51.25)
+    assert (new.detector, new.detector_sigma_px) == ("gaussderiv", 5.0)
+    focus = FocusCalibration(edges=[cal], p0_um=50.0).rezeroed([281.0], 51.0)
+    assert (focus.edges[0].detector, focus.edges[0].detector_sigma_px) == (
+        "gaussderiv",
+        5.0,
+    )
+
+
+def test_detector_mismatch():
+    hm = FocusCalibration(edges=[_edge(BOX_LEFT, "x", 2.0, 272.0)], p0_um=50.0)
+    gd = FocusCalibration(
+        edges=[_edge(BOX_LEFT, "x", 2.0, 272.0, detector="gaussderiv")], p0_um=50.0
+    )
+    assert detector_mismatch(hm, "halfmax") == ""
+    assert detector_mismatch(hm, "halfmax", 9.0) == ""  # sigma is ignored by halfmax
+    assert detector_mismatch(gd, "gaussderiv", 6.0) == ""
+    assert detector_mismatch(hm, "gaussderiv") == (
+        "calibrated with halfmax; the detector setting is gaussderiv: recalibrate"
+    )
+    assert detector_mismatch(gd, "halfmax") == (
+        "calibrated with gaussderiv; the detector setting is halfmax: recalibrate"
+    )
+    why = detector_mismatch(gd, "gaussderiv", 8.0)
+    assert "sigma 6 px" in why and "sigma 8 px" in why and "recalibrate" in why
+    # two edges: one stale edge is enough
+    mixed = FocusCalibration(
+        edges=[
+            _edge(BOX_LEFT, "x", 2.0, 272.0, detector="gaussderiv"),
+            _edge(BOX_TOP, "y", 1.9, 194.0),
+        ],
+        p0_um=50.0,
+    )
+    assert "calibrated with halfmax" in detector_mismatch(mixed, "gaussderiv")
