@@ -1364,7 +1364,7 @@ def test_lateral_drift_makes_the_edges_disagree_and_nothing_moves() -> None:
     tele: list[dict] = []
     # The image walks sideways: left and top edge both move, but not by what a
     # focus change of either would do, so the two um estimates part.
-    with _service2(mmc, lateral_px_per_s=40.0) as svc:
+    with _service2(mmc, lateral_px_per_s=80.0) as svc:
         svc.fault.connect(faults.append)
         svc.telemetry.connect(tele.append)
         assert svc.wait_ready()
@@ -1375,6 +1375,47 @@ def test_lateral_drift_makes_the_edges_disagree_and_nothing_moves() -> None:
     assert "edges disagree" in faults[0]
     assert n_moves == 0 and mmc.sets == []  # P is held
     assert any("edges disagree" in t["reason"] for t in tele)
+
+
+def test_a_held_frame_reports_held_edge_and_never_faults() -> None:
+    """Edge 1 at target, edge 2 pushed off by a sideways shift: hold on edge 1."""
+    w, pipes = _inproc_worker(cal_like=dict(CAL_DIAG))
+    try:
+        w.on_start(
+            {
+                "params": _params(strikes=3, avg_frames=2).to_dict(),
+                "calibration": _cal2().to_dict(),
+                "p_start_um": P0,
+            }
+        )
+        good = w.source.render(0.0)
+        w.on_frame(good, 0.0, 1.0)
+        w.publish(50.0)
+        tele = [m for m in _messages(pipes) if m["type"] == "telemetry"][-1]
+        assert tele["held_edge"] is None
+        # Shift the patch sideways by 4 px and refocus so that the left edge is
+        # back at its zero: only the top edge is then off (by ~1.7 um).
+        lateral = 4.0
+        w.source.lateral_px_per_s = lateral
+        w.source._p = P0 + UY * lateral / (UX * SLOPE)  # type: ignore[attr-defined]
+        shifted = w.source.render(1.0)
+        for k in range(8):  # far more than the 3 strikes
+            w.on_frame(shifted, 1.0 + k, 2.0 + k)
+        assert w.state == "running" and not w.ctl.fault
+        assert w.fused.reason == "" and w.fused.held_edge == 0
+        assert w.fused.disagreement_um is not None and w.fused.disagreement_um > 1.0
+        assert "holding on edge 1" in w.fused.note
+        w.publish(100.0)
+        tele = [m for m in _messages(pipes) if m["type"] == "telemetry"][-1]
+        assert tele["ok"] and tele["reason"] == ""
+        assert tele["held_edge"] == 0  # 0-based, an index into "edges"
+        assert "holding on edge 1" in tele["note"]
+        assert tele["disagreement_um"] > 1.0
+        e1, e2 = tele["edges"]
+        assert e1["ok"] and e2["ok"]  # both passed their own checks
+        assert tele["along_um"] == pytest.approx(e1["along_um"], abs=0.05)
+    finally:
+        _close(w, pipes)
 
 
 def test_a_lost_edge_is_a_note_and_the_lock_continues_on_the_other() -> None:

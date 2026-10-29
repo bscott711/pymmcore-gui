@@ -180,6 +180,30 @@ _PARAMS: tuple[tuple[str, str, float, float, float, int, str, str], ...] = (
         " px",
         "Frames whose edge is not straight (RMS off its line) are skipped",
     ),
+    (
+        "max_edge_disagreement_um",
+        "Edge disagreement limit",
+        0.05,
+        10.0,
+        0.1,
+        2,
+        " µm",
+        "Two-edge lock: when the two edges disagree by more than this the "
+        "frame is bad, unless one edge is within the hold band of its target "
+        "(then the lock holds on that edge)",
+    ),
+    (
+        "hold_band_um",
+        "Hold band",
+        0.0,
+        2.0,
+        0.05,
+        2,
+        " µm",
+        "When the edges disagree beyond the limit, an edge this close to its "
+        "target (or closer) is trusted and the lock holds on it instead of "
+        "faulting. 0 turns holding off",
+    ),
 )
 
 
@@ -1748,9 +1772,18 @@ class SpotFocusPanel(QWidget):
             if edge2 is None or edge2.get("edge_px") is None
             else f"{edge2['edge_px']:.2f} px"
         )
-        labels["disagreement"].setText(
-            "—" if disagreement is None else f"{disagreement:.3f}"
-        )
+        held = msg.get("held_edge")  # 0-based; the panel numbers edges from 1
+        if disagreement is None:
+            labels["disagreement"].setText("—")
+        elif held is None:
+            labels["disagreement"].setText(f"{disagreement:.3f}")
+        else:
+            labels["disagreement"].setText(
+                _colored(
+                    f"{disagreement:.3f} (holding on edge {int(held) + 1})",
+                    ATTENTION_COLOR,
+                )
+            )
         if edge2 is not None and edge2.get("x") is not None:
             self.live_view.set_secondary_point(
                 (float(edge2["x"]), float(edge2["y"])), bool(edge2.get("ok", True))

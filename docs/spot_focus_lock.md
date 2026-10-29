@@ -157,17 +157,32 @@ number.
 - **`fuse_edges(fixes, cal, params) -> FusedError`** checks each edge with
   `check_fix`. A good edge gives `a_i = edge_error(fix_i, edge_i, 0)`.
   - Two good edges: if `D = |a1 - a2|` is above
-    `max(max_edge_disagreement_um, 4 * sqrt(n1^2 + n2^2))` (limit default 0.3
-    um, `n_i` from `edge_noise_um`), the result is a bad measurement with
-    reason `"edges disagree by D um (lateral drift or a changed image)"`. That
-    is a strike and no move. Otherwise the result is the inverse-variance
-    mean, with `sigma_um = 1 / sqrt(w1 + w2)`.
+    `max(max_edge_disagreement_um, 4 * sqrt(n1^2 + n2^2))` (limit default 1.0
+    um, `n_i` from `edge_noise_um`), the edges disagree and the mean cannot be
+    trusted. Then the **hold band** applies: let `k` be the edge whose
+    estimate is closest to the target (smallest `|a_k - offset_um|`). If that
+    distance is at most `hold_band_um` (default 0.15 um), the frame **holds on
+    edge `k`** alone: `along_um = a_k - offset_um`, `sigma_um` is the noise of
+    edge `k`, `held_edge = k` (0-based), and `note` is `"edges disagree by D
+    um; holding on edge K (X um from target)"` (1-based `K`). That is not a
+    strike. If neither edge is within the band, the result is a bad
+    measurement with reason `"edges disagree by D um (lateral drift or a
+    changed image)"`: a strike and no move. When the edges agree, the result
+    is the inverse-variance mean, with `sigma_um = 1 / sqrt(w1 + w2)`.
+    - Why hold: a lateral image shift moves one edge but not the other. An
+      edge that still sits at its target is the one to trust, and faulting
+      would stop a lock that is fine. The risk: if one edge is stuck at its
+      target while the other genuinely reports a focus change, the lock holds
+      on the stuck edge and ignores the real change. The panel shows
+      "holding on edge K" in the Disagreement readout and the note line, so
+      this is visible. Set `hold_band_um` to 0 to turn holding off.
   - One good edge of two: the loop uses it, with the note
     `"edge K lost (<reason>); using edge J"` (1-based). That is not a strike.
   - No good edge: the reason of edge 1, a strike, and `along_um` is None.
   - `offset_um` is subtracted once, at the end. `FusedError` carries
     `along_um`, `sigma_um`, `used` (which edges passed `check_fix`),
-    `per_edge_um` (raw, no offset), `disagreement_um`, `reason` and `note`.
+    `per_edge_um` (raw, no offset), `disagreement_um`, `reason`, `note` and
+    `held_edge` (None unless the frame held on one edge).
   - A one-edge calibration gives the same result as the old single-edge path.
 
 Why two edges:
@@ -283,7 +298,7 @@ The calibration is stored in `SpotFocusSettingsV1.calibration` as
 sweeps, so it round-trips through JSON). Settings added for the edge workflow:
 `edge_box` and `edge_box_2` (`x, y, w, h` or `None`; box 2 is optional),
 `sweep_span_um` (2.0), `sweep_steps` (9), `sweep_frames` (3), and the loop
-parameter `max_edge_disagreement_um` (0.3).
+parameters `max_edge_disagreement_um` (1.0) and `hold_band_um` (0.15).
 `SpotFocusSettingsV1.calibration_status()` returns the `load_calibration`
 result and `to_calibration()` returns its first element.
 
@@ -311,8 +326,10 @@ old params are ignored (`SpotLoopParams.from_dict`, settings `extra="ignore"`).
   slope is signed, so no separate direction is needed.
 - **Two edges.** With two edges the error fed to the loop is the fused one from
   `fuse_edges` (see "Optional second edge and fusion"), with `offset_um`
-  applied once. A disagreement between the edges is a bad frame (a strike); a
-  single lost edge is only a note and the loop continues on the other one.
+  applied once. A disagreement between the edges beyond the limit is a bad
+  frame (a strike), unless one edge is within `hold_band_um` of its target:
+  then the loop holds on that edge (a note, no strike). A single lost edge is
+  only a note and the loop continues on the other one.
 - **Averaging.** `avg_frames` good frames (default 4; at 100 ms exposure 8
   frames took 0.8 s). The window is cleared after each decision, after each
   move and when `offset_um` changes, and frames are ignored until the
@@ -343,7 +360,9 @@ old params are ignored (`SpotLoopParams.from_dict`, settings `extra="ignore"`).
   - `residual_px > max_edge_residual_px` (3): "edge not straight".
 
   With two edges `fuse_edges` runs `check_fix` on each edge and adds the
-  disagreement check. A bad frame is a strike and is not averaged. `strikes`
+  disagreement check and the hold band. A bad frame (including a disagreement
+  with no edge inside the band) is a strike and is not averaged; a held frame
+  is a good frame. `strikes`
   (5) in a row set a fault; a good frame resets the count. Transient bad
   frames below that count are simply skipped.
 - **Fault.** No more moves; P is held where it is (never moved back, never
@@ -408,8 +427,9 @@ old params are ignored (`SpotLoopParams.from_dict`, settings `extra="ignore"`).
   - frame checks: `min_contrast` 10.0, `max_saturated_frac` 0.002,
     `min_valid_fraction` 0.5, `max_angle_change_deg` 5.0,
     `max_edge_residual_px` 3.0;
-  - two edges: `max_edge_disagreement_um` 0.3 (the fusion uses the larger of
-    this and `4 * sqrt(n1^2 + n2^2)`);
+  - two edges: `max_edge_disagreement_um` 1.0 (the fusion uses the larger of
+    this and `4 * sqrt(n1^2 + n2^2)`) and `hold_band_um` 0.15 (beyond the
+    limit, an edge within this of the target is held on instead of faulting);
   - range: `max_excursion_um` 5.0 (from the start P); `p_min_um` and
     `p_max_um` None (no absolute bound unless set or read at Start).
 - `SpotFocusController(params, p_start_um, *, linear_range_um=None)`:
@@ -538,7 +558,11 @@ Worker to main:
     (same count and order).
   - `sigma_um`: the fused noise estimate, None when not available.
   - `disagreement_um`: `|a1 - a2|`, None unless two edges are both good.
-  - `note`: for example `"edge 2 lost (<reason>); using edge 1"`.
+  - `held_edge`: 0-based index of the edge the frame holds on when the edges
+    disagree beyond the limit but that edge is within `hold_band_um` of its
+    target, else None. The panel numbers edges from 1.
+  - `note`: for example `"edge 2 lost (<reason>); using edge 1"` or
+    `"edges disagree by 1.23 um; holding on edge 1 (0.04 um from target)"`.
   - `edges`: a list with one entry per box, each `{edge_px, x, y, ok, reason,
     along_um}`. `along_um` is that edge's own error (no offset), None when the
     frame is not fused or that edge is bad.
@@ -683,10 +707,12 @@ Files:
   - Two edges: `FocusCalibration` round trip, a single `"edge"` dict wrapped
     as one edge (rig-shaped dict), `edge_noise_um`, `fuse_edges` (inverse
     variance mean, sigma drops by sqrt 2 for equal edges, offset subtracted
-    once, disagreement is a bad measurement, one bad edge gives a note, both
+    once, disagreement is a bad measurement unless an edge is inside the hold
+    band, in which case the frame holds on it, one bad edge gives a note, both
     bad gives a strike with the reason of edge 1), and synthetic cases:
     diagonal motion gives agreeing estimates, a lateral move gives a
-    disagreement, the two-edge loop converges and stops on a lateral shift.
+    disagreement, the two-edge loop converges, stops on a lateral shift when
+    neither edge is at target, and holds through one when an edge is.
   - Controller: dead band, step clamp, rate cap, range and excursion faults,
     outside-linear-range sign-only step, anti-windup, strikes. With the sign
     flipped, the controller diverges.
@@ -717,7 +743,8 @@ Files:
     per-edge npz arrays; a box without an edge is dropped with a warning and
     no edge in any box names edge 1; a single-edge calibration still starts;
     the two-edge loop holds under drift; lateral drift makes the edges
-    disagree and nothing moves; a lost edge is a note and the lock continues
+    disagree and nothing moves; a held frame reports `held_edge` and never
+    faults; a lost edge is a note and the lock continues
     on the other; `zero` re-zeroes both edges; `set_calibration` gives the
     preview an error and `stop` keeps it; `measure` with two boxes and with
     the old single-box keys; the preview box messages.
@@ -808,12 +835,15 @@ at full frame, 31 fps at a 640x480 ROI. Exposure runs 0.105 ms to 15 s, gain
 - `params`: the `SpotLoopParams` fields, including `offset_um`.
 - `calibration`, `edge_box`, `edge_box_2`, `sweep_span_um`, `sweep_steps`,
   `sweep_frames` as described above. `params` also holds
-  `max_edge_disagreement_um`.
+  `max_edge_disagreement_um` (1.0) and `hold_band_um` (0.15).
 
 ### GUI
 
-- **Spot panel** (`widgets/_spot_focus_panel.py`, hosted in a scroll area by
-  the "Spot Focus Lock" action). Top to bottom:
+- **Spot panel** (`widgets/_spot_focus_panel.py`, hosted by the "Spot Focus
+  Lock" action). A vertical splitter holds the live view on top (docked by
+  default, minimum height 240 px) and, below it, a scroll area with the
+  controls, so the image does not scroll away with them. Top to bottom in the
+  controls:
   - Buttons **Calibrate** (tooltip: focus on the cells first; sweeps P around
     here), **Zero here**, **Lock** and **Stop**. Lock is enabled whenever the
     panel is idle, because Lock without a calibration calibrates first.
@@ -834,9 +864,12 @@ at full frame, 31 fps at a 640x480 ROI. Exposure runs 0.105 ms to 15 s, gain
     - SDK folder: a line edit plus Browse, saved to
       `spot_focus.source.sdk_dir`.
     - A camera info label: model, serial, sensor, bits.
-    - A **Preview** toggle and a **Show view** button. Preview lights the CRISP
-      LED (CRISP State Ready) and turning it off restores CRISP, unless the
-      lock is running.
+    - A **Preview** toggle and a **Pop out** / **Dock** toggle. Preview lights
+      the CRISP LED (CRISP State Ready) and turning it off restores CRISP,
+      unless the lock is running. Pop out floats the live view as its own
+      window; Dock (or closing that window) puts it back above the controls.
+      There is no Show view button: docked, the view is always on screen, and
+      the floating window is owned by the panel so it stays above the app.
     - An **LED** toggle and a live **LED %** spin (saved, default 50), next to
       a readout of CRISP's state and device label, read once after each
       change. With no CRISP device the fault label says "no CRISP device
@@ -851,10 +884,15 @@ at full frame, 31 fps at a 640x480 ROI. Exposure runs 0.105 ms to 15 s, gain
     (a dash when there is no second edge), Disagreement (um), Contrast, Frame
     rate, Error (along). The error is the fused one and shows a dash when
     `along_um` is None, else the error in um. A note line shows the telemetry
-    `note` or `reason`, for example "edge 2 lost; using edge 1".
+    `note` or `reason`, for example "edge 2 lost; using edge 1". When a frame
+    holds on one edge (`held_edge` in the telemetry), the Disagreement
+    readout turns orange and reads for example "1.230 (holding on edge 2)",
+    and the note line gives the full text.
   - Group **Parameters**: Deadband, Kp, Ki, Max step, Max rate, Min contrast
-    (counts), Min valid rows (fraction), Max angle change (degrees) and Max
-    edge residual (px). `avg_frames` and `max_saturated_frac` have no spin.
+    (counts), Min valid rows (fraction), Max angle change (degrees), Max
+    edge residual (px), Edge disagreement limit (um, default 1.0) and Hold
+    band (um, default 0.15; 0 turns holding off). `avg_frames` and
+    `max_saturated_frac` have no spin.
 - Panel behaviour:
   - **Calibrate** needs a saved edge box, else the fault label says "Draw an
     edge box across the edge that moves with focus". It passes `[box1]` or
@@ -871,18 +909,21 @@ at full frame, 31 fps at a 640x480 ROI. Exposure runs 0.105 ms to 15 s, gain
   - **Draw edge box 2** and **Clear box 2** work like the box 1 button; box 2
     is optional and is saved in `spot_focus.edge_box_2`. The panel advises
     drawing it across a different edge, wide along its normal.
-  - **Draw edge box** puts the live view in edge-box draw mode, shows the
-    window and starts Preview if it is not on. The panel tells the user to
-    draw the box wide along the edge normal (about 14 x the edge sigma). The
-    box is saved in `spot_focus.edge_box` and sent to the worker with
-    `set_edge_box` (also when the service is created, and again after Stop).
+  - **Draw edge box** puts the live view in edge-box draw mode, makes it
+    visible (raises it when floating) and starts Preview if it is not on. The
+    panel tells the user to draw the box wide along the edge normal (about 14 x
+    the edge sigma). The box is saved in `spot_focus.edge_box` and sent to the
+    worker with `set_edge_box` (also when the service is created, and again
+    after Stop).
   - While the lock runs, Zero here, Calibrate and the Draw edge box buttons
     are disabled, and a box drawn then is refused ("Stop the lock before
     moving the edge box.").
   - An old or malformed saved calibration shows its message and never crashes
     the constructor.
-- **Live view** (`widgets/_spot_live_view.py`), a separate resizable top-level
-  window titled "Spot camera":
+- **Live view** (`widgets/_spot_live_view.py`), titled "Spot camera". It is
+  docked in the panel's splitter by default and can be popped out into a
+  resizable top-level window and docked again (the choice is kept in memory
+  only). The scene and zoom survive both moves:
   - It is a QGraphicsView whose scene is the sensor. Each frame is drawn at
     native resolution at its ROI offset.
   - Wheel zooms around the cursor, left-drag pans, and there are **Fit** and
@@ -920,9 +961,16 @@ at full frame, 31 fps at a 640x480 ROI. Exposure runs 0.105 ms to 15 s, gain
     levels** option (min to max). Auto levels is display only; the measurement
     always uses raw counts.
   - Under the cursor it shows x, y and the pixel value.
-  - A 30 Hz timer polls `latest_frame` and repaints only on a new `seq`.
-  - Closing the window stops preview. If the lock is running, the preview is
-    switched off after Stop instead.
+  - A 30 Hz timer polls `latest_frame` and repaints only on a new `seq`. It
+    runs while the view is visible and polling is on (`set_polling`); the panel
+    turns polling on with Preview and off when Preview stops, docked or
+    floating.
+  - Turning Preview off clears the image. A docked view keeps its space (no
+    layout jump); a floating window is hidden.
+  - Closing the floating window docks the view again and keeps Preview
+    running (`windowClosed` is still emitted). The floating window is hidden
+    with the panel (a closed dock, another tab) and with `shutdown()`, and
+    deleted with the panel.
 
 ## First rig results (2026-10-28)
 
@@ -997,8 +1045,14 @@ Do these in order. Stop at the first NO-GO and fix it before going on.
      edge): the lock continues on the other edge, the note line says "edge 2
      lost; using edge 1", and P keeps being held. Uncover it and the note
      disappears.
+   - If the edges disagree by more than the limit (1.0 um) while one edge is
+     within the hold band (0.15 um) of its target, the Disagreement readout
+     turns orange with "holding on edge K" and the note line says so; the lock
+     keeps running on that edge. If neither edge is in the band, the frames
+     are strikes and the lock faults after 5.
    - GO: both behaviours as described. NO-GO: any move toward a wrong target
-     while one edge is covered, or a persistent disagreement above 0.3 um.
+     while one edge is covered, or a persistent disagreement above 1.0 um
+     (or a "holding on edge K" that stays on for minutes).
 8. **Fault drills.**
    - LED off: fault "edge lost" after 5 bad frames, P held.
    - Exposure doubled: no move (the contrast changes, the edge position does

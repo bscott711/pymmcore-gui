@@ -88,7 +88,7 @@ def test_focus_offset_settings_roundtrip() -> None:
 
 
 def test_focus_offset_bad_offsets_entry_degrades_gracefully() -> None:
-    # A single unparseable offset drops only `offsets` (back to {}), leaving
+    # A single unparsable offset drops only `offsets` (back to {}), leaving
     # the rest of the `focus` section intact -- not the whole section.
     data = {"focus": {"enabled": True, "offsets": {"561nm": "banana"}}}
     with pytest.warns(RuntimeWarning, match="Could not validate key 'offsets'"):
@@ -142,3 +142,23 @@ def test_settings_without_image_focus_still_load() -> None:
     assert s.focus.enabled is True
     assert s.image_focus.mode == "spot"
     assert s.image_focus.to_limits().max_strikes == 3
+
+
+def test_spot_edge_disagreement_and_hold_band_settings() -> None:
+    s = SettingsV1()
+    p = s.spot_focus.params
+    assert (p.max_edge_disagreement_um, p.hold_band_um) == (1.0, 0.15)
+    assert s.spot_focus.params.to_params().hold_band_um == 0.15
+
+    p.hold_band_um = 0.2
+    p.max_edge_disagreement_um = 0.8
+    s2 = SettingsV1.model_validate_json(s.model_dump_json())
+    assert s2.spot_focus.params.hold_band_um == 0.2
+    loop = s2.spot_focus.params.to_params()
+    assert (loop.max_edge_disagreement_um, loop.hold_band_um) == (0.8, 0.2)
+
+    # a file written before hold_band_um existed loads with the default
+    old = '{"version": "1.0", "spot_focus": {"params": {"kp": 0.5}}}'
+    s3 = SettingsV1.model_validate_json(old)
+    assert s3.spot_focus.params.kp == 0.5
+    assert s3.spot_focus.params.hold_band_um == 0.15

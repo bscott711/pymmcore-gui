@@ -965,6 +965,9 @@ class _Worker:
                     if sigma is not None and math.isfinite(sigma)
                     else None,
                     "disagreement_um": None if fused is None else fused.disagreement_um,
+                    # 0-based index into "edges" (panel "Edge 1" is 0); None
+                    # unless the two edges disagreed and one was held alone.
+                    "held_edge": None if fused is None else fused.held_edge,
                     "note": self.last_note,
                     "fps": self.fps,
                     "p_cmd_um": self.p_cmd if self.ctl is None else self.ctl.p_cmd_um,

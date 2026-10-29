@@ -18,7 +18,7 @@ sub-pixel number that needs no search.
   per-frame sanity checks.
 - :class:`FocusCalibration` / :func:`fuse_edges` -- one or two calibrated
   edges and their inverse-variance fusion, with a disagreement check that
-  catches lateral image shifts.
+  catches lateral image shifts (holds on the edge already at target, else bad).
 - :class:`SpotLoopParams` / :class:`SpotFocusController` -- dead band, PI
   control, step clamp, rate cap and fault logic. It only ever returns targets;
   sending them to the stage is somebody else's job.
@@ -848,6 +848,9 @@ class FusedError:
     """Non-empty: a bad measurement (counts as a strike, no move)."""
     note: str = ""
     """Informational, e.g. "edge 2 lost (...); using edge 1" (not a strike)."""
+    held_edge: int | None = None
+    """0-based index of the edge used alone because the two edges disagreed
+    (the panel's "Edge 1" is 0); None otherwise."""
 
 
 def fuse_edges(
@@ -858,8 +861,12 @@ def fuse_edges(
     Every edge is checked with :func:`check_fix`. Two good edges give two
     estimates ``a_i = edge_error(fix_i, edge_i, 0)``; if they differ by more
     than ``max(params.max_edge_disagreement_um, 4 * sqrt(n1**2 + n2**2))``
-    (``n_i`` = :func:`edge_noise_um`) the frame is bad (a lateral shift moves
-    one edge but not the other), otherwise the inverse-variance mean is used.
+    (``n_i`` = :func:`edge_noise_um`) a lateral shift moved one edge but not
+    the other, so the mean cannot be trusted. If the edge nearest the target
+    (``params.offset_um``) is within ``params.hold_band_um`` of it, the frame
+    holds on that edge alone (``held_edge`` and ``note`` say so, no strike);
+    otherwise the frame is bad. When the edges agree the inverse-variance mean
+    is used.
     With only one good edge of two it is used alone and the loss is reported in
     ``note``. With none the frame is bad. ``params.offset_um`` is subtracted
     once at the end.
@@ -910,6 +917,21 @@ def fuse_edges(
             4.0 * math.sqrt(noise[0] ** 2 + noise[1] ** 2),
         )
         if disagreement > limit:
+            k = min(good, key=lambda i: abs(estimates[i] - params.offset_um))
+            near = abs(estimates[k] - params.offset_um)
+            if near <= params.hold_band_um:
+                return FusedError(
+                    estimates[k] - params.offset_um,
+                    noise[k],
+                    used,
+                    per_edge,
+                    disagreement,
+                    note=(
+                        f"edges disagree by {disagreement:.2f} um; holding on "
+                        f"edge {k + 1} ({near:.2f} um from target)"
+                    ),
+                    held_edge=k,
+                )
             return FusedError(
                 None,
                 sigma,
@@ -952,8 +974,11 @@ class SpotLoopParams:
     min_valid_fraction: float = 0.5
     max_angle_change_deg: float = 5.0
     max_edge_residual_px: float = 3.0
-    max_edge_disagreement_um: float = 0.3
-    """Two edges whose um estimates differ by more are a bad measurement."""
+    max_edge_disagreement_um: float = 1.0
+    """Two edges whose um estimates differ by more disagree (a bad measurement
+    unless one of them is within ``hold_band_um`` of the target)."""
+    hold_band_um: float = 0.15
+    """A disagreeing frame is held on the edge within this of the target."""
     p_min_um: float | None = None
     """Lowest allowed absolute P; None = no absolute lower bound known."""
     p_max_um: float | None = None

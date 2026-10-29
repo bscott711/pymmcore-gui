@@ -1013,18 +1013,19 @@ def test_fuse_subtracts_the_offset_once():
 
 
 def test_fuse_disagreement_is_a_bad_measurement():
-    cal, params = _fuse_cal(), SpotLoopParams()
+    cal = _fuse_cal()
+    params = SpotLoopParams(max_edge_disagreement_um=0.3)
     out = fuse_edges(_fixes(0.30, -0.30), cal, params)  # 0.6 > max(0.3, 0.447)
-    assert out.along_um is None
+    assert out.along_um is None  # neither edge is within the hold band
     assert out.disagreement_um == pytest.approx(0.6)
     assert out.reason.startswith("edges disagree by 0.60 um")
     assert "lateral drift" in out.reason
     assert out.used == (True, True)
+    assert out.held_edge is None
     # just under the limit still fuses
     assert fuse_edges(_fixes(0.0, 0.44), cal, params).reason == ""
-    # a larger limit in the params is honoured
-    loose = SpotLoopParams(max_edge_disagreement_um=1.0)
-    assert fuse_edges(_fixes(0.30, -0.30), cal, loose).reason == ""
+    # the default limit (1.0 um) lets the same pair through
+    assert fuse_edges(_fixes(0.30, -0.30), cal, SpotLoopParams()).reason == ""
     # noisy edges widen the limit: 4 * sqrt(0.5**2 + 0.5**2) = 2.83 um
     noisy = FocusCalibration(
         edges=[
@@ -1033,8 +1034,117 @@ def test_fuse_disagreement_is_a_bad_measurement():
         ],
         p0_um=50.0,
     )
-    out = fuse_edges(_fixes(0.3, -0.3, noisy), noisy, params)
+    out = fuse_edges(_fixes(1.2, -1.2, noisy), noisy, SpotLoopParams())
     assert out.reason == "" and out.along_um == pytest.approx(0.0, abs=1e-12)
+    assert out.held_edge is None
+
+
+def test_fuse_default_limit_is_about_one_micron():
+    cal, params = _fuse_cal(), SpotLoopParams()
+    assert fuse_edges(_fixes(0.40, -0.55), cal, params).reason == ""  # 0.95
+    out = fuse_edges(_fixes(0.60, -0.60), cal, params)  # 1.2, neither near
+    assert out.along_um is None and out.reason.startswith("edges disagree by 1.20")
+
+
+def test_fuse_disagreement_holds_on_edge_1_when_it_is_at_target():
+    cal, params = _fuse_cal(), SpotLoopParams()
+    out = fuse_edges(_fixes(0.04, 1.50), cal, params)
+    assert out.reason == ""
+    assert out.held_edge == 0
+    assert out.along_um == pytest.approx(0.04)
+    assert out.sigma_um == pytest.approx(edge_noise_um(cal.edges[0]))
+    assert out.used == (True, True)
+    assert out.disagreement_um == pytest.approx(1.46)
+    assert out.note == (
+        "edges disagree by 1.46 um; holding on edge 1 (0.04 um from target)"
+    )
+
+
+def test_fuse_disagreement_holds_on_edge_2_when_it_is_at_target():
+    cal, params = _fuse_cal(), SpotLoopParams()
+    out = fuse_edges(_fixes(-1.20, -0.10), cal, params)
+    assert out.reason == ""
+    assert out.held_edge == 1
+    assert out.along_um == pytest.approx(-0.10)
+    assert out.sigma_um == pytest.approx(edge_noise_um(cal.edges[1]))
+    assert out.used == (True, True)
+    assert "holding on edge 2 (0.10 um from target)" in out.note
+
+
+def test_fuse_hold_band_edges_and_param():
+    cal = _fuse_cal()
+    # just outside the default 0.15 um band: bad
+    assert fuse_edges(_fixes(0.20, 1.5), cal, SpotLoopParams()).along_um is None
+    # a wider band holds it
+    wide = SpotLoopParams(hold_band_um=0.25)
+    assert fuse_edges(_fixes(0.20, 1.5), cal, wide).held_edge == 0
+    # a zero band never holds
+    none = SpotLoopParams(hold_band_um=0.0)
+    assert fuse_edges(_fixes(0.04, 1.5), cal, none).along_um is None
+
+
+def test_fuse_hold_respects_the_offset():
+    cal = _fuse_cal()
+    fixes = _fixes(0.50, 2.00)
+    # target 0.5 um: edge 1 sits on it, so hold on edge 1 (error ~0)
+    out = fuse_edges(fixes, cal, SpotLoopParams(offset_um=0.5))
+    assert out.held_edge == 0
+    assert out.along_um == pytest.approx(0.0, abs=1e-12)
+    # target 0: edge 1 is 0.5 away, edge 2 further: bad
+    out = fuse_edges(fixes, cal, SpotLoopParams())
+    assert out.held_edge is None and out.along_um is None
+    assert out.reason.startswith("edges disagree")
+    # edge 2 close to a target of 2.0
+    out = fuse_edges(fixes, cal, SpotLoopParams(offset_um=2.0))
+    assert out.held_edge == 1
+    assert out.along_um == pytest.approx(0.0, abs=1e-12)
+
+
+def _run_controller(fixes, params, frames=60):
+    ctrl = SpotFocusController(params, 50.0)
+    cal = _fuse_cal()
+    k = 0
+    for k in range(frames):
+        out = fuse_edges(fixes, cal, params)
+        if out.reason:
+            ctrl.bad(out.reason)
+        else:
+            ctrl.good()
+            assert out.along_um is not None
+            ctrl.update(out.along_um, k * 0.5)
+        if ctrl.fault:
+            break
+    return ctrl, k
+
+
+def test_persistent_disagreement_with_neither_edge_near_faults_after_strikes():
+    params = SpotLoopParams(strikes=5, deadband_um=0.1)
+    ctrl, k = _run_controller(_fixes(0.60, -0.60), params)
+    assert ctrl.fault is not None and "edges disagree" in ctrl.fault
+    assert k == 4  # the 5th consecutive bad frame
+    assert ctrl.n_moves == 0
+
+
+def test_persistent_disagreement_with_one_edge_near_never_faults():
+    params = SpotLoopParams(strikes=5, deadband_um=0.1)
+    ctrl, _ = _run_controller(_fixes(0.04, 1.50), params, frames=200)
+    assert ctrl.fault is None
+    assert ctrl.n_moves == 0  # held inside the dead band
+
+
+def test_a_held_frame_resets_the_strike_count():
+    params = SpotLoopParams(strikes=3, deadband_um=0.1)
+    ctrl = SpotFocusController(params, 50.0)
+    cal = _fuse_cal()
+    for _ in range(2):
+        ctrl.bad(fuse_edges(_fixes(0.60, -0.60), cal, params).reason)
+    held = fuse_edges(_fixes(0.04, 1.50), cal, params)
+    assert held.reason == "" and held.along_um is not None
+    ctrl.good()
+    ctrl.update(held.along_um, 0.0)
+    for _ in range(2):
+        ctrl.bad(fuse_edges(_fixes(0.60, -0.60), cal, params).reason)
+    assert ctrl.fault is None
 
 
 def test_fuse_one_bad_edge_uses_the_other_with_a_note():
@@ -1100,9 +1210,15 @@ def test_fuse_edges_needs_one_fix_per_edge():
 
 
 def test_params_have_the_disagreement_limit():
-    assert SpotLoopParams().max_edge_disagreement_um == 0.3
-    p = SpotLoopParams(max_edge_disagreement_um=0.5)
-    assert SpotLoopParams.from_dict(p.to_dict()).max_edge_disagreement_um == 0.5
+    assert SpotLoopParams().max_edge_disagreement_um == 1.0
+    assert SpotLoopParams().hold_band_um == 0.15
+    p = SpotLoopParams(max_edge_disagreement_um=0.5, hold_band_um=0.2)
+    back = SpotLoopParams.from_dict(p.to_dict())
+    assert back.max_edge_disagreement_um == 0.5
+    assert back.hold_band_um == 0.2
+    # an old dict without the new key loads with the default
+    old = {k: v for k, v in p.to_dict().items() if k != "hold_band_um"}
+    assert SpotLoopParams.from_dict(old).hold_band_um == 0.15
 
 
 # ---------------------------------------------------------------------------
@@ -1140,14 +1256,26 @@ def test_diagonal_motion_gives_agreeing_estimates(q):
 
 def test_lateral_move_gives_a_disagreement():
     cal, params = _synthetic_cal(), SpotLoopParams()
-    out = fuse_edges(_patch_fixes(50.0, dx=1.0), cal, params)  # only x moves
-    assert out.per_edge_um[0] == pytest.approx(1.0 / SX, abs=0.03)
-    assert out.per_edge_um[1] == pytest.approx(0.0, abs=0.03)
+    # P is 0.5 um off, so neither edge is at the target once x shifts too
+    out = fuse_edges(_patch_fixes(50.5, dx=3.0), cal, params)  # only x moves
+    assert out.per_edge_um[0] == pytest.approx(0.5 + 3.0 / SX, abs=0.03)
+    assert out.per_edge_um[1] == pytest.approx(0.5, abs=0.03)
     assert out.along_um is None
     assert out.reason.startswith("edges disagree by")
     # a vertical shift disagrees in the other direction
-    out = fuse_edges(_patch_fixes(50.0, dy=-1.0), cal, params)
+    out = fuse_edges(_patch_fixes(50.5, dy=-3.0), cal, params)
     assert out.along_um is None and out.reason
+    # a 1 px shift stays under the default limit and still fuses
+    assert fuse_edges(_patch_fixes(50.0, dx=1.0), cal, params).reason == ""
+
+
+def test_lateral_move_holds_on_the_edge_that_is_at_target():
+    cal, params = _synthetic_cal(), SpotLoopParams()
+    out = fuse_edges(_patch_fixes(50.0, dx=3.0), cal, params)  # only x moves
+    assert out.reason == "" and out.held_edge == 1  # the y edge did not move
+    assert out.along_um == pytest.approx(0.0, abs=0.03)
+    out = fuse_edges(_patch_fixes(50.0, dy=-3.0), cal, params)
+    assert out.reason == "" and out.held_edge == 0
 
 
 def _two_edge_loop(*, start_off=0.8, steps=40, dx=0.0):
@@ -1186,10 +1314,18 @@ def test_two_edge_closed_loop_converges_without_search():
 
 def test_two_edge_loop_stops_on_a_lateral_shift():
     """A lateral shift is a strike, not a move: the piezo is held, then faults."""
-    ctrl, hist = _two_edge_loop(start_off=0.0, dx=1.5)
+    ctrl, hist = _two_edge_loop(start_off=0.5, dx=3.0)
     assert ctrl.n_moves == 0
     assert ctrl.fault is not None and "edges disagree" in ctrl.fault
-    assert np.all(hist == 0.0)
+    assert np.all(hist == 0.5)
+
+
+def test_two_edge_loop_holds_through_a_lateral_shift_at_target():
+    """The y edge stays at target, so the loop holds on it and never faults."""
+    ctrl, hist = _two_edge_loop(start_off=0.0, dx=3.0, steps=60)
+    assert ctrl.fault is None
+    assert ctrl.n_moves == 0
+    assert np.all(np.abs(hist) < 0.04)
 
 
 # ---------------------------------------------------------------------------

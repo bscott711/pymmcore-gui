@@ -50,6 +50,7 @@ from pymmcore_gui.asi_z_stack.spot_focus import (
 from pymmcore_gui.asi_z_stack.spot_focus_service import SpotFocusService
 from pymmcore_gui.asi_z_stack.toupcam_source import make_source
 from pymmcore_gui.widgets._spot_focus_panel import (
+    ATTENTION_COLOR,
     NEED_BOX_TEXT,
     SpotFocusPanel,
     source_spec,
@@ -287,9 +288,11 @@ def test_spot_settings_defaults_and_roundtrip() -> None:
     assert cfg.calibration_status()[0] is None
     assert cfg.edge_box is None and cfg.edge_box_2 is None
     assert (cfg.sweep_span_um, cfg.sweep_steps, cfg.sweep_frames) == (2.0, 9, 3)
-    assert cfg.params.max_edge_disagreement_um == 0.3
+    assert cfg.params.max_edge_disagreement_um == 1.0
+    assert cfg.params.hold_band_um == 0.15
     params = cfg.params.to_params()
-    assert params.max_edge_disagreement_um == 0.3
+    assert params.max_edge_disagreement_um == 1.0
+    assert params.hold_band_um == 0.15
     assert params.deadband_um == pytest.approx(0.03)
     assert params.avg_frames == 4
     assert params.offset_um == 0.0
@@ -302,6 +305,7 @@ def test_spot_settings_defaults_and_roundtrip() -> None:
     cfg.params.offset_um = 0.25
     cfg.params.min_contrast = 25.0
     cfg.params.max_edge_disagreement_um = 0.45
+    cfg.params.hold_band_um = 0.25
     cfg.calibration = _focus_cal().to_dict()
     cfg.edge_box = BOX
     cfg.edge_box_2 = BOX2
@@ -318,6 +322,7 @@ def test_spot_settings_defaults_and_roundtrip() -> None:
     p2 = s2.spot_focus.params.to_params()
     assert (p2.kp, p2.offset_um, p2.min_contrast) == (0.3, 0.25, 25.0)
     assert p2.max_edge_disagreement_um == 0.45
+    assert p2.hold_band_um == 0.25
 
 
 def test_rig_shaped_single_edge_calibration_loads_as_one_edge() -> None:
@@ -640,6 +645,63 @@ def test_telemetry_shows_both_edges_the_disagreement_and_the_note(
     assert labels["error"].text() == "—" and labels["edge2"].text() == "—"
     panel._on_telemetry({**bad, "reason": "", "along_um": 0.0})
     assert panel.note_label.text() == ""
+
+
+def test_telemetry_says_which_edge_the_lock_holds_on(
+    qtbot: QtBot, panel: SpotFocusPanel
+) -> None:
+    labels = panel.readout_labels
+    note = "edges disagree by 1.23 um; holding on edge 2 (0.04 um from target)"
+    held = {
+        "edge_px": 272.0,
+        "contrast": 700.0,
+        "fps": 30.0,
+        "along_um": 0.04,
+        "disagreement_um": 1.23,
+        "held_edge": 1,  # 0-based: panel "Edge 2"
+        "note": note,
+        "reason": "",
+        "edges": [
+            {"edge_px": 272.0, "x": 272.0, "y": 240.0, "ok": True},
+            {"edge_px": 194.25, "x": 320.0, "y": 194.25, "ok": True},
+        ],
+    }
+    panel._on_telemetry(held)
+    assert "1.230 (holding on edge 2)" in labels["disagreement"].text()
+    assert ATTENTION_COLOR in labels["disagreement"].text()
+    assert note in panel.note_label.text()
+    assert labels["error"].text() == "+0.040 µm"
+
+    panel._on_telemetry({**held, "held_edge": 0})
+    assert "holding on edge 1" in labels["disagreement"].text()
+
+    # Back to agreeing edges: the readout is plain again.
+    panel._on_telemetry(
+        {**held, "held_edge": None, "disagreement_um": 0.12, "note": ""}
+    )
+    assert labels["disagreement"].text() == "0.120"
+    assert panel.note_label.text() == ""
+    # A frame from an older worker has no held_edge at all.
+    panel._on_telemetry({k: v for k, v in held.items() if k != "held_edge"})
+    assert "holding" not in labels["disagreement"].text()
+
+
+def test_disagreement_limit_and_hold_band_spins_write_to_settings(
+    qtbot: QtBot, panel: SpotFocusPanel
+) -> None:
+    params = SettingsV1.instance().spot_focus.params
+    limit = panel.param_spins["max_edge_disagreement_um"]
+    band = panel.param_spins["hold_band_um"]
+    # The spin boxes show the settings' defaults.
+    assert limit.value() == pytest.approx(1.0)
+    assert band.value() == pytest.approx(0.15)
+    assert (limit.minimum(), limit.maximum()) == (0.05, 10.0)
+    assert (band.minimum(), band.maximum()) == (0.0, 2.0)
+    limit.setValue(1.5)
+    band.setValue(0.25)
+    assert params.max_edge_disagreement_um == pytest.approx(1.5)
+    assert params.hold_band_um == pytest.approx(0.25)
+    assert params.to_params().hold_band_um == pytest.approx(0.25)
 
 
 def test_preview_error_appears_after_calibrate(

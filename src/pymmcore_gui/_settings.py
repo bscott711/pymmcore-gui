@@ -600,7 +600,9 @@ class SpotLoopParamsSettings(BaseModel):
     min_valid_fraction: float = 0.5
     max_angle_change_deg: float = 5.0
     max_edge_residual_px: float = 3.0
-    max_edge_disagreement_um: float = 0.3
+    max_edge_disagreement_um: float = 1.0
+    hold_band_um: float = 0.15
+    """When the two edges disagree, hold on an edge this close to the target."""
     p_min_um: float | None = None
     p_max_um: float | None = None
     max_excursion_um: float = 5.0
