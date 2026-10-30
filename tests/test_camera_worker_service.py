@@ -183,6 +183,12 @@ def test_worker_group_table_lists_and_applies_worker_groups(
     assert isinstance(combo, QComboBox)
     assert combo.currentText() == "Speed"
 
+    # Worker rows can't be selected, so the stock edit/delete buttons (which
+    # assume a core group) never see them.
+    table.selectRow(rows["Cameras"])
+    assert not table.selectedIndexes()
+    wdg._edit_preset()  # no-op rather than UnboundLocalError
+
     combo.textActivated.emit("Sensitivity")
     assert svc.worker_config_groups["Cameras"].current == "Sensitivity"
     assert pool.calls[0] == ("Camera-1", (("Port", "Sensitivity"),))

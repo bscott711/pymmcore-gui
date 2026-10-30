@@ -64,6 +64,12 @@ class WorkerGroupPresetTableWidget(GroupPresetTableWidget):
             item.setFlags(Qt.ItemFlag.ItemIsEnabled)
             item.setToolTip("Applied through the camera worker processes.")
             self.table_wdg.setItem(row, 0, item)
+            # A cell with no item is selectable by default, and selecting the
+            # combo's cell is enough to make the stock edit button treat this
+            # row as a core group and crash on it.
+            placeholder = QTableWidgetItem()
+            placeholder.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.table_wdg.setItem(row, 1, placeholder)
 
             combo = QComboBox()
             combo.addItems(list(cfg.presets))
