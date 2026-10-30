@@ -169,6 +169,7 @@ def test_worker_group_table_lists_and_applies_worker_groups(
 ) -> None:
     from qtpy.QtWidgets import QComboBox
 
+    from pymmcore_gui.widgets._worker_group_editor import WorkerPresetDialog
     from pymmcore_gui.widgets._worker_group_preset_table import (
         WorkerGroupPresetTableWidget,
     )
@@ -179,7 +180,11 @@ def test_worker_group_table_lists_and_applies_worker_groups(
     qtbot.addWidget(wdg)
 
     table = wdg.table_wdg
-    rows = {table.item(r, 0).text(): r for r in range(table.rowCount())}
+    rows = {
+        item.text(): r
+        for r in range(table.rowCount())
+        if (item := table.item(r, 0)) is not None
+    }
     assert "Cameras" in rows
     assert len(rows) == len(core.getAvailableConfigGroups()) + 1
 
@@ -187,11 +192,14 @@ def test_worker_group_table_lists_and_applies_worker_groups(
     assert isinstance(combo, QComboBox)
     assert combo.currentText() == "Speed"
 
-    # Worker rows can't be selected, so the stock edit/delete buttons (which
-    # assume a core group) never see them.
+    # Worker rows are selectable; the edit buttons route to the worker dialog
+    # rather than the stock one (which assumes a core group).
     table.selectRow(rows["Cameras"])
-    assert not table.selectedIndexes()
-    wdg._edit_preset()  # no-op rather than UnboundLocalError
+    assert {i.row() for i in table.selectedIndexes()} == {rows["Cameras"]}
+    assert wdg.presets_edit_btn.isEnabled()
+    wdg._edit_preset()
+    assert isinstance(wdg._worker_dialog, WorkerPresetDialog)
+    wdg._worker_dialog.close()
 
     combo.textActivated.emit("Sensitivity")
     assert svc.worker_config_groups["Cameras"].current == "Sensitivity"
