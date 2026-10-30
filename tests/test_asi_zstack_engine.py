@@ -24,6 +24,7 @@ import pytest
 import useq
 from useq._mda_event import Channel as EventChannel
 
+from pymmcore_gui._settings import SpimTimingSettingsV1
 from pymmcore_gui.asi_z_stack import engine as engine_module
 from pymmcore_gui.asi_z_stack.camera_handoff import CameraHandoffSnapshot
 from pymmcore_gui.asi_z_stack.common import HardwareConstants
@@ -1177,3 +1178,186 @@ def test_all_rows_teardown_restores_card_timing(
         "SPIMNumScansPerSlice",
     ):
         assert restored.get(prop) == "0.1234"
+
+
+# --- Park the galvo at the sweep start between volumes ---
+
+_GALVO = "Scanner:AB:33"
+
+
+def _spim_state_core(
+    core: MagicMock,
+    allowed: tuple[str, ...] = ("Idle", "Armed", "Running"),
+    reject: tuple[str, ...] = (),
+    readback: dict[str, str] | None = None,
+) -> list[str]:
+    """Make ``core`` remember the galvo's SPIMState; return the write log.
+
+    ``reject`` values raise on write (the card refusing a transition);
+    ``readback`` maps a written value to what the card then reports.
+    """
+    state = {"v": "Idle"}
+    writes: list[str] = []
+
+    def set_property(dev: str, prop: str, value: str) -> None:
+        if (dev, prop) == (_GALVO, "SPIMState"):
+            if value in reject:
+                raise RuntimeError(f"card rejected SPIMState={value}")
+            writes.append(value)
+            state["v"] = (readback or {}).get(value, value)
+
+    core.setProperty.side_effect = set_property
+    core.getAllowedPropertyValues.return_value = allowed
+    core.getProperty.side_effect = lambda dev, prop: (
+        state["v"] if prop == "SPIMState" else "0.1234"
+    )
+    return writes
+
+
+def _run_volumes(engine: _ASITriggerEngineBase, pool: MagicMock, n: int) -> None:
+    for t in range(n):
+        _queue_frames(pool, [("cam0", 0), ("cam0", 1)])
+        list(engine.exec_event(useq.MDAEvent(index={"t": t})))
+
+
+def _park_engine(
+    park: bool, **core_kwargs: object
+) -> tuple[MagicMock, ASISPIMEngine, MagicMock, list[str]]:
+    core, engine, pool = _make_engine(n_cameras=1, n_slices=2)
+    writes = _spim_state_core(core, **core_kwargs)  # type: ignore[arg-type]
+    engine = cast("ASISPIMEngine", engine)
+    engine._timing_cfg = SpimTimingSettingsV1(park_at_start=park)
+    return core, engine, pool, writes
+
+
+def test_park_default_is_off() -> None:
+    assert SpimTimingSettingsV1().park_at_start is False
+
+
+def test_park_parks_after_each_volume_and_runs_from_armed() -> None:
+    _core, engine, pool, writes = _park_engine(park=True)
+
+    engine._park_galvo_at_start()  # what setup_sequence does at its end
+    assert writes == ["Armed"]
+    _run_volumes(engine, pool, 2)
+
+    # parked after setup, Running starts each volume, parked again after it
+    assert writes == ["Armed", "Running", "Armed", "Running", "Armed"]
+
+
+def test_park_runs_at_end_of_setup_and_idle_at_teardown(
+    monkeypatch: pytest.MonkeyPatch, settings: object
+) -> None:
+    settings.spim_timing.park_at_start = True  # type: ignore[attr-defined]
+    core, engine = _setup_spim_engine(monkeypatch)
+    writes = _spim_state_core(core)
+    monkeypatch.setattr(engine_module.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(engine, "_reclaim_from_workers", MagicMock())
+    core.getLoadedDevices.return_value = [_GALVO]
+    seq = useq.MDASequence(z_plan=useq.ZAboveBelow(above=10, below=0, step=1))
+
+    engine.setup_sequence(seq)
+    assert writes == ["Armed"]  # volume 1 benefits
+    engine.teardown_sequence(seq)
+
+    assert writes == ["Armed", "Idle"]  # teardown is the neutral return
+
+
+def test_park_off_writes_no_armed_and_changes_nothing() -> None:
+    """Negative control: with parking off the writes are exactly the old ones."""
+    core, engine, pool, writes = _park_engine(park=False)
+
+    engine._park_galvo_at_start()
+    _run_volumes(engine, pool, 2)
+
+    assert writes == ["Running", "Running"]
+    assert "Armed" not in writes
+    core.getAllowedPropertyValues.assert_not_called()
+    # nothing but the two Running writes touched the core's properties
+    assert core.setProperty.call_count == 2
+
+
+def test_park_without_armed_warns_once_and_proceeds(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _core, engine, pool, writes = _park_engine(park=True, allowed=("Idle", "Running"))
+
+    with caplog.at_level(logging.WARNING):
+        engine._park_galvo_at_start()
+        _run_volumes(engine, pool, 2)
+
+    assert writes == ["Running", "Running"]
+    assert engine._park_disabled
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "Armed" in warnings[0].getMessage()
+
+
+def test_park_readback_mismatch_disables_parking() -> None:
+    _core, engine, pool, writes = _park_engine(park=True, readback={"Armed": "Idle"})
+
+    engine._park_galvo_at_start()
+    assert engine._park_disabled
+    _run_volumes(engine, pool, 2)
+
+    assert writes == ["Armed", "Running", "Running"]  # one try, then never again
+
+
+def test_park_write_error_never_raises(caplog: pytest.LogCaptureFixture) -> None:
+    _core, engine, _pool, writes = _park_engine(park=True, reject=("Armed",))
+
+    with caplog.at_level(logging.WARNING):
+        engine._park_galvo_at_start()
+
+    assert writes == []
+    assert engine._park_disabled
+    assert sum(r.levelno == logging.WARNING for r in caplog.records) == 1
+
+
+def test_park_running_rejected_from_armed_goes_via_idle(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    core, engine, pool, writes = _park_engine(park=True)
+    engine._park_galvo_at_start()
+    assert writes == ["Armed"]
+
+    # the card now refuses Running while it is parked (only the first try)
+    first = {"done": False}
+    plain = core.setProperty.side_effect
+
+    def picky(dev: str, prop: str, value: str) -> None:
+        if (dev, prop, value) == (_GALVO, "SPIMState", "Running") and not first["done"]:
+            first["done"] = True
+            raise RuntimeError("Running not accepted from Armed")
+        plain(dev, prop, value)
+
+    core.setProperty.side_effect = picky
+    with caplog.at_level(logging.WARNING):
+        _run_volumes(engine, pool, 2)
+
+    assert writes == ["Armed", "Idle", "Running", "Running"]
+    assert engine._park_disabled  # not parked again after the failure
+    assert sum(r.levelno == logging.WARNING for r in caplog.records) == 1
+
+
+def test_park_flag_resets_each_run(
+    monkeypatch: pytest.MonkeyPatch, settings: object
+) -> None:
+    settings.spim_timing.park_at_start = True  # type: ignore[attr-defined]
+    core, engine = _setup_spim_engine(monkeypatch)
+    writes = _spim_state_core(core)
+    engine._park_disabled = True  # left over from an earlier run
+
+    engine.setup_sequence(useq.MDASequence(channels=["488nm"]))
+
+    assert not engine._park_disabled
+    assert writes == ["Armed"]
+
+
+def test_stationary_engine_never_parks() -> None:
+    core, engine, pool = _make_engine(
+        n_cameras=1, n_slices=2, engine_cls=ASIStationaryTriggerEngine
+    )
+    writes = _spim_state_core(core)
+    _run_volumes(engine, pool, 1)
+    assert writes == ["Running"]

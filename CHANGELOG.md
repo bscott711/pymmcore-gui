@@ -19,6 +19,18 @@ upstream.
 
 ### Added
 
+- **Park the galvo at the sweep start between volumes** (optional, **off by
+  default**). Timing tab: "Park at sweep start" (`park_at_start`). After setup
+  and after each volume the engine writes `SPIMState=Armed` to the galvo, so the
+  mirror sits at the sweep start for the whole inter-timepoint wait instead of
+  returning to neutral and snapping to the start; `Running` still starts each
+  volume and teardown still returns it to neutral (Idle). The mechanism is not
+  yet verified on hardware: check it first with `probe_galvo_park`, then run
+  3-5 timepoints at a 10 s interval and watch the mirror. If the card lacks
+  `Armed`, does not read it back, or refuses `Running` from `Armed` (the engine
+  then goes via Idle), one warning is logged and parking turns itself off for
+  that run; the acquisition is never aborted. With the box unticked no extra
+  property is written.
 - **`probe_galvo_park`** (bench diagnostic in `asi_z_stack/diagnostics.py`): tries
   parking the galvo at the sweep start between volumes, via `SPIMState=Armed`
   or an Idle offset write, so the mechanism can be chosen on the rig before

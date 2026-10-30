@@ -440,6 +440,12 @@ class SpimTimingSettingsV1(BaseMMSettings):
     volume_start_settle_ms: float = 0.0
     """Extra settle before each volume's first slice, for the galvo's jump
     back to the start of the sweep (``SPIMDelayBeforeSide``)."""
+    park_at_start: bool = False
+    """Hold the galvo at the sweep start between volumes (``SPIMState=Armed``)
+    so the mirror has the whole inter-timepoint wait to settle, instead of
+    returning to neutral and snapping to the start. Off until verified on the
+    rig with ``diagnostics.probe_galvo_park``; if the card refuses, parking
+    turns itself off for the run and the acquisition carries on."""
     readout_ms_override: float | None = None
     """Camera rolling readout time in ms; ``None`` uses the value the cameras
     report (PVCAM ``Timing-ReadoutTimeNs``, maximum over cameras)."""

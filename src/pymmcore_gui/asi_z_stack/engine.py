@@ -294,6 +294,15 @@ class _ASITriggerEngineBase(MDAEngine):
     def _after_arm(self) -> None:
         """Hook between arming the cameras and triggering the volume."""
 
+    def _start_volume(self) -> None:
+        """Write the trigger value to the master axis's ``SPIMState``."""
+        self.mmcore.setProperty(
+            self._master_axis_label, "SPIMState", self._trigger_spim_state_value
+        )
+
+    def _after_volume(self) -> None:
+        """Hook after a volume's workers are stopped and drained."""
+
     def _trigger_timing_summary(self) -> str:
         """One line on the slice timing this run triggers with (for errors)."""
         return ""
@@ -805,9 +814,7 @@ class _ASITriggerEngineBase(MDAEngine):
             self._snapshot.camera_labels, 0
         )
 
-        mmc.setProperty(
-            self._master_axis_label, "SPIMState", self._trigger_spim_state_value
-        )
+        self._start_volume()
         spim_state = mmc.getProperty(self._master_axis_label, "SPIMState")
         logger.info(f"{self._master_axis_label} SPIMState readback: '{spim_state}'.")
 
@@ -903,6 +910,7 @@ class _ASITriggerEngineBase(MDAEngine):
             # so frames left queued by a cancel/error would otherwise be read
             # by the next Snap/Live/MDA as its own.
             self._worker_pool.stop_and_drain(timeout=self.hw.worker_shutdown_timeout_s)
+            self._after_volume()
 
 
 class ASISPIMEngine(_ASITriggerEngineBase):
@@ -933,6 +941,8 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         # Galvo per-slice values an All Rows run overwrote, put back in
         # teardown (see _ALL_ROWS_GALVO_PROPS).
         self._galvo_timing_before: dict[str, str] | None = None
+        # Set once parking has failed this run (reset in setup_sequence).
+        self._park_disabled = False
 
     def _check_galvo_reach(
         self, amplitude_deg: float, offset_deg: float, live_offset_deg: float = 0.0
@@ -1199,6 +1209,57 @@ class ASISPIMEngine(_ASITriggerEngineBase):
             return {"trigger_mode": LEVEL_TRIGGER_OVERLAP}
         return {}
 
+    def _park_active(self) -> bool:
+        """Parking is requested for this run and has not failed yet."""
+        cfg = self._timing_cfg
+        return cfg is not None and cfg.park_at_start and not self._park_disabled
+
+    def _park_galvo_at_start(self) -> None:
+        """Hold the galvo at the sweep start (``SPIMState=Armed``) between volumes.
+
+        Off unless ``park_at_start`` is set. Never raises: if the card lacks
+        ``Armed``, rejects the write, or does not read it back, one warning is
+        logged and parking is off for the rest of the run.
+        """
+        if not self._park_active():
+            return
+        galvo = self.hw.galvo_a_label
+        try:
+            allowed = self.mmcore.getAllowedPropertyValues(galvo, "SPIMState")
+            if "Armed" not in allowed:
+                raise RuntimeError(f"'Armed' not in allowed SPIMState values {allowed}")
+            self.mmcore.setProperty(galvo, "SPIMState", "Armed")
+            state = self.mmcore.getProperty(galvo, "SPIMState")
+            if state != "Armed":
+                raise RuntimeError(f"SPIMState read back '{state}', expected 'Armed'")
+        except Exception as err:
+            self._park_disabled = True
+            logger.warning(
+                f"Parking the galvo at the sweep start failed ({err}); "
+                "parking is off for the rest of this run."
+            )
+            return
+        logger.info(f"{galvo} parked at the sweep start (SPIMState=Armed).")
+
+    def _start_volume(self) -> None:
+        if not self._park_active():
+            super()._start_volume()
+            return
+        try:
+            super()._start_volume()
+        except Exception as err:
+            # The card may not start a volume from Armed: go through Idle.
+            self._park_disabled = True
+            logger.warning(
+                f"Starting a volume from the parked (Armed) galvo failed ({err}); "
+                "going via Idle and turning parking off for the rest of this run."
+            )
+            self.mmcore.setProperty(self._master_axis_label, "SPIMState", "Idle")
+            super()._start_volume()
+
+    def _after_volume(self) -> None:
+        self._park_galvo_at_start()
+
     def _trigger_timing_summary(self) -> str:
         timing = self._applied_timing
         if timing is None:
@@ -1316,6 +1377,7 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         # Advanced slice timing: a snapshot of the settings for this run, so
         # edits mid-run apply to the next MDA only.
         self._timing_cfg = SettingsV1.instance().spim_timing.model_copy(deep=True)
+        self._park_disabled = False
         self._readout_ms = self._resolve_readout_ms(self._timing_cfg)
         self._applied_timing = None
         first = sequence.channels[0].config if sequence.channels else ""
@@ -1434,6 +1496,9 @@ class ASISPIMEngine(_ASITriggerEngineBase):
             f"offset={galvo_offset_deg:.4f}deg, "
             f"exposure={self._exposure_ms:.1f}ms)"
         )
+
+        # Optional: hold the mirror at the sweep start so volume 1 benefits.
+        self._park_galvo_at_start()
 
         # Return summary metadata. This automatically queries
         # getNumberOfCameraChannels() and informs the OmeWritersSink
