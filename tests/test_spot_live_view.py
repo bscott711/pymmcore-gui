@@ -13,11 +13,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
-
-from pymmcore_gui._qt.QtCore import QPoint, QPointF, Qt
-from pymmcore_gui._qt.QtGui import QPainter
-from pymmcore_gui.asi_z_stack.spot_frame_shm import LiveFrame
-from pymmcore_gui.widgets._spot_live_view import (
+from CRISPy.spot.live_view import (
     EDGE_BOX2_COLOR,
     EDGE_BOX_COLOR,
     ROI_COLOR,
@@ -30,6 +26,10 @@ from pymmcore_gui.widgets._spot_live_view import (
     snap_edge_box,
     snap_roi,
 )
+from CRISPy.spot.spot_frame_shm import LiveFrame
+
+from pymmcore_gui._qt.QtCore import QPoint, QPointF, Qt
+from pymmcore_gui._qt.QtGui import QPainter
 
 if TYPE_CHECKING:
     from pytestqt.qtbot import QtBot
@@ -46,7 +46,7 @@ def make_frame(
     spot_ok: bool = True,
     fill: int | None = None,
 ) -> LiveFrame:
-    x, y, w, h = roi
+    _x, _y, w, h = roi
     dtype = np.uint8 if bits <= 8 else np.uint16
     rng = np.random.default_rng(seq)
     top = (1 << bits) - 1
@@ -146,13 +146,13 @@ def test_qimage_formats_and_levels() -> None:
     assert qimg.pixelColor(2, 1).red() == int(u8[1, 2])  # fixed levels: unchanged
 
     u12 = np.array([[0, 4095]], dtype=np.uint16)
-    qimg, buf = frame_to_qimage(u12, 12)
+    qimg, _buf = frame_to_qimage(u12, 12)
     assert qimg.format().name.endswith("Grayscale16")
     assert qimg.pixelColor(0, 0).red() == 0
     assert qimg.pixelColor(1, 0).red() >= 254  # full scale maps to white
 
     dim = np.array([[10, 20, 30]], dtype=np.uint8)
-    qimg, buf = frame_to_qimage(dim, 8, auto_levels=True)
+    qimg, _buf = frame_to_qimage(dim, 8, auto_levels=True)
     assert [qimg.pixelColor(i, 0).red() for i in range(3)] == [0, 127, 255]
     flat, _ = frame_to_qimage(np.full((2, 2), 9, np.uint8), 8, auto_levels=True)
     assert flat.pixelColor(0, 0).red() == 0  # constant frame: no divide by zero
@@ -437,7 +437,7 @@ def test_view_can_be_a_child_and_a_window_again(qtbot: QtBot) -> None:
 def test_stats_signal(qtbot: QtBot, view: SpotLiveView) -> None:
     with qtbot.waitSignal(view.statsChanged, timeout=1000) as sig:
         view.show_frame(make_frame(fill=200))
-    fps, mx, sat = sig.args
+    _fps, mx, sat = sig.args
     assert mx == 200
     assert sat == pytest.approx(1.0)
 
@@ -457,7 +457,7 @@ def test_auto_levels_rebuilds_the_pixmap(view: SpotLiveView) -> None:
 
 
 def _mosaic_frame(roi: tuple[int, int, int, int] = (0, 0, 64, 48)) -> LiveFrame:
-    x, y, w, h = roi
+    _x, _y, w, h = roi
     frame = make_frame(roi=roi, fill=0)
     frame.image[:] = _rggb_mosaic(h, w)
     return frame

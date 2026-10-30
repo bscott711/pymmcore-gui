@@ -20,40 +20,10 @@ import time
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
-from unittest.mock import MagicMock, PropertyMock, patch
+from unittest.mock import PropertyMock, patch
 
 import pytest
-import useq
-
-from pymmcore_gui import _settings
-from pymmcore_gui._qt.QtCore import QPointF, Qt
-from pymmcore_gui._qt.QtWidgets import QWidget
-from pymmcore_gui._settings import (
-    CalibrationRecord,
-    FocusBoxSettings,
-    SettingsV1,
-)
-from pymmcore_gui.actions.widget_actions import (
-    SpotFocusScrollArea,
-    create_image_focus_widget,
-)
-from pymmcore_gui.asi_z_stack.common import HardwareConstants
-from pymmcore_gui.asi_z_stack.image_focus_events import (
-    CALIBRATION_METADATA_KEY,
-    spot_focus_flag,
-)
-from pymmcore_gui.asi_z_stack.image_focus_run import ImageFocusRun
-from pymmcore_gui.asi_z_stack.spot_focus import (
-    EDGE_DETECTOR_LABELS,
-    EDGE_DETECTORS,
-    SIGMA_PX_RANGE,
-    EdgeCalibration,
-    FocusCalibration,
-    measure_edge,
-)
-from pymmcore_gui.asi_z_stack.spot_focus_service import SpotFocusService
-from pymmcore_gui.asi_z_stack.toupcam_source import make_source
-from pymmcore_gui.widgets._spot_focus_panel import (
+from CRISPy.spot.panel import (
     ALERT_COLOR,
     ATTENTION_COLOR,
     NEED_BOX_TEXT,
@@ -63,6 +33,22 @@ from pymmcore_gui.widgets._spot_focus_panel import (
     noise_color,
     source_spec,
 )
+from CRISPy.spot.spot_focus import (
+    EDGE_DETECTOR_LABELS,
+    EDGE_DETECTORS,
+    SIGMA_PX_RANGE,
+    EdgeCalibration,
+    FocusCalibration,
+    measure_edge,
+)
+from CRISPy.spot.spot_focus_service import SpotFocusService
+from CRISPy.spot.store import set_settings_store
+from CRISPy.spot.toupcam_source import make_source
+
+from pymmcore_gui import _settings
+from pymmcore_gui._qt.QtCore import QPointF, Qt
+from pymmcore_gui._settings import SettingsV1
+from pymmcore_gui.widgets._crisp_widget import SpotSettingsAdapter
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -137,24 +123,22 @@ def _isolated_settings() -> Iterator[SettingsV1]:
     fresh.spot_focus.params.max_rate_hz = 5.0
     fresh.spot_focus.params.strikes = 3
     with patch("pymmcore_gui._settings._GLOBAL_SETTINGS", fresh):
-        yield fresh
+        # the panel reads and saves through CRISPy's store, here the GUI's adapter
+        set_settings_store(SpotSettingsAdapter())
+        try:
+            yield fresh
+        finally:
+            set_settings_store(None)
 
 
 @pytest.fixture(autouse=True)
 def _child_path(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make sure the spawned child can import the package under test."""
-    import pymmcore_gui
+    import CRISPy
 
-    src = str(Path(pymmcore_gui.__file__).resolve().parent.parent)
+    src = str(Path(CRISPy.__file__).resolve().parent.parent)
     old = os.environ.get("PYTHONPATH", "")
     monkeypatch.setenv("PYTHONPATH", src + (os.pathsep + old if old else ""))
-
-
-@pytest.fixture(autouse=True)
-def _flag_off() -> Iterator[None]:
-    spot_focus_flag.active = False
-    yield
-    spot_focus_flag.active = False
 
 
 @pytest.fixture
@@ -295,7 +279,6 @@ def _rig_e0() -> float:
 
 def test_spot_settings_defaults_and_roundtrip() -> None:
     s = SettingsV1()
-    assert s.image_focus.mode == "spot"
     cfg = s.spot_focus
     assert (cfg.channel, cfg.source.kind) == ("red", "toupcam")
     assert cfg.calibration is None
@@ -382,36 +365,18 @@ def test_old_calibration_in_settings_is_ignored_not_raised() -> None:
 
 
 def test_old_settings_files_still_load() -> None:
-    """A file written before the spot lock (no ``spot_focus``) loads with defaults.
-
-    An old ``image_focus.mode`` ("crisp" / "image" / "off") is dropped with a
-    RuntimeWarning and gives "spot".
-    """
-    old = {
-        "version": "1.0",
-        "image_focus": {
-            "mode": "image",
-            "loop_gain": 0.4,
-            "box": {
-                "camera": "Camera-1",
-                "preset": "488nm",
-                "slice_index": 1,
-                "rect": [100, 60, 40, 30],
-            },
-        },
-    }
-    with pytest.warns(RuntimeWarning):
-        cleaned = _settings._good_data_only(SettingsV1, old)
+    """A file written before the spot lock (no ``spot_focus``) loads with defaults."""
+    old = {"version": "1.0", "focus": {"enabled": True}}
+    cleaned = _settings._good_data_only(SettingsV1, old)
     s = SettingsV1.model_validate(cleaned)
-    assert s.image_focus.mode == "spot"
-    assert s.image_focus.loop_gain == 0.4
+    assert s.focus.enabled is True
     assert s.spot_focus.calibration is None
     assert s.spot_focus.channel == "red"
     # A bad spot section degrades to defaults and keeps the rest.
-    bad = {"image_focus": {"mode": "image"}, "spot_focus": {"channel": "purple"}}
+    bad = {"focus": {"enabled": True}, "spot_focus": {"channel": "purple"}}
     with pytest.warns(RuntimeWarning):
         cleaned = _settings._good_data_only(SettingsV1, bad)
-    assert cleaned["image_focus"] == {}
+    assert cleaned["focus"] == {"enabled": True}
     assert cleaned.get("spot_focus", {}) == {}
 
 
@@ -904,7 +869,7 @@ def test_start_telemetry_stop_restores_crisp(
     assert not panel.start_button.isEnabled()
     qtbot.waitUntil(lambda: panel.state == "running", timeout=WAIT_MS)
     assert mmc.props[(CRISP, "CRISP State")] == "Ready"
-    assert spot_focus_flag.active
+    assert panel.lock_active
     # Calibrate and Zero are only for a stopped loop.
     assert not panel.calibrate_button.isEnabled()
     assert not panel.zero_button.isEnabled()
@@ -975,7 +940,7 @@ def test_start_telemetry_stop_restores_crisp(
         cal_spy.assert_called_once()  # ... with the calibration, for the error
         assert isinstance(cal_spy.call_args[0][0], FocusCalibration)
     assert panel.state == "stopped"
-    assert not spot_focus_flag.active
+    assert not panel.lock_active
     assert mmc.props[(CRISP, "CRISP State")] == "Idle"  # restored
     assert panel.calibrate_button.isEnabled()
     assert panel.start_button.isEnabled()
@@ -1083,7 +1048,7 @@ def test_lock_without_a_calibration_calibrates_then_locks(
     assert panel._cal is not None
     assert cfg.params.offset_um == 0.0  # a new zero
     assert mmc.props[(CRISP, "CRISP State")] == "Ready"
-    assert spot_focus_flag.active
+    assert panel.lock_active
     qtbot.waitUntil(lambda: len(panel.chart) > 3, timeout=WAIT_MS)
     panel.stop()
     assert panel.state == "stopped"
@@ -1101,7 +1066,7 @@ def test_failed_calibration_inside_lock_is_reported_and_nothing_locks(
     assert "Calibration failed" in panel.fault_label.text()
     assert panel.state != "running"
     assert cfg.calibration is None
-    assert not spot_focus_flag.active
+    assert not panel.lock_active
     assert mmc.props[(CRISP, "CRISP State")] == "Idle"
     assert panel.start_button.isEnabled()
 
@@ -1118,98 +1083,8 @@ def test_start_failure_is_reported(qtbot: QtBot, mmc: FakeMMC) -> None:
     qtbot.waitUntil(lambda: not widget._busy, timeout=WAIT_MS)
     assert "no camera" in widget.fault_label.text()
     assert widget.state == "idle"
-    assert not spot_focus_flag.active
+    assert not widget.lock_active
     assert widget.start_button.isEnabled()
-
-
-# ---------------------------------------------------------------------------
-# dock: the panel is hosted directly (Spot is the only mode)
-# ---------------------------------------------------------------------------
-
-
-def _image_cfg() -> _settings.ImageFocusSettingsV1:
-    # "image" is no longer a settings value; build the legacy state directly.
-    cfg = _settings.ImageFocusSettingsV1.model_construct(mode="image")
-    cfg.box = FocusBoxSettings(
-        camera="Camera-1", preset="488nm", slice_index=1, rect=(100, 60, 40, 30)
-    )
-    cfg.calibrations = {
-        "Camera-1|488nm|": CalibrationRecord(
-            rows_per_um=4.0,
-            intercept_rows=0.0,
-            r2=0.998,
-            range_um=(-1.5, 1.5),
-            n_points=7,
-            date="2026-10-26T12:00:00",
-        )
-    }
-    return cfg
-
-
-def _image_run(cfg: _settings.ImageFocusSettingsV1, seq=None) -> ImageFocusRun:
-    return ImageFocusRun.for_sequence(
-        MagicMock(),
-        HardwareConstants(),
-        seq or useq.MDASequence(channels=[useq.Channel(config="488nm", exposure=10)]),
-        crisp_locked=lambda: False,
-        image_focus=cfg,
-        spectral=_settings.SpectralChannelSettingsV1(),
-    )
-
-
-def test_image_lock_skips_while_spot_runs(qtbot: QtBot, panel: SpotFocusPanel) -> None:
-    cfg = _image_cfg()
-    assert _image_run(cfg).active  # control: the image lock arms normally
-    cal_seq = useq.MDASequence(
-        channels=[useq.Channel(config="488nm", exposure=10)],
-        metadata={
-            CALIBRATION_METADATA_KEY: {
-                "steps_um": [-1.0, 0.0, 1.0],
-                "reps": 1,
-                "box": {
-                    "camera": "Camera-1",
-                    "preset": "488nm",
-                    "slice_index": 1,
-                    "rect": [100, 60, 40, 30],
-                },
-            }
-        },
-    )
-    assert _image_run(cfg, cal_seq).active
-
-    _calibrated(SettingsV1.instance())
-    panel.refresh()
-    panel.start()
-    qtbot.waitUntil(lambda: panel.state == "running", timeout=WAIT_MS)
-    run = _image_run(cfg)  # even if the setting says "image"
-    assert not run.active
-    assert run.mode == "off"
-    assert not run.owns_piezo
-    assert not _image_run(cfg, cal_seq).active  # nor a calibration sweep
-
-    panel.stop()
-    assert _image_run(cfg).active  # armed again once spot has stopped
-
-
-def test_spot_mode_does_not_arm_image_lock() -> None:
-    cfg = _image_cfg()
-    cfg.mode = "spot"
-    run = _image_run(cfg)
-    assert not run.active
-    assert run.mode == "off"
-
-
-def test_dock_hosts_the_spot_panel_directly(qtbot: QtBot) -> None:
-    parent = QWidget()
-    qtbot.addWidget(parent)
-    widget = create_image_focus_widget(parent)
-    assert isinstance(widget, SpotFocusScrollArea)
-    panel = widget.spot_panel
-    assert isinstance(panel, SpotFocusPanel)
-    assert widget.widget() is panel  # no mode radio, no wrapper
-    assert not hasattr(widget, "mode_buttons")
-    assert panel.start_button.text() == "Lock"
-    panel.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -1273,7 +1148,7 @@ def test_no_crisp_device_is_said_not_silent(qtbot: QtBot, mmc: FakeMMC) -> None:
     try:
         widget.preview_button.click()
         qtbot.waitUntil(lambda: not widget._preview_busy, timeout=WAIT_MS)
-        assert "no CRISP device (focus.crisp_label)" in widget.fault_label.text()
+        assert "no CRISP device (no CRISP label)" in widget.fault_label.text()
         assert mmc.props[(CRISP, "CRISP State")] == "Idle"
     finally:
         widget.shutdown()
@@ -1620,7 +1495,7 @@ def test_refusal_from_the_service_start_is_shown_not_raised(
     text = panel.fault_label.text()
     assert "calibrated with gaussderiv; the detector setting is halfmax" in text
     assert ATTENTION_COLOR in text
-    assert panel.state != "running" and not spot_focus_flag.active
+    assert panel.state != "running" and not panel.lock_active
     assert panel._owner.service is svc and not panel._owner.dead  # no rebuild
     assert panel.start_button.isEnabled()
 
@@ -1766,7 +1641,7 @@ def test_sdk_folder_is_saved_and_browse_fills_it(
     assert cfg.source.sdk_dir == str(tmp_path)
     sub = tmp_path / "sdk"
     monkeypatch.setattr(
-        "pymmcore_gui.widgets._spot_focus_panel.QFileDialog.getExistingDirectory",
+        "CRISPy.spot.panel.QFileDialog.getExistingDirectory",
         lambda *a, **k: str(sub),
     )
     panel.browse_button.click()

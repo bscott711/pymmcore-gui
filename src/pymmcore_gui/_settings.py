@@ -2,10 +2,10 @@ import json
 import os
 import threading
 import warnings
-from dataclasses import asdict
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
+from typing import Annotated, Any, Literal, cast
 
+from CRISPy.spot.settings import SpotFocusSettingsV1
 from platformdirs import user_data_dir
 from pydantic import (
     Base64Bytes,
@@ -25,17 +25,6 @@ from pydantic_settings import (
 )
 
 from pymmcore_gui.actions.widget_actions import WidgetAction
-
-if TYPE_CHECKING:
-    from pymmcore_gui.asi_z_stack.image_focus import (
-        FocusBox,
-        FocusCalibration,
-        LockLimits,
-    )
-    from pymmcore_gui.asi_z_stack.spot_focus import (
-        FocusCalibration as SpotFocusCalibration,
-    )
-    from pymmcore_gui.asi_z_stack.spot_focus import SpotLoopParams
 
 APP_NAME = "pymmcore-gui"
 USER_DATA_DIR = Path(user_data_dir(appname=APP_NAME))
@@ -466,225 +455,6 @@ class SpimTimingSettingsV1(BaseMMSettings):
     readout + exposure instead of 2 x readout + exposure."""
 
 
-class FocusBoxSettings(BaseModel):
-    """Persisted form of :class:`~pymmcore_gui.asi_z_stack.image_focus.FocusBox`."""
-
-    camera: str
-    """Physical camera device label, e.g. ``"Camera-1"``."""
-    preset: str
-    """Single-laser preset whose frames are measured, e.g. ``"488nm"``."""
-    slice_index: int = 0
-    """Which slice of the volume is measured."""
-    rect: tuple[int, int, int, int]
-    """``(x, y, w, h)`` in full-sensor pixel coordinates (x = column, y = row)."""
-
-    def to_box(self) -> "FocusBox":
-        """Return the numpy-only box the focus-lock logic works with."""
-        from pymmcore_gui.asi_z_stack.image_focus import FocusBox
-
-        return FocusBox(self.camera, self.preset, self.slice_index, self.rect)
-
-
-class CalibrationRecord(BaseModel):
-    """Persisted form of ``image_focus.FocusCalibration`` (see that module)."""
-
-    rows_per_um: float
-    """Signed rows of content shift per +1 um of piezo."""
-    intercept_rows: float = 0.0
-    r2: float
-    """Fit quality; the lock refuses calibrations below ``min_r2``."""
-    range_um: tuple[float, float]
-    """Linear range of the sweep that was kept (min, max piezo)."""
-    n_points: int
-    date: str
-    """ISO timestamp the calibration was made."""
-
-    def to_calibration(self) -> "FocusCalibration":
-        """Return the numpy-only calibration the focus-lock logic works with."""
-        from pymmcore_gui.asi_z_stack.image_focus import FocusCalibration
-
-        return FocusCalibration(**self.model_dump())
-
-    @classmethod
-    def from_calibration(cls, cal: "FocusCalibration") -> "CalibrationRecord":
-        """Build a record from a fresh :func:`fit_calibration` result."""
-        return cls(**asdict(cal))
-
-
-class ImageFocusSettingsV1(BaseMMSettings):
-    """Image-based focus lock configuration (legacy; Spot is the only mode).
-
-    Per volume, the row-intensity profile inside ``box`` is compared with a
-    reference and the piezo is moved to cancel the measured row shift (see
-    ``pymmcore_gui.asi_z_stack.image_focus``). The limits mirror
-    :class:`~pymmcore_gui.asi_z_stack.image_focus.LockLimits`.
-    """
-
-    mode: Literal["spot"] = "spot"
-    """The focus hold: ``"spot"``, the standalone spot lock
-    (:class:`SpotFocusSettingsV1`), is the only one exposed."""
-    box: FocusBoxSettings | None = None
-    """The measurement box; ``None`` until the user draws one."""
-    calibrations: dict[str, CalibrationRecord] = Field(default_factory=dict)
-    """Piezo-to-row-shift calibrations keyed by
-    :func:`~pymmcore_gui.asi_z_stack.image_focus.calibration_key`
-    (``"camera|preset|window"``)."""
-    end_of_run: Literal["restore", "stay"] = "restore"
-    """After the run, return the piezo to where it started or leave it."""
-
-    loop_gain: float = 0.5
-    """Fraction of the measured error corrected per volume."""
-    deadband_rows: float = 0.5
-    """Errors up to this size are left alone."""
-    max_step_um: float = 0.3
-    """Largest piezo move in a single volume."""
-    max_excursion_um: float = 3.0
-    """Largest distance the piezo may end up from where the run started."""
-    min_confidence: float = 0.5
-    """Minimum peak correlation to trust a measurement."""
-    max_centroid_disagreement_rows: float = 3.0
-    """Largest allowed gap between the correlation and centroid shifts."""
-    min_signal: float = 1.0
-    """Minimum background-subtracted profile mean."""
-    max_strikes: int = 3
-    """Consecutive rejected measurements before the lock falls back."""
-    max_saturated: int = 3
-    """Consecutive clipped moves before the lock falls back."""
-    min_r2: float = 0.9
-    """Calibrations fitting worse than this are refused."""
-
-    def to_limits(self) -> "LockLimits":
-        """Return the numpy-only limits the focus-lock logic works with."""
-        from pymmcore_gui.asi_z_stack.image_focus import LockLimits
-
-        return LockLimits(
-            loop_gain=self.loop_gain,
-            deadband_rows=self.deadband_rows,
-            max_step_um=self.max_step_um,
-            max_excursion_um=self.max_excursion_um,
-            min_confidence=self.min_confidence,
-            max_centroid_disagreement_rows=self.max_centroid_disagreement_rows,
-            min_signal=self.min_signal,
-            max_strikes=self.max_strikes,
-            max_saturated=self.max_saturated,
-            min_r2=self.min_r2,
-        )
-
-
-class SpotSourceSettingsV1(BaseModel):
-    """Where the spot lock's frames come from (see ``toupcam_source.make_source``)."""
-
-    kind: Literal["toupcam", "fake"] = "toupcam"
-    """``"toupcam"`` is the AmScope camera; ``"fake"`` is a simulated spot."""
-    serial: str | None = None
-    """Camera serial (``None`` takes the first camera found)."""
-    sdk_dir: str | None = None
-    """Folder holding the vendor's ``toupcam.py``; ``None`` uses the
-    ``TOUPCAM_SDK_DIR`` environment variable."""
-    fake: dict[str, Any] = Field(default_factory=dict)
-    """Keyword arguments of ``FakeSpotSource`` (``kind == "fake"`` only)."""
-
-
-class SpotLoopParamsSettings(BaseModel):
-    """Persisted form of ``asi_z_stack.spot_focus.SpotLoopParams``."""
-
-    kp: float = 0.6
-    ki: float = 0.05
-    deadband_um: float = 0.03
-    max_step_um: float = 0.5
-    max_rate_hz: float = 2.0
-    avg_frames: int = 4
-    offset_um: float = 0.0
-    min_contrast: float = 10.0
-    max_saturated_frac: float = 0.002
-    min_valid_fraction: float = 0.5
-    max_angle_change_deg: float = 5.0
-    max_edge_residual_px: float = 3.0
-    max_edge_disagreement_um: float = 1.0
-    hold_band_um: float = 0.15
-    """When the two edges disagree, hold on an edge this close to the target."""
-    p_min_um: float | None = None
-    p_max_um: float | None = None
-    max_excursion_um: float = 5.0
-    strikes: int = 5
-
-    @model_validator(mode="before")
-    @classmethod
-    def _drop_legacy_range(cls, data: Any) -> Any:
-        """Files written with the old 0..150 um default load as "no range".
-
-        The real piezo P runs negative, so that default faulted a healthy lock.
-        """
-        if (
-            isinstance(data, dict)
-            and data.get("p_min_um") == 0.0
-            and data.get("p_max_um") == 150.0
-        ):
-            data = {**data, "p_min_um": None, "p_max_um": None}
-        return data
-
-    def to_params(self) -> "SpotLoopParams":
-        """Return the numpy-only parameters the spot loop works with."""
-        from pymmcore_gui.asi_z_stack.spot_focus import SpotLoopParams
-
-        return SpotLoopParams.from_dict(self.model_dump())
-
-
-class SpotFocusSettingsV1(BaseMMSettings):
-    """Spot focus lock: the CRISP LED spot on a side camera, held by piezo P.
-
-    The loop runs from Start until Stop, independent of any acquisition (see
-    ``docs/spot_focus_lock.md``).
-    """
-
-    source: SpotSourceSettingsV1 = Field(default_factory=SpotSourceSettingsV1)
-    exposure_ms: float = 5.0
-    gain: int = 100
-    """Camera gain in percent (ToupTek convention, 100 = unity)."""
-    roi: tuple[int, int, int, int] | None = None
-    """Camera ROI ``(x, y, w, h)``; ``None`` uses the full frame."""
-    channel: Literal["sum", "red"] = "red"
-    """Which Bayer sites the spot is measured on. The LED is 720 nm on a colour
-    sensor, so only the red sites carry it."""
-    bayer: Literal["RGGB", "BGGR", "GRBG", "GBRG"] = "RGGB"
-    led_intensity: float | None = None
-    """CRISP LED intensity set on Start; ``None`` leaves it as it is."""
-    params: SpotLoopParamsSettings = Field(default_factory=SpotLoopParamsSettings)
-    calibration: dict[str, Any] | None = None
-    """``FocusCalibration.to_dict()`` of the last calibration (a single-edge
-    ``EdgeCalibration`` dict from older versions also loads)."""
-    edge_box: tuple[int, int, int, int] | None = None
-    """The edge box ``(x, y, w, h)`` in sensor pixels; ``None`` until drawn."""
-    edge_box_2: tuple[int, int, int, int] | None = None
-    """The optional second edge box, same convention as ``edge_box``."""
-    detector: Literal["gaussderiv", "halfmax"] = "gaussderiv"
-    """How the edge point is found in each row (``measure_edge``). A calibration
-    is only valid for the detector it was made with; the stored one wins for
-    measurements it applies to and Lock refuses on a mismatch."""
-    detector_sigma_px: float = Field(default=6.0, ge=2.0, le=12.0)
-    """Width of the ``gaussderiv`` filter in sensor px (ignored by ``halfmax``)."""
-    sweep_span_um: float = 2.0
-    """Total piezo span of the calibration sweep, um."""
-    sweep_steps: int = 9
-    """Number of points of the calibration sweep."""
-    sweep_frames: int = 3
-    """Frames averaged per sweep point."""
-
-    def calibration_status(self) -> "tuple[SpotFocusCalibration | None, str]":
-        """Return ``(calibration, message)``; never raises.
-
-        ``message`` is empty for a valid calibration, else says why there is none
-        (nothing stored yet, or an old / malformed calibration ignored).
-        """
-        from pymmcore_gui.asi_z_stack.spot_focus import load_calibration
-
-        return load_calibration(self.calibration)
-
-    def to_calibration(self) -> "SpotFocusCalibration | None":
-        """Return the stored calibration, ``None`` if there is none or it is bad."""
-        return self.calibration_status()[0]
-
-
 class SnapshotSettingsV1(BaseMMSettings):
     """Where the Save Image action writes Snap/Live frames."""
 
@@ -708,7 +478,6 @@ class SettingsV1(BaseMMSettings):
     argus_stream: ArgusStreamSettingsV1 = Field(default_factory=ArgusStreamSettingsV1)
     mda_writer: MdaWriterSettingsV1 = Field(default_factory=MdaWriterSettingsV1)
     focus: FocusOffsetSettingsV1 = Field(default_factory=FocusOffsetSettingsV1)
-    image_focus: ImageFocusSettingsV1 = Field(default_factory=ImageFocusSettingsV1)
     spot_focus: SpotFocusSettingsV1 = Field(default_factory=SpotFocusSettingsV1)
     snapshot: SnapshotSettingsV1 = Field(default_factory=SnapshotSettingsV1)
     spim_timing: SpimTimingSettingsV1 = Field(default_factory=SpimTimingSettingsV1)
