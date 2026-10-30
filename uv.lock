@@ -523,11 +523,14 @@ toml = [
 
 [[package]]
 name = "crispy"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "../CRISPy" }
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.14'" },
     { name = "numpy", version = "2.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.14'" },
+    { name = "psygnal" },
+    { name = "pydantic", version = "2.11.7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.14'" },
+    { name = "pydantic", version = "2.13.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.14'" },
     { name = "pymmcore-plus" },
     { name = "pymmcore-widgets" },
     { name = "qtpy" },
@@ -536,6 +539,8 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "numpy" },
+    { name = "psygnal", specifier = ">=0.12" },
+    { name = "pydantic", specifier = ">=2.10" },
     { name = "pymmcore-plus" },
     { name = "pymmcore-widgets" },
     { name = "qtpy" },

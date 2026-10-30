@@ -16,6 +16,11 @@ toolbar's Snap does (:func:`pymmcore_gui.actions.core_actions.snap_image`), firi
 selected laser(s) and, on the ASI rig, going through the camera-worker pool, since the
 main process's core has no cameras there; and how to show them
 (:func:`CRISPy.imaging.set_image_view_factory`), with the Preview windows' own widget.
+
+And it gives CRISPy's "Spot lock" section (the spot edge focus lock, ``CRISPy.spot``)
+the GUI's settings file: :class:`SpotSettingsAdapter` keeps the section's settings under
+``SettingsV1.spot_focus``, so the saved calibration, edge boxes, detector, ROI and SDK
+folder keep loading.
 """
 
 from __future__ import annotations
@@ -27,8 +32,13 @@ from typing import TYPE_CHECKING
 from pymmcore_plus import CMMCorePlus
 from PyQt6.QtWidgets import QVBoxLayout, QWidget
 
+from pymmcore_gui._settings import TESTING, USER_DATA_DIR, SettingsV1
+
 if TYPE_CHECKING:
+    from pathlib import Path
+
     import numpy as np
+    from CRISPy.spot.settings import SpotFocusSettingsV1
     from PyQt6.QtCore import QObject
 
 
@@ -69,6 +79,37 @@ def crispy_image_view(mmc: CMMCorePlus, camera_label: str) -> QWidget:
     return PygfxPreview(mmcore=mmc, camera_label=camera_label)
 
 
+class SpotSettingsAdapter:
+    """CRISPy's spot-lock settings store, backed by the GUI's settings file.
+
+    Implements :class:`CRISPy.spot.store.SpotSettingsStore`. ``settings`` is read from
+    ``SettingsV1.instance()`` each time, never captured, so a swapped global (the
+    tests do this) is followed.
+    """
+
+    #: The piezo the spot lock holds on the rig.
+    piezo_label: str | None = "PiezoStage:P:34"
+
+    @property
+    def settings(self) -> SpotFocusSettingsV1:
+        """The live ``spot_focus`` section of the GUI settings."""
+        return SettingsV1.instance().spot_focus
+
+    @property
+    def crisp_label(self) -> str | None:
+        """The CRISP device the lock uses (``focus.crisp_label``)."""
+        return SettingsV1.instance().focus.crisp_label
+
+    @property
+    def data_dir(self) -> Path | None:
+        """Where calibration sweep records go; none while testing."""
+        return None if TESTING else USER_DATA_DIR
+
+    def save(self) -> None:
+        """Write the GUI settings file."""
+        SettingsV1.instance().flush()
+
+
 class CrispWidget(QWidget):
     """Container that (re)builds the CRISPy panel on system configuration load."""
 
@@ -90,6 +131,7 @@ class CrispWidget(QWidget):
         self._set_crispy_hooks(
             partial(snap_for_crispy, self._mmc), partial(crispy_image_view, self._mmc)
         )
+        self._set_spot_store(SpotSettingsAdapter())
 
         self._rebuild()
 
@@ -106,10 +148,20 @@ class CrispWidget(QWidget):
                 if (setter := getattr(imaging, name, None)) is not None:
                     setter(hook)
 
+    @staticmethod
+    def _set_spot_store(store: object) -> None:
+        # CRISPy versions before the spot lock (0.2.0) lack the store; skip it.
+        with suppress(ImportError):
+            from CRISPy.spot import store as spot_store
+
+            if (setter := getattr(spot_store, "set_settings_store", None)) is not None:
+                setter(store)
+
     def _disconnect(self, _obj: QObject | None = None) -> None:
         with suppress(Exception):
             self._mmc.events.systemConfigurationLoaded.disconnect(self._rebuild)
         self._set_crispy_hooks(None, None)
+        self._set_spot_store(None)
 
     def _rebuild(self) -> None:
         """Discard the current panel and rebuild it from the active configuration."""

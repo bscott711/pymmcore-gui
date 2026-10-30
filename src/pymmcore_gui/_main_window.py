@@ -233,7 +233,6 @@ class MicroManagerGUI(QMainWindow):
         ],
         Menu.PLUGINS: [
             WidgetAction.CRISP,
-            WidgetAction.IMAGE_FOCUS,
             WidgetAction.SPECTRAL_CHANNELS,
             WidgetAction.SPIM_TIMING,
             WidgetAction.CAMERA_ALIGNMENT,

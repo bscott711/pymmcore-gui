@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -96,52 +97,36 @@ def test_focus_offset_bad_offsets_entry_degrades_gracefully() -> None:
     assert cleaned == {"focus": {"enabled": True}}
 
 
-def test_image_focus_settings_roundtrip() -> None:
-    s = SettingsV1()
-    assert s.image_focus.mode == "spot"
-    assert s.image_focus.box is None
-    assert s.image_focus.calibrations == {}
-    assert s.image_focus.end_of_run == "restore"
-
-    s.image_focus.end_of_run = "stay"
-    s.image_focus.loop_gain = 0.4
-    s.image_focus.box = _settings.FocusBoxSettings(
-        camera="Camera-1", preset="488nm", slice_index=60, rect=(100, 320, 150, 120)
-    )
-    s.image_focus.calibrations = {
-        "Camera-1|488nm|": _settings.CalibrationRecord(
-            rows_per_um=-1.5,
-            intercept_rows=0.2,
-            r2=0.98,
-            range_um=(-2.0, 2.0),
-            n_points=9,
-            date="2026-10-26T12:00:00",
-        )
+def test_removed_image_focus_section_is_ignored() -> None:
+    # The row-shift image lock was dropped; a settings file written while it
+    # existed still carries an ``image_focus`` section. It must load, with the
+    # other sections intact.
+    old = {
+        "version": "1.0",
+        "focus": {"enabled": True},
+        "image_focus": {
+            "mode": "image",
+            "loop_gain": 0.4,
+            "box": {
+                "camera": "Camera-1",
+                "preset": "488nm",
+                "slice_index": 1,
+                "rect": [100, 60, 40, 30],
+            },
+            "calibrations": {},
+        },
     }
-
-    s2 = SettingsV1.model_validate_json(s.model_dump_json())
-    assert s2.image_focus.mode == "spot"
-    assert s2.image_focus.end_of_run == "stay"
-    assert s2.image_focus.box == s.image_focus.box
-    assert s2.image_focus.calibrations == s.image_focus.calibrations
-
-    box = s2.image_focus.box.to_box()  # pyright: ignore[reportOptionalMemberAccess]
-    assert (box.camera, box.preset, box.slice_index) == ("Camera-1", "488nm", 60)
-    assert box.rect == (100, 320, 150, 120)
-    limits = s2.image_focus.to_limits()
-    assert limits.loop_gain == 0.4 and limits.max_step_um == 0.3
-    cal = s2.image_focus.calibrations["Camera-1|488nm|"].to_calibration()
-    assert cal.rows_per_um == -1.5 and cal.range_um == (-2.0, 2.0)
-    back = _settings.CalibrationRecord.from_calibration(cal)
-    assert back == s.image_focus.calibrations["Camera-1|488nm|"]
-
-
-def test_settings_without_image_focus_still_load() -> None:
-    old = '{"version": "1.0", "focus": {"enabled": true}}'
-    s = SettingsV1.model_validate_json(old)
+    with pytest.warns(RuntimeWarning, match="image_focus"):
+        cleaned = _settings._good_data_only(SettingsV1, old)
+    s = SettingsV1.model_validate(cleaned)
     assert s.focus.enabled is True
-    assert s.image_focus.mode == "spot"
-    assert s.image_focus.to_limits().max_strikes == 3
+    assert s.version == "1.0"
+    assert not hasattr(s, "image_focus")
+    assert "image_focus" not in s.model_dump()
+    # the JSON path (no cleaning) ignores it as well
+    s2 = SettingsV1.model_validate_json(json.dumps(old))
+    assert s2.focus.enabled is True
+    assert not hasattr(s2, "image_focus")
 
 
 def test_spot_edge_disagreement_and_hold_band_settings() -> None:
@@ -192,7 +177,7 @@ def test_spot_edge_detector_settings() -> None:
 
 
 def test_spot_calibration_in_settings_keeps_its_detector() -> None:
-    from pymmcore_gui.asi_z_stack.spot_focus import EdgeCalibration, FocusCalibration
+    from CRISPy.spot.spot_focus import EdgeCalibration, FocusCalibration
 
     edge = EdgeCalibration(
         box=(232, 210, 80, 60),
@@ -228,3 +213,78 @@ def test_spot_calibration_in_settings_keeps_its_detector() -> None:
     loaded = s3.spot_focus.to_calibration()
     assert loaded is not None and loaded.edges[0].detector == "halfmax"
     assert s3.spot_focus.calibration_status()[1] == ""
+
+
+def test_rig_spot_focus_settings_survive_the_round_trip() -> None:
+    """A rig-shaped ``spot_focus`` section loads and dumps back unchanged.
+
+    The section's models live in ``CRISPy.spot.settings``; the rig's saved
+    ``pmm_settings.json`` must keep loading with no migration.
+    """
+    calibration = {
+        "kind": "edges",
+        "edges": [
+            {
+                "kind": "edge",
+                "box": [232, 210, 80, 60],
+                "axis": "x",
+                "polarity": 1,
+                "slope_px_per_um": 2.0,
+                "e0_px": 272.0,
+                "p0_um": -50.25,
+                "detector": "halfmax",
+                "detector_sigma_px": 6.0,
+                "edge_width_px": 12.5,
+                "box_normal_px": 80,
+            }
+        ],
+        "p0_um": -50.25,
+        "created": "2026-10-26T12:00:00",
+        "record_path": "spot_calibration_20261026.npz",
+        "warnings": ["residual high"],
+    }
+    spot = {
+        "source": {"serial": "TP123", "sdk_dir": "C:/sdk/toupcam"},
+        "exposure_ms": 7.5,
+        "gain": 300,
+        "roi": [100, 120, 640, 480],
+        "channel": "sum",
+        "led_intensity": 12.0,
+        "params": {"kp": 0.4, "hold_band_um": 0.2, "p_min_um": -80.0},
+        "calibration": calibration,
+        "edge_box": [232, 210, 80, 60],
+        "edge_box_2": [400, 300, 60, 80],
+        "detector": "halfmax",
+        "detector_sigma_px": 8.0,
+        "sweep_span_um": 3.0,
+        "sweep_steps": 11,
+        "sweep_frames": 4,
+    }
+    s = SettingsV1.model_validate({"version": "1.0", "spot_focus": spot})
+    sf = s.spot_focus
+    assert sf.source.serial == "TP123"
+    assert sf.source.sdk_dir == "C:/sdk/toupcam"
+    assert sf.roi == (100, 120, 640, 480)
+    assert sf.edge_box == (232, 210, 80, 60)
+    assert sf.edge_box_2 == (400, 300, 60, 80)
+    assert sf.detector == "halfmax" and sf.detector_sigma_px == 8.0
+    assert sf.calibration == calibration
+    assert sf.to_calibration() is not None
+    assert (sf.params.kp, sf.params.hold_band_um, sf.params.p_min_um) == (
+        0.4,
+        0.2,
+        -80.0,
+    )
+    dumped = s.model_dump(mode="json", exclude_defaults=True)["spot_focus"]
+    assert dumped == spot
+
+    # the legacy 0..150 um piezo range loads as "no range" and is not written back
+    legacy = {"spot_focus": {"params": {"p_min_um": 0.0, "p_max_um": 150.0, "kp": 0.5}}}
+    s2 = SettingsV1.model_validate(legacy)
+    assert (s2.spot_focus.params.p_min_um, s2.spot_focus.params.p_max_um) == (
+        None,
+        None,
+    )
+    assert s2.model_dump(mode="json", exclude_defaults=True)["spot_focus"] == {
+        "params": {"kp": 0.5}
+    }
