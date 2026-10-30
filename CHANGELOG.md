@@ -17,6 +17,117 @@ upstream.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-30
+
+### Breaking changes
+
+- The **Spot Focus Lock** dock and its Plugins menu entry are gone. The spot
+  edge lock now lives in CRISPy 0.2.0 and is the "Spot lock" section of the
+  piezo CRISP panel; the Spot camera view opens from that panel. The
+  `spot_focus` settings group is unchanged (same name, shape and defaults).
+- The row-shift **image focus lock** (added in #50 to #52 after 0.1.0) is
+  removed again: the focus box on the MDA viewer, the lock inside the SPIM
+  engine, its calibration sweep and the `image_focus` settings group. The spot
+  edge lock is the only O3 focus lock. A settings file that still has an
+  `image_focus` section loads fine; the section is ignored (one "not found in
+  model" warning) and dropped the next time settings are saved. A saved
+  `pymmcore_gui.image_focus_widget` entry in the open-widgets list shows one
+  "Unable to reload widget" notice on the next start and does nothing else.
+- **CRISPy >= 0.2.0 is required** (sibling checkout `../CRISPy`, as before). It
+  now carries the spot lock, so pymmcore-gui no longer ships any spot code.
+- Reloading the hardware configuration rebuilds the CRISP panel, which now
+  stops a running spot lock (the old separate dock did not listen to config
+  loads). Start the lock again after a reload.
+
+### Added
+
+#### Spot edge focus lock (now in CRISPy)
+
+- Spot focus lock for the O3 piezo, driven by the AmScope/Toupcam camera that
+  sees the CRISP LED spot (#53): core, camera worker subprocess and piezo
+  service, settings, and a panel with Start/Stop, calibration, live spot and a
+  strip chart.
+- The lock follows the spot's **edge** rather than its centre: edge-based error
+  signal (Spot is the only O3 focus mode), an optional second edge box fused
+  into one focus error, a selectable edge detector (Gaussian derivative by
+  default), a 1 um limit on how far the two edges may disagree, and a hold on
+  the edge at its target.
+- Spot camera live view (#57): shared-memory frames, a Preview window, live
+  exposure/gain/channel/ROI controls, LED control in the panel (Preview lights
+  the CRISP LED, #58), coarse block-sum peak search for large frames, and
+  Bayer moire removal in the camera window. The view can be docked in the
+  panel.
+- The panel and its settings models (`SpotFocusSettingsV1`) moved to CRISPy;
+  pymmcore-gui only supplies a small settings adapter to the CRISPy piezo panel
+  (settings, CRISP and piezo labels, data directory, save).
+
+#### Image focus lock (added, then removed in this release)
+
+- Per-volume piezo correction from the row shift of a drawn box, with a
+  calibration sweep, a focus panel and a box that follows the viewer's slice and
+  channel (#50, #51, #52). Superseded by the spot lock and removed; see
+  Breaking changes.
+
+#### CRISPy focus curve
+
+- CRISPy's focus curve snaps through the toolbar's Snap path, and its images
+  show in the Preview windows' widget.
+
+#### ASI SPIM timing and acquisition
+
+- Advanced SPIM slice timing panel and the Kinetix **All Rows** mode: the laser
+  is delayed so the cameras stay in Level Trigger; edits in the timing panel
+  apply at once, and Legacy mode sends exactly the proven PLogic and galvo setup
+  and per-slice timing. The galvo's `SPIMCameraDuration` follows the exposure,
+  and the sweep amplitude (not just the offset) is restored after an MDA.
+- Cameras crop to the bounding box of the spectral regions; spectral channel
+  names are editable with an nm wavelength suffix.
+- Each MDA logs the timing and drift evidence it ran with (per-volume piezo and
+  CRISP state, drift summary).
+- Ctrl+S saves the newest Snap/Live frame of each camera. The stage panel no
+  longer offers "Zero" on piezo stages, and the Z stage's axis polarity is set
+  at startup.
+
+#### Argus backfill sender
+
+- `opym-backfill-send`: an SSH backfill sender shipped with the app (#26). It
+  sends each run once and says what it cannot send (#27), never walks the
+  recycle bin or system folders (#28), scans without reading chunk files and
+  shows progress (#30), uses as many tunnels as the live stream (4, #32),
+  confirms single volumes and completes partial copies held elsewhere (#35),
+  and probes hashes from one plane instead of a whole volume (#37).
+- The sender records its plan and results, can resume and retry, and follows
+  renamed runs (#39). It checks stream/Globus copies against the PC before they
+  count as sent (#41), drops a dead tunnel instead of waiting on it and keeps
+  the PC usable (#43), and reads and hashes volumes side by side with 8 files in
+  flight (#47, #48). Argus paths stay POSIX when a copy is held elsewhere (#49).
+
+### Fixed
+
+- Streaming: a new run closes a run that never got its finished signal (#24),
+  and a stream never goes into the void silently (#25). The backfill metadata
+  guard no longer refuses good stores (#45).
+- Live view shows the newest frame instead of draining the worker buffer in
+  order (#21); a locked viewer slice advances `t` when frames arrive in bursts,
+  holds slice and channel, and keeps the full z slider range.
+- Spot lock: no fault on a negative piezo position, CRISP is restored on
+  shutdown even before the worker reports running, the worker never blocks on
+  output (Windows pipe), and Toupcam opens RAW8-only cameras and releases the
+  handle on failure.
+- Only pass slot priority for psygnal signals.
+
+### Notes
+
+- The version comes from the `v0.2.0` tag (`hatch-vcs`); there is no version
+  field to edit. `uv.lock` pins `crispy` 0.2.0, which adds `psygnal` and
+  `pydantic` as dependencies.
+- The rig ran `feat/spot-only-focus`, which this release contains; main and
+  `feat/mda-live-parity` are ancestors of it, so the rig can switch to `main`
+  or fast-forward the branch it tracks.
+- Rig pull order: pull `../CRISPy` (>= 0.2.0) first, then pymmcore-gui. The
+  launcher only pulls the pymmcore-gui checkout, and `pyproject.toml` now
+  requires `crispy>=0.2.0`, so an old CRISPy fails to resolve.
+
 ## [0.1.0] - 2026-09-30
 
 First tagged release of the fork.
@@ -179,5 +290,6 @@ save.
 - The former working branch `feat/mda-ux-perf-fixes` was landed on `main` in #19
   and is frozen. `main` is the base branch for pull requests from here on.
 
-[Unreleased]: https://github.com/bscott711/pymmcore-gui/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/bscott711/pymmcore-gui/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/bscott711/pymmcore-gui/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/bscott711/pymmcore-gui/releases/tag/v0.1.0
