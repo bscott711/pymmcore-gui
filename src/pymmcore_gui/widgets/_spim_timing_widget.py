@@ -151,6 +151,15 @@ class SpimTimingWidget(QWidget):
         self.volume_settle.setToolTip(
             "Extra settle before each volume's first slice (galvo jump back)"
         )
+        self.park = QCheckBox("Park at sweep start")
+        self.park.setChecked(cfg.park_at_start)
+        self.park.setToolTip(
+            "Experimental. Hold the galvo at the start of the sweep between "
+            "volumes (SPIMState=Armed) so it has the whole wait between "
+            "timepoints to settle. Unverified on the rig: check with "
+            "diagnostics.probe_galvo_park first. If the card refuses, parking "
+            "turns itself off for that run."
+        )
         self.readout_auto = QCheckBox("from cameras")
         self.readout_auto.setChecked(cfg.readout_ms_override is None)
         self.readout = _spin(0, 100, 0.05)
@@ -183,6 +192,7 @@ class SpimTimingWidget(QWidget):
         form.addRow(self.legacy_note)
         form.addRow("Galvo settle", self.settle)
         form.addRow("Volume-start settle", self.volume_settle)
+        form.addRow("Park", self.park)
         form.addRow("Camera readout", readout_row)
         form.addRow("Timing margin", self.margin)
         form.addRow("Overlap", self.overlap)
@@ -240,6 +250,7 @@ class SpimTimingWidget(QWidget):
         ):
             box.valueChanged.connect(self._apply)
         self.overlap.toggled.connect(self._apply)
+        self.park.toggled.connect(self._apply)
         self.mode.currentIndexChanged.connect(self._apply)
         self.preview_exposure.valueChanged.connect(self._update_preview)
         self.preview_slices.valueChanged.connect(self._update_preview)
@@ -327,6 +338,7 @@ class SpimTimingWidget(QWidget):
         cfg.mode = self.mode.currentData()
         cfg.galvo_settle_ms = self.settle.value()
         cfg.volume_start_settle_ms = self.volume_settle.value()
+        cfg.park_at_start = self.park.isChecked()
         cfg.readout_ms_override = (
             None if self.readout_auto.isChecked() else self.readout.value()
         )
