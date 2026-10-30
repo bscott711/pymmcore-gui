@@ -10,7 +10,6 @@ import useq
 from pymmcore_plus import CMMCorePlus, DeviceType
 
 from pymmcore_gui.asi_z_stack.common import HardwareConstants
-from pymmcore_gui.widgets import _galvo_control
 from pymmcore_gui.widgets._galvo_control import OFFSET_PROP, GalvoControlWidget
 from pymmcore_gui.widgets._stage_control import (
     StagesControlWidget,
@@ -78,7 +77,7 @@ SLOPE = HardwareConstants().slice_calibration_slope_um_per_deg
 
 
 class _FakeGalvo:
-    """Property state behind the patched core and ``set_property``."""
+    """Property state behind the patched core."""
 
     def __init__(self, offset: float = 0.0, limits: tuple[float, float] = (-2.0, 2.0)):
         self.offset = offset
@@ -108,7 +107,8 @@ def galvo(monkeypatch: pytest.MonkeyPatch) -> tuple[CMMCorePlus, _FakeGalvo]:
     monkeypatch.setattr(core, "hasPropertyLimits", lambda d, p: True)
     monkeypatch.setattr(core, "getPropertyLowerLimit", lambda d, p: state.limits[0])
     monkeypatch.setattr(core, "getPropertyUpperLimit", lambda d, p: state.limits[1])
-    monkeypatch.setattr(_galvo_control, "set_property", state.write)
+    monkeypatch.setattr(core, "hasProperty", lambda d, p: True)
+    monkeypatch.setattr(core, "setProperty", state.write)
     return core, state
 
 

@@ -22,7 +22,6 @@ from pymmcore_gui._qt.QtWidgets import (
     QPushButton,
     QWidget,
 )
-from pymmcore_gui.asi_z_stack.asi_controller import set_property
 from pymmcore_gui.asi_z_stack.common import HardwareConstants
 
 logger = logging.getLogger(__name__)
@@ -150,7 +149,13 @@ class GalvoControlWidget(QWidget):
         if current is not None and abs(current - deg) < 1e-9:
             self.refresh()
             return
-        set_property(self._device, OFFSET_PROP, f"{deg:.6f}")
+        mmc = self._mmc
+        if self._device in mmc.getLoadedDevices() and mmc.hasProperty(
+            self._device, OFFSET_PROP
+        ):
+            mmc.setProperty(self._device, OFFSET_PROP, f"{deg:.6f}")
+        else:
+            logger.warning("Cannot set %s on %s", OFFSET_PROP, self._device)
         self.refresh()
 
     def nudge(self, direction: int) -> None:
