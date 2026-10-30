@@ -129,24 +129,28 @@ def test_removed_image_focus_section_is_ignored() -> None:
     assert not hasattr(s2, "image_focus")
 
 
-def test_spot_edge_disagreement_and_hold_band_settings() -> None:
+def test_spot_settings_without_the_removed_two_box_fields() -> None:
     s = SettingsV1()
     p = s.spot_focus.params
-    assert (p.max_edge_disagreement_um, p.hold_band_um) == (1.0, 0.15)
-    assert s.spot_focus.params.to_params().hold_band_um == 0.15
+    assert not hasattr(p, "max_edge_disagreement_um")
+    assert not hasattr(p, "hold_band_um")
+    assert not hasattr(s.spot_focus, "edge_box_2")
+    assert not hasattr(p.to_params(), "hold_band_um")
 
-    p.hold_band_um = 0.2
-    p.max_edge_disagreement_um = 0.8
-    s2 = SettingsV1.model_validate_json(s.model_dump_json())
-    assert s2.spot_focus.params.hold_band_um == 0.2
-    loop = s2.spot_focus.params.to_params()
-    assert (loop.max_edge_disagreement_um, loop.hold_band_um) == (0.8, 0.2)
-
-    # a file written before hold_band_um existed loads with the default
-    old = '{"version": "1.0", "spot_focus": {"params": {"kp": 0.5}}}'
-    s3 = SettingsV1.model_validate_json(old)
-    assert s3.spot_focus.params.kp == 0.5
-    assert s3.spot_focus.params.hold_band_um == 0.15
+    # a file written by the two-box version loads; the old fields are dropped
+    old = (
+        '{"version": "1.0", "spot_focus": {"edge_box": [1, 2, 30, 40], '
+        '"edge_box_2": [5, 6, 70, 80], "params": {"kp": 0.5, '
+        '"hold_band_um": 0.2, "max_edge_disagreement_um": 0.8}}}'
+    )
+    s2 = SettingsV1.model_validate_json(old)
+    assert s2.spot_focus.params.kp == 0.5
+    assert s2.spot_focus.edge_box == (1, 2, 30, 40)
+    assert not hasattr(s2.spot_focus, "edge_box_2")
+    dumped = s2.model_dump(mode="json")["spot_focus"]
+    assert "edge_box_2" not in dumped
+    assert "hold_band_um" not in dumped["params"]
+    assert "max_edge_disagreement_um" not in dumped["params"]
 
 
 def test_spot_edge_detector_settings() -> None:
@@ -191,27 +195,26 @@ def test_spot_calibration_in_settings_keeps_its_detector() -> None:
         edge_width_px=12.5,
         box_normal_px=80,
     )
-    cal = FocusCalibration(edges=[edge], p0_um=50.0, created="t")
+    cal = FocusCalibration(edge=edge, p0_um=50.0, created="t")
     s = SettingsV1()
     s.spot_focus.calibration = cal.to_dict()
     s2 = SettingsV1.model_validate_json(s.model_dump_json())
     back = s2.spot_focus.to_calibration()
-    assert back is not None and back.edges[0] == edge
-    assert (back.edges[0].detector, back.edges[0].detector_sigma_px) == (
+    assert back is not None and back.edge == edge
+    assert (back.edge.detector, back.edge.detector_sigma_px) == (
         "gaussderiv",
         7.0,
     )
-    assert back.edges[0].edge_width_px == 12.5 and back.edges[0].box_normal_px == 80
+    assert back.edge.edge_width_px == 12.5 and back.edge.box_normal_px == 80
 
     # a calibration saved before the detector existed loads as halfmax
     old = cal.to_dict()
-    for e in old["edges"]:
-        for k in ("detector", "detector_sigma_px", "edge_width_px", "box_normal_px"):
-            e.pop(k)
+    for k in ("detector", "detector_sigma_px", "edge_width_px", "box_normal_px"):
+        old["edge"].pop(k)
     s3 = SettingsV1()
     s3.spot_focus.calibration = old
     loaded = s3.spot_focus.to_calibration()
-    assert loaded is not None and loaded.edges[0].detector == "halfmax"
+    assert loaded is not None and loaded.edge.detector == "halfmax"
     assert s3.spot_focus.calibration_status()[1] == ""
 
 
@@ -250,10 +253,9 @@ def test_rig_spot_focus_settings_survive_the_round_trip() -> None:
         "roi": [100, 120, 640, 480],
         "channel": "sum",
         "led_intensity": 12.0,
-        "params": {"kp": 0.4, "hold_band_um": 0.2, "p_min_um": -80.0},
+        "params": {"kp": 0.4, "deadband_um": 0.2, "p_min_um": -80.0},
         "calibration": calibration,
         "edge_box": [232, 210, 80, 60],
-        "edge_box_2": [400, 300, 60, 80],
         "detector": "halfmax",
         "detector_sigma_px": 8.0,
         "sweep_span_um": 3.0,
@@ -266,17 +268,28 @@ def test_rig_spot_focus_settings_survive_the_round_trip() -> None:
     assert sf.source.sdk_dir == "C:/sdk/toupcam"
     assert sf.roi == (100, 120, 640, 480)
     assert sf.edge_box == (232, 210, 80, 60)
-    assert sf.edge_box_2 == (400, 300, 60, 80)
     assert sf.detector == "halfmax" and sf.detector_sigma_px == 8.0
     assert sf.calibration == calibration
     assert sf.to_calibration() is not None
-    assert (sf.params.kp, sf.params.hold_band_um, sf.params.p_min_um) == (
+    assert (sf.params.kp, sf.params.deadband_um, sf.params.p_min_um) == (
         0.4,
         0.2,
         -80.0,
     )
     dumped = s.model_dump(mode="json", exclude_defaults=True)["spot_focus"]
     assert dumped == spot
+
+    # the same section with the removed two-box keys still loads, minus them
+    s_old = SettingsV1.model_validate(
+        {
+            "spot_focus": {
+                **spot,
+                "edge_box_2": [400, 300, 60, 80],
+                "params": {**spot["params"], "hold_band_um": 0.2},
+            }
+        }
+    )
+    assert s_old.model_dump(mode="json", exclude_defaults=True)["spot_focus"] == spot
 
     # the legacy 0..150 um piezo range loads as "no range" and is not written back
     legacy = {"spot_focus": {"params": {"p_min_um": 0.0, "p_max_um": 150.0, "kp": 0.5}}}

@@ -14,12 +14,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pytest
 from CRISPy.spot.live_view import (
-    EDGE_BOX2_COLOR,
     EDGE_BOX_COLOR,
     ROI_COLOR,
-    SETPOINT2_COLOR,
-    SETPOINT_COLOR,
-    SPOT2_COLOR,
     SpotLiveView,
     bayer_to_grey,
     frame_to_qimage,
@@ -301,63 +297,26 @@ def test_edge_box_overlay_is_dashed_and_distinct_from_the_roi(
     assert not view._edge_box_item.isVisible() and view.edge_box is None
 
 
-def test_edge_box_2_overlay_is_dashed_and_has_its_own_colour(
+def test_the_view_has_one_edge_box_and_one_pair_of_markers(
     view: SpotLiveView,
 ) -> None:
-    assert not view._edge_box2_item.isVisible()
-    assert view.edge_box2 is None
-    view.set_edge_box2((288, 154, 64, 80))
-    assert view._edge_box2_item.isVisible()
-    assert view.edge_box2 == (288, 154, 64, 80)
-    r = view._edge_box2_item.rect()
-    assert (r.x(), r.y(), r.width(), r.height()) == (288, 154, 64, 80)
-    pen = view._edge_box2_item.pen()
-    assert pen.style() == Qt.PenStyle.DashLine and pen.isCosmetic()
-    assert pen.color().name() == EDGE_BOX2_COLOR
-    assert len({EDGE_BOX2_COLOR, EDGE_BOX_COLOR, ROI_COLOR}) == 3
-    assert view._edge_box2_item is not view._edge_box_item
-    assert not view._edge_box_item.isVisible()  # box 1 is independent
-    # the user's box: frames and clear() leave it alone
-    view.show_frame(make_frame(roi=(64, 32, 400, 300)))
-    view.clear()
-    assert view._edge_box2_item.isVisible()
-    assert not view.grab().isNull()  # paints without raising
-    view.set_edge_box2(None)
-    assert not view._edge_box2_item.isVisible() and view.edge_box2 is None
-
-
-def test_secondary_point_and_setpoint_have_their_own_markers(
-    view: SpotLiveView,
-) -> None:
-    assert not view._spot2_item.isVisible()
-    assert not view._setpoint2_item.isVisible()
+    for gone in (
+        "edge_box2",
+        "set_edge_box2",
+        "set_secondary_point",
+        "set_secondary_setpoint",
+        "draw_edge2_button",
+        "edgeBox2Drawn",
+        "edge2DrawModeChanged",
+        "_spot2_item",
+        "_setpoint2_item",
+    ):
+        assert not hasattr(view, gone), gone
+    # the one cross and ring still follow the frame and the panel
     view.set_setpoint((120.0, 90.0))
-    view.set_secondary_point((320.0, 194.25))
-    view.set_secondary_setpoint((320.0, 194.0))
-    assert view._spot2_item.isVisible() and view._setpoint2_item.isVisible()
-    assert view._spot2_item.pos().x() == pytest.approx(320.5)
-    assert view._spot2_item.pos().y() == pytest.approx(194.75)
-    assert view._setpoint2_item.pos().y() == pytest.approx(194.5)
-    assert view._spot2_item.pen().color().name() == SPOT2_COLOR
-    assert view._setpoint2_item.pen().color().name() == SETPOINT2_COLOR
-    assert SETPOINT2_COLOR != SETPOINT_COLOR
-    view.set_secondary_point((320.0, 194.25), ok=False)
-    assert view._spot2_item.pen().color().name() == "#ff9a1f"
-    # the first ring and cross are untouched by the second
-    assert view._setpoint_item.pos().x() == pytest.approx(120.5)
-    assert not view._spot_item.isVisible()
-    # a frame does not move or hide the panel-fed second cross; clear() hides it
     view.show_frame(make_frame(spot=(150.5, 100.0)))
-    assert view._spot_item.isVisible() and view._spot2_item.isVisible()
-    assert not view.grab().isNull()
-    view.clear()
-    assert not view._spot2_item.isVisible()
-    assert view._setpoint2_item.isVisible()  # a zero marker, not frame data
-    view.set_secondary_point(None)
-    view.set_secondary_setpoint(None)
-    assert not view._spot2_item.isVisible()
-    assert not view._setpoint2_item.isVisible()
-    assert view._setpoint_item.isVisible()
+    assert view._setpoint_item.isVisible() and view._spot_item.isVisible()
+    assert not view.grab().isNull()  # paints without raising
 
 
 def test_status_text_says_edge(view: SpotLiveView) -> None:
@@ -578,71 +537,6 @@ def test_draw_edge_box_emits_even_clamped_values_not_a_roi(
     assert modes == [True, False]
 
 
-def test_draw_edge_box_2_emits_its_own_signal(qtbot: QtBot, view: SpotLiveView) -> None:
-    view.show_frame(make_frame())
-    view.fit()
-    rois: list[tuple] = []
-    boxes: list[tuple] = []
-    view.roiDrawn.connect(lambda *a: rois.append(a))
-    view.edgeBoxDrawn.connect(lambda *a: boxes.append(a))
-    modes: list[bool] = []
-    view.edge2DrawModeChanged.connect(modes.append)
-    view.set_edge2_draw_mode(True)  # the panel's way in
-    assert view.draw_edge2_button.isChecked()
-    assert view.draw_target == "edge2" and view.view.draw_mode
-    assert not view.draw_roi_button.isChecked()
-    assert not view.draw_edge_button.isChecked()
-    with qtbot.waitSignal(view.edgeBox2Drawn, timeout=2000) as sig:
-        _drag(view, qtbot, QPointF(401.0, 301.0), QPointF(2200.0, 1700.0))
-    x, y, w, h = sig.args
-    assert all(v % 2 == 0 for v in (x, y, w, h))
-    assert x + w == SENSOR[0] and y + h == SENSOR[1]  # clamped to the sensor
-    assert rois == [] and boxes == []  # different signals
-    assert not view.draw_edge2_button.isChecked()  # one box per click
-    assert view.draw_target is None and not view.view.draw_mode
-    assert modes == [True, False]
-
-
-def test_draw_edge_box_2_ignores_a_click_and_a_sliver(
-    qtbot: QtBot, view: SpotLiveView
-) -> None:
-    view.show_frame(make_frame())
-    view.fit()
-    got: list[tuple] = []
-    view.edgeBox2Drawn.connect(lambda *a: got.append(a))
-    view.draw_edge2_button.setChecked(True)
-    _drag(view, qtbot, QPointF(500.0, 500.0), QPointF(502.0, 502.0))
-    _drag(view, qtbot, QPointF(500.0, 500.0), QPointF(900.0, 504.0))
-    assert got == []
-    assert view.draw_edge2_button.isChecked()  # still armed
-
-
-def test_all_three_draw_modes_are_exclusive(qtbot: QtBot, view: SpotLiveView) -> None:
-    view.show_frame(make_frame())
-    view.fit()
-    buttons = {
-        "roi": view.draw_roi_button,
-        "edge": view.draw_edge_button,
-        "edge2": view.draw_edge2_button,
-    }
-    for target, button in buttons.items():
-        button.setChecked(True)
-        assert view.draw_target == target and view.view.draw_mode
-        assert [n for n, b in buttons.items() if b.isChecked()] == [target]
-    buttons["edge2"].setChecked(False)
-    assert view.draw_target is None and not view.view.draw_mode
-    # Draw edge box 1 still emits only its own signal after box 2 was armed
-    first: list[tuple] = []
-    second: list[tuple] = []
-    view.edgeBoxDrawn.connect(lambda *a: first.append(a))
-    view.edgeBox2Drawn.connect(lambda *a: second.append(a))
-    view.draw_edge2_button.setChecked(True)
-    view.draw_edge_button.setChecked(True)
-    with qtbot.waitSignal(view.edgeBoxDrawn, timeout=2000):
-        _drag(view, qtbot, QPointF(401.0, 301.0), QPointF(900.0, 700.0))
-    assert len(first) == 1 and second == []
-
-
 def test_draw_edge_box_ignores_a_click_and_a_sliver(
     qtbot: QtBot, view: SpotLiveView
 ) -> None:
@@ -691,10 +585,10 @@ def test_closing_the_window_leaves_draw_modes(qtbot: QtBot, view: SpotLiveView) 
         view.close()
     assert not view.draw_edge_button.isChecked() and view.draw_target is None
     view.show()
-    view.draw_edge2_button.setChecked(True)
+    view.draw_roi_button.setChecked(True)
     with qtbot.waitSignal(view.windowClosed, timeout=1000):
         view.close()
-    assert not view.draw_edge2_button.isChecked() and view.draw_target is None
+    assert not view.draw_roi_button.isChecked() and view.draw_target is None
 
 
 # ---------------------------------------------------------------------------
