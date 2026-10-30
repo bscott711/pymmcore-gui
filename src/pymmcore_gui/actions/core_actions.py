@@ -273,8 +273,17 @@ def save_sys_config_dialog(action: QCoreAction, checked: bool) -> None:
         "",
         "cfg(*.cfg)",
     )
-    if path:
-        action.mmc.saveSystemConfiguration(path)
+    if not path:
+        return
+
+    from pymmcore_gui.asi_z_stack.config_save import save_system_configuration
+
+    try:
+        save_system_configuration(action.mmc, path)
+    except RuntimeError as exc:
+        from qtpy.QtWidgets import QMessageBox
+
+        QMessageBox.warning(None, "Cannot save configuration", str(exc))
 
 
 # ########################## Action Info Instances #############################
