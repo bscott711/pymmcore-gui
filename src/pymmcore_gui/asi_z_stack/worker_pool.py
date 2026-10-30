@@ -166,6 +166,9 @@ class CameraWorkerHandle:
         self.process: BaseProcess | None = None
         self.conn: Connection | None = None
         self.shm: SharedMemory | None = None
+        # Camera timing reported by the most recent ArmedMsg (see
+        # worker_messages.ArmedMsg.timing); empty until the first arm.
+        self.last_timing: dict[str, str] = {}
 
     def spawn(self, ctx: SpawnContext) -> None:
         """Create this worker's shared memory and pipe, then start its process.
@@ -208,7 +211,9 @@ class CameraWorkerHandle:
         self.process = process
         child_conn.close()
 
-    def read_frame(self, slot_index: int, nbytes: int) -> np.ndarray:
+    def read_frame(
+        self, slot_index: int, nbytes: int, height: int = 0, width: int = 0
+    ) -> np.ndarray:
         """Copy one frame out of shared memory slot *slot_index*.
 
         Parameters
@@ -216,9 +221,13 @@ class CameraWorkerHandle:
         slot_index : int
             Which ring-buffer slot the worker wrote the frame into.
         nbytes : int
-            The exact byte length the worker wrote (for a truncated/short
-            final row this can be less than ``slot_nbytes``, though normally
-            they match).
+            The exact byte length the worker wrote.
+        height : int
+            The frame's height (from ``FrameMsg``). With a cropped camera ROI
+            this is smaller than the full-sensor slot; ``0`` means the slot's
+            own full-sensor shape.
+        width : int
+            The frame's width; see *height*.
 
         Returns
         -------
@@ -226,17 +235,19 @@ class CameraWorkerHandle:
             An owned copy (safe to use after the slot is recycled).
         """
         assert self.shm is not None
-        offset = slot_index * self.slot_nbytes
-        expected = self.height * self.width * np.dtype(self.dtype).itemsize
-        if nbytes != expected:
+        if not (height and width):
+            height, width = self.height, self.width
+        expected = height * width * np.dtype(self.dtype).itemsize
+        if nbytes != expected or nbytes > self.slot_nbytes:
             raise ValueError(
-                f"{self.camera_label} frame is {nbytes} bytes, expected {expected}"
+                f"{self.camera_label} frame is {nbytes} bytes, expected {expected} "
+                f"for {width}x{height} (slot holds {self.slot_nbytes})"
             )
         arr: np.ndarray = np.ndarray(
-            (self.height, self.width),
+            (height, width),
             dtype=self.dtype,
             buffer=self.shm.buf,
-            offset=offset,
+            offset=slot_index * self.slot_nbytes,
         )
         return arr.copy()
 
@@ -328,6 +339,9 @@ class CameraWorkerPool:
         armed_timeout: float = 10.0,
         *,
         external_trigger: bool = True,
+        trigger_mode: str | None = None,
+        expose_out_mode: str | None = None,
+        exposure_ms: float | None = None,
     ) -> None:
         """Arm every worker for *n_images* frames and wait for all acks.
 
@@ -343,13 +357,29 @@ class CameraWorkerPool:
         external_trigger : bool
             ``True`` (MDA) to wait for the hardware trigger; ``False`` (Snap)
             to free-run on the camera's internal trigger.
+        trigger_mode : str | None
+            An exact ``TriggerMode`` to use instead of the worker's default
+            (see :class:`~pymmcore_gui.asi_z_stack.worker_messages.ArmCmd`).
+        expose_out_mode : str | None
+            Expose-out mode for this arm; ``None`` restores the camera's own.
+        exposure_ms : float | None
+            Camera exposure to set before arming; ``None`` leaves it.
         """
+        cmd = ArmCmd(
+            n_images,
+            external_trigger=external_trigger,
+            trigger_mode=trigger_mode,
+            expose_out_mode=expose_out_mode,
+            exposure_ms=exposure_ms,
+        )
         for worker in self.workers:
             assert worker.conn is not None
-            worker.conn.send(ArmCmd(n_images, external_trigger=external_trigger))
+            worker.conn.send(cmd)
         self._wait_for_all(ArmedMsg, armed_timeout)
 
-    def arm_live_all(self, armed_timeout: float = 10.0) -> None:
+    def arm_live_all(
+        self, armed_timeout: float = 10.0, *, exposure_ms: float | None = None
+    ) -> None:
         """Arm every worker for unbounded, free-running acquisition.
 
         Live counterpart to :meth:`arm_all` -- no target frame count, since
@@ -362,11 +392,17 @@ class CameraWorkerPool:
         armed_timeout : float
             Seconds to wait for every worker's
             :class:`~pymmcore_gui.asi_z_stack.worker_messages.ArmedMsg`.
+        exposure_ms : float | None
+            Camera exposure to set before arming; ``None`` leaves it.
         """
         for worker in self.workers:
             assert worker.conn is not None
-            worker.conn.send(ArmLiveCmd())
+            worker.conn.send(ArmLiveCmd(exposure_ms=exposure_ms))
         self._wait_for_all(ArmedMsg, armed_timeout)
+
+    def camera_timing(self) -> dict[str, dict[str, str]]:
+        """Each camera's timing from its most recent arm (see ``ArmedMsg``)."""
+        return {w.camera_label: dict(w.last_timing) for w in self.workers}
 
     def _worker_for(self, camera_label: str) -> CameraWorkerHandle:
         for worker in self.workers:
@@ -453,7 +489,9 @@ class CameraWorkerPool:
                 worker = conn_map[obj]
                 msg = worker.conn.recv()  # type: ignore[union-attr]
                 if isinstance(msg, FrameMsg):
-                    img = worker.read_frame(msg.slot_index, msg.nbytes)
+                    img = worker.read_frame(
+                        msg.slot_index, msg.nbytes, msg.height, msg.width
+                    )
                     worker.conn.send(SlotFreeCmd(msg.slot_index))  # type: ignore[union-attr]
                     frames_seen[worker.camera_label] += 1
                     last_frame_time = time.monotonic()
@@ -620,4 +658,6 @@ class CameraWorkerPool:
                         f"{msg.traceback_text}"
                     )
                 if isinstance(msg, expected):
+                    if isinstance(msg, ArmedMsg):
+                        worker.last_timing = dict(msg.timing)
                     pending.pop(worker.camera_label, None)

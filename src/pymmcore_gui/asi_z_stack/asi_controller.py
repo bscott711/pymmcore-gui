@@ -306,6 +306,153 @@ def configure_plogic_for_dual_nrt_pulses(
             set_property(tiger_comm_hub_label, hub_prop, "Yes")
 
 
+#: PLogic cell type codes (``CCA Y`` at a cell address), per ASI's Tiger
+#: PLogic docs: non-retriggerable one-shot (output high for Z clock ticks
+#: after the trigger's rising edge) and non-retriggerable delay (output high
+#: for one clock tick, Z ticks after the trigger).
+_PLOGIC_CELL_ONE_SHOT_NRT = 14
+_PLOGIC_CELL_DELAY_NRT = 15
+
+#: PLogic adapter properties describing the cell under the pointer.
+_EDIT_CELL_PROPS = (
+    "EditCellCellType",
+    "EditCellConfig",
+    "EditCellInput1",
+    "EditCellInput2",
+    "EditCellInput3",
+)
+
+
+def describe_plogic_cell(plogic_label: str, cell: int) -> dict[str, str]:
+    """Return what the PLogic adapter reports for *cell* (type, config, inputs).
+
+    Best effort, for logging a cell's programming before overwriting it: moves
+    the adapter's pointer to *cell* and reads its ``EditCell*`` properties.
+    Returns an empty dict if the adapter doesn't expose them.
+
+    Parameters
+    ----------
+    plogic_label : str
+        PLogic device label (e.g. ``"PLogic:E:36"``).
+    cell : int
+        Logic cell number (1-16).
+    """
+    if plogic_label not in mmc.getLoadedDevices() or not mmc.hasProperty(
+        plogic_label, "PointerPosition"
+    ):
+        return {}
+    try:
+        mmc.setProperty(plogic_label, "PointerPosition", str(cell))
+        return {
+            prop: mmc.getProperty(plogic_label, prop)
+            for prop in _EDIT_CELL_PROPS
+            if mmc.hasProperty(plogic_label, prop)
+        }
+    except Exception:
+        logger.debug(f"Could not read PLogic cell {cell}.", exc_info=True)
+        return {}
+
+
+def configure_plogic_for_delayed_laser(
+    plogic_label: str,
+    tiger_comm_hub_label: str,
+    plogic_camera_cell: int,
+    plogic_laser_on_cell: int,
+    plogic_laser_delay_cell: int,
+    pulses_per_ms: float,
+    plogic_4khz_clock_addr: int,
+    plogic_trigger_ttl_addr: int,
+    camera_pulse_ms: float,
+    laser_delay_ms: float,
+    laser_pulse_ms: float,
+) -> None:
+    """Program PLogic for pseudo-global ("All Rows") exposure with a delayed laser.
+
+    Same trigger source and command form as the proven
+    :func:`configure_plogic_for_dual_nrt_pulses`; only the widths change and
+    the laser waits for a delay cell:
+
+    - Camera: cell ``plogic_camera_cell`` is an NRT one-shot of
+      ``camera_pulse_ms`` off the galvo's slice TTL, routed to BNC1 (the
+      cameras' Level Trigger: readout + exposure, so every row is integrating
+      during the laser pulse).
+    - Delay: cell ``plogic_laser_delay_cell`` is an NRT delay of
+      ``laser_delay_ms`` off the same TTL (one clock tick high when it fires).
+    - Laser: cell ``plogic_laser_on_cell`` ("laser on", which the ``Lasers``
+      presets route to the selected laser's BNC) is an NRT one-shot of
+      ``laser_pulse_ms`` triggered by the delay cell.
+
+    Parameters
+    ----------
+    plogic_label : str
+        PLogic device label.
+    tiger_comm_hub_label : str
+        Tiger comm hub device label.
+    plogic_camera_cell : int
+        Cell that drives the camera trigger (BNC1).
+    plogic_laser_on_cell : int
+        Cell the laser presets take "laser on" from.
+    plogic_laser_delay_cell : int
+        Free cell used as the laser delay.
+    pulses_per_ms : float
+        PLogic clock ticks per millisecond.
+    plogic_4khz_clock_addr : int
+        Clock input address for the cells.
+    plogic_trigger_ttl_addr : int
+        Backplane address of the galvo's per-slice TTL.
+    camera_pulse_ms : float
+        Camera Level Trigger pulse width.
+    laser_delay_ms : float
+        Delay from the slice TTL to the laser pulse.
+    laser_pulse_ms : float
+        Laser pulse width (the exposure).
+    """
+    prefix = plogic_label.split(":")[-1]
+    hub_prop = "OnlySendSerialCommandOnChange"
+    original_hub_setting = get_property(tiger_comm_hub_label, hub_prop)
+
+    def _send(cmd: str) -> None:
+        _send_tiger_command(cmd, tiger_comm_hub_label)
+
+    def _ticks(ms: float) -> int:
+        return max(1, round(ms * pulses_per_ms))
+
+    try:
+        if original_hub_setting == "Yes":
+            set_property(tiger_comm_hub_label, hub_prop, "No")
+
+        # 1. Camera: NRT one-shot off the slice TTL (Y and Z bundled into one
+        # command -- see configure_plogic_for_dual_nrt_pulses).
+        _send(f"M E={plogic_camera_cell}")
+        _send(f"{prefix}CCA Y={_PLOGIC_CELL_ONE_SHOT_NRT} Z={_ticks(camera_pulse_ms)}")
+        _send(f"{prefix}CCB X={plogic_trigger_ttl_addr} Y={plogic_4khz_clock_addr} Z=0")
+
+        # 2. Delay: NRT delay off the same slice TTL.
+        _send(f"M E={plogic_laser_delay_cell}")
+        _send(f"{prefix}CCA Y={_PLOGIC_CELL_DELAY_NRT} Z={_ticks(laser_delay_ms)}")
+        _send(f"{prefix}CCB X={plogic_trigger_ttl_addr} Y={plogic_4khz_clock_addr} Z=0")
+
+        # 3. Laser: NRT one-shot triggered by the delay cell.
+        _send(f"M E={plogic_laser_on_cell}")
+        _send(f"{prefix}CCA Y={_PLOGIC_CELL_ONE_SHOT_NRT} Z={_ticks(laser_pulse_ms)}")
+        _send(f"{prefix}CCB X={plogic_laser_delay_cell} Y={plogic_4khz_clock_addr} Z=0")
+
+        # 4. Camera trigger cell -> BNC1 (address 33).
+        _send("M E=33")
+        _send(f"{prefix}CCA Z={plogic_camera_cell}")
+
+        _send(f"{prefix}SS Z")
+        logger.info(
+            f"PLogic configured for All Rows: camera pulse {camera_pulse_ms:g} ms "
+            f"(cell {plogic_camera_cell} -> BNC1), laser {laser_pulse_ms:g} ms "
+            f"(cell {plogic_laser_on_cell}) delayed {laser_delay_ms:g} ms by cell "
+            f"{plogic_laser_delay_cell}."
+        )
+    finally:
+        if original_hub_setting == "Yes":
+            set_property(tiger_comm_hub_label, hub_prop, "Yes")
+
+
 def read_plogic_trigger_chain_state(
     plogic_label: str, tiger_comm_hub_label: str
 ) -> dict[str, str | None]:

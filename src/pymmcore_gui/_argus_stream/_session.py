@@ -70,6 +70,8 @@ from pymmcore_gui._spectral_channel_handler import (
     _strip_known_suffix,
     active_channels_for_event,
     channels_for_sequence,
+    crop_region,
+    roi_origin,
 )
 from pymmcore_gui._vendored.mda_handlers._util import position_sizes
 
@@ -236,11 +238,13 @@ def _camera_geometry(meta: SummaryMetaV1, mmcore: CMMCorePlus) -> CameraGeometry
     ) is not None:
         infos = meta.get("image_infos") or ()
         pixel_size = float(infos[0].get("pixel_size_um") or 0.0) if infos else 0.0
+        # Current (possibly cropped) frame size, not the spawn snapshot's.
+        width, height = svc.frame_size(snap.camera_labels[0])
         return CameraGeometry(
             labels=list(snap.camera_labels),
             dtype=snap.dtype_str,
-            height=snap.image_height,
-            width=snap.image_width,
+            height=height,
+            width=width,
             pixel_size_um=pixel_size or float(mmcore.getPixelSizeUm() or 0.0),
         )
 
@@ -1391,6 +1395,9 @@ class ArgusStreamSession:
         # when this run isn't in spectral mode -- see sequenceStarted.
         self._active_spectral: list[SpectralChannelConfig] = []
         self._spectral_index: dict[str, int] = {}
+        # camera label -> its ROI's top-left on the sensor (regions are stored
+        # in full-sensor coordinates; a cropped camera's frames start here).
+        self._spectral_origins: dict[str, tuple[int, int]] = {}
         self._laser_group = ""
         self._all_lasers_preset = ""
         # (shape, z step, dtype) of the last PREPARE and when it went out.
@@ -1486,6 +1493,9 @@ class ArgusStreamSession:
             return
 
         self._active_spectral = active_spectral
+        self._spectral_origins = {
+            c.camera: roi_origin(self._mmc, c.camera) for c in active_spectral
+        }
         self._spectral_index = {c.name: i for i, c in enumerate(active_spectral)}
         self._laser_group = settings.spectral.laser_config_group
         self._all_lasers_preset = settings.spectral.all_lasers_preset
@@ -1568,8 +1578,10 @@ class ArgusStreamSession:
         for channel in lit:
             if channel.camera != label or channel.rect is None:
                 continue
-            x, y, w, h = channel.rect
-            crop = np.ascontiguousarray(frame[y : y + h, x : x + w])
+            origin = self._spectral_origins.get(label, (0, 0))
+            crop = crop_region(frame, channel.rect, origin)
+            if crop is None:  # region outside this camera's ROI; local save warns
+                continue
             idx = self._spectral_index[channel.name]
             synthetic_event = clean_event.model_copy(
                 update={"index": {**clean_event.index, "c": idx}}

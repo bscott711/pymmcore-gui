@@ -253,6 +253,64 @@ def _set_trigger_mode(mmc: CMMCorePlus, label: str, mode: str | None) -> None:
     _log(label, f"TriggerMode -> {mode!r} ({(time.perf_counter() - t0) * 1e3:.0f} ms)")
 
 
+def _expose_out_property(mmc: CMMCorePlus, label: str) -> str | None:
+    """Name of *label*'s expose-out mode property (PVCAM), if it has one."""
+    for prop in mmc.getDevicePropertyNames(label):
+        lowered = prop.lower().replace(" ", "")
+        if "exposeout" in lowered and "mode" in lowered:
+            return prop
+    return None
+
+
+def _set_expose_out(
+    mmc: CMMCorePlus, label: str, prop: str | None, mode: str | None
+) -> None:
+    """Switch *label*'s expose-out mode to *mode* (matched case-insensitively).
+
+    Raises if the camera has no expose-out property or doesn't offer *mode*,
+    so an acquisition that depends on it fails loudly instead of running
+    with the wrong illumination timing.
+    """
+    if mode is None:
+        return
+    if prop is None:
+        raise RuntimeError(f"{label} has no expose-out mode property")
+    allowed = list(mmc.getAllowedPropertyValues(label, prop))
+    match = next((v for v in allowed if v.lower() == mode.lower()), None)
+    if match is None:
+        raise RuntimeError(f"{label} {prop} has no {mode!r} mode (allowed: {allowed})")
+    if mmc.getProperty(label, prop) != match:
+        mmc.setProperty(label, prop, match)
+        _log(label, f"{prop} -> {match!r}")
+
+
+def _set_exposure(mmc: CMMCorePlus, label: str, exposure_ms: float | None) -> None:
+    """Set *label*'s exposure if *exposure_ms* is given and differs."""
+    if exposure_ms is None:
+        return
+    if abs(mmc.getExposure(label) - exposure_ms) > 1e-6:
+        mmc.setExposure(label, exposure_ms)
+        _log(label, f"Exposure -> {exposure_ms:g} ms")
+
+
+def _require_trigger_mode(mmc: CMMCorePlus, label: str, mode: str) -> str:
+    """Return the camera's own name for trigger *mode*, or raise.
+
+    Matched ignoring case, spaces, hyphens and underscores, so e.g. "Level
+    Trigger Overlap" finds the adapter's spelling of it. Raises (listing what
+    the camera offers) rather than silently arming in the wrong mode.
+    """
+
+    def _norm(text: str) -> str:
+        return "".join(c for c in text.lower() if c.isalnum())
+
+    allowed = list(mmc.getAllowedPropertyValues(label, "TriggerMode"))
+    match = next((v for v in allowed if _norm(v) == _norm(mode)), None)
+    if match is None:
+        raise RuntimeError(f"{label} has no {mode!r} trigger mode (allowed: {allowed})")
+    return match
+
+
 def _internal_trigger_mode(
     mmc: CMMCorePlus, label: str, snapshot_mode: str | None
 ) -> str | None:
@@ -275,6 +333,51 @@ def _internal_trigger_mode(
     if "Internal Trigger" in allowed:
         return "Internal Trigger"
     return None
+
+
+def _frame_shape(img: np.ndarray) -> tuple[int, int]:
+    """``(height, width)`` of a mono frame, or ``(0, 0)`` (slot shape) otherwise."""
+    if img.ndim == 2:
+        return int(img.shape[0]), int(img.shape[1])
+    return 0, 0
+
+
+#: Substrings of camera property names worth reporting in ArmedMsg.timing.
+_TIMING_PROP_KEYS = ("Timing", "Trigger", "Expose", "Port", "Readout", "Clear")
+
+
+def _read_camera_timing(mmc: CMMCorePlus, label: str) -> dict[str, str]:
+    """Read *label*'s timing-related properties (see ``ArmedMsg.timing``).
+
+    Must run after the acquisition is set up -- before that PVCAM refuses the
+    ``Timing-*`` reads (``PL_ERR_ACQUISITION_SETUP_REQUIRED``). Unreadable
+    properties are skipped, never raised.
+    """
+    timing: dict[str, str] = {}
+    for prop in mmc.getDevicePropertyNames(label):
+        if prop != "Exposure" and not any(k in prop for k in _TIMING_PROP_KEYS):
+            continue
+        try:
+            timing[prop] = str(mmc.getProperty(label, prop))
+        except Exception:
+            continue
+    try:
+        x, y, w, h = mmc.getROI(label)
+        timing["ROI"] = f"{x},{y},{w},{h}"
+    except Exception:
+        pass
+    return timing
+
+
+def _report_timing(
+    mmc: CMMCorePlus, label: str, last: dict[str, str]
+) -> dict[str, str]:
+    """Read the camera timing, log it to stderr when it changed, return it."""
+    timing = _read_camera_timing(mmc, label)
+    if timing != last:
+        summary = ", ".join(f"{k}={v}" for k, v in sorted(timing.items()))
+        _log(label, f"camera timing: {summary}")
+    return timing
 
 
 def _stop_and_clear(mmc: CMMCorePlus, label: str) -> None:
@@ -355,8 +458,14 @@ def _drain_sequence(
                 camera_metadata = {}
 
             data = img.tobytes()
+            if len(data) > config.slot_nbytes:
+                raise ValueError(
+                    f"{label}: frame is {len(data)} bytes, exceeds this "
+                    f"worker's {config.slot_nbytes}-byte frame slots"
+                )
             offset = slot * config.slot_nbytes
             shm.buf[offset : offset + len(data)] = data
+            height, width = _frame_shape(img)
             conn.send(
                 FrameMsg(
                     camera_label=label,
@@ -366,6 +475,8 @@ def _drain_sequence(
                     camera_metadata=camera_metadata,
                     images_remaining=remaining - 1,
                     worker_perf_counter=time.perf_counter(),
+                    height=height,
+                    width=width,
                 )
             )
             slice_idx += 1
@@ -539,6 +650,7 @@ def _drain_live(
             mmc.clearCircularBuffer()
 
             skipped = remaining - 1
+            height, width = _frame_shape(img)
             conn.send(
                 FrameMsg(
                     camera_label=label,
@@ -548,6 +660,8 @@ def _drain_live(
                     camera_metadata=camera_metadata,
                     images_remaining=skipped,
                     worker_perf_counter=time.perf_counter(),
+                    height=height,
+                    width=width,
                 )
             )
             slice_idx += 1
@@ -630,6 +744,10 @@ def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
             label,
             f"trigger modes: internal={internal_mode!r} external={external_mode!r}",
         )
+        expose_out_prop = _expose_out_property(mmc, label)
+        normal_expose_out = (
+            mmc.getProperty(label, expose_out_prop) if expose_out_prop else None
+        )
         shm = SharedMemory(name=config.shm_name, create=False)
     except Exception:
         _log(label, f"startup failed:\n{traceback.format_exc()}")
@@ -644,6 +762,7 @@ def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
         return
 
     conn.send(ReadyMsg(label))
+    last_timing: dict[str, str] = {}
 
     try:
         while True:
@@ -655,14 +774,23 @@ def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
             if isinstance(cmd, ArmCmd):
                 shutdown_requested = False
                 try:
-                    _set_trigger_mode(
+                    mode: str | None
+                    if cmd.trigger_mode is not None:
+                        mode = _require_trigger_mode(mmc, label, cmd.trigger_mode)
+                    else:
+                        mode = external_mode if cmd.external_trigger else internal_mode
+                    _set_trigger_mode(mmc, label, mode)
+                    _set_expose_out(
                         mmc,
                         label,
-                        external_mode if cmd.external_trigger else internal_mode,
+                        expose_out_prop,
+                        cmd.expose_out_mode or normal_expose_out,
                     )
+                    _set_exposure(mmc, label, cmd.exposure_ms)
                     armed_count = cmd.n_images + _ARM_COUNT_PADDING
                     mmc.startSequenceAcquisition(label, armed_count, 0, True)
-                    conn.send(ArmedMsg(label))
+                    last_timing = _report_timing(mmc, label, last_timing)
+                    conn.send(ArmedMsg(label, last_timing))
                     shutdown_requested = _drain_sequence(
                         mmc, conn, shm, config, cmd.n_images
                     )
@@ -682,8 +810,11 @@ def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
                 shutdown_requested = False
                 try:
                     _set_trigger_mode(mmc, label, internal_mode)
+                    _set_expose_out(mmc, label, expose_out_prop, normal_expose_out)
+                    _set_exposure(mmc, label, cmd.exposure_ms)
                     mmc.startContinuousSequenceAcquisition(0)
-                    conn.send(ArmedMsg(label))
+                    last_timing = _report_timing(mmc, label, last_timing)
+                    conn.send(ArmedMsg(label, last_timing))
                     shutdown_requested = _drain_live(mmc, conn, shm, config)
                 except Exception:
                     _log(label, f"live arm/drain failed:\n{traceback.format_exc()}")

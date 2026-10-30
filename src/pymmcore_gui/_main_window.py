@@ -7,9 +7,10 @@ from collections.abc import Callable
 from contextlib import suppress
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast, overload
+from typing import TYPE_CHECKING, Any, Literal, cast, overload
 from weakref import WeakValueDictionary
 
+from psygnal import SignalInstance
 from pymmcore_plus import CMMCorePlus
 from pymmcore_widgets import ConfigWizard
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
@@ -177,6 +178,20 @@ _ARGUS_NOTIFY_STATES = {StreamState.PAUSED, StreamState.ERROR}
 _ARGUS_SLOT_PRIORITY = 100
 
 
+def _connect_first(signal: Any, slot: Callable[..., Any]) -> None:
+    """Connect ``slot`` ahead of default-priority slots where the backend allows.
+
+    ``priority`` is a psygnal feature. The app forces the Qt signals backend
+    (``PYMM_SIGNALS_BACKEND=qt``), whose signals reject the keyword. There a
+    raising slot doesn't stop the others from running, so the plain connect
+    already gives the stream the isolation the priority exists to provide.
+    """
+    if isinstance(signal, SignalInstance):
+        signal.connect(slot, priority=_ARGUS_SLOT_PRIORITY)
+    else:
+        signal.connect(slot)
+
+
 class MicroManagerGUI(QMainWindow):
     """Micro-Manager minimal GUI."""
 
@@ -219,6 +234,7 @@ class MicroManagerGUI(QMainWindow):
         Menu.PLUGINS: [
             WidgetAction.CRISP,
             WidgetAction.SPECTRAL_CHANNELS,
+            WidgetAction.SPIM_TIMING,
             WidgetAction.CAMERA_ALIGNMENT,
             WidgetAction.ARGUS_QC,
         ],
@@ -312,11 +328,10 @@ class MicroManagerGUI(QMainWindow):
         self.argus_qc_received = self._argus_status_relay.qcReceived
         argus_mda_ev = self._mmc.mda.events
         stream = self._argus_stream
-        first = _ARGUS_SLOT_PRIORITY
-        argus_mda_ev.sequenceStarted.connect(stream.sequenceStarted, priority=first)
-        argus_mda_ev.frameReady.connect(stream.frameReady, priority=first)
-        argus_mda_ev.sequenceFinished.connect(stream.sequenceFinished, priority=first)
-        argus_mda_ev.sequenceCanceled.connect(stream.sequenceCanceled, priority=first)
+        _connect_first(argus_mda_ev.sequenceStarted, stream.sequenceStarted)
+        _connect_first(argus_mda_ev.frameReady, stream.frameReady)
+        _connect_first(argus_mda_ev.sequenceFinished, stream.sequenceFinished)
+        _connect_first(argus_mda_ev.sequenceCanceled, stream.sequenceCanceled)
         self._argus_last_notified = ""
 
         # Status bar -----------------------------------------
@@ -607,6 +622,9 @@ class MicroManagerGUI(QMainWindow):
 
         ensure_global_shutter_open()
         ensure_beam_enabled()
+        # No other PLogic writes at startup: the Expose Out BNCs are only
+        # configured when an All Rows MDA actually runs, so a legacy session
+        # sends exactly the proven PLogic programming.
 
         # Live stays disabled until BOTH the circular-buffer grow (if any)
         # and the persistent camera worker pool (if this config needs one)
@@ -621,6 +639,7 @@ class MicroManagerGUI(QMainWindow):
         def _on_camera_service_ready() -> None:
             with suppress(RuntimeError):
                 live_action.setEnabled(has_camera(self._mmc))
+            self._reapply_camera_crop()
             self.bufferReady.emit()
 
         def _on_buffer_ready() -> None:
@@ -629,6 +648,25 @@ class MicroManagerGUI(QMainWindow):
         ensure_circular_buffer_capacity_async(on_done=_on_buffer_ready)
 
         self._register_mda_engine()
+
+    def _reapply_camera_crop(self) -> None:
+        """Restore the saved "crop cameras to spectral regions" ROI at startup.
+
+        Cameras come up full frame after every config load; the crop is a
+        persisted preference (``SpectralChannelSettingsV1.crop_camera_roi``).
+        """
+        from pymmcore_gui._camera_crop import apply_camera_crop
+        from pymmcore_gui.asi_z_stack.camera_worker_service import CameraWorkerService
+
+        spectral = Settings.instance().spectral
+        if not (spectral.enabled and spectral.crop_camera_roi):
+            return
+        if CameraWorkerService.get_active() is None:
+            return
+        try:
+            apply_camera_crop(self._mmc, spectral)
+        except Exception:
+            logger.exception("Could not crop cameras to the spectral regions.")
 
     def _register_mda_engine(self) -> None:
         """Select the MDA engine to match the loaded configuration.
@@ -878,11 +916,11 @@ class MicroManagerGUI(QMainWindow):
         title = f"MDA {sha}" + (f" — {camera_label}" if camera_label else "")
         q_viewer.setWindowTitle(title)
 
-        # Small header row with a "Lock current slice" toggle -- lets the
-        # user pin whichever z-index is currently displayed, so the view
-        # stops jumping to every new frame and only updates when a new
-        # frame arrives at that same z (see NDVViewersManager.set_viewer_z_locked
-        # / _update_mda_viewer). A no-op for sequences with no z axis.
+        # Small header row with a "Lock slice & channel" toggle -- lets the
+        # user pin whichever z slice and channel are currently displayed, so
+        # the view stops jumping to every new frame and only updates when a
+        # new frame arrives at that same z and channel (see
+        # NDVViewersManager.set_viewer_slice_locked / _update_mda_viewer).
         container = QWidget(self)
         container_layout = QVBoxLayout(container)
         container_layout.setContentsMargins(0, 0, 0, 0)
@@ -890,9 +928,13 @@ class MicroManagerGUI(QMainWindow):
         lock_row = QWidget(container)
         lock_layout = QHBoxLayout(lock_row)
         lock_layout.setContentsMargins(4, 2, 4, 2)
-        lock_checkbox = QCheckBox("Lock current slice", lock_row)
+        lock_checkbox = QCheckBox("Lock slice && channel", lock_row)
+        lock_checkbox.setToolTip(
+            "Stay on the displayed z slice and channel, updating only when a "
+            "new frame arrives for them. Drag the sliders to re-lock elsewhere."
+        )
         lock_checkbox.toggled.connect(
-            lambda checked, v=ndv_viewer: self._viewers_manager.set_viewer_z_locked(
+            lambda checked, v=ndv_viewer: self._viewers_manager.set_viewer_slice_locked(
                 v, checked
             )
         )

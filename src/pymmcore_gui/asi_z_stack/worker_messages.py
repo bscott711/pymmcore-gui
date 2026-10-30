@@ -28,10 +28,20 @@ class ArmCmd:
     ``True`` (MDA) waits for PLogic's hardware trigger; ``False`` (Snap)
     free-runs on the camera's internal trigger -- nothing else would ever
     trigger it outside an MDA.
+
+    ``trigger_mode`` names an exact ``TriggerMode`` (e.g. ``"Edge Trigger"``
+    for the camera's All Rows mode) instead of the worker's default choice.
+    ``expose_out_mode`` selects the camera's expose-out signal mode (e.g.
+    ``"All Rows"``, matched case-insensitively); ``None`` restores the
+    camera's own startup mode. ``exposure_ms`` sets the camera's exposure
+    before arming; ``None`` leaves it as is.
     """
 
     n_images: int
     external_trigger: bool = True
+    trigger_mode: str | None = None
+    expose_out_mode: str | None = None
+    exposure_ms: float | None = None
 
 
 @dataclass(frozen=True)
@@ -43,7 +53,12 @@ class ArmLiveCmd:
     the worker streams frames via ``startContinuousSequenceAcquisition``
     until a :class:`StopCmd`/:class:`ShutdownCmd` arrives. See
     :func:`~pymmcore_gui.asi_z_stack.camera_worker._drain_live`.
+
+    Always restores the camera's startup expose-out mode; ``exposure_ms`` (if
+    given) sets the camera's exposure first.
     """
+
+    exposure_ms: float | None = None
 
 
 @dataclass(frozen=True)
@@ -116,14 +131,26 @@ class ReadyMsg:
 
 @dataclass(frozen=True)
 class ArmedMsg:
-    """The worker's camera has accepted ``startSequenceAcquisition``."""
+    """The worker's camera has accepted ``startSequenceAcquisition``.
+
+    ``timing`` carries the camera's timing-related properties (PVCAM's
+    ``Timing-*`` readout/clearing/trigger delays, trigger and expose-out
+    modes, port, ROI) as read right after arming -- PVCAM only reports
+    them once an acquisition is set up.
+    """
 
     camera_label: str
+    timing: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class FrameMsg:
-    """One frame is ready to read from the worker's shared-memory ring buffer."""
+    """One frame is ready to read from the worker's shared-memory ring buffer.
+
+    ``height``/``width`` give the frame's own shape, which follows the
+    camera's current ROI rather than the full-sensor slot size; ``0`` means
+    "the slot's full-sensor shape".
+    """
 
     camera_label: str
     slot_index: int
@@ -132,6 +159,8 @@ class FrameMsg:
     camera_metadata: dict[str, Any] = field(default_factory=dict)
     images_remaining: int = 0
     worker_perf_counter: float = 0.0
+    height: int = 0
+    width: int = 0
 
 
 @dataclass(frozen=True)

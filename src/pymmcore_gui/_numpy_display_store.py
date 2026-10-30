@@ -103,11 +103,11 @@ class NumpyDisplayStore:
         # Highest "t" seen so far (-1 before the first frame).
         self._max_t_seen: int = -1
         # (t, p) of the volume currently being written, and how many z-slices
-        # it has received so far. Only the newest (t, p) can ever be
-        # in-progress -- a frame for a new (t, p) implies the previous one is
-        # complete (acquisition order is monotonic).
+        # each channel has received so far ({c: z_filled}). Only the newest
+        # (t, p) can ever be in-progress -- a frame for a new (t, p) implies
+        # the previous one is complete (acquisition order is monotonic).
         self._newest_tp: tuple[int, int] | None = None
-        self._newest_tp_z_filled: int = 0
+        self._newest_tp_z_filled: dict[int, int] = {}
 
     @property
     def array(self) -> zarr.Array | None:
@@ -143,16 +143,19 @@ class NumpyDisplayStore:
             return False
         return t < self._max_t_seen - self._window_size + 1
 
-    def z_progress_for(self, t: int, p: int) -> int | None:
-        """Number of z-slices written so far for ``(t, p)``.
+    def is_unwritten(self, t: int, p: int, c: int, z: int) -> bool:
+        """Return True if plane ``(t, p, c, z)`` hasn't been written yet.
 
-        Returns ``None`` if ``(t, p)`` is not the currently-filling volume --
-        i.e. it's an older, and therefore guaranteed-complete, volume, and
-        callers should use the full declared z size instead.
+        Only the newest, still-filling ``(t, p)`` volume can have unwritten
+        planes; every older one is complete. Matters once the rolling window
+        has wrapped: an unwritten plane's storage slot still holds the plane
+        from ``window_size`` timepoints ago, so readers must blank it rather
+        than display that stale data. Always False when not windowing (no
+        slot is ever reused, so an unwritten plane already reads as zeros).
         """
-        if (t, p) != self._newest_tp:
-            return None
-        return self._newest_tp_z_filled
+        if self._window_size is None or (t, p) != self._newest_tp:
+            return False
+        return z >= self._newest_tp_z_filled.get(c, 0)
 
     def reset(self, sequence: useq.MDASequence) -> None:
         """Reset state to prepare for new *sequence*."""
@@ -162,7 +165,7 @@ class NumpyDisplayStore:
         self._window_size = None
         self._max_t_seen = -1
         self._newest_tp = None
-        self._newest_tp_z_filled = 0
+        self._newest_tp_z_filled = {}
 
     def frameReady(
         self, frame: np.ndarray, event: useq.MDAEvent, meta: FrameMetaV1, /
@@ -287,11 +290,14 @@ class NumpyDisplayStore:
         return tuple(storage[label] for label in self._labels)
 
     def _update_window_bookkeeping(self, index: Mapping[str, int]) -> None:
-        """Track ``max_t_seen`` and the newest volume's z-fill progress.
+        """Track ``max_t_seen`` and the newest volume's per-channel z-fill progress.
 
-        Assumes z arrives in non-decreasing order within a volume (true for
-        every engine in this app), so "highest z seen + 1" is an accurate
-        count of z-slices written so far for the in-progress volume.
+        Assumes z arrives in non-decreasing order within each channel of a
+        volume (true for every engine in this app, whether channels are
+        interleaved per slice or acquired one stack at a time), so "highest z
+        seen + 1" is an accurate count of z-slices written so far for that
+        channel of the in-progress volume. A sequence with no z axis counts
+        as a single slice (z=0) per channel.
         """
         t = index.get("t")
         if t is None:
@@ -301,10 +307,11 @@ class NumpyDisplayStore:
         tp = (t, p)
         if tp != self._newest_tp:
             self._newest_tp = tp
-            self._newest_tp_z_filled = 0
-        z = index.get("z")
-        if z is not None:
-            self._newest_tp_z_filled = max(self._newest_tp_z_filled, z + 1)
+            self._newest_tp_z_filled = {}
+        c = index.get("c", 0)
+        z = index.get("z", 0)
+        filled = self._newest_tp_z_filled
+        filled[c] = max(filled.get(c, 0), z + 1)
 
     def _grow(self, ary: zarr.Array) -> zarr.Array:
         """Grow the frame-dim fallback array by ``_SIZE_INCREMENT`` frames."""

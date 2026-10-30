@@ -32,6 +32,7 @@ from pymmcore_gui.asi_z_stack.engine import (
     ASIStationaryTriggerEngine,
     _ASITriggerEngineBase,
 )
+from pymmcore_gui.asi_z_stack.spim_timing import compute_slice_timing
 from pymmcore_gui.asi_z_stack.worker_pool import WorkerDiedError
 
 if TYPE_CHECKING:
@@ -360,6 +361,36 @@ def test_exec_event_timeout_stops_workers_and_reraises() -> None:
     pool.stop_and_drain.assert_called_once()
 
 
+def test_exec_event_zero_frame_stall_names_the_timing() -> None:
+    """No frame from any camera: the error says what timing triggered it."""
+    _core, engine, pool = _make_engine(n_cameras=2, n_slices=3)
+    assert isinstance(engine, ASISPIMEngine)
+    engine._applied_timing = compute_slice_timing("all_rows", 10.0, 4.04, 0.25)
+    pool.iter_frames.side_effect = TimeoutError("no frame for 5.0s")
+
+    with pytest.raises(TimeoutError) as info:
+        list(engine.exec_event(useq.MDAEvent(index={"t": 0})))
+
+    message = str(info.value)
+    assert message.startswith("no frame for 5.0s")
+    assert "no trigger reached them" in message
+    assert "PLogic BNC1" in message
+    assert "all_rows: settle 0.25" in message
+
+
+def test_exec_event_partial_stall_keeps_original_error() -> None:
+    _core, engine, pool = _make_engine(n_cameras=1, n_slices=3)
+
+    def frames() -> Generator[tuple[str, int, np.ndarray, dict, int], None, None]:
+        yield "cam0", 0, np.zeros((2, 2), dtype=np.uint16), {}, 2
+        raise TimeoutError("no frame for 5.0s")
+
+    pool.iter_frames.return_value = frames()
+
+    with pytest.raises(TimeoutError, match=r"^no frame for 5\.0s$"):
+        list(engine.exec_event(useq.MDAEvent(index={"t": 0})))
+
+
 def test_exec_event_generator_close_stops_workers() -> None:
     """Abandoning ``exec_event`` mid-iteration (``GeneratorExit``) still stops workers.
 
@@ -520,31 +551,76 @@ def test_setup_sequence_honors_z_stack_mode(
     offset_um: float,
     amplitude_um: float,
 ) -> None:
-    """Each Z Stack mode sets its own galvo sweep center/direction, not always 0."""
+    """Each Z Stack mode sets its own galvo sweep center/direction, not always 0.
+
+    The sweep is placed relative to the galvo offset Live sits at (0.1234 deg
+    here), so slice i images the Live plane + z[i] in every mode.
+    """
     core, engine = _setup_spim_engine(monkeypatch, focus_um=focus)
     engine.setup_sequence(useq.MDASequence(z_plan=z_plan))
 
     slope = engine.hw.slice_calibration_slope_um_per_deg
     assert _galvo_value(core, "SingleAxisYOffset(deg)") == pytest.approx(
-        offset_um / slope, abs=1e-4
+        0.1234 + offset_um / slope, abs=1e-4
     )
     assert _galvo_value(core, "SingleAxisYAmplitude(deg)") == pytest.approx(
         amplitude_um / slope, abs=1e-4
     )
 
 
-def test_teardown_restores_galvo_offset(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Live/Snap after an off-center MDA must image the original plane again."""
+def test_teardown_restores_galvo_sweep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Live/Snap after an MDA must see the galvo exactly as before it.
+
+    Not just the sweep center: the amplitude was left at the run's 0.3 deg on
+    the bench after the user had set it to 0.
+    """
     core, engine = _setup_spim_engine(monkeypatch)
     monkeypatch.setattr(engine_module.time, "sleep", lambda _s: None)
     monkeypatch.setattr(engine, "_reclaim_from_workers", MagicMock())
     core.getLoadedDevices.return_value = ["Scanner:AB:33"]
+    live = {
+        "SingleAxisYOffset(deg)": "0.1234",
+        "SingleAxisYAmplitude(deg)": "0.0000",
+        "SingleAxisXOffset(deg)": "0.0100",
+        "SingleAxisXAmplitude(deg)": "0.0200",
+    }
+    core.getProperty.side_effect = lambda dev, prop: live.get(prop, "0.1234")
     seq = useq.MDASequence(z_plan=useq.ZAboveBelow(above=10, below=0, step=1))
 
     engine.setup_sequence(seq)
+    assert _galvo_value(core, "SingleAxisYAmplitude(deg)") != 0.0
     engine.teardown_sequence(seq)
 
+    for prop, value in live.items():
+        assert _galvo_value(core, prop) == pytest.approx(float(value))
+
+
+def test_stationary_teardown_restores_galvo_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "configure_plogic_for_dual_nrt_pulses",
+        "log_plogic_trigger_chain_state",
+        "summary_metadata",
+    ):
+        monkeypatch.setattr(engine_module, name, MagicMock())
+    monkeypatch.setattr(engine_module.time, "sleep", lambda _s: None)
+    core, engine, _pool = _make_engine(
+        n_cameras=1, n_slices=1, engine_cls=ASIStationaryTriggerEngine
+    )
+    monkeypatch.setattr(engine, "_reclaim_from_workers", MagicMock())
+    core.getLoadedDevices.return_value = ["Scanner:AB:33"]
+    core.getProperty.return_value = "0.1234"
+    core.getExposure.return_value = 10.0
+    core.getImageWidth.return_value = 2
+    core.getImageHeight.return_value = 2
+    core.getBytesPerPixel.return_value = 2
+
+    engine.setup_sequence(useq.MDASequence())
+    engine.teardown_sequence(useq.MDASequence())
+
     assert _galvo_value(core, "SingleAxisYOffset(deg)") == pytest.approx(0.1234)
+    assert _galvo_value(core, "SingleAxisYAmplitude(deg)") == pytest.approx(0.1234)
 
 
 def test_setup_sequence_rejects_unreachable_top_bottom(
@@ -783,3 +859,321 @@ def test_teardown_sequence_skips_close_all_lasers_when_flag_off(
     engine.teardown_sequence(useq.MDASequence())
 
     mock_close_all_lasers.assert_not_called()
+
+
+def test_warn_if_piezo_moved_names_crisp_when_locked(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """With CRISP locked the warning attributes the move to CRISP, not SPIM homing."""
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=3)
+    core.getLoadedDevices.return_value = ["PiezoStage:P:34", "CRISPAFocus:P:34"]
+    core.getProperty.side_effect = lambda dev, prop: (
+        "In Focus" if prop == "CRISP State" else "0"
+    )
+
+    core.getPosition.return_value = 10.0
+    engine._snapshot_piezo_position()
+    core.getPosition.return_value = 12.5
+    with caplog.at_level(logging.WARNING):
+        engine._warn_if_piezo_moved()
+
+    assert len(caplog.records) == 1
+    assert "+2.500" in caplog.records[0].message
+    assert "CRISP is locked" in caplog.records[0].message
+
+
+def test_exec_event_logs_one_line_per_volume(caplog: pytest.LogCaptureFixture) -> None:
+    """Each volume logs piezo before/after, CRISP state, XY, offset and frames."""
+    core, engine, pool = _make_engine(n_cameras=2, n_slices=2)
+    core.getLoadedDevices.return_value = [
+        "PiezoStage:P:34",
+        "CRISPAFocus:P:34",
+        "Scanner:AB:33",
+    ]
+    core.getXYStageDevice.return_value = "XY"
+    core.getXYPosition.return_value = (-3218.0, 2482.3)
+    core.getProperty.side_effect = lambda dev, prop: {
+        "CRISP State": "In Focus",
+        "SingleAxisYOffset(deg)": "0.2000",
+    }.get(prop, "Running")
+    engine._piezo_pos_at_setup = -69.4
+    core.getPosition.side_effect = [-69.4, -69.6]  # before, after the volume
+    _queue_frames(pool, [("cam0", 0), ("cam1", 0), ("cam0", 1), ("cam1", 1)])
+
+    with caplog.at_level(logging.INFO):
+        list(engine.exec_event(useq.MDAEvent(index={"t": 3})))
+
+    lines = [r.message for r in caplog.records if r.message.startswith("Volume")]
+    assert len(lines) == 1
+    line = lines[0]
+    assert "{'t': 3}" in line
+    assert "-69.400 -> -69.600 um" in line
+    assert "-0.200 during volume" in line
+    assert "CRISP=In Focus" in line
+    assert "XY=(-3218.00, 2482.30)" in line
+    assert "galvo offset=0.2000 deg" in line
+    assert "cam0=2, cam1=2" in line
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_exec_event_warns_on_short_frame_count(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A camera delivering fewer frames than slices is flagged (z labels shift)."""
+    core, engine, pool = _make_engine(n_cameras=2, n_slices=2)
+    core.getLoadedDevices.return_value = []
+    core.getXYStageDevice.return_value = ""
+    _queue_frames(pool, [("cam0", 0), ("cam1", 0), ("cam0", 1)])
+
+    with caplog.at_level(logging.INFO):
+        list(engine.exec_event(useq.MDAEvent(index={"t": 0})))
+
+    warnings_ = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings_) == 1
+    assert "['cam1']" in warnings_[0]
+
+
+def test_drift_summary_spans_all_volumes(caplog: pytest.LogCaptureFixture) -> None:
+    core, engine, pool = _make_engine(n_cameras=1, n_slices=1)
+    core.getLoadedDevices.return_value = ["PiezoStage:P:34"]
+    core.getXYStageDevice.return_value = ""
+    engine._piezo_pos_at_setup = 0.0
+    core.getPosition.side_effect = [0.0, 0.1, 1.0, 1.3, 2.0, 2.05]
+    for t in range(3):
+        _queue_frames(pool, [("cam0", 0)])
+        list(engine.exec_event(useq.MDAEvent(index={"t": t})))
+
+    with caplog.at_level(logging.INFO):
+        engine._log_drift_summary()
+
+    summary = caplog.records[-1].message
+    assert "over 3 volumes" in summary
+    assert "net +2.050 um" in summary
+    assert "largest move within one volume +0.300 um" in summary
+
+
+def test_setup_sequence_logs_galvo_spim_properties(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The card-persisted per-slice delays are logged, not assumed."""
+    for name in (
+        "configure_plogic_for_dual_nrt_pulses",
+        "set_plogic_evaluation_clock",
+        "summary_metadata",
+    ):
+        monkeypatch.setattr(engine_module, name, MagicMock())
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=1)
+    core.getLoadedDevices.return_value = ["Scanner:AB:33"]
+    core.getDevicePropertyNames.return_value = [
+        "SPIMDelayBeforeCamera(ms)",
+        "SingleAxisYOffset(deg)",
+        "Description",
+    ]
+    core.getProperty.side_effect = lambda dev, prop: {
+        "SPIMDelayBeforeCamera(ms)": "0.25",
+        "SPIMDelayBeforeLaser(ms)": "25.75",
+        "SingleAxisYOffset(deg)": "0.0",
+    }.get(prop, "x")
+    core.hasPropertyLimits.return_value = False
+    core.getImageWidth.return_value = 2
+    core.getImageHeight.return_value = 2
+    core.getBytesPerPixel.return_value = 2
+    core.getExposure.return_value = 10.0
+
+    with caplog.at_level(logging.INFO):
+        engine.setup_sequence(useq.MDASequence(channels=["405nm"]))
+
+    messages = [r.message for r in caplog.records]
+    assert "  [galvo] SPIMDelayBeforeCamera(ms) = 0.25" in messages
+    assert not any("Description" in m for m in messages)
+    assert any(
+        "Pre-MDA (Live) galvo SingleAxisYOffset = 0.0 deg" in m for m in messages
+    )
+
+
+# --- Advanced slice timing / All Rows mode ---
+
+
+def _all_rows_engine(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: object,
+    readout_override: float | None = 6.0,
+    overlap: bool = False,
+) -> tuple[MagicMock, ASISPIMEngine, MagicMock]:
+    timing = settings.spim_timing  # type: ignore[attr-defined]
+    timing.mode = "all_rows"
+    timing.galvo_settle_ms = 2.0
+    timing.readout_ms_override = readout_override
+    timing.level_trigger_overlap = overlap
+    delayed = MagicMock()
+    monkeypatch.setattr(engine_module, "configure_plogic_for_delayed_laser", delayed)
+    monkeypatch.setattr(
+        engine_module, "describe_plogic_cell", MagicMock(return_value={})
+    )
+    core, engine = _setup_spim_engine(monkeypatch)
+    engine.setup_sequence(
+        useq.MDASequence(
+            channels=(useq.Channel(config="488nm", group="Lasers", exposure=10.0),)
+        )
+    )
+    return core, engine, delayed
+
+
+def _cells(delayed: MagicMock) -> tuple[float, float, float]:
+    """(camera pulse, laser delay, laser pulse) of the last PLogic programming."""
+    args = delayed.call_args.args
+    return args[-3], args[-2], args[-1]
+
+
+def test_all_rows_setup_programs_delayed_laser_and_galvo(
+    monkeypatch: pytest.MonkeyPatch, settings: object
+) -> None:
+    core, _engine, delayed = _all_rows_engine(monkeypatch, settings)
+
+    delayed.assert_called_once()
+    args = delayed.call_args.args
+    assert args[2:5] == (11, 10, 9)  # camera cell, laser cell, delay cell
+    # S=6, E=10, margin 0.5: laser 6.5 ms after the trigger for 10 ms, inside
+    # a 17 ms camera pulse
+    assert _cells(delayed) == (17.0, 6.5, 10.0)
+    engine_module.configure_plogic_for_dual_nrt_pulses.assert_not_called()  # type: ignore[attr-defined]
+    # plain Level Trigger, s=2: hold = max(C, C + S - s) = 21, period 23 ms
+    assert _galvo_value(core, "SPIMDelayBeforeCamera(ms)") == 2.0
+    assert _galvo_value(core, "SPIMDelayBeforeLaser(ms)") == 2.0
+    assert _galvo_value(core, "SPIMCameraDuration(ms)") == 21.0
+    assert _galvo_value(core, "SPIMLaserDuration(ms)") == 21.0
+    assert _galvo_value(core, "SPIMNumScansPerSlice") == 1
+    assert _galvo_value(core, "SPIMDelayBeforeSide(ms)") == 0.0
+
+
+def test_all_rows_keeps_level_trigger_and_retimes_per_channel(
+    monkeypatch: pytest.MonkeyPatch, settings: object
+) -> None:
+    core, engine, delayed = _all_rows_engine(monkeypatch, settings)
+    event = useq.MDAEvent(
+        index={"t": 0}, channel={"config": "561nm", "group": "Lasers"}, exposure=20.0
+    )
+
+    options = engine._prepare_volume(event)
+
+    assert options == {}  # cameras arm exactly as in legacy (Level Trigger)
+    assert _cells(delayed) == (27.0, 6.5, 20.0)  # reprogrammed for E = 20
+    assert _galvo_value(core, "SPIMLaserDuration(ms)") == 31.0
+
+
+def test_all_rows_overlap_arms_level_trigger_overlap(
+    monkeypatch: pytest.MonkeyPatch, settings: object
+) -> None:
+    core, engine, _delayed = _all_rows_engine(monkeypatch, settings, overlap=True)
+
+    options = engine._prepare_volume(useq.MDAEvent(exposure=10.0))
+
+    assert options == {"trigger_mode": "Level Trigger Overlap"}
+    # galvo steps as soon as the camera pulse (and the laser in it) ends
+    assert _galvo_value(core, "SPIMLaserDuration(ms)") == 17.0
+
+
+def test_all_rows_held_on_laser_uses_plain_level_trigger(
+    monkeypatch: pytest.MonkeyPatch, settings: object
+) -> None:
+    core, engine, delayed = _all_rows_engine(monkeypatch, settings, overlap=True)
+    monkeypatch.setattr(engine, "_shutter_gated_bncs", lambda: [40])
+
+    options = engine._prepare_volume(useq.MDAEvent(exposure=10.0))
+
+    assert options == {}  # constant light: no overlap
+    assert _cells(delayed)[0] == 10.0  # camera pulse = E
+    assert _galvo_value(core, "SPIMLaserDuration(ms)") == 16.5  # S + E + margin
+
+
+def test_all_rows_after_arm_retimes_to_reported_readout(
+    monkeypatch: pytest.MonkeyPatch, settings: object
+) -> None:
+    core, engine, delayed = _all_rows_engine(
+        monkeypatch, settings, readout_override=None
+    )
+    assert engine._readout_ms == 13.5  # fallback: nothing reported yet
+    pool = cast("MagicMock", engine._worker_pool)
+    pool.camera_timing.return_value = {
+        "cam0": {"Timing-ReadoutTimeNs": "8000000"},
+        "cam1": {"Timing-ReadoutTimeNs": "7000000"},
+    }
+
+    engine._after_arm()
+
+    assert engine._readout_ms == 8.0  # slowest camera wins
+    assert _cells(delayed) == (19.0, 8.5, 10.0)
+    # S=8, s=2: hold = max(19, 19 + 8 - 2)
+    assert _galvo_value(core, "SPIMLaserDuration(ms)") == 25.0
+
+
+def test_legacy_mode_keeps_original_arming(
+    monkeypatch: pytest.MonkeyPatch, settings: object
+) -> None:
+    core, engine = _setup_spim_engine(monkeypatch)
+    engine.setup_sequence(useq.MDASequence(channels=["488nm"]))
+
+    assert engine._prepare_volume(useq.MDAEvent(exposure=10.0)) == {}
+    # default settings: 25.75 ms settle + 10 ms hold = the original 35.75 ms
+    assert _galvo_value(core, "SPIMDelayBeforeLaser(ms)") == 25.75
+    assert _galvo_value(core, "SPIMLaserDuration(ms)") == 10.0
+
+
+def test_legacy_mode_ignores_all_rows_settle(
+    monkeypatch: pytest.MonkeyPatch, settings: object
+) -> None:
+    """A settle tuned for All Rows must not leak into the known-good legacy run."""
+    timing = settings.spim_timing  # type: ignore[attr-defined]
+    timing.galvo_settle_ms = 0.25
+    timing.volume_start_settle_ms = 3.0
+    timing.margin_ms = 0.0
+    core, engine = _setup_spim_engine(monkeypatch)
+    engine.setup_sequence(useq.MDASequence(channels=["488nm"]))
+
+    # exactly the proven legacy card timing: 25.75 ms camera/laser delays,
+    # no scan delay, one scan per slice, camera/laser pulses = exposure
+    assert _galvo_value(core, "SPIMDelayBeforeSide(ms)") == 0.0
+    assert _galvo_value(core, "SPIMDelayBeforeCamera(ms)") == 25.75
+    assert _galvo_value(core, "SPIMDelayBeforeLaser(ms)") == 25.75
+    assert _galvo_value(core, "SPIMDelayBeforeScan(ms)") == 0.0
+    assert _galvo_value(core, "SPIMNumScansPerSlice") == 1
+    assert _galvo_value(core, "SPIMLaserDuration(ms)") == 10.0
+    assert _galvo_value(core, "SPIMCameraDuration(ms)") == 10.0
+    # legacy PLogic: the proven E-long one-shots, never the All Rows cells
+    engine_module.configure_plogic_for_dual_nrt_pulses.assert_called_once()  # type: ignore[attr-defined]
+    settings_arg = engine_module.configure_plogic_for_dual_nrt_pulses.call_args.args[0]  # type: ignore[attr-defined]
+    assert settings_arg.camera_exposure_ms == 10.0
+    # no per-volume or after-arm changes in legacy
+    core.setProperty.reset_mock()
+    assert engine._prepare_volume(useq.MDAEvent(exposure=20.0)) == {}
+    engine._after_arm()
+    core.setProperty.assert_not_called()
+
+
+def test_all_rows_teardown_restores_card_timing(
+    monkeypatch: pytest.MonkeyPatch, settings: object
+) -> None:
+    """An All Rows run puts the galvo card's per-slice values back afterwards."""
+    monkeypatch.setattr(engine_module.time, "sleep", lambda _s: None)
+    core, engine, _all_rows = _all_rows_engine(monkeypatch, settings)
+    monkeypatch.setattr(engine, "_reclaim_from_workers", MagicMock())
+    core.getLoadedDevices.return_value = ["Scanner:AB:33"]
+    # setup wrote All Rows values over the card's "0.1234"s; teardown must
+    # write every one of them back
+    core.getProperty.return_value = "all-rows value"
+    core.setProperty.reset_mock()
+
+    engine.teardown_sequence(useq.MDASequence())
+
+    restored = {
+        c.args[1]: c.args[2]
+        for c in core.setProperty.call_args_list
+        if c.args[0] == "Scanner:AB:33" and c.args[1] != "SPIMState"
+    }
+    for prop in (
+        "SPIMDelayBeforeCamera(ms)",
+        "SPIMDelayBeforeLaser(ms)",
+        "SPIMLaserDuration(ms)",
+        "SPIMNumScansPerSlice",
+    ):
+        assert restored.get(prop) == "0.1234"

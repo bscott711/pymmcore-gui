@@ -1,0 +1,1 @@
+The spot focus lock moved into CRISPy (`CRISPy.spot`, the "Spot lock" section of the piezo CRISP panel); its documentation and the edge-detection notebook live in the CRISPy repository (`docs/spot_focus_lock.md`).

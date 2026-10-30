@@ -5,6 +5,7 @@ import warnings
 from pathlib import Path
 from typing import Annotated, Any, Literal, cast
 
+from CRISPy.spot.settings import SpotFocusSettingsV1
 from platformdirs import user_data_dir
 from pydantic import (
     Base64Bytes,
@@ -188,7 +189,7 @@ class SpectralChannelConfig(BaseModel):
     # laser isn't in the MDA" override for power users capturing extra regions.
 
     name: str
-    """Per-file label, e.g. ``"GFP_488"``."""
+    """Per-file label, e.g. ``"mNG_488nm"``."""
     camera: str
     """Physical camera device label, e.g. ``"Camera-1"``."""
     laser_preset: str
@@ -212,19 +213,22 @@ class SpectralChannelConfig(BaseModel):
 def _default_spectral_channels() -> list[SpectralChannelConfig]:
     return [
         SpectralChannelConfig(
-            name="GFP_488", camera="Camera-1", laser_preset="488nm", position="top"
+            name="mNG_488nm", camera="Camera-1", laser_preset="488nm", position="top"
         ),
         SpectralChannelConfig(
-            name="CalceinViolet_405",
+            name="Electra_405nm",
             camera="Camera-1",
             laser_preset="405nm",
             position="bottom",
         ),
         SpectralChannelConfig(
-            name="mScarlet_561", camera="Camera-2", laser_preset="561nm", position="top"
+            name="mScarlet_561nm",
+            camera="Camera-2",
+            laser_preset="561nm",
+            position="top",
         ),
         SpectralChannelConfig(
-            name="CF647_638",
+            name="CF647_638nm",
             camera="Camera-2",
             laser_preset="638nm",
             position="bottom",
@@ -237,6 +241,12 @@ class SpectralChannelSettingsV1(BaseMMSettings):
 
     enabled: bool = False
     """Master on/off switch for the whole feature."""
+    crop_camera_roi: bool = False
+    """Crop each camera's hardware ROI to the bounding box of its regions.
+
+    Shorter rolling readout (faster slices) and less data per frame; the
+    regions stay in full-sensor coordinates (see ``pymmcore_gui._camera_crop``).
+    """
     laser_config_group: str = "Lasers"
     all_lasers_preset: str = "AllLasers"
     channels: list[SpectralChannelConfig] = Field(
@@ -411,6 +421,47 @@ class FocusOffsetSettingsV1(BaseMMSettings):
     keyed by laser-preset name (e.g. ``{"561nm": 0.35}``)."""
 
 
+class SpimTimingSettingsV1(BaseMMSettings):
+    """Advanced per-slice timing for the ASI galvo SPIM MDA.
+
+    See ``pymmcore_gui.asi_z_stack.spim_timing`` for the timing model; the
+    engine writes these to the galvo card and PLogic for every MDA.
+    """
+
+    mode: Literal["legacy", "all_rows"] = "legacy"
+    """``"all_rows"``: pseudo-global exposure -- the camera's Level Trigger
+    pulse covers readout + exposure and PLogic delays the laser until every
+    row is integrating, so every row gets the full exposure, matching Live.
+    ``"legacy"``: the proven setup, camera and laser share one PLogic pulse
+    (later-read rows get less light)."""
+    galvo_settle_ms: float = 25.75
+    """Galvo settle between each slice step and the camera trigger (written to
+    both ``SPIMDelayBeforeCamera`` and ``SPIMDelayBeforeLaser``)."""
+    volume_start_settle_ms: float = 0.0
+    """Extra settle before each volume's first slice, for the galvo's jump
+    back to the start of the sweep (``SPIMDelayBeforeSide``)."""
+    readout_ms_override: float | None = None
+    """Camera rolling readout time in ms; ``None`` uses the value the cameras
+    report (PVCAM ``Timing-ReadoutTimeNs``, maximum over cameras)."""
+    fallback_readout_ms: float = 13.5
+    """Readout time assumed when the cameras haven't reported one yet (e.g.
+    the first MDA of a session before any Snap/Live) and no override is set."""
+    margin_ms: float = 0.5
+    """All Rows safety margin: the laser starts this long after the last row
+    has started, and the camera pulse ends this long after the laser."""
+    level_trigger_overlap: bool = False
+    """All Rows with the cameras in Level Trigger Overlap: the next frame
+    starts exposing while the previous one reads out, so a slice costs about
+    readout + exposure instead of 2 x readout + exposure."""
+
+
+class SnapshotSettingsV1(BaseMMSettings):
+    """Where the Save Image action writes Snap/Live frames."""
+
+    save_dir: Path | None = None
+    """Destination folder; ``None`` means ask on the next save."""
+
+
 class SettingsV1(BaseMMSettings):
     """Global settings for the PyMMCore GUI."""
 
@@ -427,6 +478,9 @@ class SettingsV1(BaseMMSettings):
     argus_stream: ArgusStreamSettingsV1 = Field(default_factory=ArgusStreamSettingsV1)
     mda_writer: MdaWriterSettingsV1 = Field(default_factory=MdaWriterSettingsV1)
     focus: FocusOffsetSettingsV1 = Field(default_factory=FocusOffsetSettingsV1)
+    spot_focus: SpotFocusSettingsV1 = Field(default_factory=SpotFocusSettingsV1)
+    snapshot: SnapshotSettingsV1 = Field(default_factory=SnapshotSettingsV1)
+    spim_timing: SpimTimingSettingsV1 = Field(default_factory=SpimTimingSettingsV1)
 
     send_error_reports: bool | None = None
     """Whether to send error reports to the developers, None means undecided."""

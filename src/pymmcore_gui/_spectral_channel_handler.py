@@ -10,6 +10,7 @@ based on the laser preset used for that MDA event (see
 
 from __future__ import annotations
 
+import logging
 from inspect import signature
 from typing import TYPE_CHECKING, Any
 
@@ -31,6 +32,8 @@ if TYPE_CHECKING:
     from pymmcore_plus.metadata import FrameMetaV1, SummaryMetaV1
 
     from pymmcore_gui._settings import SpectralChannelConfig
+
+logger = logging.getLogger(__name__)
 
 # Output suffix implied by each writer format; ``handler_for_path`` dispatches
 # to the concrete writer class based on this suffix.
@@ -134,6 +137,91 @@ def channels_for_sequence(
     return [c for c in ready if c.laser_preset in used]
 
 
+def camera_roi(mmc: CMMCorePlus, camera_label: str) -> tuple[int, int, int, int] | None:
+    """*camera_label*'s current hardware ROI ``(x, y, w, h)`` on the sensor.
+
+    Worker-owned cameras (the persistent ``CameraWorkerService``) report the
+    ROI the service last set; otherwise the core is asked. ``None`` if it
+    can't be determined.
+    """
+    from pymmcore_gui.asi_z_stack.camera_worker_service import CameraWorkerService
+
+    svc = CameraWorkerService.get_active()
+    if svc is not None and camera_label in svc.camera_labels:
+        try:
+            return svc.roi(camera_label)
+        except RuntimeError:
+            return None
+    try:
+        x, y, w, h = mmc.getROI(camera_label)
+    except Exception:
+        return None
+    return int(x), int(y), int(w), int(h)
+
+
+def roi_origin(mmc: CMMCorePlus, camera_label: str) -> tuple[int, int]:
+    """Top-left ``(x, y)`` of *camera_label*'s ROI on the sensor, else ``(0, 0)``.
+
+    Spectral regions are stored in full-sensor coordinates; frames from a
+    cropped camera start at this offset, so every crop must subtract it.
+    """
+    roi = camera_roi(mmc, camera_label)
+    return (roi[0], roi[1]) if roi is not None else (0, 0)
+
+
+def regions_bounding_box(
+    channels: list[SpectralChannelConfig], camera_label: str
+) -> tuple[int, int, int, int] | None:
+    """Full-sensor ``(x, y, w, h)`` enclosing *camera_label*'s drawn regions.
+
+    The smallest hardware ROI that still contains every spectral region on
+    that camera; ``None`` if the camera has none drawn.
+    """
+    rects = [c.rect for c in channels if c.camera == camera_label and c.rect]
+    if not rects:
+        return None
+    x0 = min(r[0] for r in rects)
+    y0 = min(r[1] for r in rects)
+    x1 = max(r[0] + r[2] for r in rects)
+    y1 = max(r[1] + r[3] for r in rects)
+    return x0, y0, x1 - x0, y1 - y0
+
+
+def regions_outside_roi(
+    channels: list[SpectralChannelConfig],
+    rois: dict[str, tuple[int, int, int, int] | None],
+) -> list[str]:
+    """Names of drawn regions not fully inside their camera's current ROI."""
+    outside: list[str] = []
+    for c in channels:
+        roi = rois.get(c.camera)
+        if c.rect is None or roi is None:
+            continue
+        x, y, w, h = c.rect
+        rx, ry, rw, rh = roi
+        if x < rx or y < ry or x + w > rx + rw or y + h > ry + rh:
+            outside.append(c.name)
+    return outside
+
+
+def crop_region(
+    frame: np.ndarray,
+    rect: tuple[int, int, int, int],
+    origin: tuple[int, int] = (0, 0),
+) -> np.ndarray | None:
+    """Crop full-sensor *rect* out of a frame whose top-left sits at *origin*.
+
+    Returns ``None`` (rather than a silently short crop) when the region
+    doesn't lie entirely inside the frame.
+    """
+    x, y, w, h = rect
+    x -= origin[0]
+    y -= origin[1]
+    if x < 0 or y < 0 or y + h > frame.shape[0] or x + w > frame.shape[1]:
+        return None
+    return np.ascontiguousarray(frame[y : y + h, x : x + w])
+
+
 def next_fft_friendly(n: int) -> int:
     """Return the smallest ``m >= n`` whose only prime factors are 2, 3, 5, 7.
 
@@ -208,6 +296,10 @@ class SpectralChannelHandler:
         # channel axis collapsed (see _active_channels_for_event / sequenceStarted).
         self._writer_seq: useq.MDASequence | None = None
         self._summary_meta: SummaryMetaV1 | dict = {}
+        # camera label -> its ROI's top-left on the sensor, read once per
+        # sequence (ROI changes are refused while an MDA runs).
+        self._origins: dict[str, tuple[int, int]] = {}
+        self._warned_out_of_frame: set[str] = set()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -269,6 +361,11 @@ class SpectralChannelHandler:
         self._summary_meta = meta or {}
         self._writers.clear()
         self._started.clear()
+        self._warned_out_of_frame.clear()
+        self._origins = {
+            cam: roi_origin(self._mmc, cam)
+            for cam in {c.camera for c in self._channels}
+        }
         for channel in self._channels:
             self._get_writer(channel)
 
@@ -280,8 +377,16 @@ class SpectralChannelHandler:
         for channel in self._active_channels_for_event(event):
             if channel.camera != label or channel.rect is None:
                 continue
-            x, y, w, h = channel.rect
-            crop = np.ascontiguousarray(frame[y : y + h, x : x + w])
+            crop = crop_region(frame, channel.rect, self._origins.get(label, (0, 0)))
+            if crop is None:
+                if channel.name not in self._warned_out_of_frame:
+                    self._warned_out_of_frame.add(channel.name)
+                    logger.warning(
+                        f"Spectral region {channel.name} {channel.rect} is not "
+                        f"inside {label}'s {frame.shape[1]}x{frame.shape[0]} frame "
+                        f"at origin {self._origins.get(label, (0, 0))}; not saved."
+                    )
+                continue
             self._get_writer(channel).frameReady(crop, clean_event, meta)
 
     def sequenceFinished(self, seq: useq.MDASequence) -> None:

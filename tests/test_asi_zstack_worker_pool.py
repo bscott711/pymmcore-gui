@@ -211,3 +211,52 @@ def test_stop_and_drain_times_out_without_raising() -> None:
     start = time.monotonic()
     CameraWorkerPool([handle]).stop_and_drain(timeout=0.3)
     assert time.monotonic() - start < 2.0
+
+
+def test_arm_all_records_camera_timing() -> None:
+    """ArmedMsg.timing lands on the handle and in pool.camera_timing()."""
+    from pymmcore_gui.asi_z_stack.worker_messages import ArmCmd, ArmedMsg
+    from pymmcore_gui.asi_z_stack.worker_pool import CameraWorkerPool
+
+    handle, child, _keep = _pipe_handle("Camera-1")
+    pool = CameraWorkerPool([handle])
+    timing = {"Timing-ReadoutTimeNs": "6400000", "TriggerMode": "Edge Trigger"}
+    child.send(ArmedMsg("Camera-1", timing))
+
+    pool.arm_all(81, armed_timeout=2.0)
+
+    assert isinstance(child.recv(), ArmCmd)
+    assert pool.camera_timing() == {"Camera-1": timing}
+
+
+def test_read_frame_uses_message_shape_for_cropped_frames() -> None:
+    from multiprocessing.shared_memory import SharedMemory
+
+    import numpy as np
+    import pytest
+
+    from pymmcore_gui.asi_z_stack.worker_pool import CameraWorkerHandle
+
+    handle = CameraWorkerHandle(
+        "Camera-1",
+        None,  # type: ignore[arg-type]
+        height=8,
+        width=10,
+        dtype="uint16",
+        n_slots=2,
+    )
+    shm = SharedMemory(create=True, size=handle.slot_nbytes * 2)
+    handle.shm = shm
+    try:
+        cropped = np.arange(4 * 6, dtype=np.uint16).reshape(4, 6)
+        offset = handle.slot_nbytes  # slot 1
+        shm.buf[offset : offset + cropped.nbytes] = cropped.tobytes()
+
+        out = handle.read_frame(1, cropped.nbytes, height=4, width=6)
+        np.testing.assert_array_equal(out, cropped)
+
+        with pytest.raises(ValueError, match="expected"):
+            handle.read_frame(1, cropped.nbytes, height=5, width=6)
+    finally:
+        shm.close()
+        shm.unlink()

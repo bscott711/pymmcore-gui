@@ -201,3 +201,91 @@ def test_next_fft_friendly() -> None:
     assert next_fft_friendly(512) == 512  # 2**9, already 7-smooth
     assert next_fft_friendly(500) == 500  # 2**2 * 5**3, already 7-smooth
     assert next_fft_friendly(513) == 525  # 3**3 * 19 -> next 7-smooth is 3*5*5*7
+
+
+def test_crop_region_translates_by_roi_origin() -> None:
+    from pymmcore_gui._spectral_channel_handler import crop_region
+
+    full = np.arange(40 * 30, dtype=np.uint16).reshape(30, 40)
+    roi = full[5:25, 8:36]  # camera cropped to x=8, y=5, w=28, h=20
+
+    crop = crop_region(roi, (10, 6, 4, 3), origin=(8, 5))
+
+    assert crop is not None
+    np.testing.assert_array_equal(crop, full[6:9, 10:14])
+    # a region reaching outside the cropped frame is refused, not truncated
+    assert crop_region(roi, (2, 6, 4, 3), origin=(8, 5)) is None
+
+
+def test_regions_bounding_box_and_outside_roi() -> None:
+    from pymmcore_gui._spectral_channel_handler import (
+        regions_bounding_box,
+        regions_outside_roi,
+    )
+
+    # The rig's current regions: shared 1458x490, stacked top/bottom.
+    channels = [
+        SpectralChannelConfig(
+            name="top",
+            camera="Camera-1",
+            laser_preset="488nm",
+            rect=(485, 644, 1458, 490),
+        ),
+        SpectralChannelConfig(
+            name="bot",
+            camera="Camera-1",
+            laser_preset="405nm",
+            rect=(485, 1297, 1458, 490),
+        ),
+        SpectralChannelConfig(name="none", camera="Camera-2", laser_preset="561nm"),
+    ]
+
+    assert regions_bounding_box(channels, "Camera-1") == (485, 644, 1458, 1143)
+    assert regions_bounding_box(channels, "Camera-2") is None
+    assert regions_outside_roi(channels, {"Camera-1": (485, 644, 1458, 1143)}) == []
+    assert regions_outside_roi(channels, {"Camera-1": (485, 700, 1458, 1100)}) == [
+        "top"
+    ]
+
+
+class _CroppedCore(_StubCore):
+    def __init__(self, cameras: list[str], origin: tuple[int, int]) -> None:
+        super().__init__(cameras)
+        self._origin = origin
+
+    def getROI(self, label: str) -> tuple[int, int, int, int]:
+        return (*self._origin, 20, 20)
+
+
+def test_handler_crops_cropped_frames_at_roi_origin(tmp_path: Path) -> None:
+    """Full-sensor regions land on the right pixels of a cropped camera's frames."""
+    channels = [
+        SpectralChannelConfig(
+            name="GFP_488",
+            camera="Camera-1",
+            laser_preset="488nm",
+            rect=(105, 50, 20, 10),
+        ),
+    ]
+    handler = SpectralChannelHandler(
+        tmp_path / "out.ome.zarr",
+        channels,
+        LASER_GROUP,
+        ALL_LASERS,
+        mmcore=_CroppedCore(["Camera-1"], origin=(100, 45)),  # type: ignore[arg-type]
+    )
+    received: list[np.ndarray] = []
+
+    class _Recorder:
+        def frameReady(self, frame: np.ndarray, *_: object) -> None:
+            received.append(frame)
+
+    handler._get_writer = lambda channel: _Recorder()  # type: ignore[method-assign]
+    handler.sequenceStarted(useq.MDASequence())
+    frame = np.arange(20 * 30, dtype=np.uint16).reshape(20, 30)
+    event = useq.MDAEvent(channel={"config": "488nm", "group": LASER_GROUP})
+
+    handler.frameReady(frame, event, {"camera_device": "Camera-1"})  # type: ignore[arg-type]
+
+    assert len(received) == 1
+    np.testing.assert_array_equal(received[0], frame[5:15, 5:25])

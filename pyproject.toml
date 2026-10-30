@@ -54,7 +54,7 @@ dependencies = [
     "zarr>=2.18.3,<3.0",
     "sentry-sdk>=2.20.0",
     "rendercanvas>=2.6.3",
-    "crispy",
+    "crispy>=0.2.0",
     "pygfx>=0.16.0",
     "pylinalg>=0.6.8",
     "pyvcam>=2.3.2",

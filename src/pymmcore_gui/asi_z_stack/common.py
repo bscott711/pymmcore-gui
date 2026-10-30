@@ -19,6 +19,9 @@ class HardwareConstants:
     cfg_path: str = "hardware_profiles/20250701-SingleChannelOPM.cfg"
     galvo_a_label: str = "Scanner:AB:33"
     piezo_a_label: str = "PiezoStage:P:34"
+    # CRISP autofocus servoing the piezo; read (never written) by the engine
+    # to tell CRISP-driven piezo motion apart from anything else.
+    crisp_label: str = "CRISPAFocus:P:34"
     camera_a_label: str = "Camera-1"
     plogic_label: str = "PLogic:E:36"
     tiger_comm_hub_label: str = "TigerCommHub"
@@ -27,6 +30,8 @@ class HardwareConstants:
     plogic_laser_on_cell: int = 10
     plogic_camera_cell: int = 11
     plogic_always_on_cell: int = 12
+    # Free cell (per ASI's diSPIM cell map) used as the All Rows laser delay.
+    plogic_laser_delay_cell: int = 9
     plogic_bnc3_addr: int = 35
     pulses_per_ms: float = 4.0
 

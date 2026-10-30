@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 
 class CameraToolBar(QToolBar):
-    """Snap, Live, and the Snap/Live exposure.
+    """Snap, Live, Save Image, and the Snap/Live exposure.
 
     Parameters
     ----------
@@ -28,5 +28,7 @@ class CameraToolBar(QToolBar):
         super().__init__("Camera Actions", parent)
         self.addAction(parent.get_action(CoreAction.SNAP))
         self.addAction(parent.get_action(CoreAction.TOGGLE_LIVE))
+        self.addAction(parent.get_action(CoreAction.SAVE_IMAGE))
+        self.addAction(parent.get_action(CoreAction.SAVE_IMAGE_AS))
         self.exposure = ExposureWidget(mmc, self)
         self.addWidget(self.exposure)

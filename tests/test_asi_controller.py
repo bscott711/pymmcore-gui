@@ -72,3 +72,50 @@ def test_configure_plogic_no_longer_loads_a_laser_preset(
     # The very first command must now address the camera cell directly,
     # not load a preset.
     assert commands[0] == "M E=11"
+
+
+def test_configure_plogic_for_delayed_laser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All Rows: camera pulse S+E on BNC1, laser one-shot fired by a delay cell."""
+    from pymmcore_gui.asi_z_stack.asi_controller import (
+        configure_plogic_for_delayed_laser,
+    )
+
+    fake_mmc = MagicMock()
+    fake_mmc.getLoadedDevices.return_value = [TIGER_COMM_HUB_LABEL]
+    fake_mmc.hasProperty.return_value = False
+    monkeypatch.setattr(asi_controller, "mmc", fake_mmc)
+
+    configure_plogic_for_delayed_laser(
+        PLOGIC_LABEL,
+        TIGER_COMM_HUB_LABEL,
+        plogic_camera_cell=11,
+        plogic_laser_on_cell=10,
+        plogic_laser_delay_cell=9,
+        pulses_per_ms=4.0,
+        plogic_4khz_clock_addr=192,
+        plogic_trigger_ttl_addr=41,
+        camera_pulse_ms=15.25,
+        laser_delay_ms=4.75,
+        laser_pulse_ms=10.0,
+    )
+
+    assert _sent_commands(fake_mmc) == [
+        # camera: NRT one-shot, 61 ticks, off the galvo slice TTL
+        "M E=11",
+        "36CCA Y=14 Z=61",
+        "36CCB X=41 Y=192 Z=0",
+        # delay: NRT delay cell, 19 ticks, off the same TTL
+        "M E=9",
+        "36CCA Y=15 Z=19",
+        "36CCB X=41 Y=192 Z=0",
+        # laser: NRT one-shot, 40 ticks, triggered by the delay cell
+        "M E=10",
+        "36CCA Y=14 Z=40",
+        "36CCB X=9 Y=192 Z=0",
+        # camera cell -> BNC1, saved
+        "M E=33",
+        "36CCA Z=11",
+        "36SS Z",
+    ]

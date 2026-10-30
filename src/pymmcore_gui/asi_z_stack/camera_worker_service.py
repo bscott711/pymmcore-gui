@@ -182,6 +182,8 @@ class CameraWorkerService(QObject):
     #: New Snap/Live exposure (ms) after set_exposure succeeds.
     exposureChanged = pyqtSignal(float)
     liveStateChanged = pyqtSignal(bool)
+    #: ``(camera_label)`` -- that camera's hardware ROI changed (see set_roi).
+    roiChanged = pyqtSignal(str)
     liveErrored = pyqtSignal(str)
     #: Internal: "camera_label has a new latest Live frame waiting." Carries
     #: no pixel data -- see _run_live_drain for why.
@@ -207,6 +209,9 @@ class CameraWorkerService(QObject):
         #: core's getExposure() (e.g. engine.py's per-sequence exposure
         #: default when a sequence omits it). Not kept live-updated.
         self.last_known_exposure_ms: float = 10.0
+        #: Current hardware ROI per camera, full-sensor ``(x, y, w, h)``;
+        #: kept in sync by set_roi. See roi().
+        self._roi: dict[str, tuple[int, int, int, int]] = {}
 
     # ------------------------------------------------------------------
     # Registry
@@ -248,6 +253,39 @@ class CameraWorkerService(QObject):
     def worker_config_groups(self) -> dict[str, WorkerConfigGroup]:
         """Config groups moved off the main-process core at :meth:`begin_release`."""
         return self._worker_config_groups
+
+    def roi(self, camera_label: str) -> tuple[int, int, int, int]:
+        """*camera_label*'s current hardware ROI, ``(x, y, w, h)`` on the sensor.
+
+        Frames from a cropped camera are only ``w`` x ``h``; anything stored
+        in full-sensor coordinates (spectral regions, overlays) has to be
+        shifted by ``(x, y)`` to land on them.
+        """
+        if camera_label in self._roi:
+            return self._roi[camera_label]
+        return self.full_frame_roi(camera_label)
+
+    def full_frame_roi(self, camera_label: str) -> tuple[int, int, int, int]:
+        """The uncropped ROI -- the geometry the workers' frame slots hold."""
+        snap = self._snapshot
+        if snap is None:
+            raise RuntimeError("Camera worker service is not active.")
+        return (0, 0, snap.image_width, snap.image_height)
+
+    def frame_size(self, camera_label: str) -> tuple[int, int]:
+        """``(width, height)`` of *camera_label*'s frames at its current ROI."""
+        _x, _y, w, h = self.roi(camera_label)
+        return w, h
+
+    def camera_timing(self) -> dict[str, dict[str, str]]:
+        """Each camera's timing properties from its most recent arm.
+
+        Empty per camera until it has been armed once (Snap, Live or MDA) --
+        PVCAM only reports readout/clearing times after an acquisition setup.
+        """
+        with self._lock:
+            pool = self._pool
+        return pool.camera_timing() if pool is not None else {}
 
     # ------------------------------------------------------------------
     # Startup (see _main_window.py::_on_system_config_loaded)
@@ -305,6 +343,11 @@ class CameraWorkerService(QObject):
             released.add(role)
         self._worker_config_groups = _detach_unloadable_config_groups(mmc, released)
         self._snapshot = release_cameras_for_workers(mmc, hw)
+        self._roi = {
+            label: cam.roi
+            for label, cam in self._snapshot.per_camera.items()
+            if cam.roi is not None
+        }
         # What the workers will actually start with (their Exposure property
         # is restored from this snapshot), rather than the composite's value.
         for cam in self._snapshot.per_camera.values():
@@ -473,7 +516,12 @@ class CameraWorkerService(QObject):
             raise RuntimeError(
                 f"Camera worker service is not ready for Live (state={state.name})."
             )
-        pool.arm_live_all(armed_timeout=self.hw.worker_arm_timeout_s)
+        # Explicit exposure: an MDA may have left the cameras at a channel's
+        # exposure (All Rows mode sets it per channel).
+        pool.arm_live_all(
+            armed_timeout=self.hw.worker_arm_timeout_s,
+            exposure_ms=self.last_known_exposure_ms,
+        )
         with self._lock:
             self._state = CameraWorkerServiceState.LIVE
             self._live_thread = threading.Thread(
@@ -588,7 +636,10 @@ class CameraWorkerService(QObject):
         # Internal trigger: outside an MDA nothing fires the external one, so
         # an externally-triggered Snap just times out with zero frames.
         pool.arm_all(
-            1, armed_timeout=self.hw.worker_arm_timeout_s, external_trigger=False
+            1,
+            armed_timeout=self.hw.worker_arm_timeout_s,
+            external_trigger=False,
+            exposure_ms=self.last_known_exposure_ms,
         )
         try:
             for camera_label, slice_idx, img, meta, remaining in pool.iter_frames(
@@ -748,7 +799,16 @@ class CameraWorkerService(QObject):
             pool = self._pool
         if pool is None:
             raise RuntimeError("Camera worker service has no active pool.")
-        return pool.set_roi(camera_label, x, y, w, h, timeout)
+        roi = pool.set_roi(camera_label, x, y, w, h, timeout)
+        self._roi[camera_label] = roi
+        # Keep the respawn snapshot current, so a worker restarted by
+        # spawn_async's recovery path comes back with the same crop.
+        if self._snapshot is not None and (
+            cam := self._snapshot.per_camera.get(camera_label)
+        ):
+            cam.roi = roi
+        self.roiChanged.emit(camera_label)
+        return roi
 
     def get_roi(
         self, camera_label: str, timeout: float = 5.0
@@ -763,4 +823,6 @@ class CameraWorkerService(QObject):
             pool = self._pool
         if pool is None:
             raise RuntimeError("Camera worker service has no active pool.")
-        return pool.get_roi(camera_label, timeout)
+        roi = pool.get_roi(camera_label, timeout)
+        self._roi[camera_label] = roi
+        return roi
