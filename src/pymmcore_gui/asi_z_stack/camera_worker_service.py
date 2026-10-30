@@ -56,10 +56,12 @@ from .common import HardwareConstants
 from .worker_pool import CameraWorkerHandle, CameraWorkerPool
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     import numpy as np
     from pymmcore_plus import CMMCorePlus
+
+    from .camera_handoff import PropertyInfo
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +181,9 @@ class CameraWorkerService(QObject):
     frameReady = pyqtSignal(str, int, object, object, int)
     #: (group, preset) after apply_worker_config succeeds.
     workerConfigChanged = pyqtSignal(str, str)
+    #: A structural edit changed the set of worker config groups/presets
+    #: (define/delete/rename); not emitted by apply_worker_config.
+    workerConfigGroupsChanged = pyqtSignal()
     #: New Snap/Live exposure (ms) after set_exposure succeeds.
     exposureChanged = pyqtSignal(float)
     liveStateChanged = pyqtSignal(bool)
@@ -253,6 +258,19 @@ class CameraWorkerService(QObject):
     def worker_config_groups(self) -> dict[str, WorkerConfigGroup]:
         """Config groups moved off the main-process core at :meth:`begin_release`."""
         return self._worker_config_groups
+
+    def released_device_properties(self) -> dict[str, dict[str, PropertyInfo]]:
+        """Property metadata of every released device, captured at release time.
+
+        Returns
+        -------
+        dict[str, dict[str, PropertyInfo]]
+            Device label -> property name -> metadata; ``{}`` when there is no
+            snapshot.
+        """
+        if self._snapshot is None:
+            return {}
+        return self._snapshot.device_properties
 
     def roi(self, camera_label: str) -> tuple[int, int, int, int]:
         """*camera_label*'s current hardware ROI, ``(x, y, w, h)`` on the sensor.
@@ -721,6 +739,194 @@ class CameraWorkerService(QObject):
         self._set_camera_properties(per_camera, main_process)
         cfg.current = preset
         self.workerConfigChanged.emit(group, preset)
+
+    # Structural edits of worker_config_groups. They never touch hardware, so
+    # they are allowed in every state (including during an MDA).
+
+    @staticmethod
+    def _validated_settings(
+        settings: Sequence[tuple[str, str, str]], where: str
+    ) -> tuple[tuple[str, str, str], ...]:
+        """Normalize *settings* to a tuple of 3-tuples, rejecting bad input."""
+        normalized = tuple((str(d), str(p), str(v)) for d, p, v in settings)
+        if not normalized:
+            raise ValueError(f"{where}: a preset needs at least one setting.")
+        pairs = [(d, p) for d, p, _ in normalized]
+        if len(set(pairs)) != len(pairs):
+            raise ValueError(f"{where}: duplicate (device, property) pair.")
+        return normalized
+
+    def _check_group_name_free(self, group: str) -> None:
+        """Raise ``ValueError`` if *group* clashes with a core or worker group."""
+        if self._mmc is not None and group in self._mmc.getAvailableConfigGroups():
+            raise ValueError(f"{group!r} is already a config group of the core.")
+        if group in self._worker_config_groups:
+            raise ValueError(f"{group!r} is already a worker config group.")
+
+    def define_worker_preset(
+        self,
+        group: str,
+        preset: str,
+        settings: Sequence[tuple[str, str, str]],
+        *,
+        replace: str | None = None,
+    ) -> None:
+        """Create or overwrite *preset* of *group*, creating the group if needed.
+
+        Nothing is applied to hardware. ``replace=preset`` overwrites that
+        preset's settings in place; ``replace=<old name>`` renames it in place
+        (same position, and ``current`` follows the rename).
+
+        Parameters
+        ----------
+        group : str
+            Worker group name; created if it does not exist.
+        preset : str
+            The (new) preset name.
+        settings : Sequence[tuple[str, str, str]]
+            ``(device, property, value)`` settings of the preset.
+        replace : str | None
+            Name of an existing preset of *group* that *preset* replaces.
+
+        Raises
+        ------
+        ValueError
+            Empty names or settings, *group* is a new name that clashes with a
+            main-process core group, *preset* already exists and is not
+            *replace*, or *settings* repeats a (device, property) pair.
+        KeyError
+            *replace* is not a preset of *group*.
+        """
+        if not group or not preset:
+            raise ValueError("Group and preset names must not be empty.")
+        where = f"{group}/{preset}"
+        new_settings = self._validated_settings(settings, where)
+        cfg = self._worker_config_groups.get(group)
+        if cfg is None:
+            self._check_group_name_free(group)
+        if replace is not None and (cfg is None or replace not in cfg.presets):
+            raise KeyError(replace)
+        if cfg is not None and preset in cfg.presets and preset != replace:
+            raise ValueError(f"Preset {preset!r} already exists in group {group!r}.")
+
+        if cfg is None:
+            self._worker_config_groups[group] = WorkerConfigGroup(
+                presets={preset: new_settings}, current=""
+            )
+        elif replace is None:
+            cfg.presets[preset] = new_settings
+        else:
+            cfg.presets = {
+                (preset if name == replace else name): (
+                    new_settings if name == replace else old
+                )
+                for name, old in cfg.presets.items()
+            }
+            if cfg.current == replace:
+                cfg.current = preset
+        self.workerConfigGroupsChanged.emit()
+
+    def delete_worker_preset(self, group: str, preset: str) -> None:
+        """Remove *preset* from *group*; removing the last preset removes the group.
+
+        Parameters
+        ----------
+        group : str
+            A key of :attr:`worker_config_groups`.
+        preset : str
+            One of that group's presets.
+
+        Raises
+        ------
+        KeyError
+            Unknown *group* or *preset*.
+        """
+        cfg = self._worker_config_groups[group]
+        if preset not in cfg.presets:
+            raise KeyError(preset)
+        del cfg.presets[preset]
+        if cfg.current == preset:
+            cfg.current = ""
+        if not cfg.presets:
+            del self._worker_config_groups[group]
+        self.workerConfigGroupsChanged.emit()
+
+    def delete_worker_group(self, group: str) -> None:
+        """Remove the whole worker config *group*.
+
+        Parameters
+        ----------
+        group : str
+            A key of :attr:`worker_config_groups`.
+
+        Raises
+        ------
+        KeyError
+            Unknown *group*.
+        """
+        del self._worker_config_groups[group]
+        self.workerConfigGroupsChanged.emit()
+
+    def set_worker_group(
+        self,
+        group: str,
+        presets: Mapping[str, Sequence[tuple[str, str, str]]],
+        *,
+        rename_from: str | None = None,
+    ) -> None:
+        """Replace a whole worker group's presets (Add/Edit Group).
+
+        With *rename_from* the old group is replaced by *group* at the same
+        position. The group keeps its ``current`` preset if it still exists
+        (an existing group is replaced the same way when *group* names it);
+        a new group starts with ``current == ""``. Nothing is applied to
+        hardware.
+
+        Parameters
+        ----------
+        group : str
+            The group's (new) name.
+        presets : Mapping[str, Sequence[tuple[str, str, str]]]
+            Preset name -> ``(device, property, value)`` settings.
+        rename_from : str | None
+            Existing worker group that *group* replaces.
+
+        Raises
+        ------
+        ValueError
+            Empty names, no presets, empty or duplicate-pair settings, or
+            *group* clashes with a core group or another worker group.
+        KeyError
+            *rename_from* is not a worker group.
+        """
+        if not group:
+            raise ValueError("Group name must not be empty.")
+        if rename_from is not None and rename_from not in self._worker_config_groups:
+            raise KeyError(rename_from)
+        if not presets:
+            raise ValueError(f"{group}: a group needs at least one preset.")
+        new_presets: dict[str, tuple[tuple[str, str, str], ...]] = {}
+        for name, settings in presets.items():
+            if not name:
+                raise ValueError(f"{group}: preset names must not be empty.")
+            new_presets[name] = self._validated_settings(settings, f"{group}/{name}")
+        replaced = rename_from if rename_from is not None else group
+        old = self._worker_config_groups.get(replaced)
+        if old is None or replaced != group:
+            self._check_group_name_free(group)
+        current = old.current if old is not None and old.current in new_presets else ""
+        new_cfg = WorkerConfigGroup(presets=new_presets, current=current)
+
+        if old is None:
+            self._worker_config_groups[group] = new_cfg
+        else:
+            self._worker_config_groups = {
+                (group if name == replaced else name): (
+                    new_cfg if name == replaced else cfg
+                )
+                for name, cfg in self._worker_config_groups.items()
+            }
+        self.workerConfigGroupsChanged.emit()
 
     def set_exposure(self, exposure_ms: float) -> None:
         """Set every worker-owned camera's exposure for Snap/Live.

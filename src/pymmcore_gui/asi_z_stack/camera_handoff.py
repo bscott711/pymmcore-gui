@@ -45,6 +45,38 @@ class _CameraSnapshot:
     property_values: dict[str, str]
 
 
+@dataclass(frozen=True)
+class PropertyInfo:
+    """Metadata of one device property, captured while the device was loaded.
+
+    Parameters
+    ----------
+    value : str
+        The property's value at capture time.
+    read_only : bool
+        Whether the property is read-only.
+    pre_init : bool
+        Whether the property is a pre-initialization property.
+    ptype : str
+        The ``PropertyType`` name: ``"String"``, ``"Float"``, ``"Integer"`` or
+        ``"Undef"``.
+    allowed : tuple[str, ...]
+        The allowed values (empty if unrestricted).
+    lower : float | None
+        Lower limit; set only when the property has limits.
+    upper : float | None
+        Upper limit; set only when the property has limits.
+    """
+
+    value: str
+    read_only: bool = False
+    pre_init: bool = False
+    ptype: str = "String"
+    allowed: tuple[str, ...] = ()
+    lower: float | None = None
+    upper: float | None = None
+
+
 @dataclass
 class CameraHandoffSnapshot:
     """Everything the main process needs cached while its cameras are detached.
@@ -65,6 +97,9 @@ class CameraHandoffSnapshot:
     bytes_per_pixel: int
     n_components: int
     per_camera: dict[str, _CameraSnapshot] = field(default_factory=dict)
+    #: device label -> property name -> metadata, for every released device
+    #: (physical cameras and the composite core-camera device).
+    device_properties: dict[str, dict[str, PropertyInfo]] = field(default_factory=dict)
 
     @property
     def dtype_str(self) -> str:
@@ -107,6 +142,71 @@ def _snapshot_camera(mmc: CMMCorePlus, label: str) -> _CameraSnapshot:
     return _CameraSnapshot(trigger_mode=trigger_mode, roi=roi, property_values=values)
 
 
+def snapshot_device_properties(mmc: CMMCorePlus, label: str) -> dict[str, PropertyInfo]:
+    """Capture metadata of every property of *label* (read-only and pre-init too).
+
+    Each MMCore call is guarded so one misbehaving property never aborts the
+    snapshot.
+
+    Parameters
+    ----------
+    mmc : CMMCorePlus
+        The core, with *label* still loaded.
+    label : str
+        The device label to snapshot.
+
+    Returns
+    -------
+    dict[str, PropertyInfo]
+        Property name -> its captured metadata.
+    """
+    try:
+        names = tuple(mmc.getDevicePropertyNames(label))
+    except Exception:
+        return {}
+
+    info: dict[str, PropertyInfo] = {}
+    for prop in names:
+        try:
+            value = str(mmc.getProperty(label, prop))
+        except Exception:
+            value = ""
+        try:
+            read_only = bool(mmc.isPropertyReadOnly(label, prop))
+        except Exception:
+            read_only = False
+        try:
+            pre_init = bool(mmc.isPropertyPreInit(label, prop))
+        except Exception:
+            pre_init = False
+        try:
+            ptype = str(mmc.getPropertyType(label, prop).name)
+        except Exception:
+            ptype = "Undef"
+        try:
+            allowed = tuple(str(v) for v in mmc.getAllowedPropertyValues(label, prop))
+        except Exception:
+            allowed = ()
+        lower: float | None = None
+        upper: float | None = None
+        try:
+            if mmc.hasPropertyLimits(label, prop):
+                lower = float(mmc.getPropertyLowerLimit(label, prop))
+                upper = float(mmc.getPropertyUpperLimit(label, prop))
+        except Exception:
+            lower = upper = None
+        info[prop] = PropertyInfo(
+            value=value,
+            read_only=read_only,
+            pre_init=pre_init,
+            ptype=ptype,
+            allowed=allowed,
+            lower=lower,
+            upper=upper,
+        )
+    return info
+
+
 def release_cameras_for_workers(
     mmc: CMMCorePlus, hw: HardwareConstants
 ) -> CameraHandoffSnapshot:
@@ -144,11 +244,17 @@ def release_cameras_for_workers(
         per_camera={label: _snapshot_camera(mmc, label) for label in labels},
     )
 
+    for label in labels:
+        snapshot.device_properties[label] = snapshot_device_properties(mmc, label)
+
     loaded = mmc.getLoadedDevices()
     # Multi Camera holds references to the physical cameras behind it and must
     # be unloaded first; the physical cameras themselves unload in reverse of
     # their (arbitrary but consistent) load order.
     if n_cameras > 1 and core_role in loaded:
+        snapshot.device_properties[core_role] = snapshot_device_properties(
+            mmc, core_role
+        )
         mmc.unloadDevice(core_role)
     for label in reversed(labels):
         if label in mmc.getLoadedDevices():

@@ -7,7 +7,10 @@ import pytest
 
 from pymmcore_gui.asi_z_stack.camera_handoff import (
     CameraHandoffSnapshot,
+    PropertyInfo,
     _CameraSnapshot,
+    release_cameras_for_workers,
+    snapshot_device_properties,
 )
 from pymmcore_gui.asi_z_stack.camera_worker_service import (
     CameraWorkerService,
@@ -16,6 +19,7 @@ from pymmcore_gui.asi_z_stack.camera_worker_service import (
     _detach_unloadable_config_groups,
     has_camera,
 )
+from pymmcore_gui.asi_z_stack.common import HardwareConstants
 
 if TYPE_CHECKING:
     from pymmcore_plus import CMMCorePlus
@@ -331,3 +335,178 @@ def test_set_roi_refused_while_live(core: CMMCorePlus) -> None:
     svc._state = CameraWorkerServiceState.LIVE
     with pytest.raises(RuntimeError, match="stop Live/MDA"):
         svc.set_roi("Camera-1", 0, 0, 4, 4)
+
+
+def test_snapshot_device_properties_captures_metadata(core: CMMCorePlus) -> None:
+    info = snapshot_device_properties(core, "Camera")
+
+    assert set(info) == set(core.getDevicePropertyNames("Camera"))
+    assert info["AllowMultiROI"].ptype == "Integer"
+    assert info["AllowMultiROI"].allowed == ("0", "1")
+    assert info["AsyncPropertyFollower"].read_only
+    beads = info["BeadBlurRate"]
+    assert beads.ptype == "Float"
+    assert beads.lower is not None
+    assert beads.upper is not None
+    assert info["AsyncPropertyLeader"].lower is None
+    assert info["Binning"].value == core.getProperty("Camera", "Binning")
+    with pytest.raises(AttributeError):
+        info["Binning"].value = "2"  # type: ignore[misc]
+
+
+def test_release_cameras_records_device_properties(core: CMMCorePlus) -> None:
+    snap = release_cameras_for_workers(core, HardwareConstants())
+
+    assert "Camera" not in core.getLoadedDevices()
+    assert set(snap.device_properties) == {"Camera"}
+    assert "Binning" in snap.device_properties["Camera"]
+
+
+def test_released_device_properties_accessor(core: CMMCorePlus) -> None:
+    svc = _service(core, _FakePool())
+    assert svc.released_device_properties() == {}
+    info = PropertyInfo("1", allowed=("1", "2"))
+    assert svc._snapshot is not None
+    svc._snapshot.device_properties["Camera-1"] = {"Binning": info}
+    assert svc.released_device_properties() == {"Camera-1": {"Binning": info}}
+    svc._snapshot = None
+    assert svc.released_device_properties() == {}
+
+
+_SPEED = (("Camera-1", "Port", "Speed"),)
+_GAIN = (("Camera-1", "Gain", "2"),)
+
+
+def test_define_worker_preset_new_and_overwrite(core: CMMCorePlus) -> None:
+    svc = _service(core, _FakePool())
+    n: list[int] = []
+    svc.workerConfigGroupsChanged.connect(lambda: n.append(1))
+
+    svc.define_worker_preset("Cameras", "Gain", _GAIN)
+    svc.define_worker_preset("Cameras", "Gain", _SPEED, replace="Gain")
+    svc.define_worker_preset("Fresh", "A", _GAIN)
+
+    groups = svc.worker_config_groups
+    assert list(groups["Cameras"].presets) == ["Sensitivity", "Speed", "Gain"]
+    assert groups["Cameras"].presets["Gain"] == _SPEED
+    assert groups["Fresh"].presets == {"A": _GAIN}
+    assert groups["Fresh"].current == ""
+    assert len(n) == 3
+
+
+def test_define_worker_preset_rename_keeps_position_and_current(
+    core: CMMCorePlus,
+) -> None:
+    svc = _service(core, _FakePool())
+    svc.define_worker_preset("Cameras", "Fast", _GAIN, replace="Speed")
+
+    cfg = svc.worker_config_groups["Cameras"]
+    assert list(cfg.presets) == ["Sensitivity", "Fast"]
+    assert cfg.presets["Fast"] == _GAIN
+    assert cfg.current == "Fast"
+
+
+def test_define_worker_preset_validation(core: CMMCorePlus) -> None:
+    svc = _service(core, _FakePool())
+    n: list[int] = []
+    svc.workerConfigGroupsChanged.connect(lambda: n.append(1))
+    before = dict(svc.worker_config_groups["Cameras"].presets)
+
+    with pytest.raises(ValueError):
+        svc.define_worker_preset("", "A", _GAIN)
+    with pytest.raises(ValueError):
+        svc.define_worker_preset("Cameras", "", _GAIN)
+    with pytest.raises(ValueError):
+        svc.define_worker_preset("Cameras", "A", ())
+    with pytest.raises(ValueError):
+        svc.define_worker_preset("Channel", "A", _GAIN)  # core group
+    with pytest.raises(ValueError):
+        svc.define_worker_preset("Cameras", "Speed", _GAIN)  # exists
+    with pytest.raises(ValueError):
+        svc.define_worker_preset("Cameras", "Sensitivity", _GAIN, replace="Speed")
+    with pytest.raises(ValueError):
+        svc.define_worker_preset(
+            "Cameras", "A", (("Camera-1", "Gain", "1"), ("Camera-1", "Gain", "2"))
+        )
+    with pytest.raises(KeyError):
+        svc.define_worker_preset("Cameras", "A", _GAIN, replace="Nope")
+    with pytest.raises(KeyError):
+        svc.define_worker_preset("NewGroup", "A", _GAIN, replace="Nope")
+
+    assert svc.worker_config_groups["Cameras"].presets == before
+    assert "NewGroup" not in svc.worker_config_groups
+    assert n == []
+
+
+def test_delete_worker_preset_and_group(core: CMMCorePlus) -> None:
+    svc = _service(core, _FakePool())
+    n: list[int] = []
+    svc.workerConfigGroupsChanged.connect(lambda: n.append(1))
+
+    svc.delete_worker_preset("Cameras", "Speed")  # the current preset
+    cfg = svc.worker_config_groups["Cameras"]
+    assert list(cfg.presets) == ["Sensitivity"]
+    assert cfg.current == ""
+
+    svc.delete_worker_preset("Cameras", "Sensitivity")  # last one: group goes
+    assert "Cameras" not in svc.worker_config_groups
+
+    with pytest.raises(KeyError):
+        svc.delete_worker_preset("Cameras", "Speed")
+    with pytest.raises(KeyError):
+        svc.delete_worker_group("Cameras")
+    assert len(n) == 2
+
+    svc.define_worker_preset("G", "A", _GAIN)
+    svc.delete_worker_group("G")
+    assert "G" not in svc.worker_config_groups
+    assert len(n) == 4
+
+
+def test_set_worker_group_rename_keeps_position_and_current(
+    core: CMMCorePlus,
+) -> None:
+    svc = _service(core, _FakePool())
+    svc.define_worker_preset("Other", "A", _GAIN)
+    n: list[int] = []
+    svc.workerConfigGroupsChanged.connect(lambda: n.append(1))
+
+    svc.set_worker_group(
+        "Renamed", {"Speed": _SPEED, "Extra": _GAIN}, rename_from="Cameras"
+    )
+
+    assert list(svc.worker_config_groups) == ["Renamed", "Other"]
+    assert list(svc.worker_config_groups["Renamed"].presets) == ["Speed", "Extra"]
+    assert svc.worker_config_groups["Renamed"].current == "Speed"
+    assert len(n) == 1
+
+    svc.set_worker_group("Renamed", {"Only": _GAIN}, rename_from="Renamed")
+    assert svc.worker_config_groups["Renamed"].current == ""
+
+    svc.set_worker_group("Brand", {"A": _GAIN})
+    assert list(svc.worker_config_groups) == ["Renamed", "Other", "Brand"]
+    assert svc.worker_config_groups["Brand"].current == ""
+
+
+def test_set_worker_group_validation(core: CMMCorePlus) -> None:
+    svc = _service(core, _FakePool())
+    svc.define_worker_preset("Other", "A", _GAIN)
+
+    with pytest.raises(ValueError):
+        svc.set_worker_group("", {"A": _GAIN})
+    with pytest.raises(ValueError):
+        svc.set_worker_group("G", {})
+    with pytest.raises(ValueError):
+        svc.set_worker_group("G", {"": _GAIN})
+    with pytest.raises(ValueError):
+        svc.set_worker_group("G", {"A": ()})
+    with pytest.raises(ValueError):
+        svc.set_worker_group("G", {"A": _GAIN + _GAIN})
+    with pytest.raises(ValueError):
+        svc.set_worker_group("Channel", {"A": _GAIN})  # core group
+    with pytest.raises(ValueError):
+        svc.set_worker_group("Other", {"A": _GAIN}, rename_from="Cameras")
+    with pytest.raises(KeyError):
+        svc.set_worker_group("G", {"A": _GAIN}, rename_from="Nope")
+
+    assert list(svc.worker_config_groups) == ["Cameras", "Other"]
