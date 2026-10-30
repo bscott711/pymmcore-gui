@@ -17,6 +17,20 @@ upstream.
 
 ## [Unreleased]
 
+### Added
+
+- **`probe_galvo_park`** (bench diagnostic in `asi_z_stack/diagnostics.py`): tries
+  parking the galvo at the sweep start between volumes, via `SPIMState=Armed`
+  or an Idle offset write, so the mechanism can be chosen on the rig before
+  any engine change.
+- **Galvo control in Stage Control.** A group per galvo device (and the ASI
+  `Scanner:AB:33` if it is loaded) sets the Live offset
+  `SingleAxisYOffset(deg)`, the reference the Z stack sweeps around. The
+  offset is shown in um-equivalent with the degrees beside it, with a step
+  size, -/+ buttons and "Go to 0". Writes are clamped to the card's property
+  limits, the display follows the card, and the group is locked while an MDA
+  runs.
+
 ## [0.2.0] - 2026-10-30
 
 ### Breaking changes
