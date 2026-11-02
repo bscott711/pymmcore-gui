@@ -461,12 +461,13 @@ def test_source_spec_from_settings() -> None:
 
 
 def test_buttons_and_readouts_are_the_edge_workflow(panel: SpotFocusPanel) -> None:
-    assert panel.calibrate_button.text() == "Calibrate"
+    assert panel.calibrate_button.text() == "2. Calibrate"
     assert "Focus on the cells first" in panel.calibrate_button.toolTip()
     assert panel.zero_button.text() == "Zero here"
-    assert panel.start_button.text() == "Lock"
-    assert panel.stop_button.text() == "Stop"
-    assert panel.draw_edge_button.text() == "Draw edge box"
+    assert panel.lock_button.text() == "Unlocked"
+    assert panel.lock_button.isCheckable() and not panel.lock_button.isChecked()
+    assert not hasattr(panel, "stop_button")
+    assert panel.draw_edge_button.text() == "1. Draw Edge"
     assert not hasattr(panel, "modeForced")
     assert list(panel.readout_labels) == [
         "edge",
@@ -479,10 +480,10 @@ def test_buttons_and_readouts_are_the_edge_workflow(panel: SpotFocusPanel) -> No
     for gone in ("draw_edge2_button", "clear_edge2_button", "edge_box2_label"):
         assert not hasattr(panel, gone)
     # Nothing calibrated yet: Lock and Calibrate try (and ask for a box), Zero waits.
-    assert panel.start_button.isEnabled() and panel.calibrate_button.isEnabled()
-    assert not panel.zero_button.isEnabled() and not panel.stop_button.isEnabled()
+    assert panel.lock_button.isEnabled() and panel.calibrate_button.isEnabled()
+    assert not panel.zero_button.isEnabled() and not panel.lock_button.isChecked()
     assert "not calibrated" in panel.calibration_label.text()
-    assert panel.edge_box_label.text() == "none"
+    assert panel.edge_box_label.text() == "none: 1. Draw Edge first"
     assert panel.offset_spin.value() == 0.0
     assert (panel.span_spin.value(), panel.steps_spin.value()) == (2.0, 9)
     assert panel.frames_spin.value() == 3
@@ -500,7 +501,7 @@ def test_lock_and_calibrate_need_an_edge_box(panel: SpotFocusPanel) -> None:
     assert NEED_BOX_TEXT in panel.fault_label.text()
     assert panel.service is None
     assert panel.state == "idle"
-    assert panel.start_button.isEnabled()
+    assert panel.lock_button.isEnabled()
 
 
 def test_old_calibration_in_settings_does_not_crash_the_panel(
@@ -538,7 +539,7 @@ def test_drawing_an_edge_box_saves_it_and_shows_the_overlay(
     assert not view._edge_box_item.isVisible()
     view.edgeBoxDrawn.emit(*BOX)
     assert cfg.edge_box == BOX
-    assert panel.edge_box_label.text() == "232, 210, 80, 60"
+    assert panel.edge_box_label.text().startswith("232, 210, 80, 60 (saved")
     assert view.edge_box == BOX
     assert view._edge_box_item.isVisible()
     r = view._edge_box_item.rect()
@@ -550,7 +551,7 @@ def test_drawing_an_edge_box_saves_it_and_shows_the_overlay(
     assert view.edge_box == BOX and view._edge_box_item.isVisible()
     panel.set_edge_box(None)
     assert cfg.edge_box is None and not view._edge_box_item.isVisible()
-    assert panel.edge_box_label.text() == "none"
+    assert panel.edge_box_label.text() == "none: 1. Draw Edge first"
 
 
 def test_stale_box_warning_follows_the_edge_box(
@@ -722,7 +723,7 @@ def test_rig_shaped_single_edge_calibration_locks_at_negative_p(
     text = panel.calibration_label.text()
     assert "edge axis y" in text and "+1.92 px/µm" in text
     assert "changed since the calibration" not in text
-    assert panel.zero_button.isEnabled() and panel.start_button.isEnabled()
+    assert panel.zero_button.isEnabled() and panel.lock_button.isEnabled()
 
     panel.start()
     qtbot.waitUntil(lambda: panel.state == "running", timeout=WAIT_MS)
@@ -776,13 +777,16 @@ def test_start_telemetry_stop_releases_led_and_joystick(
     _calibrated(settings)
     panel.refresh()
     assert panel.service is None
-    assert panel.start_button.isEnabled()
+    assert panel.lock_button.isEnabled()
     assert panel.zero_button.isEnabled()
-    assert not panel.stop_button.isEnabled()
+    assert not panel.lock_button.isChecked()
+    assert panel.lock_button.text() == "Unlocked"
     assert "px/µm" in panel.calibration_label.text()
 
-    panel.start()
-    assert not panel.start_button.isEnabled()
+    panel.lock_button.click()
+    # starting is asynchronous: not "Locked" yet, and not clickable meanwhile
+    assert not panel.lock_button.isEnabled()
+    assert not panel.lock_button.isChecked()
     qtbot.waitUntil(lambda: panel.state == "running", timeout=WAIT_MS)
     assert mmc.crisp.leds[-1] is True  # lit by a raw command
     # the piezo wheel is off under the lock (the worker's status can lag the panel's)
@@ -792,7 +796,8 @@ def test_start_telemetry_stop_releases_led_and_joystick(
     assert not panel.calibrate_button.isEnabled()
     assert not panel.zero_button.isEnabled()
     assert not panel.draw_edge_button.isEnabled()
-    assert panel.stop_button.isEnabled()
+    assert panel.lock_button.isEnabled() and panel.lock_button.isChecked()
+    assert panel.lock_button.text() == "Locked"
 
     qtbot.waitUntil(lambda: len(panel.chart) > 5, timeout=WAIT_MS)
     # The lock streams frames whether or not a window is open: open it now,
@@ -844,23 +849,25 @@ def test_start_telemetry_stop_releases_led_and_joystick(
     # A box drawn while the lock runs is refused (the lock keeps its own).
     view.edgeBoxDrawn.emit(0, 0, 40, 40)
     assert settings.spot_focus.edge_box == BOX
-    assert "Stop the lock" in panel.fault_label.text()
+    assert "Unlock before" in panel.fault_label.text()
 
     sets_before_stop = len(mmc.sets)
     with (
         patch.object(svc, "set_edge_box", wraps=svc.set_edge_box) as box_spy,
         patch.object(svc, "set_calibration", wraps=svc.set_calibration) as cal_spy,
     ):
-        panel.stop()
+        panel.lock_button.click()  # Locked -> Unlocked
         box_spy.assert_called_with(BOX)  # the preview measures the drawn box again
         cal_spy.assert_called_once()  # ... with the calibration, for the error
         assert isinstance(cal_spy.call_args[0][0], FocusCalibration)
     assert panel.state == "stopped"
     assert not panel.lock_active
+    assert not panel.lock_button.isChecked()
+    assert panel.lock_button.text() == "Unlocked"
     assert mmc.crisp.leds[-1] is False  # the lock's LED is released
     assert mmc.crisp.joystick == [False, True]  # the wheel is back
     assert panel.calibrate_button.isEnabled()
-    assert panel.start_button.isEnabled()
+    assert panel.lock_button.isEnabled()
     assert panel.zero_button.isEnabled()
     qtbot.wait(300)
     assert len(mmc.sets) - sets_before_stop <= 1  # at most one in flight
@@ -885,7 +892,7 @@ def test_calibrate_off_the_gui_thread(
     panel.calibrate()
     assert panel._busy == "calibrating"
     assert not panel.calibrate_button.isEnabled()
-    assert not panel.start_button.isEnabled()
+    assert not panel.lock_button.isEnabled()
     assert not panel.zero_button.isEnabled()
     qtbot.waitUntil(lambda: not panel._busy, timeout=WAIT_MS)
     stored = cfg.calibration
@@ -899,7 +906,7 @@ def test_calibrate_off_the_gui_thread(
     assert stored["p0_um"] == pytest.approx(P0)
     assert edge["e0_px"] == pytest.approx(_e0(), abs=0.5)
     assert tuple(edge["box"]) == BOX
-    assert panel.start_button.isEnabled() and panel.zero_button.isEnabled()
+    assert panel.lock_button.isEnabled() and panel.zero_button.isEnabled()
     assert mmc.pos[P_LABEL] == pytest.approx(P0)  # P returned to where it was
     assert mmc.props[(CRISP, "CRISP State")] == "Idle"  # never written
     assert mmc.crisp.joystick == []  # calibrating leaves the wheel alone
@@ -926,7 +933,7 @@ def test_zero_here_rezeroes_and_resets_the_offset(
     mmc.pos[P_LABEL] = P0 + 0.4
     panel.zero()
     assert panel._busy == "zeroing"
-    assert not panel.zero_button.isEnabled() and not panel.start_button.isEnabled()
+    assert not panel.zero_button.isEnabled() and not panel.lock_button.isEnabled()
     qtbot.waitUntil(lambda: not panel._busy, timeout=WAIT_MS)
     assert panel.fault_label.text() == "", panel.fault_label.text()
     stored = settings.spot_focus.calibration
@@ -954,7 +961,7 @@ def test_lock_without_a_calibration_calibrates_then_locks(
     cfg.params.offset_um = 0.2
     panel.refresh()
     assert panel._cal is None
-    assert panel.start_button.isEnabled()
+    assert panel.lock_button.isEnabled()
     panel.start()
     qtbot.waitUntil(lambda: panel.state == "running", timeout=WAIT_MS)
     assert panel.fault_label.text() == "", panel.fault_label.text()
@@ -985,7 +992,7 @@ def test_failed_calibration_inside_lock_is_reported_and_nothing_locks(
     assert cfg.calibration is None
     assert not panel.lock_active
     assert mmc.crisp.joystick == []  # the wheel was never switched off
-    assert panel.start_button.isEnabled()
+    assert panel.lock_button.isEnabled()
 
 
 def test_start_failure_is_reported(qtbot: QtBot, mmc: FakeMMC) -> None:
@@ -1001,7 +1008,7 @@ def test_start_failure_is_reported(qtbot: QtBot, mmc: FakeMMC) -> None:
     assert "no camera" in widget.fault_label.text()
     assert widget.state == "idle"
     assert not widget.lock_active
-    assert widget.start_button.isEnabled()
+    assert widget.lock_button.isEnabled()
 
 
 # ---------------------------------------------------------------------------
@@ -1362,8 +1369,8 @@ def test_detector_mismatch_is_shown_and_blocks_lock(panel: SpotFocusPanel) -> No
     cfg.edge_box = BOX
     panel.refresh()  # setting gaussderiv, calibration halfmax
     why = "calibrated with halfmax; the detector setting is gaussderiv: recalibrate"
-    assert not panel.start_button.isEnabled()
-    assert panel.start_button.toolTip() == why
+    assert not panel.lock_button.isEnabled()
+    assert panel.lock_button.toolTip() == why
     text = panel.calibration_label.text()
     assert why in text and ATTENTION_COLOR in text
     assert "detector halfmax" in text  # what the calibration was made with
@@ -1372,17 +1379,17 @@ def test_detector_mismatch_is_shown_and_blocks_lock(panel: SpotFocusPanel) -> No
     assert why in panel.fault_label.text() and panel._busy == ""
     # switching the setting to the calibration's detector clears it
     panel.detector_combo.setCurrentIndex(panel.detector_combo.findData("halfmax"))
-    assert panel.start_button.isEnabled()
+    assert panel.lock_button.isEnabled()
     assert why not in panel.calibration_label.text()
     # a different gaussderiv width is a mismatch too
     cfg.calibration = _focus_cal().to_dict()
     panel.refresh()
     panel.detector_combo.setCurrentIndex(panel.detector_combo.findData("gaussderiv"))
-    assert panel.start_button.isEnabled()
+    assert panel.lock_button.isEnabled()
     assert "detector gaussderiv 6 px" in panel.calibration_label.text()
     panel.detector_sigma_spin.setValue(3.0)
-    assert not panel.start_button.isEnabled()
-    assert "sigma 6 px" in panel.start_button.toolTip()
+    assert not panel.lock_button.isEnabled()
+    assert "sigma 6 px" in panel.lock_button.toolTip()
 
 
 def test_refusal_from_the_service_start_is_shown_not_raised(
@@ -1391,7 +1398,7 @@ def test_refusal_from_the_service_start_is_shown_not_raised(
     svc = _preview_on(qtbot, panel)
     _calibrated(SettingsV1.instance())
     panel.refresh()
-    assert panel.start_button.isEnabled()  # the panel's own check passes
+    assert panel.lock_button.isEnabled()  # the panel's own check passes
     # The service's idea of the setting differs (a race): its start() refuses.
     with patch.object(
         SpotFocusService,
@@ -1406,7 +1413,7 @@ def test_refusal_from_the_service_start_is_shown_not_raised(
     assert ATTENTION_COLOR in text
     assert panel.state != "running" and not panel.lock_active
     assert panel._owner.service is svc and not panel._owner.dead  # no rebuild
-    assert panel.start_button.isEnabled()
+    assert panel.lock_button.isEnabled()
 
 
 @pytest.mark.parametrize(
@@ -1659,3 +1666,194 @@ def test_camera_parameters_section_is_collapsible(
         assert again.exposure_spin.isVisible()
     finally:
         again.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# layout pass: Auto levels, one Lock toggle, Calibration steps, auto Preview
+# ---------------------------------------------------------------------------
+
+
+def test_auto_levels_is_on_by_default_in_the_panel(panel: SpotFocusPanel) -> None:
+    assert panel.live_view.auto_levels.isChecked()
+
+
+def test_lock_toggle_is_unlocked_and_enabled_when_idle_with_a_box(
+    panel: SpotFocusPanel,
+) -> None:
+    SettingsV1.instance().spot_focus.edge_box = BOX
+    panel.refresh()
+    button = panel.lock_button
+    assert button.isCheckable()
+    assert button.text() == "Unlocked" and not button.isChecked()
+    assert button.isEnabled()
+    assert "Calibrates first" in button.toolTip()
+    assert not hasattr(panel, "start_button") and not hasattr(panel, "stop_button")
+
+
+@pytest.mark.parametrize("busy", ["starting", "calibrating", "zeroing"])
+def test_lock_toggle_is_disabled_while_busy(panel: SpotFocusPanel, busy: str) -> None:
+    SettingsV1.instance().spot_focus.edge_box = BOX
+    panel.refresh()
+    panel._busy = busy
+    panel._set_state(panel.state)
+    assert not panel.lock_button.isEnabled()
+    assert panel.lock_button.text() == "Unlocked" and not panel.lock_button.isChecked()
+    panel._busy = ""
+    panel._set_state(panel.state)
+    assert panel.lock_button.isEnabled()
+
+
+def test_lock_toggle_reads_locked_only_once_the_lock_runs(
+    panel: SpotFocusPanel,
+) -> None:
+    _calibrated(SettingsV1.instance())
+    panel.refresh()
+    panel._set_state("running")
+    button = panel.lock_button
+    assert button.text() == "Locked" and button.isChecked() and button.isEnabled()
+    assert "Unlock" in button.toolTip()
+    panel._set_state("stopped")
+    assert button.text() == "Unlocked" and not button.isChecked()
+    # a click only asks; the button follows the real state (start is async)
+    with patch.object(panel, "start") as start:
+        button.click()
+        start.assert_called_once()
+    assert button.text() == "Unlocked" and not button.isChecked()
+
+
+def test_lock_toggle_unlocks_a_fault_by_acknowledging_it(
+    panel: SpotFocusPanel,
+) -> None:
+    _calibrated(SettingsV1.instance())
+    panel.refresh()
+    panel._on_fault("edge lost")
+    button = panel.lock_button
+    assert panel.state == "fault"
+    assert button.text() == "Locked" and button.isChecked() and button.isEnabled()
+    assert "fault" in button.toolTip()
+    assert "edge lost" in panel.message_label.text()
+    with patch.object(panel, "start") as start:
+        button.click()
+        start.assert_not_called()
+    assert panel.state == "stopped"
+    assert button.text() == "Unlocked" and not button.isChecked() and button.isEnabled()
+    assert "edge lost" not in panel.message_label.text()
+
+
+def test_lock_toggle_locks_then_unlocks_and_releases_led_and_joystick(
+    qtbot: QtBot, panel: SpotFocusPanel, mmc: FakeMMC
+) -> None:
+    _calibrated(SettingsV1.instance())
+    panel.refresh()
+    button = panel.lock_button
+    button.click()
+    assert not button.isChecked() and not button.isEnabled()  # starting
+    qtbot.waitUntil(lambda: panel.state == "running", timeout=WAIT_MS)
+    assert button.text() == "Locked" and button.isChecked() and button.isEnabled()
+    qtbot.waitUntil(lambda: mmc.crisp.joystick == [False], timeout=WAIT_MS)
+    assert mmc.crisp.leds[-1] is True
+    button.click()
+    assert panel.state == "stopped"
+    assert button.text() == "Unlocked" and not button.isChecked()
+    assert mmc.crisp.leds[-1] is False
+    assert mmc.crisp.joystick == [False, True]
+
+
+def test_calibration_section_holds_the_two_numbered_steps(
+    panel: SpotFocusPanel,
+) -> None:
+    cfg = SettingsV1.instance().spot_focus
+    page = panel.section_pages["calibration"]
+    assert panel.section_buttons["calibration"].text() == "Calibration"
+    assert page.isHidden()  # closed until opened: the dock does not grow
+    assert panel.draw_edge_button.text() == "1. Draw Edge"
+    assert panel.calibrate_button.text() == "2. Calibrate"
+    for step in (panel.draw_edge_button, panel.calibrate_button):
+        assert page.isAncestorOf(step)
+    # the old homes are gone: step 2 left the control row (Zero here stays)
+    assert panel.zero_button.parentWidget() is panel
+    assert panel.calibrate_button.parentWidget() is not panel
+    assert panel.draw_edge_button.parentWidget() is not panel
+    # a saved box is reused: Calibrate is ready with no drawing
+    cfg.edge_box = BOX
+    panel.refresh()
+    assert panel.calibrate_button.isEnabled()
+    assert not panel.draw_edge_button.isChecked()
+    assert "saved" in panel.edge_box_label.text()
+    assert panel.live_view.edge_box == BOX
+    # opening the section shows both steps
+    panel.section_buttons["calibration"].click()
+    assert panel.draw_edge_button.isVisible() and panel.calibrate_button.isVisible()
+
+
+def test_missing_edge_box_text_points_at_the_step() -> None:
+    from CRISPy import piezo_status
+
+    assert "1. Draw Edge" in NEED_BOX_TEXT
+    assert piezo_status.NEED_BOX_TEXT == NEED_BOX_TEXT
+
+
+def test_auto_preview_starts_once_after_the_first_show(
+    qtbot: QtBot, mmc: FakeMMC
+) -> None:
+    widget = SpotFocusPanel(mmc, service_factory=_factory(mmc), auto_preview=True)
+    qtbot.addWidget(widget)
+    try:
+        assert widget.service is None and not widget.preview_button.isChecked()
+        widget.show()
+        qtbot.waitUntil(lambda: widget._preview_busy, timeout=WAIT_MS)
+        qtbot.waitUntil(lambda: not widget._preview_busy, timeout=WAIT_MS)
+        assert widget.preview_button.isChecked() and widget.service is not None
+        qtbot.waitUntil(lambda: widget.live_view.frame is not None, timeout=WAIT_MS)
+        # Preview off, then hide and show: it stays off
+        widget.preview_button.click()
+        assert not widget.preview_button.isChecked()
+        widget.hide()
+        widget.show()
+        qtbot.wait(100)
+        assert not widget.preview_button.isChecked() and not widget._preview_busy
+    finally:
+        widget.shutdown()
+
+
+def test_auto_preview_fires_once_per_panel(qtbot: QtBot, mmc: FakeMMC) -> None:
+    widget = SpotFocusPanel(mmc, service_factory=_factory(mmc), auto_preview=True)
+    qtbot.addWidget(widget)
+    try:
+        with patch.object(widget, "_start_preview") as start:
+            widget.show()
+            qtbot.waitUntil(lambda: start.call_count == 1, timeout=3000)
+            widget.hide()
+            widget.show()
+            qtbot.wait(100)
+            assert start.call_count == 1
+    finally:
+        widget.shutdown()
+
+
+def test_auto_preview_does_not_fire_after_shutdown(qtbot: QtBot, mmc: FakeMMC) -> None:
+    widget = SpotFocusPanel(mmc, service_factory=_factory(mmc), auto_preview=True)
+    qtbot.addWidget(widget)
+    with patch.object(widget, "_start_preview") as start:
+        widget.show()  # schedules the start on the event loop ...
+        widget.shutdown()  # ... which must find the panel shut down
+        qtbot.wait(100)
+        start.assert_not_called()
+        widget.hide()
+        widget.show()
+        qtbot.wait(100)
+        start.assert_not_called()
+    assert widget.service is None
+
+
+def test_auto_preview_is_off_by_default(qtbot: QtBot, mmc: FakeMMC) -> None:
+    widget = SpotFocusPanel(mmc, service_factory=_factory(mmc))
+    qtbot.addWidget(widget)
+    try:
+        with patch.object(widget, "_start_preview") as start:
+            widget.show()
+            qtbot.wait(100)
+            start.assert_not_called()
+        assert widget.service is None and not widget.preview_button.isChecked()
+    finally:
+        widget.shutdown()

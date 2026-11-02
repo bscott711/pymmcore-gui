@@ -24,7 +24,7 @@ from CRISPy.spot.live_view import (
 )
 from CRISPy.spot.spot_frame_shm import LiveFrame
 
-from pymmcore_gui._qt.QtCore import QPoint, QPointF, Qt
+from pymmcore_gui._qt.QtCore import QPoint, QPointF, QRectF, Qt
 from pymmcore_gui._qt.QtGui import QPainter
 
 if TYPE_CHECKING:
@@ -222,15 +222,15 @@ def test_bayer_to_grey_is_fast_enough_and_rejects_3d() -> None:
 
 
 def test_roi_frame_drawn_at_offset_and_native_size(view: SpotLiveView) -> None:
-    view.show_frame(make_frame(roi=(400, 300, 640, 480)))
+    view.show_frame(make_frame(roi=(400, 300, 1200, 900)))
     item = view.pixmap_item
     assert (item.pos().x(), item.pos().y()) == (400, 300)
     pm = item.pixmap()
-    assert (pm.width(), pm.height()) == (640, 480)  # not downsampled
+    assert (pm.width(), pm.height()) == (1200, 900)  # not downsampled
     assert view.sensor == SENSOR
     rect = view.scene.sceneRect()
     assert (rect.width(), rect.height()) == SENSOR
-    # the sensor was fitted to the window (zoom < 1): resampled smoothly ...
+    # the ROI was fitted to the window (zoom < 1): resampled smoothly ...
     assert view.zoom < 1.0
     assert view.view.renderHints() & QPainter.RenderHint.SmoothPixmapTransform
     assert item.transformationMode() == Qt.TransformationMode.SmoothTransformation
@@ -686,3 +686,95 @@ def test_real_wheel_event_zooms_around_the_cursor(
     after = view.view.mapToScene(pos)
     assert after.x() == pytest.approx(before.x(), abs=1.5)
     assert after.y() == pytest.approx(before.y(), abs=1.5)
+
+
+# ---------------------------------------------------------------------------
+# camera ROI crop
+# ---------------------------------------------------------------------------
+
+ROI = (400, 300, 640, 480)
+
+
+def _fit_zoom(v: SpotLiveView, w: float, h: float) -> float:
+    vp = v.view.viewport()
+    return min((vp.width() - 4) / w, (vp.height() - 4) / h)
+
+
+def test_roi_frame_crops_the_view(view: SpotLiveView) -> None:
+    view.show_frame(make_frame(roi=ROI))
+    # the scene stays the sensor, the view is the ROI alone (no pan margin)
+    r = view.scene.sceneRect()
+    assert (r.width(), r.height()) == SENSOR
+    r = view.view.sceneRect()
+    assert (r.x(), r.y(), r.width(), r.height()) == ROI
+
+    # Fit shows the ROI: it fills the viewport in one dimension
+    view.fit()
+    assert view.zoom == pytest.approx(_fit_zoom(view, ROI[2], ROI[3]), rel=1e-3)
+    visible = view.view.mapToScene(view.view.viewport().rect()).boundingRect()
+    roi = QRectF(*ROI)
+    assert visible.contains(roi.adjusted(1, 1, -1, -1))
+    assert visible.width() < ROI[2] + 8 or visible.height() < ROI[3] + 8
+
+    # no zooming out past the fit ...
+    z_fit = view.zoom
+    view.view.zoom_by(0.1)
+    assert view.zoom >= z_fit * (1 - 1e-6)
+    # ... but zooming in is free, up to the limit
+    view.view.zoom_by(4.0)
+    assert view.zoom == pytest.approx(4 * z_fit)
+    view.view.zoom_by(1e6)
+    assert view.zoom == pytest.approx(128.0)
+
+
+def test_cropped_view_cannot_pan_off_the_roi(view: SpotLiveView) -> None:
+    view.show_frame(make_frame(roi=ROI))
+    view.view.zoom_by(4.0)
+    hbar, vbar = view.view.horizontalScrollBar(), view.view.verticalScrollBar()
+    roi = QRectF(*ROI)
+    for bar_h, bar_v in (
+        (hbar.minimum(), vbar.minimum()),
+        (hbar.maximum(), vbar.maximum()),
+    ):
+        hbar.setValue(bar_h)
+        vbar.setValue(bar_v)
+        visible = view.view.mapToScene(view.view.viewport().rect()).boundingRect()
+        assert roi.adjusted(-1, -1, 1, 1).contains(visible)
+    # zoomed out to the fit, the letterbox is the only thing beyond the ROI
+    view.fit()
+    assert hbar.maximum() - hbar.minimum() <= 1
+    assert vbar.maximum() - vbar.minimum() <= 1
+
+
+def test_cropped_fit_follows_a_resize(qtbot: QtBot, view: SpotLiveView) -> None:
+    view.show_frame(make_frame(roi=ROI))
+    view.resize(500, 400)
+    qtbot.wait(50)
+    assert view.zoom == pytest.approx(_fit_zoom(view, ROI[2], ROI[3]), rel=1e-3)
+    view.view.zoom_by(0.1)  # the limit follows the new viewport size
+    assert view.zoom == pytest.approx(_fit_zoom(view, ROI[2], ROI[3]), rel=1e-3)
+
+
+def test_full_frame_restores_the_sensor_view(view: SpotLiveView) -> None:
+    view.show_frame(make_frame(roi=ROI))
+    view.show_frame(make_frame(seq=2))
+    r = view.view.sceneRect()
+    margin = max(SENSOR) / 2
+    assert (r.x(), r.y()) == (-margin, -margin)
+    assert (r.width(), r.height()) == (SENSOR[0] + 2 * margin, SENSOR[1] + 2 * margin)
+    assert view.view.min_zoom == 0.02
+    assert view.fit_mode
+    visible = view.view.mapToScene(view.view.viewport().rect()).boundingRect()
+    assert visible.contains(view.scene.sceneRect().adjusted(1, 1, -1, -1))
+    view.view.zoom_by(1e-6)
+    assert view.zoom == pytest.approx(0.02)  # the old floor, not the ROI fit
+
+
+def test_clear_resets_the_crop(view: SpotLiveView) -> None:
+    view.show_frame(make_frame(roi=ROI))
+    view.clear()
+    r = view.view.sceneRect()
+    assert r.width() > SENSOR[0]  # sensor plus margin again
+    assert view.view.min_zoom == 0.02
+    view.show_frame(make_frame(seq=3))  # a later full frame is not cropped
+    assert view.view.sceneRect().width() > SENSOR[0]

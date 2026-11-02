@@ -25,6 +25,7 @@ folder keep loading.
 
 from __future__ import annotations
 
+import logging
 from contextlib import suppress
 from functools import partial
 from typing import TYPE_CHECKING
@@ -40,6 +41,8 @@ if TYPE_CHECKING:
     import numpy as np
     from CRISPy.spot.settings import SpotFocusSettingsV1
     from PyQt6.QtCore import QObject
+
+logger = logging.getLogger(__name__)
 
 
 def snap_for_crispy(mmc: CMMCorePlus) -> dict[str, np.ndarray]:
@@ -168,6 +171,9 @@ class CrispWidget(QWidget):
         from CRISPy.plugin import launch_crisp_plugin
 
         if self._inner is not None:
+            # Release the camera first: the new panel auto-starts Preview, and the
+            # old one is only deleted later.
+            self._shutdown_spot_panels(self._inner)
             self._layout.removeWidget(self._inner)
             self._inner.deleteLater()
             self._inner = None
@@ -176,3 +182,17 @@ class CrispWidget(QWidget):
         inner.setParent(self)
         self._layout.addWidget(inner)
         self._inner = inner
+
+    @staticmethod
+    def _shutdown_spot_panels(inner: QWidget) -> None:
+        """Stop the spot-lock panel inside *inner* (its worker holds the camera)."""
+        try:
+            from CRISPy.spot.panel import SpotFocusPanel
+        except ImportError:  # CRISPy without the spot lock
+            return
+        try:
+            for child in inner.findChildren(QWidget):
+                if isinstance(child, SpotFocusPanel):
+                    child.shutdown()
+        except Exception:
+            logger.warning("spot focus panel shutdown failed", exc_info=True)
