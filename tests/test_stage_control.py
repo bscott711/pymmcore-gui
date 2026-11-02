@@ -20,6 +20,8 @@ from pymmcore_gui.widgets._stage_control import (
 if TYPE_CHECKING:
     from pytestqt.qtbot import QtBot
 
+    from pymmcore_gui._settings import Settings
+
 
 def _core(name: str, description: str) -> MagicMock:
     mmc = MagicMock()
@@ -358,3 +360,66 @@ def test_mirror_label_when_unreadable(
     assert w.mirror.text() == "mirror ?"
     w.set_offset_deg(0.5)  # must not raise
     assert w.mirror.text() == "mirror ?"
+
+
+def test_user_changes_are_persisted(
+    qtbot: QtBot, galvo: tuple[CMMCorePlus, _FakeGalvo], settings: Settings
+) -> None:
+    core, _ = galvo
+    w = GalvoControlWidget(GALVO, core)
+    qtbot.addWidget(w)
+    # Opening the widget alone must not overwrite the saved value.
+    assert settings.galvo.live_offset_deg == pytest.approx(-0.26)
+
+    w.offset.setValue(-80.0)  # spin box, um -> deg
+    assert settings.galvo.live_offset_deg == pytest.approx(-80.0 / SLOPE)
+
+    w.step.setValue(10.0)  # um
+    w.plus.click()
+    assert settings.galvo.live_offset_deg == pytest.approx(-70.0 / SLOPE)
+    w.minus.click()
+    assert settings.galvo.live_offset_deg == pytest.approx(-80.0 / SLOPE)
+
+    w.zero.click()
+    assert settings.galvo.live_offset_deg == 0.0
+
+
+def test_go_to_zero_persists_even_if_the_property_is_already_zero(
+    qtbot: QtBot, galvo: tuple[CMMCorePlus, _FakeGalvo], settings: Settings
+) -> None:
+    core, state = galvo
+    state.offset = 0.0  # card already at 0, saved value is -0.26
+    w = GalvoControlWidget(GALVO, core)
+    qtbot.addWidget(w)
+    w.zero.click()
+    assert state.writes == []
+    assert settings.galvo.live_offset_deg == 0.0
+
+
+def test_the_clamped_value_is_persisted(
+    qtbot: QtBot, galvo: tuple[CMMCorePlus, _FakeGalvo], settings: Settings
+) -> None:
+    core, _ = galvo
+    w = GalvoControlWidget(GALVO, core)
+    qtbot.addWidget(w)
+    w.set_offset_deg(5.0)
+    assert settings.galvo.live_offset_deg == 2.0
+
+
+def test_external_property_changes_are_not_persisted(
+    qtbot: QtBot, galvo: tuple[CMMCorePlus, _FakeGalvo], settings: Settings
+) -> None:
+    core, state = galvo
+    w = GalvoControlWidget(GALVO, core)
+    qtbot.addWidget(w)
+    # An engine write (during or after an MDA) only refreshes the display.
+    state.offset = 1.0
+    core.events.propertyChanged.emit(GALVO, OFFSET_PROP, "1.0")
+    assert w.offset.value() == pytest.approx(1.0 * SLOPE)
+    assert settings.galvo.live_offset_deg == pytest.approx(-0.26)
+    # Same for the refresh after a sequence finishes.
+    state.offset = 0.5
+    seq = useq.MDASequence()
+    core.mda.events.sequenceFinished.emit(seq)
+    assert w.offset.value() == pytest.approx(0.5 * SLOPE)
+    assert settings.galvo.live_offset_deg == pytest.approx(-0.26)

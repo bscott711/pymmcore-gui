@@ -8,7 +8,9 @@ the sweep centre), so every write is followed by a static move of the slice axis
 (:func:`~pymmcore_gui.asi_z_stack.galvo_position.move_galvo_slice`), which is
 what positions the mirror in Live. A read-only label shows the mirror's
 read-back position. The offset is shown in um-equivalent (degrees times the
-slice calibration slope), with the degree value beside it.
+slice calibration slope), with the degree value beside it. Each value set here
+is saved and re-applied to the card on every config load
+(:mod:`~pymmcore_gui.asi_z_stack.live_offset`).
 """
 
 from __future__ import annotations
@@ -32,10 +34,12 @@ from pymmcore_gui.asi_z_stack.galvo_position import (
     move_galvo_slice,
     read_galvo_position,
 )
+from pymmcore_gui.asi_z_stack.live_offset import OFFSET_PROP, save_live_offset_deg
 
 logger = logging.getLogger(__name__)
 
-OFFSET_PROP = "SingleAxisYOffset(deg)"
+__all__ = ["OFFSET_PROP", "GalvoControlWidget"]
+
 #: Used when the card reports no property limits.
 _FALLBACK_RANGE_UM = 1_000_000.0
 
@@ -45,7 +49,8 @@ class GalvoControlWidget(QWidget):
 
     The property is the sweep centre the MDA reads; each write is also a static
     move of the slice axis (card axis B), which is what places the mirror in
-    Live. The widget never writes ``SPIMState``, ``SingleAxis*Mode`` or
+    Live. Each user change is saved to the settings and re-applied on config
+    load. The widget never writes ``SPIMState``, ``SingleAxis*Mode`` or
     ``BeamEnabled``.
 
     Parameters
@@ -212,6 +217,8 @@ class GalvoControlWidget(QWidget):
                 current = self._read_deg()
                 if current is None or abs(current - deg) >= 1e-9:
                     mmc.setProperty(self._device, OFFSET_PROP, f"{deg:.6f}")
+                # Only user changes are saved (not refresh / engine writes).
+                save_live_offset_deg(deg)
             else:
                 logger.warning("Cannot set %s on %s", OFFSET_PROP, self._device)
             position = move_galvo_slice(mmc, self._device, deg)

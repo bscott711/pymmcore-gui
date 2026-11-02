@@ -619,9 +619,13 @@ class MicroManagerGUI(QMainWindow):
             ensure_circular_buffer_capacity_async,
             ensure_global_shutter_open,
         )
+        from pymmcore_gui.asi_z_stack.live_offset import restore_live_offset
 
         ensure_global_shutter_open()
         ensure_beam_enabled()
+        # The card forgets its galvo Live offset on power-up; re-apply the saved
+        # one now that the beam is on (a static move is ignored while it is off).
+        restore_live_offset(self._mmc)
         # No other PLogic writes at startup: the Expose Out BNCs are only
         # configured when an All Rows MDA actually runs, so a legacy session
         # sends exactly the proven PLogic programming.

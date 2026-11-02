@@ -461,6 +461,21 @@ class SpimTimingSettingsV1(BaseMMSettings):
     readout + exposure instead of 2 x readout + exposure."""
 
 
+class GalvoSettingsV1(BaseMMSettings):
+    """SPIM galvo settings that must survive restarts and power cycles.
+
+    The ASI card forgets its ``SingleAxisYOffset(deg)`` when it powers down, so
+    the app keeps the user's value and re-applies it on every config load (see
+    ``pymmcore_gui.asi_z_stack.live_offset``).
+    """
+
+    live_offset_deg: float = -0.26
+    """SPIM galvo Live offset in degrees, the card's ``SingleAxisYOffset(deg)``.
+    -0.26 deg is -26 um at 100 um/deg. Stored in degrees so the mirror angle is
+    reproduced exactly even if the slope calibration changes. Re-applied (property
+    write plus static mirror move) on every config load."""
+
+
 class SnapshotSettingsV1(BaseMMSettings):
     """Where the Save Image action writes Snap/Live frames."""
 
@@ -487,6 +502,7 @@ class SettingsV1(BaseMMSettings):
     spot_focus: SpotFocusSettingsV1 = Field(default_factory=SpotFocusSettingsV1)
     snapshot: SnapshotSettingsV1 = Field(default_factory=SnapshotSettingsV1)
     spim_timing: SpimTimingSettingsV1 = Field(default_factory=SpimTimingSettingsV1)
+    galvo: GalvoSettingsV1 = Field(default_factory=GalvoSettingsV1)
 
     send_error_reports: bool | None = None
     """Whether to send error reports to the developers, None means undecided."""

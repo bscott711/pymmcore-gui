@@ -483,3 +483,10 @@ def test_camera_toolbar_has_snap_live_and_exposure(gui: MicroManagerGUI) -> None
     assert gui.get_action(CoreAction.SNAP) in toolbar.actions()
     assert gui.get_action(CoreAction.TOGGLE_LIVE) in toolbar.actions()
     assert toolbar.exposure.spin.value() == pytest.approx(gui._mmc.getExposure())
+
+
+def test_config_load_restores_the_galvo_live_offset(gui: MicroManagerGUI) -> None:
+    """Every config load re-applies the saved galvo Live offset to the card."""
+    with patch("pymmcore_gui.asi_z_stack.live_offset.restore_live_offset") as restore:
+        gui._on_system_config_loaded()
+    restore.assert_called_once_with(gui._mmc)

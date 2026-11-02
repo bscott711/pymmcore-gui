@@ -51,6 +51,12 @@ upstream.
   (the slice axis, X kept) and shows the mirror's read-back position in the
   group. Stationary-trigger z-stacks hold the galvo at the Live offset instead
   of 0, and MDA teardown returns the mirror to the Live offset. Rig-unverified.
+- **The galvo Live offset is remembered across restarts.** The ASI card comes up
+  with `SingleAxisYOffset(deg)` at 0 after a restart or power cycle. The value
+  set in Stage Control is now saved in the app settings (default -26 um, stored
+  as -0.26 deg) and re-applied to the card (property write plus static mirror
+  move) on every config load, whether or not Stage Control is open. Never
+  applied during an MDA. Rig-unverified.
 
 ## [0.2.0] - 2026-10-30
 
