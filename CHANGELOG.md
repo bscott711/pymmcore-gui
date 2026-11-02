@@ -19,6 +19,11 @@ upstream.
 
 ### Added
 
+- **Plugin loader.** `create_mmgui` now loads every entry point in the
+  `pymmcore_gui.plugins` group and calls it with the main window, after the
+  window is built and before any config is loaded. A plugin that fails to load
+  or raises is logged and shown as a warning; it does not stop the GUI or the
+  other plugins.
 - **`probe_galvo_park`** (bench diagnostic in `asi_z_stack/diagnostics.py`): tries
   parking the galvo at the sweep start between volumes, via `SPIMState=Armed`
   or an Idle offset write, so the mechanism can be chosen on the rig before
