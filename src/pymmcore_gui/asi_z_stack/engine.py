@@ -28,6 +28,7 @@ from .asi_controller import (
 )
 from .camera_worker_service import CameraWorkerService
 from .common import AcquisitionSettings, HardwareConstants
+from .galvo_position import move_galvo_slice
 from .spim_timing import (
     LEGACY_SETTLE_MS,
     SliceTiming,
@@ -162,6 +163,10 @@ class _ASITriggerEngineBase(MDAEngine):
         # Galvo sweep settings from before the MDA (see _GALVO_SCAN_PROPS),
         # restored in teardown so Live images the same plane it did before.
         self._galvo_scan_before: dict[str, str] | None = None
+        # The Live galvo slice offset parsed from that snapshot (None if it was
+        # not captured or unreadable); teardown statically moves the mirror
+        # back to it, since the offset property is only the sweep centre.
+        self._live_offset_deg: float | None = None
 
     def _set_event_z(self, event: MDAEvent) -> None:
         """No-op: Z-stepping here is done entirely by the galvo hardware trigger.
@@ -267,6 +272,9 @@ class _ASITriggerEngineBase(MDAEngine):
             for prop in _GALVO_SCAN_PROPS
             if mmc.hasProperty(label, prop)
         }
+        self._live_offset_deg = _try_float(
+            self._galvo_scan_before.get("SingleAxisYOffset(deg)")
+        )
         return self._galvo_scan_before
 
     def _restore_galvo_scan(self) -> None:
@@ -282,6 +290,23 @@ class _ASITriggerEngineBase(MDAEngine):
             "Restored pre-MDA galvo "
             + ", ".join(f"{prop}={value}" for prop, value in before.items())
         )
+
+    def _return_galvo_to_live_offset(self) -> None:
+        """Statically move the mirror back to the Live offset (teardown, no raise).
+
+        Restoring ``SingleAxisYOffset(deg)`` only re-centres the sweep (serial
+        ``SAO``); it does not move an idle mirror, which would otherwise stay
+        wherever the last sweep left it while Live shows the old plane. Call
+        after ``SPIMState=Idle`` and :meth:`_restore_galvo_scan`.
+        """
+        live_offset_deg = self._live_offset_deg
+        self._live_offset_deg = None
+        if live_offset_deg is None:
+            return
+        try:
+            move_galvo_slice(self.mmcore, self.hw.galvo_a_label, live_offset_deg)
+        except Exception as e:
+            logger.warning("Could not return galvo to the Live offset: %r", e)
 
     def _prepare_volume(self, event: MDAEvent) -> dict[str, Any]:
         """Per-volume hardware prep before arming; returns extra ``arm_all`` options.
@@ -1516,6 +1541,7 @@ class ASISPIMEngine(_ASITriggerEngineBase):
             # Undo this run's sweep (amplitude and center shift) so Live/Snap
             # image the same plane they did before the MDA.
             self._restore_galvo_scan()
+            self._return_galvo_to_live_offset()
             self._restore_galvo_timing()
 
         # Belt-and-suspenders: exec_event's own finally block already closes
@@ -1595,6 +1621,10 @@ class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
         self._reset_channel_config_cache()
         self._snapshot_piezo_position()
         self._snapshot_galvo_scan()
+        # Hold the mirror at the Live offset (not 0.0) so the stationary
+        # volumes image the plane Live showed.
+        hold_offset_deg = self._live_offset_deg or 0.0
+        logger.info(f"Stationary galvo hold offset = {hold_offset_deg} deg (Live).")
 
         # 1. Number of trigger pulses/frames wanted. Neither axis moves, so
         # there's no amplitude/step-size to compute from the z_plan
@@ -1683,7 +1713,9 @@ class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
             self.hw.galvo_a_label, "SingleAxisXAmplitude(deg)", "0.0"
         )
         self.mmcore.setProperty(self.hw.galvo_a_label, "SingleAxisXOffset(deg)", "0.0")
-        self.mmcore.setProperty(self.hw.galvo_a_label, "SingleAxisYOffset(deg)", "0.0")
+        self.mmcore.setProperty(
+            self.hw.galvo_a_label, "SingleAxisYOffset(deg)", str(hold_offset_deg)
+        )
         self.mmcore.setProperty(self.hw.galvo_a_label, "SPIMNumSlicesPerPiezo", "1")
         self.mmcore.setProperty(
             self.hw.galvo_a_label,
@@ -1733,6 +1765,7 @@ class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
         if self.hw.galvo_a_label in self.mmcore.getLoadedDevices():
             self.mmcore.setProperty(self.hw.galvo_a_label, "SPIMState", "Idle")
             self._restore_galvo_scan()
+            self._return_galvo_to_live_offset()
         if self.hw.piezo_a_label in self.mmcore.getLoadedDevices():
             self.mmcore.setProperty(self.hw.piezo_a_label, "SPIMState", "Idle")
 

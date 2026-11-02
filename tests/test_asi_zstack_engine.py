@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import time
 from typing import TYPE_CHECKING, cast
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import numpy as np
 import pytest
@@ -622,6 +622,126 @@ def test_stationary_teardown_restores_galvo_sweep(
 
     assert _galvo_value(core, "SingleAxisYOffset(deg)") == pytest.approx(0.1234)
     assert _galvo_value(core, "SingleAxisYAmplitude(deg)") == pytest.approx(0.1234)
+
+
+def _setup_stationary_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[MagicMock, ASIStationaryTriggerEngine]:
+    """Stationary engine with PLogic stubbed and a core whose galvo reads back."""
+    for name in (
+        "configure_plogic_for_dual_nrt_pulses",
+        "log_plogic_trigger_chain_state",
+        "summary_metadata",
+    ):
+        monkeypatch.setattr(engine_module, name, MagicMock())
+    monkeypatch.setattr(engine_module.time, "sleep", lambda _s: None)
+    core, engine, _pool = _make_engine(
+        n_cameras=1, n_slices=1, engine_cls=ASIStationaryTriggerEngine
+    )
+    monkeypatch.setattr(engine, "_reclaim_from_workers", MagicMock())
+    core.getLoadedDevices.return_value = ["Scanner:AB:33"]
+    core.getProperty.return_value = "0.1234"
+    core.getGalvoPosition.return_value = (0.05, 0.0)
+    core.getExposure.return_value = 10.0
+    core.getImageWidth.return_value = 2
+    core.getImageHeight.return_value = 2
+    core.getBytesPerPixel.return_value = 2
+    return core, cast("ASIStationaryTriggerEngine", engine)
+
+
+def _call_index(core: MagicMock, name: str, *args: object) -> int:
+    """Index of the last ``core.<name>(*args)`` call in ``core.mock_calls``."""
+    matches = [
+        i for i, c in enumerate(core.mock_calls) if c == getattr(call, name)(*args)
+    ]
+    assert matches, f"no {name}{args} call recorded"
+    return matches[-1]
+
+
+def test_stationary_setup_holds_galvo_at_live_offset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stationary hold uses the Live offset, not a hard-coded 0.0."""
+    core, engine = _setup_stationary_engine(monkeypatch)
+
+    engine.setup_sequence(useq.MDASequence())
+
+    assert _galvo_value(core, "SingleAxisYOffset(deg)") == pytest.approx(0.1234)
+    core.setGalvoPosition.assert_not_called()
+
+
+def test_stationary_teardown_returns_mirror_to_live_offset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    core, engine = _setup_stationary_engine(monkeypatch)
+
+    engine.setup_sequence(useq.MDASequence())
+    engine.teardown_sequence(useq.MDASequence())
+
+    core.setGalvoPosition.assert_called_once_with("Scanner:AB:33", 0.05, 0.1234)
+    move = _call_index(core, "setGalvoPosition", "Scanner:AB:33", 0.05, 0.1234)
+    idle = _call_index(core, "setProperty", "Scanner:AB:33", "SPIMState", "Idle")
+    restore = _call_index(
+        core, "setProperty", "Scanner:AB:33", "SingleAxisYOffset(deg)", "0.1234"
+    )
+    assert idle < move
+    assert restore < move
+
+
+def test_spim_teardown_returns_mirror_to_live_offset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    core, engine = _setup_spim_engine(monkeypatch)
+    monkeypatch.setattr(engine_module.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(engine, "_reclaim_from_workers", MagicMock())
+    core.getLoadedDevices.return_value = ["Scanner:AB:33"]
+    core.getGalvoPosition.return_value = (0.05, 0.3)
+    seq = useq.MDASequence(z_plan=useq.ZAboveBelow(above=10, below=0, step=1))
+
+    engine.setup_sequence(seq)
+    core.setGalvoPosition.assert_not_called()
+    engine.teardown_sequence(seq)
+
+    core.setGalvoPosition.assert_called_once_with("Scanner:AB:33", 0.05, 0.1234)
+    move = _call_index(core, "setGalvoPosition", "Scanner:AB:33", 0.05, 0.1234)
+    idle = _call_index(core, "setProperty", "Scanner:AB:33", "SPIMState", "Idle")
+    restore = _call_index(
+        core, "setProperty", "Scanner:AB:33", "SingleAxisYOffset(deg)", "0.1234"
+    )
+    assert idle < move
+    assert restore < move
+
+
+def _junk_live_offset(_dev: str, prop: str) -> str:
+    """Only the Live slice offset is unreadable; everything else reads 0.1234."""
+    return "junk" if prop == "SingleAxisYOffset(deg)" else "0.1234"
+
+
+def test_stationary_teardown_unreadable_live_offset_skips_move(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    core, engine = _setup_stationary_engine(monkeypatch)
+    core.getProperty.side_effect = _junk_live_offset
+
+    engine.setup_sequence(useq.MDASequence())
+    engine.teardown_sequence(useq.MDASequence())
+
+    core.setGalvoPosition.assert_not_called()
+
+
+def test_spim_teardown_unreadable_live_offset_skips_move(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    core, engine = _setup_spim_engine(monkeypatch)
+    monkeypatch.setattr(engine_module.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(engine, "_reclaim_from_workers", MagicMock())
+    core.getLoadedDevices.return_value = ["Scanner:AB:33"]
+    core.getProperty.side_effect = _junk_live_offset
+
+    engine.setup_sequence(useq.MDASequence())
+    engine.teardown_sequence(useq.MDASequence())
+
+    core.setGalvoPosition.assert_not_called()
 
 
 def test_setup_sequence_rejects_unreachable_top_bottom(
