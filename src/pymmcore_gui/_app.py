@@ -13,6 +13,7 @@ from superqt.utils import WorkerBase
 
 from pymmcore_gui import __version__
 from pymmcore_gui._main_window import ICON, RESOURCES, MicroManagerGUI
+from pymmcore_gui._plugins import load_plugins
 from pymmcore_gui._qt.QtCore import (
     QCoreApplication,
     QPointF,
@@ -168,6 +169,13 @@ def create_mmgui(
 
     _set_status("Building interface...")
     win = MicroManagerGUI(mmcore=mmcore)
+
+    # Plugins (entry-point group ``pymmcore_gui.plugins``) get the fully built
+    # window -- Plugins menu and ``win.mmcore`` exist -- but run before any
+    # configuration is loaded, so they can hook core signals such as
+    # ``systemConfigurationLoaded`` and see the config load below.
+    _set_status("Loading plugins...")
+    load_plugins(win)
 
     def _show_main_window() -> None:
         win.restore_state(show=True)

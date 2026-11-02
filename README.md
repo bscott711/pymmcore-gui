@@ -265,6 +265,27 @@ can pass it to `create_mmgui(mmcore=my_core)`. By default the GUI will first
 check if there is a global singleton (`CMMCorePlus.instance()`), and if not, it
 will create a new instance.
 
+## Plugins
+
+Other packages can add features to the GUI without patching it. Declare an
+entry point in the `pymmcore_gui.plugins` group; it must resolve to a callable
+that receives the main window (`MicroManagerGUI`):
+
+```toml
+[project.entry-points."pymmcore_gui.plugins"]
+my-plugin = "my_package.plugin:install"
+```
+
+```python
+def install(win):  # win.mmcore is the CMMCorePlus; win.nm shows notifications
+    ...
+```
+
+Install the plugin package into the same environment as pymmcore-gui and
+`mmgui` loads it at startup, after the window is built and before any hardware
+configuration is loaded. A plugin that fails to load is logged and reported as
+a warning; the GUI and other plugins keep going.
+
 ## Prior Work
 
 This project builds upon several prior efforts in the Python microscopy
