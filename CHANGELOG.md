@@ -36,6 +36,10 @@ upstream.
   window is built and before any config is loaded. A plugin that fails to load
   or raises is logged and shown as a warning; it does not stop the GUI or the
   other plugins.
+- **`plugins` extra.** `uv sync --extra plugins` installs the PEACH-PIT plugin
+  (`peach-pit-plugin`) as an editable sibling checkout at
+  `../peach-pit-plugin` (Python 3.11+ only). CRISPy stays a core dependency
+  because `_settings.py` imports it at module level.
 - **`probe_galvo_park`** (bench diagnostic in `asi_z_stack/diagnostics.py`): tries
   parking the galvo at the sweep start between volumes, via `SPIMState=Armed`
   or an Idle offset write, so the mechanism can be chosen on the rig before

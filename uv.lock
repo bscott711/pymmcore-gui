@@ -1902,6 +1902,35 @@ wheels = [
 ]
 
 [[package]]
+name = "peach-pit-plugin"
+version = "0.1.0"
+source = { editable = "../peach-pit-plugin" }
+dependencies = [
+    { name = "pyserial", marker = "python_full_version >= '3.11'" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "pymmcore-plus", marker = "extra == 'gui'", specifier = ">=0.18" },
+    { name = "pymmcore-widgets", marker = "extra == 'gui'" },
+    { name = "pyserial", specifier = ">=3.5" },
+    { name = "qtpy", marker = "extra == 'gui'" },
+]
+provides-extras = ["gui"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pymmcore-plus", specifier = ">=0.18" },
+    { name = "pyqt6" },
+    { name = "pytest", specifier = ">=8.0" },
+    { name = "pytest-qt" },
+    { name = "pytest-timeout", specifier = ">=2.3" },
+    { name = "qtpy" },
+    { name = "ruff", specifier = ">=0.6" },
+    { name = "useq-schema" },
+]
+
+[[package]]
 name = "pefile"
 version = "2023.2.7"
 source = { registry = "https://pypi.org/simple" }
@@ -2627,6 +2656,11 @@ dependencies = [
     { name = "zarr" },
 ]
 
+[package.optional-dependencies]
+plugins = [
+    { name = "peach-pit-plugin", marker = "python_full_version >= '3.11'" },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "diff-cover" },
@@ -2665,6 +2699,7 @@ requires-dist = [
     { name = "msgpack", specifier = ">=1.0.8" },
     { name = "ndv", extras = ["vispy"], editable = "../ndv" },
     { name = "ome-writers", extras = ["tifffile"], specifier = ">=0.3.0" },
+    { name = "peach-pit-plugin", marker = "python_full_version >= '3.11' and extra == 'plugins'", editable = "../peach-pit-plugin" },
     { name = "pydantic-settings", specifier = ">=2.7.1" },
     { name = "pygfx", specifier = ">=0.16.0" },
     { name = "pylinalg", specifier = ">=0.6.8" },
@@ -2683,6 +2718,7 @@ requires-dist = [
     { name = "tqdm", specifier = ">=4.67.1" },
     { name = "zarr", specifier = ">=2.18.3,<3.0" },
 ]
+provides-extras = ["plugins"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -2919,6 +2955,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/aa/04/ce0c132d00e20f2d2fb3b3e7c125264ca8b909e693841210534b1ea1752f/pyright-1.1.402.tar.gz", hash = "sha256:85a33c2d40cd4439c66aa946fd4ce71ab2f3f5b8c22ce36a623f59ac22937683", size = 3888207, upload-time = "2025-06-11T08:48:35.759Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/fe/37/1a1c62d955e82adae588be8e374c7f77b165b6cb4203f7d581269959abbc/pyright-1.1.402-py3-none-any.whl", hash = "sha256:2c721f11869baac1884e846232800fe021c33f1b4acb3929cff321f7ea4e2982", size = 5624004, upload-time = "2025-06-11T08:48:33.998Z" },
+]
+
+[[package]]
+name = "pyserial"
+version = "3.5"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/1e/7d/ae3f0a63f41e4d2f6cb66a5b57197850f919f59e558159a4dd3a818f5082/pyserial-3.5.tar.gz", hash = "sha256:3c77e014170dfffbd816e6ffc205e9842efb10be9f58ec16d3e8675b4925cddb", size = 159125, upload-time = "2020-11-23T03:59:15.045Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/07/bc/587a445451b253b285629263eb51c2d8e9bcea4fc97826266d186f96f558/pyserial-3.5-py2.py3-none-any.whl", hash = "sha256:c4451db6ba391ca6ca299fb3ec7bae67a5c55dde170964c7a14ceefec02f2cf0", size = 90585, upload-time = "2020-11-23T03:59:13.41Z" },
 ]
 
 [[package]]

@@ -60,6 +60,10 @@ dependencies = [
     "pyvcam>=2.3.2",
 ]
 
+[project.optional-dependencies]
+# Optional pymmcore_gui.plugins entry-point plugins: `uv sync --extra plugins`
+plugins = ["peach-pit-plugin; python_version >= '3.11'"]
+
 # TO USE pymmcore-nano, you need to add pymmcore-nano to dependencies
 # and uncomment the override-dependencies line below
 # currently, pymmcore-nano has some issues related to threading that need to be solved
@@ -73,6 +77,7 @@ superqt = { git = "https://github.com/bscott711/superqt.git", branch = "main" }
 pymmcore-widgets = { path = "../pymmcore-widgets", editable = true }
 crispy = { path = "../CRISPy", editable = true }
 ndv = { path = "../ndv", editable = true }
+peach-pit-plugin = { path = "../peach-pit-plugin", editable = true }
 
 [dependency-groups]
 # should only be used after manually uninstalling PyQt6 and PyQt6Ads
