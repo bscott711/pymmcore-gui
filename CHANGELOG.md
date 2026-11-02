@@ -43,6 +43,15 @@ upstream.
   limits, the display follows the card, and the group is locked while an MDA
   runs.
 
+### Fixed
+
+- **Stage Control galvo offset now moves the mirror in Live.** Writing
+  `SingleAxisYOffset(deg)` only sets the sweep centre and never moved an idle
+  mirror; each offset write now also does a static `setGalvoPosition` on axis B
+  (the slice axis, X kept) and shows the mirror's read-back position in the
+  group. Stationary-trigger z-stacks hold the galvo at the Live offset instead
+  of 0, and MDA teardown returns the mirror to the Live offset. Rig-unverified.
+
 ## [0.2.0] - 2026-10-30
 
 ### Breaking changes

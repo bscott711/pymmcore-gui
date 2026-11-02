@@ -83,11 +83,27 @@ class _FakeGalvo:
         self.offset = offset
         self.limits = limits
         self.writes: list[float] = []
+        # The mirror: setGalvoPosition moves it, getGalvoPosition reads it.
+        self.position = (0.0, 0.0)
+        self.moves: list[tuple[float, float]] = []
+        self.reads = 0
+        self.moves_ignored = False  # beam off / single-axis mode on
 
     def write(self, device: str, prop: str, value: str) -> None:
         assert (device, prop) == (GALVO, OFFSET_PROP)
         self.offset = float(value)
         self.writes.append(float(value))
+
+    def move(self, device: str, x: float, y: float) -> None:
+        assert device == GALVO
+        self.moves.append((x, y))
+        if not self.moves_ignored:
+            self.position = (x, y)
+
+    def read(self, device: str) -> tuple[float, float]:
+        assert device == GALVO
+        self.reads += 1
+        return self.position
 
 
 @pytest.fixture
@@ -109,6 +125,8 @@ def galvo(monkeypatch: pytest.MonkeyPatch) -> tuple[CMMCorePlus, _FakeGalvo]:
     monkeypatch.setattr(core, "getPropertyUpperLimit", lambda d, p: state.limits[1])
     monkeypatch.setattr(core, "hasProperty", lambda d, p: True)
     monkeypatch.setattr(core, "setProperty", state.write)
+    monkeypatch.setattr(core, "setGalvoPosition", state.move)
+    monkeypatch.setattr(core, "getGalvoPosition", state.read)
     return core, state
 
 
@@ -244,3 +262,99 @@ def test_locked_while_an_mda_runs(
     assert not w.isEnabled()
     core.mda.events.sequenceFinished.emit(seq)
     assert w.isEnabled()
+
+
+def test_spin_write_moves_the_mirror_and_keeps_x(
+    qtbot: QtBot, galvo: tuple[CMMCorePlus, _FakeGalvo]
+) -> None:
+    core, state = galvo
+    state.position = (1.5, 0.0)
+    w = GalvoControlWidget(GALVO, core)
+    qtbot.addWidget(w)
+    w.offset.setValue(-80.0)  # um -> deg
+    assert state.writes == [pytest.approx(-80.0 / SLOPE)]
+    assert state.moves == [(1.5, pytest.approx(-80.0 / SLOPE))]
+    assert w.mirror.text() == f"mirror {-80.0 / SLOPE:.4f} deg"
+
+
+def test_go_to_zero_moves_the_mirror_even_if_the_property_is_unchanged(
+    qtbot: QtBot, galvo: tuple[CMMCorePlus, _FakeGalvo]
+) -> None:
+    core, state = galvo
+    state.offset = 0.0
+    state.position = (0.0, 0.7)  # property says 0, mirror is elsewhere
+    w = GalvoControlWidget(GALVO, core)
+    qtbot.addWidget(w)
+    assert w.mirror.text() == "mirror 0.7000 deg"
+    assert w.mirror.toolTip().startswith("The mirror is not at the offset")
+    w.zero.click()
+    assert state.writes == []  # redundant property write skipped
+    assert state.moves == [(0.0, 0.0)]  # but the mirror is re-asserted
+    assert w.mirror.text() == "mirror 0.0000 deg"
+    assert not w.mirror.toolTip().startswith("The mirror is not at the offset")
+
+
+def test_refresh_does_not_read_the_mirror_during_an_mda(
+    qtbot: QtBot,
+    galvo: tuple[CMMCorePlus, _FakeGalvo],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    core, state = galvo
+    w = GalvoControlWidget(GALVO, core)
+    qtbot.addWidget(w)
+    monkeypatch.setattr(core.mda, "is_running", lambda: True)
+    state.reads = 0
+    w.refresh()
+    core.events.propertyChanged.emit(GALVO, OFFSET_PROP, "0.0")
+    assert state.reads == 0
+    # Negative control: once the run is over, refresh reads the mirror again.
+    monkeypatch.setattr(core.mda, "is_running", lambda: False)
+    w.refresh()
+    assert state.reads == 1
+
+
+def test_sequence_finished_refreshes_the_mirror_label(
+    qtbot: QtBot, galvo: tuple[CMMCorePlus, _FakeGalvo]
+) -> None:
+    core, state = galvo
+    w = GalvoControlWidget(GALVO, core)
+    qtbot.addWidget(w)
+    seq = useq.MDASequence()
+    core.mda.events.sequenceStarted.emit(seq, {})
+    state.position = (0.0, 0.3)  # the engine re-moved the mirror at teardown
+    state.offset = 0.3
+    core.mda.events.sequenceFinished.emit(seq)
+    assert w.isEnabled()
+    assert w.mirror.text() == "mirror 0.3000 deg"
+
+
+def test_mirror_label_flags_a_move_the_card_ignored(
+    qtbot: QtBot, galvo: tuple[CMMCorePlus, _FakeGalvo]
+) -> None:
+    core, state = galvo
+    w = GalvoControlWidget(GALVO, core)
+    qtbot.addWidget(w)
+    state.moves_ignored = True
+    w.set_offset_deg(0.5)
+    assert state.moves == [(0.0, 0.5)]
+    assert w.mirror.text() == "mirror 0.0000 deg"
+    assert "not at the offset" in w.mirror.toolTip()
+    assert "single-axis" in w.mirror.toolTip()
+
+
+def test_mirror_label_when_unreadable(
+    qtbot: QtBot,
+    galvo: tuple[CMMCorePlus, _FakeGalvo],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    core, _ = galvo
+
+    def _boom(device: str) -> tuple[float, float]:
+        raise RuntimeError("no card")
+
+    monkeypatch.setattr(core, "getGalvoPosition", _boom)
+    w = GalvoControlWidget(GALVO, core)
+    qtbot.addWidget(w)
+    assert w.mirror.text() == "mirror ?"
+    w.set_offset_deg(0.5)  # must not raise
+    assert w.mirror.text() == "mirror ?"
