@@ -42,6 +42,7 @@ from superqt import QIconifyIcon
 
 from ._argus_stream import ArgusStreamSession, ArgusTunnelManager, StreamState
 from ._argus_stream import _log as argus_log
+from ._design import apply_dock_style
 from ._mmcore_shutdown import shutdown_mmcore, track_mda_thread
 from ._ndv_viewers import NDVViewersManager
 from ._notification_manager import NotificationManager
@@ -381,6 +382,7 @@ class MicroManagerGUI(QMainWindow):
             CDockManager.eAutoHideFlag.AutoHideFeatureEnabled, True
         )
         self.dock_manager = CDockManager(self)
+        apply_dock_style(self.dock_manager)
 
         self._central = CDockWidget("Viewers", self)
         self._central.setFeature(CDockWidget.DockWidgetFeature.NoTab, True)
