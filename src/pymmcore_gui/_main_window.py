@@ -237,6 +237,7 @@ class MicroManagerGUI(QMainWindow):
             WidgetAction.SPIM_TIMING,
             WidgetAction.CAMERA_ALIGNMENT,
             WidgetAction.ARGUS_QC,
+            WidgetAction.LED_CONTROL,
         ],
         Menu.HELP: [],
     }

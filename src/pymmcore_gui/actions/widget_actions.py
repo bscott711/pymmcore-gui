@@ -46,6 +46,7 @@ class WidgetAction(ActionKey):
     SPIM_TIMING = "pymmcore_gui.spim_timing_widget"
     CAMERA_ALIGNMENT = "pymmcore_gui.camera_alignment_widget"
     ARGUS_QC = "pymmcore_gui.argus_qc_widget"
+    LED_CONTROL = "pymmcore_gui.led_control_widget"
 
 
 # ######################## Functions that create widgets #########################
@@ -226,6 +227,15 @@ def create_argus_qc_widget(parent: QWidget) -> QWidget:
     return widget
 
 
+def create_led_control_widget(parent: QWidget) -> QWidget:
+    """Create the ASI TGLED epifluorescence LED on/off panel."""
+    from pymmcore_gui.widgets._led_control import LedControlWidget
+
+    # PySide6-typed widget (pymmcore_gui._qt) vs this module's PyQt6 QWidget;
+    # the bindings are duck-type compatible at runtime.
+    return LedControlWidget(parent=parent, mmcore=_get_core(parent))  # type: ignore[return-value]
+
+
 # ######################## WidgetAction Enum #########################
 
 
@@ -369,6 +379,14 @@ show_argus_qc = WidgetActionInfo(
     text="Argus QC",
     icon="mdi:clipboard-check-outline",
     create_widget=create_argus_qc_widget,
+    dock_area=DockWidgetArea.RightDockWidgetArea,
+)
+
+show_led_control = WidgetActionInfo(
+    key=WidgetAction.LED_CONTROL,
+    text="Epi LEDs (TGLED)",
+    icon="mdi:led-on",
+    create_widget=create_led_control_widget,
     dock_area=DockWidgetArea.RightDockWidgetArea,
 )
 
