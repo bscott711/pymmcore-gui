@@ -1759,21 +1759,23 @@ def test_lock_toggle_locks_then_unlocks_and_releases_led_and_joystick(
     assert mmc.crisp.joystick == [False, True]
 
 
-def test_calibration_section_holds_the_two_numbered_steps(
+def test_calibration_steps_box_holds_the_two_numbered_steps(
     panel: SpotFocusPanel,
 ) -> None:
     cfg = SettingsV1.instance().spot_focus
     page = panel.section_pages["calibration"]
+    box = panel.calibration_steps_box
     assert panel.section_buttons["calibration"].text() == "Calibration"
     assert page.isHidden()  # closed until opened: the dock does not grow
     assert panel.draw_edge_button.text() == "1. Draw Edge"
     assert panel.calibrate_button.text() == "2. Calibrate"
+    # the steps live in the always-visible box, not in the section page
     for step in (panel.draw_edge_button, panel.calibrate_button):
-        assert page.isAncestorOf(step)
-    # the old homes are gone: step 2 left the control row (Zero here stays)
+        assert box.isAncestorOf(step)
+        assert not page.isAncestorOf(step)
+    # the box is the first item of the panel's column, above the control row
+    assert panel.layout().itemAt(0).widget() is box  # type: ignore[union-attr]
     assert panel.zero_button.parentWidget() is panel
-    assert panel.calibrate_button.parentWidget() is not panel
-    assert panel.draw_edge_button.parentWidget() is not panel
     # a saved box is reused: Calibrate is ready with no drawing
     cfg.edge_box = BOX
     panel.refresh()
@@ -1781,8 +1783,73 @@ def test_calibration_section_holds_the_two_numbered_steps(
     assert not panel.draw_edge_button.isChecked()
     assert "saved" in panel.edge_box_label.text()
     assert panel.live_view.edge_box == BOX
-    # opening the section shows both steps
+
+
+def _assert_steps_visible_and_sections_closed(panel: SpotFocusPanel) -> None:
+    """Both steps are on screen, and no section is open (nothing was clicked)."""
+    assert not any(b.isChecked() for b in panel.section_buttons.values())
+    assert all(p.isHidden() for p in panel.section_pages.values())
+    calibration_page = panel.section_pages["calibration"]
+    for step in (panel.draw_edge_button, panel.calibrate_button):
+        assert step.isVisible()
+        assert step.width() > 0 and step.height() > 0
+        assert not calibration_page.isAncestorOf(step)
+    assert panel.calibration_steps_box.isVisible()
+
+
+def test_calibration_steps_are_visible_without_opening_a_section(
+    qtbot: QtBot, mmc: FakeMMC
+) -> None:
+    # built and shown like the demo does: no click on any section button
+    widget = SpotFocusPanel(mmc, service_factory=_factory(mmc))
+    qtbot.addWidget(widget)
+    try:
+        widget.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
+        widget.show()
+        qtbot.waitExposed(widget)
+        qtbot.wait(50)
+        _assert_steps_visible_and_sections_closed(widget)
+        # a single row of buttons above the control row
+        box = widget.calibration_steps_box
+        assert box.geometry().bottom() < widget.zero_button.geometry().top()
+    finally:
+        widget.shutdown()
+
+
+def test_piezo_spot_widget_shows_the_calibration_steps_unopened(
+    qtbot: QtBot, mmc: FakeMMC
+) -> None:
+    from CRISPy.piezo_ui import PiezoSpotWidget
+
+    class Controller(FakeCrisp):
+        actuator_label = P_LABEL
+
+    # PiezoSpotWidget (what the demo docks) turns auto_preview on; keep the camera
+    # and its worker out of this layout test.
+    with patch.object(SpotFocusPanel, "_start_preview"):
+        widget = PiezoSpotWidget(Controller(), mmc)  # type: ignore[arg-type]
+        qtbot.addWidget(widget)
+        try:
+            widget.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
+            widget.show()
+            qtbot.waitExposed(widget)
+            qtbot.wait(50)
+            _assert_steps_visible_and_sections_closed(widget.panel)
+        finally:
+            widget.panel.shutdown()
+
+
+def test_calibration_section_still_shows_the_settings(panel: SpotFocusPanel) -> None:
     panel.section_buttons["calibration"].click()
+    assert panel.section_pages["calibration"].isVisible()
+    assert panel.span_spin.isVisible()
+    assert panel.span_spin.width() > 0 and panel.span_spin.height() > 0
+    # the steps stay visible (they never moved into the page)
+    assert panel.draw_edge_button.isVisible() and panel.calibrate_button.isVisible()
+    assert panel.calibration_steps_box.isVisible()
+    # closing the section hides the settings, not the steps
+    panel.section_buttons["calibration"].click()
+    assert not panel.span_spin.isVisible()
     assert panel.draw_edge_button.isVisible() and panel.calibrate_button.isVisible()
 
 
