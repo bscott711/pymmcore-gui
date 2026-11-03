@@ -23,6 +23,20 @@ def main(port: str) -> None:
     """
     mmc = CMMCorePlus()
     mmc.loadDevice(port, "SerialManager", port)
+    # same port settings as the OPM profiles
+    for prop, value in {
+        "AnswerTimeout": "500.0000",
+        "BaudRate": "115200",
+        "DTR": "Disable",
+        "DataBits": "8",
+        "DelayBetweenCharsMs": "0.0000",
+        "Fast USB to Serial": "Disable",
+        "Handshaking": "Off",
+        "Parity": "None",
+        "StopBits": "1",
+    }.items():
+        mmc.setProperty(port, prop, value)
+    mmc.initializeDevice(port)
     mmc.loadDevice("TigerCommHub", "ASITiger", "TigerCommHub")
     mmc.setProperty("TigerCommHub", "Port", port)
     mmc.initializeDevice("TigerCommHub")
@@ -30,7 +44,7 @@ def main(port: str) -> None:
     installed = mmc.getInstalledDevices("TigerCommHub")
     print(f"{len(installed)} devices reported by TigerCommHub on {port}:")
     for name in installed:
-        mark = "  <-- LED" if name.startswith("LED") else ""
+        mark = "  # LED" if name.startswith("LED") else ""
         print(f"Device,{name},ASITiger,{name}{mark}")
     if not any(n.startswith("LED") for n in installed):
         print("No LED* devices found; check the card is powered and addressed.")
