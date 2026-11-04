@@ -9,8 +9,10 @@ import zarr
 from pymmcore_gui._settings import SpectralChannelConfig
 from pymmcore_gui._spectral_channel_handler import (
     SpectralChannelHandler,
+    centered_positions,
     channel_output_path,
     channels_for_sequence,
+    clamp_position,
     next_fft_friendly,
 )
 
@@ -289,3 +291,27 @@ def test_handler_crops_cropped_frames_at_roi_origin(tmp_path: Path) -> None:
 
     assert len(received) == 1
     np.testing.assert_array_equal(received[0], frame[5:15, 5:25])
+
+
+def test_centered_positions() -> None:
+    # 3200x3200 chip, two 1536x540 regions with a 40 px gap.
+    assert centered_positions((3200, 3200), (1536, 540), 40) == (832, 1040, 1620)
+    # Zero gap: regions touch, pair still centered.
+    assert centered_positions((3200, 3200), (1536, 540), 0) == (832, 1060, 1600)
+    # Odd leftover rounds down; pair never leaves the sensor.
+    x, y_top, y_bottom = centered_positions((3201, 3201), (1536, 540), 41)  # type: ignore[misc]
+    assert y_top >= 0 and y_bottom + 540 <= 3201 and x + 1536 <= 3201
+
+
+def test_centered_positions_too_big_returns_none() -> None:
+    assert centered_positions((3200, 3200), (3300, 540), 40) is None
+    assert centered_positions((3200, 1000), (1536, 540), 40) is None
+
+
+def test_clamp_position() -> None:
+    size, sensor = (1536, 540), (3200, 3200)
+    assert clamp_position((832, 1040), size, sensor) == (832, 1040)
+    assert clamp_position((-5, -9), size, sensor) == (0, 0)
+    assert clamp_position((3000, 3000), size, sensor) == (3200 - 1536, 3200 - 540)
+    # Larger than the sensor: pinned to the origin rather than negative.
+    assert clamp_position((50, 50), (4000, 540), sensor) == (0, 50)

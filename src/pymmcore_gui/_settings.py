@@ -247,6 +247,11 @@ class SpectralChannelSettingsV1(BaseMMSettings):
     Shorter rolling readout (faster slices) and less data per frame; the
     regions stay in full-sensor coordinates (see ``pymmcore_gui._camera_crop``).
     """
+    region_gap_px: int = Field(default=40, ge=0)
+    """Vertical gap (px) between a camera's top and bottom regions.
+
+    Used when auto-populating sibling regions and by "Center on chip".
+    """
     laser_config_group: str = "Lasers"
     all_lasers_preset: str = "AllLasers"
     channels: list[SpectralChannelConfig] = Field(

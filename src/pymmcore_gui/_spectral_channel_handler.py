@@ -169,6 +169,77 @@ def roi_origin(mmc: CMMCorePlus, camera_label: str) -> tuple[int, int]:
     return (roi[0], roi[1]) if roi is not None else (0, 0)
 
 
+def sensor_size(mmc: CMMCorePlus, camera_label: str) -> tuple[int, int] | None:
+    """Full-sensor ``(width, height)`` of *camera_label*, or ``None`` if unknown.
+
+    Worker-owned cameras report their uncropped geometry. Otherwise the
+    core's current ROI is only trusted when it starts at the origin and the
+    spectral camera-crop is off (a cropped camera's ROI is smaller than the
+    chip, and we must not guess).
+    """
+    from pymmcore_gui.asi_z_stack.camera_worker_service import CameraWorkerService
+
+    svc = CameraWorkerService.get_active()
+    if svc is not None and camera_label in svc.camera_labels:
+        try:
+            _x, _y, w, h = svc.full_frame_roi(camera_label)
+        except RuntimeError:
+            return None
+        return int(w), int(h)
+
+    from pymmcore_gui._settings import SettingsV1
+
+    spectral = SettingsV1.instance().spectral
+    if spectral.enabled and spectral.crop_camera_roi:
+        return None
+    roi = camera_roi(mmc, camera_label)
+    if roi is None or roi[:2] != (0, 0) or not (roi[2] and roi[3]):
+        return None
+    return roi[2], roi[3]
+
+
+def centered_positions(
+    sensor: tuple[int, int], size: tuple[int, int], gap: int
+) -> tuple[int, int, int] | None:
+    """Top-left ``(x, y_top, y_bottom)`` of a centered top/bottom region pair.
+
+    Both regions (``size`` each) are centered horizontally on the sensor and
+    stacked vertically with *gap* pixels between them, the pair as a whole
+    centered vertically. ``None`` if the pair does not fit on the sensor.
+
+    Parameters
+    ----------
+    sensor : tuple[int, int]
+        Full-sensor ``(width, height)``.
+    size : tuple[int, int]
+        Shared region ``(width, height)``.
+    gap : int
+        Vertical space between the top region's bottom edge and the bottom
+        region's top edge.
+    """
+    sw, sh = sensor
+    w, h = size
+    total_h = 2 * h + gap
+    if w > sw or total_h > sh:
+        return None
+    x = (sw - w) // 2
+    y_top = (sh - total_h) // 2
+    return x, y_top, y_top + h + gap
+
+
+def clamp_position(
+    pos: tuple[int, int], size: tuple[int, int], sensor: tuple[int, int]
+) -> tuple[int, int]:
+    """Clamp a region's top-left *pos* so a *size* region lies inside *sensor*.
+
+    A region larger than the sensor is pinned to ``0`` on that axis.
+    """
+    x, y = pos
+    w, h = size
+    sw, sh = sensor
+    return max(0, min(x, sw - w)), max(0, min(y, sh - h))
+
+
 def regions_bounding_box(
     channels: list[SpectralChannelConfig], camera_label: str
 ) -> tuple[int, int, int, int] | None:
