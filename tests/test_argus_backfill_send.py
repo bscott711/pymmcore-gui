@@ -8,6 +8,7 @@ the Settings-based defaults, and the ``ArgusTunnelManager`` hand-over.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -84,8 +85,11 @@ def test_no_tunnel_means_a_plain_message_not_a_hang(
 
 def test_the_scheduled_tasks_module_path_runs() -> None:
     """The rig runs ``python -m pymmcore_gui._argus_stream.backfill_send --map ...``."""
+    # The child sees the same import path as this process (a checkout, not an install).
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
     done = subprocess.run(
         [sys.executable, "-m", "pymmcore_gui._argus_stream.backfill_send", "--help"],
+        env=env,
         capture_output=True,
         text=True,
         timeout=120,
