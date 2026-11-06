@@ -17,6 +17,21 @@ upstream.
 
 ## [Unreleased]
 
+### Changed
+
+- **The stream imports opym instead of copying it.** `_argus_stream/_protocol.py`,
+  `_bfill.py` and `_bfill_run.py` are deleted; the wire protocol, the backfill
+  wire format and the backfill sender come from `opym` (pinned by commit SHA).
+  `backfill_send.py` is now a wrapper around `opym.stream.backfill_client` that
+  supplies the `ArgusTunnelManager` and the Settings; `python -m
+  pymmcore_gui._argus_stream.backfill_send` takes the same flags as before. The
+  `opym-backfill-send` console script is removed from this package (opym owns
+  it). Deploy order and the `uv sync` the PC needs: CONTRIBUTING.md,
+  "Deploying to the acquisition PC".
+- **FRAME `timestamp` is epoch seconds** (the volume's `acq_first_s`), not
+  milliseconds since the run began, so Argus stores real acquisition times
+  (`runner_time_ms` stays in the frame metadata for the local save).
+
 ### Added
 
 - **Plugin loader.** `create_mmgui` now loads every entry point in the
