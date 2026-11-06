@@ -49,6 +49,7 @@ from typing import Any
 import numpy as np
 import useq
 import zarr
+from opym.store import DSR_VOXEL_UM
 
 from ._session import ArgusStreamSession
 from ._tunnel import ArgusTunnelManager
@@ -383,7 +384,7 @@ def main(argv: list[str] | None = None) -> int:
                 "dtype": str(arrays[0].dtype),
                 "height": ny,
                 "width": nx,
-                "pixel_size_um": 0.136,
+                "pixel_size_um": DSR_VOXEL_UM,
             }
         ]
     }

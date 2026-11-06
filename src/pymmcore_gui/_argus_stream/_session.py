@@ -63,6 +63,7 @@ from uuid import uuid4
 import numpy as np
 import zmq
 from opym.stream.protocol import (
+    DEFAULT_BIND_ADDR,
     IDLE_CLOSED_PREFIX,
     MSG_ACK,
     MSG_CLIENT_LOG,
@@ -625,7 +626,7 @@ class _RunWorker(threading.Thread):
     ) -> None:
         super().__init__(name="ArgusStreamWorker", daemon=True)
         self._session_id = session_id
-        self._endpoints = endpoints or ["tcp://127.0.0.1:5555"]
+        self._endpoints = endpoints or [DEFAULT_BIND_ADDR]
         self._direct_endpoint = direct_endpoint
         self._compress_over_tunnel = compress_over_tunnel
         # Set once an ACK advertises "slabs": the acquisition thread then

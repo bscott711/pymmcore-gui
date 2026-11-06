@@ -80,7 +80,10 @@ and the backfill sender are not copied here: they are imported from
 pinned by commit SHA in `pyproject.toml` (`[tool.uv.sources]`). To move the pin,
 change `rev`, run `uv lock` and check that the lock diff holds no other package.
 `_argus_stream/backfill_send.py` is only the wrapper that adds this app's
-`ArgusTunnelManager` and Settings to opym's sender.
+`ArgusTunnelManager` and Settings to opym's sender. After the rig's `uv sync`,
+the `opym-backfill-send.exe` console script is opym's bare sender (no SSH
+tunnel); the rig must keep using
+`python -m pymmcore_gui._argus_stream.backfill_send`.
 <!-- END fork-specific section -->
 
 ## ✅ Project Status
