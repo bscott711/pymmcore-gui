@@ -9,7 +9,7 @@ save (and vice versa): see the plan's "Key architecture findings" for the
 verified code paths this relies on.
 
 v1 scope: single-position MDA sequences only (Argus's wire protocol has no
-position axis -- see ``_protocol.py``). Multi-camera sequences are streamed
+position axis -- see ``opym.stream.protocol``). Multi-camera sequences are streamed
 *only* when spectral-channel cropping is active and resolves each camera's
 regions into distinct channel identities -- exactly what
 :class:`~pymmcore_gui._spectral_channel_handler.SpectralChannelHandler`
@@ -62,21 +62,8 @@ from uuid import uuid4
 
 import numpy as np
 import zmq
-from pymmcore_widgets.useq_widgets import PYMMCW_METADATA_KEY
-from zmq.utils.monitor import recv_monitor_message
-
-from pymmcore_gui._multi_camera_handler import physical_camera_labels, without_cam_index
-from pymmcore_gui._spectral_channel_handler import (
-    _strip_known_suffix,
-    active_channels_for_event,
-    channels_for_sequence,
-    crop_region,
-    roi_origin,
-)
-from pymmcore_gui._vendored.mda_handlers._util import position_sizes
-
-from . import _log
-from ._protocol import (
+from opym.stream.protocol import (
+    IDLE_CLOSED_PREFIX,
     MSG_ACK,
     MSG_CLIENT_LOG,
     MSG_FRAME,
@@ -93,6 +80,20 @@ from ._protocol import (
     pack_message,
     unpack_message,
 )
+from pymmcore_widgets.useq_widgets import PYMMCW_METADATA_KEY
+from zmq.utils.monitor import recv_monitor_message
+
+from pymmcore_gui._multi_camera_handler import physical_camera_labels, without_cam_index
+from pymmcore_gui._spectral_channel_handler import (
+    _strip_known_suffix,
+    active_channels_for_event,
+    channels_for_sequence,
+    crop_region,
+    roi_origin,
+)
+from pymmcore_gui._vendored.mda_handlers._util import position_sizes
+
+from . import _log
 from ._tunnel import link_endpoints
 from ._volume_assembler import Volume, VolumeAssembler
 
@@ -165,7 +166,7 @@ _FINISH_GIVE_UP_S = 600.0
 # If the RAM can't be read; the setting's 0 otherwise means a quarter of it.
 _FALLBACK_HARD_CAP_BYTES = 8 * 1024**3
 # Once Argus advertises "heartbeat": how often this run reports in, so Argus
-# can tell "alive but nothing gets through" from "gone" (see _protocol.py).
+# can tell "alive but nothing gets through" from "gone" (see opym.stream.protocol).
 _HEARTBEAT_EVERY_S = 5.0
 # Once Argus advertises "client_log": how often new stream log lines go.
 _CLIENT_LOG_EVERY_S = 10.0
@@ -676,7 +677,10 @@ class _RunWorker(threading.Thread):
             "t": volume.t,
             "c": volume.c,
             "frame_index": frame_index,
-            "timestamp": volume.timestamp,
+            # Epoch seconds of the volume's first plane (the wire contract, see
+            # opym.stream.protocol.frame_epoch_s), not ``volume.timestamp``
+            # (ms since the run started, which the local save keeps).
+            "timestamp": volume.acq_first_s,
             "camera_id": volume.camera_id,
             "shape_zyx": list(volume.array.shape),
             "dtype": str(volume.array.dtype),
@@ -772,7 +776,7 @@ class _RunWorker(threading.Thread):
         last_progress = time.monotonic()
         finished_at: float | None = None
         # Argus clock minus ours, from the SESSION_START -> first ACK round
-        # trip; sent with every FRAME once known (see _protocol.py).
+        # trip; sent with every FRAME once known (see opym.stream.protocol).
         clock_offset: float | None = None
         next_link = 0
         rate_mark = (time.monotonic(), [0] * n_links)
@@ -881,7 +885,7 @@ class _RunWorker(threading.Thread):
                 # what's unACKed. A resync already out is retried on a timer.
                 if ack.get("rejected"):
                     rejected = str(ack["rejected"])
-                if ack.get("closed") or rejected.startswith("closed on Argus"):
+                if ack.get("closed") or rejected.startswith(IDLE_CLOSED_PREFIX):
                     # Closed for good (no new data for its idle timeout):
                     # retrying only loops (every 30 s, 2026-10-23). Stop.
                     if not self.paused.is_set():
