@@ -66,12 +66,24 @@ Anything skipped is still saved locally. Every option is documented on
 uv run python -m pymmcore_gui._argus_stream.replay <channel .ome.zarr>
 # measure SSH link throughput to the server
 uv run python -m pymmcore_gui._argus_stream.linkbench
+# send finished OME-Zarr runs to Argus over SSH (opym's sender; flags: --help)
+uv run python -m pymmcore_gui._argus_stream.backfill_send --map "S:\\=/mmfs1/..." --dry-run
 ```
 
 Docs for the fork: [CHANGELOG.md](./CHANGELOG.md), the "Deploying to the
 acquisition PC" and "Streaming to Argus over the direct 10 GbE link" sections
 of [CONTRIBUTING.md](./CONTRIBUTING.md), and the module docstrings in
-`src/pymmcore_gui/_argus_stream/` (the wire protocol is in `_protocol.py`).
+`src/pymmcore_gui/_argus_stream/`. The wire protocol, the backfill wire format
+and the backfill sender are not copied here: they are imported from
+[opym](https://github.com/bscott711/opym) (`opym.stream.protocol`,
+`opym.stream.bfill`, `opym.stream.bfill_run`, `opym.stream.backfill_client`),
+pinned by commit SHA in `pyproject.toml` (`[tool.uv.sources]`). To move the pin,
+change `rev`, run `uv lock` and check that the lock diff holds no other package.
+`_argus_stream/backfill_send.py` is only the wrapper that adds this app's
+`ArgusTunnelManager` and Settings to opym's sender. After the rig's `uv sync`,
+the `opym-backfill-send.exe` console script is opym's bare sender (no SSH
+tunnel); the rig must keep using
+`python -m pymmcore_gui._argus_stream.backfill_send`.
 <!-- END fork-specific section -->
 
 ## ✅ Project Status

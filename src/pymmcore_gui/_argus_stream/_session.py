@@ -9,7 +9,7 @@ save (and vice versa): see the plan's "Key architecture findings" for the
 verified code paths this relies on.
 
 v1 scope: single-position MDA sequences only (Argus's wire protocol has no
-position axis -- see ``_protocol.py``). Multi-camera sequences are streamed
+position axis -- see ``opym.stream.protocol``). Multi-camera sequences are streamed
 *only* when spectral-channel cropping is active and resolves each camera's
 regions into distinct channel identities -- exactly what
 :class:`~pymmcore_gui._spectral_channel_handler.SpectralChannelHandler`
@@ -57,11 +57,35 @@ import time
 from collections import deque
 from enum import Enum
 from pathlib import PureWindowsPath
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, cast
 from uuid import uuid4
 
 import numpy as np
 import zmq
+from opym.stream.protocol import (
+    DEFAULT_BIND_ADDR,
+    IDLE_CLOSED_PREFIX,
+    MSG_ACK,
+    MSG_CLIENT_LOG,
+    MSG_FRAME,
+    MSG_HEARTBEAT,
+    MSG_PREPARE,
+    MSG_QC,
+    MSG_RESUME,
+    MSG_SESSION_END,
+    MSG_SESSION_START,
+    REASON_CLIENT_ABORT,
+    REASON_CLIENT_ERROR,
+    REASON_COMPLETE,
+    REASON_PAUSED,
+    FrameHeader,
+    PrepareHeader,
+    QCHeader,
+    SessionEndReason,
+    SessionStartHeader,
+    pack_message,
+    unpack_message,
+)
 from pymmcore_widgets.useq_widgets import PYMMCW_METADATA_KEY
 from zmq.utils.monitor import recv_monitor_message
 
@@ -76,23 +100,6 @@ from pymmcore_gui._spectral_channel_handler import (
 from pymmcore_gui._vendored.mda_handlers._util import position_sizes
 
 from . import _log
-from ._protocol import (
-    MSG_ACK,
-    MSG_CLIENT_LOG,
-    MSG_FRAME,
-    MSG_HEARTBEAT,
-    MSG_PREPARE,
-    MSG_QC,
-    MSG_RESUME,
-    MSG_SESSION_END,
-    MSG_SESSION_START,
-    FrameHeader,
-    PrepareHeader,
-    QCHeader,
-    SessionStartHeader,
-    pack_message,
-    unpack_message,
-)
 from ._tunnel import link_endpoints
 from ._volume_assembler import Volume, VolumeAssembler
 
@@ -165,7 +172,7 @@ _FINISH_GIVE_UP_S = 600.0
 # If the RAM can't be read; the setting's 0 otherwise means a quarter of it.
 _FALLBACK_HARD_CAP_BYTES = 8 * 1024**3
 # Once Argus advertises "heartbeat": how often this run reports in, so Argus
-# can tell "alive but nothing gets through" from "gone" (see _protocol.py).
+# can tell "alive but nothing gets through" from "gone" (see opym.stream.protocol).
 _HEARTBEAT_EVERY_S = 5.0
 # Once Argus advertises "client_log": how often new stream log lines go.
 _CLIENT_LOG_EVERY_S = 10.0
@@ -183,9 +190,6 @@ _NO_FRAMES_ALARM_S = 120.0
 _STALL_LABEL_STEP_S = 10
 _HOST = socket.gethostname()
 _DTYPE_BY_BYTES_PER_PIXEL = {1: "uint8", 2: "uint16", 4: "uint32"}
-_SessionEndReason = Literal[
-    "complete", "idle_timeout", "client_abort", "paused", "client_error"
-]
 
 
 class StreamState(str, Enum):
@@ -624,7 +628,7 @@ class _RunWorker(threading.Thread):
     ) -> None:
         super().__init__(name="ArgusStreamWorker", daemon=True)
         self._session_id = session_id
-        self._endpoints = endpoints or ["tcp://127.0.0.1:5555"]
+        self._endpoints = endpoints or [DEFAULT_BIND_ADDR]
         self._direct_endpoint = direct_endpoint
         self._compress_over_tunnel = compress_over_tunnel
         # Set once an ACK advertises "slabs": the acquisition thread then
@@ -663,7 +667,7 @@ class _RunWorker(threading.Thread):
         self._next_frame_index = 0
         self._finish_event = threading.Event()
         self._abort_event = threading.Event()
-        self._finish_reason: _SessionEndReason = "complete"
+        self._finish_reason: SessionEndReason = REASON_COMPLETE
 
     def submit(self, volume: Volume) -> int:
         """Queue one completed volume (or slab) for sending.
@@ -676,7 +680,10 @@ class _RunWorker(threading.Thread):
             "t": volume.t,
             "c": volume.c,
             "frame_index": frame_index,
-            "timestamp": volume.timestamp,
+            # Epoch seconds of the volume's first plane (the wire contract, see
+            # opym.stream.protocol.frame_epoch_s), not ``volume.timestamp``
+            # (ms since the run started, which the local save keeps).
+            "timestamp": volume.acq_first_s,
             "camera_id": volume.camera_id,
             "shape_zyx": list(volume.array.shape),
             "dtype": str(volume.array.dtype),
@@ -691,7 +698,7 @@ class _RunWorker(threading.Thread):
         self._to_send.put((frame_index, header, payload))
         return frame_index
 
-    def finish(self, reason: _SessionEndReason = "complete") -> None:
+    def finish(self, reason: SessionEndReason = REASON_COMPLETE) -> None:
         """Request a graceful stop: drain and fully ACK before SESSION_END."""
         if not self.paused.is_set():
             self._finish_reason = reason
@@ -772,7 +779,7 @@ class _RunWorker(threading.Thread):
         last_progress = time.monotonic()
         finished_at: float | None = None
         # Argus clock minus ours, from the SESSION_START -> first ACK round
-        # trip; sent with every FRAME once known (see _protocol.py).
+        # trip; sent with every FRAME once known (see opym.stream.protocol).
         clock_offset: float | None = None
         next_link = 0
         rate_mark = (time.monotonic(), [0] * n_links)
@@ -881,7 +888,7 @@ class _RunWorker(threading.Thread):
                 # what's unACKed. A resync already out is retried on a timer.
                 if ack.get("rejected"):
                     rejected = str(ack["rejected"])
-                if ack.get("closed") or rejected.startswith("closed on Argus"):
+                if ack.get("closed") or rejected.startswith(IDLE_CLOSED_PREFIX):
                     # Closed for good (no new data for its idle timeout):
                     # retrying only loops (every 30 s, 2026-10-23). Stop.
                     if not self.paused.is_set():
@@ -940,7 +947,7 @@ class _RunWorker(threading.Thread):
         def pause(total: int, why: str, status: str = "") -> None:
             nonlocal unacked_bytes
             self.paused.set()
-            self._finish_reason = "paused"
+            self._finish_reason = REASON_PAUSED
             self._finish_event.set()
             unacked.clear()
             pending.clear()
@@ -1065,7 +1072,7 @@ class _RunWorker(threading.Thread):
                     break
             try:
                 flush_log(force=True)
-                end = {"reason": "client_error", "detail": detail}
+                end = {"reason": REASON_CLIENT_ERROR, "detail": detail}
                 end_link = send(pack_message(MSG_SESSION_END, sid, end))  # type: ignore[arg-type]
             except Exception:
                 logger.exception("Could not tell Argus the stream sender failed")
@@ -1279,8 +1286,8 @@ class _RunWorker(threading.Thread):
                     rate_mark = (time.monotonic(), sent_now)
 
             if self._abort_event.is_set() and end_link is None:
-                reason: _SessionEndReason = (
-                    "paused" if self.paused.is_set() else "client_abort"
+                reason: SessionEndReason = (
+                    REASON_PAUSED if self.paused.is_set() else REASON_CLIENT_ABORT
                 )
                 end_link = send(pack_message(MSG_SESSION_END, sid, {"reason": reason}))
         except Exception as exc:
@@ -1470,7 +1477,7 @@ class ArgusStreamSession:
             # Argus -- holding the live lease that pauses the backfill -- for
             # as long as this app runs, re-attaching after any Argus restart.
             logger.warning("Argus stream: previous run never ended; closing it")
-            self._worker.finish("client_abort")
+            self._worker.finish(REASON_CLIENT_ABORT)
             self._worker = None
         settings = self._get_settings()
         argus = settings.argus_stream
@@ -1592,14 +1599,14 @@ class ArgusStreamSession:
     def sequenceFinished(self, sequence: useq.MDASequence) -> None:
         """Signal a graceful end-of-run; does not block the acquisition thread."""
         if self._worker is not None:
-            self._worker.finish("complete")
+            self._worker.finish(REASON_COMPLETE)
         self._worker = None
 
     @_never_raises
     def sequenceCanceled(self, sequence: useq.MDASequence) -> None:
         """Signal an aborted run; does not block the acquisition thread."""
         if self._worker is not None:
-            self._worker.finish("client_abort")
+            self._worker.finish(REASON_CLIENT_ABORT)
         self._worker = None
 
     def shutdown(self, timeout: float = 2.0) -> None:
@@ -1612,7 +1619,7 @@ class ArgusStreamSession:
         """
         workers = [w for w in self._all_workers if w.is_alive()]
         for worker in workers:
-            worker.finish("client_abort")
+            worker.finish(REASON_CLIENT_ABORT)
         deadline = time.monotonic() + timeout
         for worker in workers:
             worker.join(timeout=max(0.0, deadline - time.monotonic()))

@@ -1875,6 +1875,15 @@ tifffile = [
 ]
 
 [[package]]
+name = "opym"
+version = "0.5.0"
+source = { git = "https://github.com/bscott711/opym?rev=b9189d2419c47f0736b188307f4a76f08002cd65#b9189d2419c47f0736b188307f4a76f08002cd65" }
+dependencies = [
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.14'" },
+    { name = "numpy", version = "2.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.14'" },
+]
+
+[[package]]
 name = "packaging"
 version = "25.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2637,6 +2646,7 @@ dependencies = [
     { name = "msgpack" },
     { name = "ndv", extra = ["vispy"] },
     { name = "ome-writers", extra = ["tifffile"] },
+    { name = "opym" },
     { name = "pydantic-settings" },
     { name = "pygfx" },
     { name = "pylinalg" },
@@ -2699,6 +2709,7 @@ requires-dist = [
     { name = "msgpack", specifier = ">=1.0.8" },
     { name = "ndv", extras = ["vispy"], editable = "../ndv" },
     { name = "ome-writers", extras = ["tifffile"], specifier = ">=0.3.0" },
+    { name = "opym", git = "https://github.com/bscott711/opym?rev=b9189d2419c47f0736b188307f4a76f08002cd65" },
     { name = "peach-pit-plugin", marker = "python_full_version >= '3.11' and extra == 'plugins'", editable = "../peach-pit-plugin" },
     { name = "pydantic-settings", specifier = ">=2.7.1" },
     { name = "pygfx", specifier = ">=0.16.0" },

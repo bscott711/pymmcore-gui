@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, cast
 
 from CRISPy.spot.settings import SpotFocusSettingsV1
+from opym.stream.protocol import STREAM_PORT
 from platformdirs import user_data_dir
 from pydantic import (
     Base64Bytes,
@@ -293,7 +294,7 @@ class ArgusStreamSettingsV1(BaseMMSettings):
     ~33 MB/s, so this is ~2.5x the frames per second; the direct link is
     faster than one thread can compress, so frames always go to it raw.
     """
-    local_port: int = 5555
+    local_port: int = STREAM_PORT
     """Local end of the SSH port-forward that the ZMQ DEALER connects to.
 
     With several ``stream_links``, link k's forward listens on
@@ -316,10 +317,11 @@ class ArgusStreamSettingsV1(BaseMMSettings):
     Separate processes are separate TCP connections (and encrypt in
     parallel); several links in one process share its connection.
     """
-    remote_port: int = 5555
+    remote_port: int = STREAM_PORT
     """Port ``opym-receive`` binds to on ``127.0.0.1`` on the Argus side.
 
-    Matches ``opym.stream.receiver.DEFAULT_BIND_ADDR`` (``tcp://127.0.0.1:5555``).
+    Is ``opym.stream.protocol.STREAM_PORT`` (``DEFAULT_BIND_ADDR`` is
+    ``tcp://127.0.0.1:`` plus it).
     """
     buffer_budget_mb: int = 4096
     """RAM budget for buffered-but-unacked volumes before raising an alarm.

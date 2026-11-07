@@ -4,7 +4,8 @@ Run on the acquisition PC, between acquisitions::
 
     uv run python -m pymmcore_gui._argus_stream.linkbench
 
-It needs ``opym-linkbench-sink`` listening on Argus (``127.0.0.1:5599``).
+It needs ``opym-linkbench-sink`` listening on Argus (``127.0.0.1``, port
+``opym.stream.protocol.LINKBENCH_PORT``).
 For each case it opens the tunnels with the same
 :class:`~pymmcore_gui._argus_stream._tunnel.ArgusTunnelManager` the app
 uses, pushes incompressible 6 MB messages (about one compressed slab)
@@ -40,6 +41,7 @@ from typing import Any
 
 import numpy as np
 import zmq
+from opym.stream.protocol import LINKBENCH_PORT
 from zmq.utils.monitor import recv_monitor_message
 
 from ._tunnel import ArgusTunnelManager
@@ -351,7 +353,7 @@ def _print_table(results: list[CaseResult]) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
     parser.add_argument("--host", default=None, help="ssh Host alias (settings)")
-    parser.add_argument("--remote-port", type=int, default=5599)
+    parser.add_argument("--remote-port", type=int, default=LINKBENCH_PORT)
     parser.add_argument("--local-port", type=int, default=5600)
     parser.add_argument("--links", default="1,2,4,8")
     parser.add_argument("--seconds", type=float, default=15.0)

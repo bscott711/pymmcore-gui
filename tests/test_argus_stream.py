@@ -11,10 +11,7 @@ import numpy as np
 import pytest
 import useq
 import zmq
-
-from pymmcore_gui._argus_stream import ArgusStreamSession, StreamState
-from pymmcore_gui._argus_stream import _session as session_mod
-from pymmcore_gui._argus_stream._protocol import (
+from opym.stream.protocol import (
     MSG_ACK,
     MSG_FRAME,
     MSG_PREPARE,
@@ -24,9 +21,15 @@ from pymmcore_gui._argus_stream._protocol import (
     MSG_SESSION_START,
     AckHeader,
     MessageHeader,
+    frame_epoch,
+    frame_epoch_s,
     pack_message,
     unpack_message,
 )
+from opym.testing.stream import EPOCH_S, FRAME_TIME_CASES, rig_frame_header
+
+from pymmcore_gui._argus_stream import ArgusStreamSession, StreamState
+from pymmcore_gui._argus_stream import _session as session_mod
 from pymmcore_gui._argus_stream._session import (
     CameraGeometry,
     _active_spectral_channels,
@@ -1086,6 +1089,57 @@ def test_frames_carry_trace_timestamps_and_the_measured_clock_offset(
         )
         assert header["clock_offset_s"] == pytest.approx(1000.0, abs=0.5)
     session.shutdown(timeout=1)
+
+
+def test_frame_timestamp_is_the_epoch_second_of_the_volumes_first_plane(
+    fake_receiver: _FakeReceiver,
+) -> None:
+    """ING-F1: the wire ``timestamp`` is epoch seconds (``acq_first_s``), not the
+    ``runner_time_ms`` (ms since the run began) the frame meta carries, so Argus
+    can store a real acquisition time."""
+    settings = _full_settings(
+        ArgusStreamSettingsV1(
+            enabled=True, local_port=fake_receiver.port, gpfs_scratch_root="/scratch"
+        )
+    )
+    session = ArgusStreamSession(
+        _StubCore(),  # pyright: ignore[reportArgumentType]
+        _NoopTunnel(),  # pyright: ignore[reportArgumentType]
+        get_settings=lambda: settings,
+    )
+    seq = _save_seq(z_plan=useq.ZRangeAround(range=1, step=1))
+    session.sequenceStarted(seq, {})  # pyright: ignore[reportArgumentType]
+    for event in seq:
+        session.frameReady(
+            np.zeros((4, 4), dtype="uint16"),
+            event,  # pyright: ignore[reportArgumentType]
+            {"runner_time_ms": 3408.0},  # type: ignore[arg-type]
+        )
+    session.sequenceFinished(seq)
+    _wait_for_session_end(fake_receiver)
+
+    frames = fake_receiver.frame_messages()
+    assert len(frames) == 2
+    for header, _payload in frames:
+        assert header["timestamp"] > 1e9  # epoch seconds, not 3408 ms
+        assert header["timestamp"] == header["acq_first_s"]
+        # What the receiver reads: the timestamp itself, no fallback needed.
+        assert frame_epoch(header) == (header["acq_first_s"], "timestamp")
+        assert frame_epoch_s(header) == header["acq_first_s"]
+        # The keys the golden rig header (opym.testing.stream) lists are all there.
+        assert set(rig_frame_header(EPOCH_S)) <= set(header)
+    session.shutdown(timeout=1)
+
+
+def test_the_golden_frame_headers_give_the_epoch_the_rig_sends() -> None:
+    """The receiver's rule, on opym's golden headers: the rig's epoch header is
+    taken as is; the ms-since-start header the rig used to send is recovered from
+    ``acq_first_s``."""
+    header, expected, source = FRAME_TIME_CASES["epoch"]
+    assert header["timestamp"] == header["acq_first_s"]
+    assert (frame_epoch_s(header), frame_epoch(header)[1]) == (expected, source)
+    old, expected, source = FRAME_TIME_CASES["ms_since_start"]
+    assert (frame_epoch_s(old), frame_epoch(old)[1]) == (expected, source)
 
 
 def _wait_for_session_end(receiver: _FakeReceiver) -> None:

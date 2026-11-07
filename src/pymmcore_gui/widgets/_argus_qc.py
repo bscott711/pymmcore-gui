@@ -3,7 +3,7 @@
 Argus (``celldet-live-qc``) judges every streamed timepoint about a second
 after it lands. It checks whether the cell is cut off by a face of the imaged
 volume, drifting toward one, defocused or bleaching, and says what to change.
-Those verdicts arrive as ``MSG_QC`` (see ``_argus_stream._protocol.QCHeader``).
+Those verdicts arrive as ``MSG_QC`` (see ``opym.stream.protocol.QCHeader``).
 This panel shows the newest one, its advice (tagged *now* when it can change
 mid-run, *next run* when it changes the volume's shape), the cell's margin on
 every face, and a strip of recent verdicts.

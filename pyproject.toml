@@ -39,6 +39,7 @@ dependencies = [
     "msgpack>=1.0.8",
     "ndv[vispy]>=0.5.0rc4",
     "ome-writers[tifffile]>=0.3.0",
+    "opym",
     "pydantic-settings>=2.7.1",
     "pymmcore-plus[cli]>=0.18.0",
     "pymmcore-widgets>=0.12.0",
@@ -78,6 +79,11 @@ pymmcore-widgets = { path = "../pymmcore-widgets", editable = true }
 crispy = { path = "../CRISPy", editable = true }
 ndv = { path = "../ndv", editable = true }
 peach-pit-plugin = { path = "../peach-pit-plugin", editable = true }
+# The stream wire contract and the backfill sender live in opym (pinned by SHA, never a
+# branch). Base install only, not `opym[stream]`: msgpack, pyzmq, zarr and numcodecs come
+# from the list above, and the extra's `zarr>=2.18.7` would move the rig's 2.18.3. To bump:
+# change `rev`, run `uv lock`, check the diff moves no unrelated package.
+opym = { git = "https://github.com/bscott711/opym", rev = "b9189d2419c47f0736b188307f4a76f08002cd65" }
 
 [dependency-groups]
 # should only be used after manually uninstalling PyQt6 and PyQt6Ads
@@ -114,8 +120,6 @@ allow-direct-references = true
 [project.scripts]
 mmgui = "pymmcore_gui.__main__:main"
 microscope-control = "pymmcore_gui.asi_z_stack.__main__:main"
-# Send finished runs to Argus over SSH (the live stream's fallback).
-opym-backfill-send = "pymmcore_gui._argus_stream.backfill_send:main"
 
 [project.urls]
 homepage = "https://github.com/tlambert03/pymmcore-gui"
