@@ -19,10 +19,11 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING
 from unittest.mock import PropertyMock, patch
 
 import pytest
+from CRISPy import piezo_status
 from CRISPy.spot.panel import (
     ALERT_COLOR,
     ATTENTION_COLOR,
@@ -300,6 +301,29 @@ def _rig_e0() -> float:
     return float(sum(f.position for f in fixes) / len(fixes))
 
 
+#: How ``piezo_status.message`` begins when it reports a failure; any other text on
+#: the message line is a hint ("Calibrate first", "Ready to lock", "Locked", ...).
+_PROBLEM_PREFIXES = (
+    "Fault",
+    "Could not start",
+    "Calibration failed",
+    "Zero failed",
+    "Stop failed",
+    "Camera:",
+    "LED:",
+)
+
+
+def _problem(panel: SpotFocusPanel) -> str:
+    """The panel's message line when it reports a failure, else ``""``.
+
+    The panel has one contextual line (``message_label``) that always says
+    something, so "no error" is "no failure text", not an empty label.
+    """
+    text = panel.message_label.text()
+    return text if text.startswith(_PROBLEM_PREFIXES) else ""
+
+
 # ---------------------------------------------------------------------------
 # settings
 # ---------------------------------------------------------------------------
@@ -469,14 +493,16 @@ def test_buttons_and_readouts_are_the_edge_workflow(panel: SpotFocusPanel) -> No
     assert not hasattr(panel, "stop_button")
     assert panel.draw_edge_button.text() == "1. Draw Edge"
     assert not hasattr(panel, "modeForced")
+    # the tracking error moved out of the readouts to its own label (see
+    # test_telemetry_shows_the_edge_the_error_and_the_note)
     assert list(panel.readout_labels) == [
+        "moves",
+        "move_ms",
         "edge",
         "contrast",
         "fps",
-        "error",
-        "moves",
-        "move_ms",
     ]
+    assert panel.tracking_error_label.text() == "Not available"
     for gone in ("draw_edge2_button", "clear_edge2_button", "edge_box2_label"):
         assert not hasattr(panel, gone)
     # Nothing calibrated yet: Lock and Calibrate try (and ask for a box), Zero waits.
@@ -484,6 +510,8 @@ def test_buttons_and_readouts_are_the_edge_workflow(panel: SpotFocusPanel) -> No
     assert not panel.zero_button.isEnabled() and not panel.lock_button.isChecked()
     assert "not calibrated" in panel.calibration_label.text()
     assert panel.edge_box_label.text() == "none: 1. Draw Edge first"
+    # the one message line asks for the box first
+    assert panel.message_label.text() == NEED_BOX_TEXT
     assert panel.offset_spin.value() == 0.0
     assert (panel.span_spin.value(), panel.steps_spin.value()) == (2.0, 9)
     assert panel.frames_spin.value() == 3
@@ -493,12 +521,12 @@ def test_buttons_and_readouts_are_the_edge_workflow(panel: SpotFocusPanel) -> No
 
 def test_lock_and_calibrate_need_an_edge_box(panel: SpotFocusPanel) -> None:
     panel.calibrate()
-    assert NEED_BOX_TEXT in panel.fault_label.text()
+    assert NEED_BOX_TEXT in panel.message_label.text()
     assert panel._busy == ""
     assert panel.service is None  # lazy: nothing was created
-    panel.fault_label.setText("")
+    panel.message_label.setText("")
     panel.start()
-    assert NEED_BOX_TEXT in panel.fault_label.text()
+    assert NEED_BOX_TEXT in panel.message_label.text()
     assert panel.service is None
     assert panel.state == "idle"
     assert panel.lock_button.isEnabled()
@@ -579,12 +607,19 @@ def test_telemetry_shows_the_edge_the_error_and_the_note(
         "note": "",
         "reason": "",
     }
+    # The tracking error has its own label and is only shown while the lock runs.
     panel._on_telemetry(tele)
     assert labels["edge"].text() == "272.00 px"
-    assert labels["error"].text() == "+0.050 µm"
+    assert panel.tracking_error_label.text() == "Not available"
     assert labels["contrast"].text() == "700"
     assert labels["fps"].text() == "30.0"
     assert panel.note_label.text() == ""
+    panel._set_state("running")  # the last frame's error shows once the lock runs
+    assert panel.tracking_error_label.text() == "+0.050 µm"
+    panel._on_telemetry({**tele, "along_um": -0.02})
+    assert panel.tracking_error_label.text() == "-0.020 µm"
+    panel._on_telemetry(tele)
+    assert panel.tracking_error_label.text() == "+0.050 µm"
 
     # a note is shown whether or not there is an error
     panel._on_telemetry({**tele, "note": "holding"})
@@ -600,12 +635,16 @@ def test_telemetry_shows_the_edge_the_error_and_the_note(
     }
     panel._on_telemetry(bad)
     assert "edge too weak" in panel.note_label.text()
-    assert labels["error"].text() == "—"
+    assert panel.tracking_error_label.text() == "Not available"
     panel._on_telemetry({**bad, "reason": "", "along_um": 0.0})
     assert panel.note_label.text() == ""
+    assert panel.tracking_error_label.text() == "+0.000 µm"
     # an old worker's two-edge fields are ignored
     panel._on_telemetry({**tele, "disagreement_um": 0.4, "edges": [{"ok": True}]})
-    assert labels["error"].text() == "+0.050 µm"
+    assert panel.tracking_error_label.text() == "+0.050 µm"
+    # unlocking takes the error away again
+    panel._set_state("stopped")
+    assert panel.tracking_error_label.text() == "Not available"
 
 
 def test_loop_parameters_have_no_fusion_spins(panel: SpotFocusPanel) -> None:
@@ -617,22 +656,33 @@ def test_loop_parameters_have_no_fusion_spins(panel: SpotFocusPanel) -> None:
 def test_preview_error_appears_after_calibrate(
     qtbot: QtBot, panel: SpotFocusPanel
 ) -> None:
+    """The preview's telemetry carries the error once there is a calibration.
+
+    The panel only *shows* the tracking error while the lock runs, so the preview's
+    error is read from the telemetry the panel received (``_telemetry``).
+    """
     svc = _preview_on(qtbot, panel)
     panel.set_edge_box(BOX)
     labels = panel.readout_labels
     # The edge is measured in the preview, but there is no calibration: no error.
     qtbot.waitUntil(lambda: "px" in labels["edge"].text(), timeout=WAIT_MS)
-    assert labels["error"].text() == "—"
+    assert (panel._telemetry or {}).get("along_um") is None
+    assert panel.tracking_error_label.text() == "Not available"
     with patch.object(svc, "set_calibration", wraps=svc.set_calibration) as spy:
         panel.calibrate()
         qtbot.waitUntil(lambda: not panel._busy, timeout=WAIT_MS)
-        assert panel.fault_label.text() == "", panel.fault_label.text()
+        assert _problem(panel) == "", panel.message_label.text()
         spy.assert_called()
         sent = spy.call_args[0][0]
         assert isinstance(sent, FocusCalibration) and sent.box == BOX
-    # Now the preview shows the error (about 0 um: the fake is at its zero).
-    qtbot.waitUntil(lambda: "µm" in labels["error"].text(), timeout=WAIT_MS)
-    assert abs(float(labels["error"].text().split()[0])) < 0.5
+    # Now the preview measures the error (about 0 um: the fake is at its zero) ...
+    qtbot.waitUntil(
+        lambda: (panel._telemetry or {}).get("along_um") is not None, timeout=WAIT_MS
+    )
+    assert abs(float((panel._telemetry or {})["along_um"])) < 0.5
+    # ... but only the running lock displays it
+    assert panel.state != "running"
+    assert panel.tracking_error_label.text() == "Not available"
 
 
 @pytest.mark.parametrize("sign", [1.0, -1.0])
@@ -651,7 +701,7 @@ def test_calibrate_gives_a_two_line_label_for_the_one_edge(
         qtbot.waitUntil(lambda: not panel._busy, timeout=WAIT_MS)
         assert spy.call_args[0][0] == BOX
     stored = cfg.calibration
-    assert stored is not None, panel.fault_label.text()
+    assert stored is not None, panel.message_label.text()
     assert stored["kind"] == "edge" and "edges" not in stored
     edge = stored["edge"]
     assert edge["slope_px_per_um"] == pytest.approx(sign * SLOPE * 0.8, rel=0.15)
@@ -668,10 +718,11 @@ def test_calibrate_gives_a_two_line_label_for_the_one_edge(
     # the ring sits on the zero edge point
     view = panel.live_view
     assert view._setpoint_item.pos().x() == pytest.approx(edge["e0_px"] + 0.5)
-    # the preview shows the edge and the error
+    # the preview shows the edge and measures the error
     labels = panel.readout_labels
     qtbot.waitUntil(
-        lambda: "px" in labels["edge"].text() and "µm" in labels["error"].text(),
+        lambda: "px" in labels["edge"].text()
+        and (panel._telemetry or {}).get("along_um") is not None,
         timeout=WAIT_MS,
     )
     assert mmc.pos[P_LABEL] == pytest.approx(P0)  # P returned to where it was
@@ -689,11 +740,11 @@ def test_zero_here_rezeroes_the_edge(
     panel.calibrate()
     qtbot.waitUntil(lambda: not panel._busy, timeout=WAIT_MS)
     before = cfg.calibration
-    assert before is not None, panel.fault_label.text()
+    assert before is not None, panel.message_label.text()
     mmc.pos[P_LABEL] = P0 + 0.5  # the user refocused by hand
     panel.zero()
     qtbot.waitUntil(lambda: not panel._busy, timeout=WAIT_MS)
-    assert panel.fault_label.text() == "", panel.fault_label.text()
+    assert _problem(panel) == "", panel.message_label.text()
     after = cfg.calibration
     assert after is not None and after["kind"] == "edge"
     assert after["p0_um"] == pytest.approx(P0 + 0.5)
@@ -727,7 +778,7 @@ def test_rig_shaped_single_edge_calibration_locks_at_negative_p(
 
     panel.start()
     qtbot.waitUntil(lambda: panel.state == "running", timeout=WAIT_MS)
-    assert panel.fault_label.text() == "", panel.fault_label.text()
+    assert _problem(panel) == "", panel.message_label.text()
     qtbot.waitUntil(lambda: len(panel.chart) > 5, timeout=WAIT_MS)
     assert panel.state == "running"  # no range / excursion fault at P = -45.5
     assert abs(mmc.pos[P_LABEL] - RIG_P) < 1.0
@@ -833,7 +884,7 @@ def test_start_telemetry_stop_releases_led_and_joystick(
     qtbot.waitUntil(
         lambda: view.frame is not None and view.frame.seq > seq + 3, timeout=WAIT_MS
     )
-    assert "µm" in panel.readout_labels["error"].text()
+    assert re.fullmatch(r"[+-]\d\.\d{3} µm", panel.tracking_error_label.text())
 
     # Editing a parameter while running reaches the settings (and the worker).
     panel.param_spins["deadband_um"].setValue(0.05)
@@ -849,7 +900,7 @@ def test_start_telemetry_stop_releases_led_and_joystick(
     # A box drawn while the lock runs is refused (the lock keeps its own).
     view.edgeBoxDrawn.emit(0, 0, 40, 40)
     assert settings.spot_focus.edge_box == BOX
-    assert "Unlock before" in panel.fault_label.text()
+    assert "Unlock before" in panel.message_label.text()
 
     sets_before_stop = len(mmc.sets)
     with (
@@ -896,7 +947,7 @@ def test_calibrate_off_the_gui_thread(
     assert not panel.zero_button.isEnabled()
     qtbot.waitUntil(lambda: not panel._busy, timeout=WAIT_MS)
     stored = cfg.calibration
-    assert stored is not None, panel.fault_label.text()
+    assert stored is not None, panel.message_label.text()
     assert stored["kind"] == "edge" and "edges" not in stored
     edge = stored["edge"]
     assert edge["slope_px_per_um"] == pytest.approx(SLOPE, rel=0.1)  # signed
@@ -935,7 +986,7 @@ def test_zero_here_rezeroes_and_resets_the_offset(
     assert panel._busy == "zeroing"
     assert not panel.zero_button.isEnabled() and not panel.lock_button.isEnabled()
     qtbot.waitUntil(lambda: not panel._busy, timeout=WAIT_MS)
-    assert panel.fault_label.text() == "", panel.fault_label.text()
+    assert _problem(panel) == "", panel.message_label.text()
     stored = settings.spot_focus.calibration
     assert stored is not None
     edge = stored["edge"]
@@ -964,7 +1015,7 @@ def test_lock_without_a_calibration_calibrates_then_locks(
     assert panel.lock_button.isEnabled()
     panel.start()
     qtbot.waitUntil(lambda: panel.state == "running", timeout=WAIT_MS)
-    assert panel.fault_label.text() == "", panel.fault_label.text()
+    assert _problem(panel) == "", panel.message_label.text()
     stored = cfg.calibration
     assert stored is not None and stored["kind"] == "edge"
     assert stored["edge"]["slope_px_per_um"] == pytest.approx(SLOPE, rel=0.1)
@@ -987,7 +1038,7 @@ def test_failed_calibration_inside_lock_is_reported_and_nothing_locks(
     panel.refresh()
     panel.start()
     qtbot.waitUntil(lambda: not panel._busy, timeout=WAIT_MS)
-    assert "Calibration failed" in panel.fault_label.text()
+    assert "Calibration failed" in panel.message_label.text()
     assert panel.state != "running"
     assert cfg.calibration is None
     assert not panel.lock_active
@@ -1005,7 +1056,7 @@ def test_start_failure_is_reported(qtbot: QtBot, mmc: FakeMMC) -> None:
     widget.refresh()
     widget.start()
     qtbot.waitUntil(lambda: not widget._busy, timeout=WAIT_MS)
-    assert "no camera" in widget.fault_label.text()
+    assert "no camera" in widget.message_label.text()
     assert widget.state == "idle"
     assert not widget.lock_active
     assert widget.lock_button.isEnabled()
@@ -1016,12 +1067,17 @@ def test_start_failure_is_reported(qtbot: QtBot, mmc: FakeMMC) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _led_word(panel: SpotFocusPanel) -> str:
+    """The LED status word the host shows (``On`` / ``Off`` / ``No CRISP device``)."""
+    return piezo_status.led_word(panel.status_inputs())
+
+
 def _preview_on(qtbot: QtBot, panel: SpotFocusPanel) -> SpotFocusService:
     panel.preview_button.click()
     assert panel._preview_busy
     assert not panel.preview_button.isEnabled()  # while the camera opens
     qtbot.waitUntil(lambda: not panel._preview_busy, timeout=WAIT_MS)
-    assert panel.fault_label.text() == "", panel.fault_label.text()
+    assert _problem(panel) == "", panel.message_label.text()
     svc = panel.service
     assert svc is not None
     qtbot.waitUntil(lambda: panel.live_view.frame is not None, timeout=WAIT_MS)
@@ -1038,12 +1094,13 @@ def test_preview_lights_the_led_and_off_switches_it_off(
     qtbot.waitUntil(lambda: panel.led_button.isChecked(), timeout=WAIT_MS)
     assert mmc.props[(CRISP, "LED Intensity")] == "50.0"  # the default
     assert panel.led_spin.value() == 50
-    assert "LED on" in panel.crisp_readout.text()
-    assert CRISP in panel.crisp_readout.text()
+    # the CRISP readout is now the LED status word (a device is known: not "No CRISP")
+    assert _led_word(panel) == piezo_status.LED_ON
+    assert panel.status_inputs().crisp_present is True
     panel.preview_button.click()  # off
     assert mmc.crisp.leds == [True, False]
     qtbot.waitUntil(lambda: not panel.led_button.isChecked(), timeout=WAIT_MS)
-    assert "LED off" in panel.crisp_readout.text()
+    assert _led_word(panel) == piezo_status.LED_OFF
     # CRISP's own state is never written
     assert mmc.props[(CRISP, "CRISP State")] == "Idle"
 
@@ -1052,26 +1109,34 @@ def test_led_button_and_spin_apply_live_and_are_saved(
     qtbot: QtBot, panel: SpotFocusPanel, mmc: FakeMMC, _isolated_settings: SettingsV1
 ) -> None:
     panel.led_button.click()
-    qtbot.waitUntil(lambda: "LED on" in panel.crisp_readout.text(), timeout=WAIT_MS)
-    assert mmc.crisp.leds == [True]
+    # the click checks the button at once; the lit LED comes from the worker thread
+    qtbot.waitUntil(lambda: mmc.crisp.leds == [True], timeout=WAIT_MS)
+    qtbot.waitUntil(
+        lambda: panel.status_inputs().crisp_present is True, timeout=WAIT_MS
+    )
+    assert _led_word(panel) == piezo_status.LED_ON
     panel.led_spin.setValue(80)
     assert mmc.props[(CRISP, "LED Intensity")] == "80.0"
     assert _isolated_settings.spot_focus.led_intensity == 80.0
     panel.led_button.click()  # off
-    qtbot.waitUntil(lambda: "LED off" in panel.crisp_readout.text(), timeout=WAIT_MS)
-    assert mmc.crisp.leds == [True, False]
+    qtbot.waitUntil(lambda: mmc.crisp.leds == [True, False], timeout=WAIT_MS)
+    assert _led_word(panel) == piezo_status.LED_OFF
 
 
 def test_no_crisp_device_is_said_not_silent(qtbot: QtBot, mmc: FakeMMC) -> None:
     def make(spec: dict, led: float | None) -> SpotFocusService:
         return SpotFocusService(mmc, P_LABEL, None, spec, ready_timeout_s=25.0)
 
+    # With no edge box the line asks for one first; the CRISP hint comes after it.
+    SettingsV1.instance().spot_focus.edge_box = BOX
     widget = SpotFocusPanel(mmc, service_factory=make)
     qtbot.addWidget(widget)
     try:
         widget.preview_button.click()
         qtbot.waitUntil(lambda: not widget._preview_busy, timeout=WAIT_MS)
-        assert "no CRISP device (no CRISP label)" in widget.fault_label.text()
+        assert widget.message_label.text() == piezo_status.NO_CRISP_TEXT
+        assert "no CRISP device (no CRISP label)" in widget.message_label.text()
+        assert piezo_status.led_word(widget.status_inputs()) == "No CRISP device"
         assert mmc.props[(CRISP, "CRISP State")] == "Idle"
     finally:
         widget.shutdown()
@@ -1095,12 +1160,9 @@ def test_preview_opens_a_full_resolution_live_view(
     assert (pm.width(), pm.height()) == (frame.roi[2], frame.roi[3])
     assert view.sensor == tuple(frame.sensor)
     assert "FakeSpotSource" in panel.camera_label.text()
-    qtbot.waitUntil(
-        lambda: "fps" in panel.camera_readout.text()
-        and panel.camera_readout.text() != "-",
-        timeout=WAIT_MS,
-    )
-    assert "saturated" in panel.camera_readout.text()
+    # fps / max / saturated now sit in the frame-statistics line under the image
+    stats = panel.frame_stats_label._values
+    qtbot.waitUntil(lambda: all(v.text() != "-" for v in stats), timeout=WAIT_MS)
     # No calibration: the ring is hidden. Calibrating shows it.
     assert not view._setpoint_item.isVisible()
 
@@ -1111,6 +1173,7 @@ def test_preview_opens_a_full_resolution_live_view(
     assert not view.polling and not view._timer.isActive()
     assert view.frame is None  # cleared
     assert not svc.preview_active
+    assert all(v.text() == "-" for v in stats)  # the statistics are cleared too
 
 
 def test_view_is_docked_above_the_controls_by_default(
@@ -1119,15 +1182,21 @@ def test_view_is_docked_above_the_controls_by_default(
     view = panel.live_view
     assert not view.isWindow()
     assert view.window() is panel.window()  # not its own top-level window
-    assert panel.splitter.indexOf(view) == 0
-    assert panel.splitter.orientation() == Qt.Orientation.Vertical
+    # no splitter any more: the view is a row of the panel's one column, under the
+    # message line and above the toolbar rows that drive it
+    assert not hasattr(panel, "splitter")
+    layout = panel.layout()
+    assert layout is not None
+    assert layout.indexOf(view) > layout.indexOf(panel.message_label)
+    assert panel.calibration_steps_box.geometry().bottom() < view.geometry().top()
+    assert view.geometry().bottom() < panel.preview_button.geometry().top()
     assert view.minimumHeight() >= 240
     assert not panel.view_floating
     assert not panel.pop_out_button.isChecked()
     assert panel.pop_out_button.text() == "Pop out"
     assert view.isVisible()  # the space is kept even before Preview
     assert not view.polling and not view._timer.isActive()
-    assert all(s > 0 for s in panel.splitter.sizes())
+    assert view.height() >= 240
 
 
 def test_pop_out_and_dock_back_keep_the_index_and_the_scene(
@@ -1135,30 +1204,33 @@ def test_pop_out_and_dock_back_keep_the_index_and_the_scene(
 ) -> None:
     view = panel.live_view
     scene = view.scene
-    index = panel.splitter.indexOf(view)
+    layout = panel.layout()
+    assert layout is not None
+    index, count = layout.indexOf(view), layout.count()
+    assert index > 0
     panel.pop_out_button.click()
     assert view.isWindow() and view.isVisible()
     assert panel.view_floating and panel.pop_out_button.isChecked()
     assert panel.pop_out_button.text() == "Dock"
     assert view.window() is view
     assert view.scene is scene
-    assert panel.splitter.indexOf(view) == -1
-    assert panel.splitter.count() == 1
+    assert layout.indexOf(view) == -1
+    assert layout.count() == count - 1
     assert view.parentWidget() is panel  # owned by the panel: deleted with it
 
     panel.pop_out_button.click()  # dock again
     assert not view.isWindow() and view.isVisible()
     assert not panel.view_floating and not panel.pop_out_button.isChecked()
     assert panel.pop_out_button.text() == "Pop out"
-    assert panel.splitter.indexOf(view) == index
-    assert panel.splitter.count() == 2
+    assert layout.indexOf(view) == index
+    assert layout.count() == count
     assert view.scene is scene
     # The code path works too, and a repeat is a no-op.
     panel.set_view_floating(True)
     panel.set_view_floating(True)
     assert panel.pop_out_button.isChecked() and view.isWindow()
     panel.set_view_floating(False)
-    assert panel.splitter.indexOf(view) == index
+    assert layout.indexOf(view) == index
 
 
 def test_polling_follows_preview_docked_and_floating(
@@ -1191,6 +1263,9 @@ def test_closing_the_floating_view_docks_it_and_keeps_preview(
     qtbot: QtBot, panel: SpotFocusPanel
 ) -> None:
     view = panel.live_view
+    layout = panel.layout()
+    assert layout is not None
+    index = layout.indexOf(view)
     svc = _preview_on(qtbot, panel)
     panel.pop_out_button.click()
     assert view.isWindow()
@@ -1198,7 +1273,7 @@ def test_closing_the_floating_view_docks_it_and_keeps_preview(
         view.close()
     qtbot.waitUntil(lambda: not view.isWindow(), timeout=2000)
     assert view.isVisible()
-    assert panel.splitter.indexOf(view) == 0
+    assert layout.indexOf(view) == index  # back in its row
     assert not panel.pop_out_button.isChecked()
     assert panel.preview_button.isChecked()  # closing a window is not Preview off
     assert svc.preview_active and view._timer.isActive()
@@ -1376,7 +1451,7 @@ def test_detector_mismatch_is_shown_and_blocks_lock(panel: SpotFocusPanel) -> No
     assert "detector halfmax" in text  # what the calibration was made with
     assert panel.calibrate_button.isEnabled()  # recalibrating is the way out
     panel.start()  # also refuses when called directly
-    assert why in panel.fault_label.text() and panel._busy == ""
+    assert why in panel.message_label.text() and panel._busy == ""
     # switching the setting to the calibration's detector clears it
     panel.detector_combo.setCurrentIndex(panel.detector_combo.findData("halfmax"))
     assert panel.lock_button.isEnabled()
@@ -1408,9 +1483,10 @@ def test_refusal_from_the_service_start_is_shown_not_raised(
     ):
         panel.start()
         qtbot.waitUntil(lambda: not panel._busy, timeout=WAIT_MS)
-    text = panel.fault_label.text()
+    text = panel.message_label.text()
     assert "calibrated with gaussderiv; the detector setting is halfmax" in text
-    assert ATTENTION_COLOR in text
+    # the message line is plain text: the refusal is shown as is, not coloured
+    assert panel.message_label.textFormat() == Qt.TextFormat.PlainText
     assert panel.state != "running" and not panel.lock_active
     assert panel._owner.service is svc and not panel._owner.dead  # no rebuild
     assert panel.lock_button.isEnabled()
@@ -1578,7 +1654,7 @@ def test_camera_error_is_shown_and_preview_can_be_retried(
     try:
         widget.preview_button.click()
         qtbot.waitUntil(lambda: not widget._preview_busy, timeout=WAIT_MS)
-        assert "SDK folder not found" in widget.fault_label.text()
+        assert "SDK folder not found" in widget.message_label.text()
         assert not widget.preview_button.isChecked()
         assert widget.preview_button.isEnabled()
         assert not widget.live_view.polling
@@ -1588,7 +1664,7 @@ def test_camera_error_is_shown_and_preview_can_be_retried(
         widget.preview_button.click()
         qtbot.waitUntil(lambda: not widget._preview_busy, timeout=WAIT_MS)
         qtbot.waitUntil(lambda: widget.live_view.frame is not None, timeout=WAIT_MS)
-        assert widget.fault_label.text() == ""
+        assert _problem(widget) == "", widget.message_label.text()
         assert widget.preview_button.isChecked()
         assert widget.live_view.isVisible()
     finally:
@@ -1616,56 +1692,43 @@ def test_setpoint_ring_is_in_sensor_pixels_with_a_roi(
     assert abs(spot[0] - _e0()) < 3 and abs(spot[1] - 240.0) < 3
 
 
-class FakeQSettings:
-    """An in-memory ``QSettings`` so a test never touches the user's store."""
-
-    store: ClassVar[dict[str, object]] = {}
-
-    def __init__(self, *args: object) -> None:
-        pass
-
-    def value(self, key: str, default: object = None, type: object = None) -> object:
-        return self.store.get(key, default)
-
-    def setValue(self, key: str, value: object) -> None:
-        self.store[key] = value
-
-
 def test_camera_parameters_section_is_collapsible(
-    qtbot: QtBot, mmc: FakeMMC, monkeypatch: pytest.MonkeyPatch
+    qtbot: QtBot, panel: SpotFocusPanel
 ) -> None:
-    monkeypatch.setattr("CRISPy.spot.panel.QSettings", FakeQSettings)
-    monkeypatch.setattr(FakeQSettings, "store", {})
-    widget = SpotFocusPanel(mmc, service_factory=_factory(mmc))
-    qtbot.addWidget(widget)
-    widget.show()
-    try:
-        section = widget.camera_params_section
-        assert section.toggle_btn.text() == "Camera parameters"
-        # collapsed by default: the body is hidden, Preview stays visible
-        assert not section.toggle_btn.isChecked()
-        assert not widget.exposure_spin.isVisible()
-        assert not widget.apply_roi_button.isVisible()
-        assert widget.preview_button.isVisible() and widget.camera_label.isVisible()
-        # the title shows and hides the body
-        section.toggle_btn.click()
-        assert widget.exposure_spin.isVisible() and widget.apply_roi_button.isVisible()
-        assert FakeQSettings.store["camera_params_expanded"] is True
-        section.toggle_btn.click()
-        assert not widget.exposure_spin.isVisible()
-        assert FakeQSettings.store["camera_params_expanded"] is False
-    finally:
-        widget.shutdown()
-    # the choice is remembered by the next panel
-    FakeQSettings.store["camera_params_expanded"] = True
-    again = SpotFocusPanel(mmc, service_factory=_factory(mmc))
-    qtbot.addWidget(again)
-    again.show()
-    try:
-        assert again.camera_params_section.toggle_btn.isChecked()
-        assert again.exposure_spin.isVisible()
-    finally:
-        again.shutdown()
+    """The Camera parameters section is now a Camera section button.
+
+    CRISPy 64a9092 replaced the collapsible ``camera_params_section`` (its open/closed
+    state kept in ``QSettings``) with four section buttons under the image, one open
+    at a time and all closed at start; nothing is persisted.
+    """
+    assert list(panel.section_buttons) == [
+        "camera",
+        "calibration",
+        "diagnostics",
+        "advanced",
+    ]
+    button, page = panel.section_buttons["camera"], panel.section_pages["camera"]
+    assert button.text() == "Camera"
+    # closed by default: the body is hidden, Preview and the camera line stay
+    assert not button.isChecked() and page.isHidden()
+    assert not panel.exposure_spin.isVisible()
+    assert not panel.apply_roi_button.isVisible()
+    assert panel.preview_button.isVisible()
+    assert not hasattr(panel, "camera_params_section")
+    # the button shows and hides the body
+    button.click()
+    assert page.isVisible() and button.isChecked()
+    assert panel.exposure_spin.isVisible() and panel.apply_roi_button.isVisible()
+    assert panel.camera_label.isVisible()
+    # opening another section closes this one
+    other = panel.section_buttons["advanced"]
+    other.click()
+    assert other.isChecked() and panel.section_pages["advanced"].isVisible()
+    assert not button.isChecked() and page.isHidden()
+    assert not panel.exposure_spin.isVisible()
+    other.click()
+    assert not any(b.isChecked() for b in panel.section_buttons.values())
+    assert all(p.isHidden() for p in panel.section_pages.values())
 
 
 # ---------------------------------------------------------------------------

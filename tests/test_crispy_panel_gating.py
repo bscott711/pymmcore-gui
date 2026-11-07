@@ -1,4 +1,4 @@
-"""CRISPy's panels as the GUI builds them: the camera-only piezo panel, the Z-stage
+"""CRISPy's panels as the GUI builds them: the piezo spot widget, the Z-stage
 hardware panel and the spot settings.
 
 Builds the panels through :class:`CrispWidget` on a small fake core with one CRISP axis
@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from CRISPy._section import _Section
-from CRISPy.piezo_panel import PiezoSpotPanel
+from CRISPy.piezo_ui import PiezoSpotWidget
 from CRISPy.spot.panel import SpotFocusPanel
 from CRISPy.spot.store import get_settings_store, set_settings_store
 from CRISPy.ui import CrispControlPanel
@@ -139,9 +139,9 @@ def crisp(
     set_settings_store(None)
 
 
-def _panels(widget: CrispWidget) -> tuple[PiezoSpotPanel, CrispControlPanel]:
-    """The piezo (camera-only) panel and the Z-stage (hardware) panel."""
-    piezo = widget.findChildren(PiezoSpotPanel)
+def _panels(widget: CrispWidget) -> tuple[PiezoSpotWidget, CrispControlPanel]:
+    """The piezo spot widget (camera-only) and the Z-stage (hardware) panel."""
+    piezo = widget.findChildren(PiezoSpotWidget)
     stage = widget.findChildren(CrispControlPanel)
     assert len(piezo) == 1 and len(stage) == 1
     assert piezo[0].controller.actuator_type == "piezo"
@@ -149,9 +149,9 @@ def _panels(widget: CrispWidget) -> tuple[PiezoSpotPanel, CrispControlPanel]:
     return piezo[0], stage[0]
 
 
-#: Widgets only the hardware panel has: readouts, operation, calibration, dither,
+#: Widgets the hardware panel has: readouts, operation, calibration, dither,
 #: parameters, the Tiger poller and the joystick checkbox.
-HARDWARE_ONLY = (
+HARDWARE_WIDGETS = (
     "readouts_box",
     "dither_section",
     "params_section",
@@ -160,33 +160,48 @@ HARDWARE_ONLY = (
     "joystick_chk",
     "_poller",
 )
+#: The ones the piezo widget does not have: it reads nothing (no poller), lights the
+#: LED and locks through the spot service, and has its own readouts and Joystick box.
+HARDWARE_ONLY = tuple(
+    n for n in HARDWARE_WIDGETS if n not in ("readouts_box", "joystick_chk")
+)
 
 
-def test_the_piezo_panel_is_camera_lock_only(crisp: CrispWidget) -> None:
+def test_the_piezo_widget_is_camera_lock_only(crisp: CrispWidget) -> None:
     piezo, _ = _panels(crisp)
-    assert isinstance(piezo.spot_panel, SpotFocusPanel)
-    assert piezo.spot_panel._controller is piezo.controller
+    assert isinstance(piezo.panel, SpotFocusPanel)
+    assert piezo.panel._controller is piezo.controller
     # none of the hardware panel's sections, no poller reading the serial port
     assert not isinstance(piezo, CrispControlPanel)
     assert piezo.findChildren(CrispControlPanel) == []
     for name in HARDWARE_ONLY:
         assert not hasattr(piezo, name), name
-    titles = {sec.toggle_btn.text() for sec in piezo.findChildren(_Section)}
-    assert "Dither" not in titles
-    assert titles == {"Camera parameters", "Parameters"}  # the camera lock's own
+    assert piezo.findChildren(_Section) == []  # no Dither / Parameters sections
+    # the camera lock's own section buttons, all closed
+    assert set(piezo.panel.section_buttons) == {
+        "camera",
+        "calibration",
+        "diagnostics",
+        "advanced",
+    }
+    assert not any(b.isChecked() for b in piezo.panel.section_buttons.values())
+    # the Joystick box sits in the lock panel's control row, on until the lock runs
+    assert piezo.joystick_chk.isChecked()
+    assert piezo.panel.isAncestorOf(piezo.joystick_chk)
     # the spot panel is built lazily: no worker, no camera yet
-    assert piezo.spot_panel.service is None
-    assert piezo.spot_panel.edge_box_label.text() == "none"
+    assert piezo.panel.service is None
+    assert piezo.panel.edge_box_label.text().startswith("none")
 
 
 def test_the_stage_panel_keeps_its_hardware_sections(
     crisp: CrispWidget,
 ) -> None:
     _, stage = _panels(crisp)
-    for name in HARDWARE_ONLY:
+    for name in HARDWARE_WIDGETS:
         assert hasattr(stage, name), name
     assert not hasattr(stage, "spot_section")
     assert not hasattr(stage, "spot_panel")
+    assert not hasattr(stage, "panel")
     assert stage.findChildren(SpotFocusPanel) == []
     titles = {sec.toggle_btn.text() for sec in stage.findChildren(_Section)}
     assert {"Dither", "Parameters"} <= titles

@@ -337,8 +337,11 @@ def test_pixel_readout_and_status(view: SpotLiveView) -> None:
     assert view.cursor_label.text() == "x 105  y 53  value 77"
     view._on_cursor(None)
     assert view.cursor_label.text() == ""
-    text = view.status_label.text()
-    assert "max" in text and "saturated" in text and "ROI 20x10 at (100, 50)" in text
+    # fps / max / saturation moved to the owner (statsChanged, see
+    # test_stats_signal); the status line is bit depth, ROI and the edge point.
+    assert view.status_label.text() == (
+        "8-bit  |  ROI 20x10 at (100, 50)  |  edge (100.0, 80.0)"
+    )
 
 
 def test_timer_polls_and_repaints_only_new_frames(
