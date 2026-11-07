@@ -1877,7 +1877,7 @@ tifffile = [
 [[package]]
 name = "opym"
 version = "0.5.0"
-source = { git = "https://github.com/bscott711/opym?rev=059220a081b3bdb659e08191e10e68f0111650b6#059220a081b3bdb659e08191e10e68f0111650b6" }
+source = { git = "https://github.com/bscott711/opym?rev=b9189d2419c47f0736b188307f4a76f08002cd65#b9189d2419c47f0736b188307f4a76f08002cd65" }
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.14'" },
     { name = "numpy", version = "2.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.14'" },
@@ -2675,7 +2675,7 @@ requires-dist = [
     { name = "msgpack", specifier = ">=1.0.8" },
     { name = "ndv", extras = ["vispy"], editable = "../ndv" },
     { name = "ome-writers", extras = ["tifffile"], specifier = ">=0.3.0" },
-    { name = "opym", git = "https://github.com/bscott711/opym?rev=059220a081b3bdb659e08191e10e68f0111650b6" },
+    { name = "opym", git = "https://github.com/bscott711/opym?rev=b9189d2419c47f0736b188307f4a76f08002cd65" },
     { name = "pydantic-settings", specifier = ">=2.7.1" },
     { name = "pygfx", specifier = ">=0.16.0" },
     { name = "pylinalg", specifier = ">=0.6.8" },
