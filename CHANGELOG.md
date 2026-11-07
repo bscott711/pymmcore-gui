@@ -17,6 +17,8 @@ upstream.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-07
+
 ### Changed
 
 - **The stream imports opym instead of copying it.** `_argus_stream/_protocol.py`,
@@ -34,6 +36,20 @@ upstream.
 
 ### Added
 
+- **Alignment: co-align N spectral-region layers against a reference**
+  (`feat(alignment)`).
+- **Spectral ROI settings:** a gap setting between regions, a "Center on chip"
+  action, and clamping of regions to the sensor.
+- **Worker-owned config groups are editable** in the Config Groups panel (an
+  edit API plus unselectable worker-owned rows); released cameras and worker
+  groups are kept in the saved config.
+- **Live galvo offset is remembered** across restarts and re-applied when a
+  config loads; the galvo is held at the Live offset and returned to it after
+  an MDA, and moves statically when the offset changes.
+- **Tested against CRISPy `feat/piezo-led-joystick-on-ui-polish`** (its
+  `PiezoSpotWidget`, replacing `piezo_panel.PiezoSpotPanel`). The CRISPy panel
+  and spot-focus tests were rewritten for it; keep the `../CRISPy` checkout on
+  that branch.
 - **Park the galvo at the sweep start between volumes** (optional, **off by
   default**). Timing tab: "Park at sweep start" (`park_at_start`). After setup
   and after each volume the engine writes `SPIMState=Armed` to the galvo, so the
@@ -69,6 +85,9 @@ upstream.
 
 ### Fixed
 
+- **The pymmcore-plus logfile is isolated before package imports**, so an
+  early import no longer writes to the shared log.
+- **Unselected dock tab text is readable in dark mode.**
 - **Stage Control galvo offset now moves the mirror in Live.** Writing
   `SingleAxisYOffset(deg)` only sets the sweep centre and never moved an idle
   mirror; each offset write now also does a static `setGalvoPosition` on axis B
@@ -355,6 +374,7 @@ save.
 - The former working branch `feat/mda-ux-perf-fixes` was landed on `main` in #19
   and is frozen. `main` is the base branch for pull requests from here on.
 
-[Unreleased]: https://github.com/bscott711/pymmcore-gui/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/bscott711/pymmcore-gui/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/bscott711/pymmcore-gui/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/bscott711/pymmcore-gui/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/bscott711/pymmcore-gui/releases/tag/v0.1.0
