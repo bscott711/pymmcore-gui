@@ -57,7 +57,7 @@ import time
 from collections import deque
 from enum import Enum
 from pathlib import PureWindowsPath
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, cast
 from uuid import uuid4
 
 import numpy as np
@@ -74,9 +74,14 @@ from opym.stream.protocol import (
     MSG_RESUME,
     MSG_SESSION_END,
     MSG_SESSION_START,
+    REASON_CLIENT_ABORT,
+    REASON_CLIENT_ERROR,
+    REASON_COMPLETE,
+    REASON_PAUSED,
     FrameHeader,
     PrepareHeader,
     QCHeader,
+    SessionEndReason,
     SessionStartHeader,
     pack_message,
     unpack_message,
@@ -185,9 +190,6 @@ _NO_FRAMES_ALARM_S = 120.0
 _STALL_LABEL_STEP_S = 10
 _HOST = socket.gethostname()
 _DTYPE_BY_BYTES_PER_PIXEL = {1: "uint8", 2: "uint16", 4: "uint32"}
-_SessionEndReason = Literal[
-    "complete", "idle_timeout", "client_abort", "paused", "client_error"
-]
 
 
 class StreamState(str, Enum):
@@ -665,7 +667,7 @@ class _RunWorker(threading.Thread):
         self._next_frame_index = 0
         self._finish_event = threading.Event()
         self._abort_event = threading.Event()
-        self._finish_reason: _SessionEndReason = "complete"
+        self._finish_reason: SessionEndReason = REASON_COMPLETE
 
     def submit(self, volume: Volume) -> int:
         """Queue one completed volume (or slab) for sending.
@@ -696,7 +698,7 @@ class _RunWorker(threading.Thread):
         self._to_send.put((frame_index, header, payload))
         return frame_index
 
-    def finish(self, reason: _SessionEndReason = "complete") -> None:
+    def finish(self, reason: SessionEndReason = REASON_COMPLETE) -> None:
         """Request a graceful stop: drain and fully ACK before SESSION_END."""
         if not self.paused.is_set():
             self._finish_reason = reason
@@ -945,7 +947,7 @@ class _RunWorker(threading.Thread):
         def pause(total: int, why: str, status: str = "") -> None:
             nonlocal unacked_bytes
             self.paused.set()
-            self._finish_reason = "paused"
+            self._finish_reason = REASON_PAUSED
             self._finish_event.set()
             unacked.clear()
             pending.clear()
@@ -1070,7 +1072,7 @@ class _RunWorker(threading.Thread):
                     break
             try:
                 flush_log(force=True)
-                end = {"reason": "client_error", "detail": detail}
+                end = {"reason": REASON_CLIENT_ERROR, "detail": detail}
                 end_link = send(pack_message(MSG_SESSION_END, sid, end))  # type: ignore[arg-type]
             except Exception:
                 logger.exception("Could not tell Argus the stream sender failed")
@@ -1284,8 +1286,8 @@ class _RunWorker(threading.Thread):
                     rate_mark = (time.monotonic(), sent_now)
 
             if self._abort_event.is_set() and end_link is None:
-                reason: _SessionEndReason = (
-                    "paused" if self.paused.is_set() else "client_abort"
+                reason: SessionEndReason = (
+                    REASON_PAUSED if self.paused.is_set() else REASON_CLIENT_ABORT
                 )
                 end_link = send(pack_message(MSG_SESSION_END, sid, {"reason": reason}))
         except Exception as exc:
@@ -1475,7 +1477,7 @@ class ArgusStreamSession:
             # Argus -- holding the live lease that pauses the backfill -- for
             # as long as this app runs, re-attaching after any Argus restart.
             logger.warning("Argus stream: previous run never ended; closing it")
-            self._worker.finish("client_abort")
+            self._worker.finish(REASON_CLIENT_ABORT)
             self._worker = None
         settings = self._get_settings()
         argus = settings.argus_stream
@@ -1597,14 +1599,14 @@ class ArgusStreamSession:
     def sequenceFinished(self, sequence: useq.MDASequence) -> None:
         """Signal a graceful end-of-run; does not block the acquisition thread."""
         if self._worker is not None:
-            self._worker.finish("complete")
+            self._worker.finish(REASON_COMPLETE)
         self._worker = None
 
     @_never_raises
     def sequenceCanceled(self, sequence: useq.MDASequence) -> None:
         """Signal an aborted run; does not block the acquisition thread."""
         if self._worker is not None:
-            self._worker.finish("client_abort")
+            self._worker.finish(REASON_CLIENT_ABORT)
         self._worker = None
 
     def shutdown(self, timeout: float = 2.0) -> None:
@@ -1617,7 +1619,7 @@ class ArgusStreamSession:
         """
         workers = [w for w in self._all_workers if w.is_alive()]
         for worker in workers:
-            worker.finish("client_abort")
+            worker.finish(REASON_CLIENT_ABORT)
         deadline = time.monotonic() + timeout
         for worker in workers:
             worker.join(timeout=max(0.0, deadline - time.monotonic()))

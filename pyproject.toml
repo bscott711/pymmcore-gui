@@ -78,7 +78,7 @@ ndv = { path = "../ndv", editable = true }
 # branch). Base install only, not `opym[stream]`: msgpack, pyzmq, zarr and numcodecs come
 # from the list above, and the extra's `zarr>=2.18.7` would move the rig's 2.18.3. To bump:
 # change `rev`, run `uv lock`, check the diff moves no unrelated package.
-opym = { git = "https://github.com/bscott711/opym", rev = "059220a081b3bdb659e08191e10e68f0111650b6" }
+opym = { git = "https://github.com/bscott711/opym", rev = "b9189d2419c47f0736b188307f4a76f08002cd65" }
 
 [dependency-groups]
 # should only be used after manually uninstalling PyQt6 and PyQt6Ads
