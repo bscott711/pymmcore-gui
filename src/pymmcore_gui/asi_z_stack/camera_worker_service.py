@@ -43,8 +43,11 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, ClassVar
 
-from PyQt6.QtCore import QObject, pyqtSignal
+from pymmcore_plus._logger import logger as _pmp_logger
+from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from superqt.utils import create_worker
+
+from pymmcore_gui._exceptions import report_background_exception
 
 from .camera_handoff import (
     CameraHandoffSnapshot,
@@ -53,7 +56,7 @@ from .camera_handoff import (
 )
 from .camera_worker import CameraWorkerConfig
 from .common import HardwareConstants
-from .worker_pool import CameraWorkerHandle, CameraWorkerPool
+from .worker_pool import CameraWorkerHandle, CameraWorkerPool, CameraWorkersDeadError
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -64,6 +67,9 @@ if TYPE_CHECKING:
     from .camera_handoff import PropertyInfo
 
 logger = logging.getLogger(__name__)
+
+#: Interval of the worker health log line (see CameraWorkerService._health_tick).
+_HEALTH_INTERVAL_MS = 60_000
 
 
 def has_camera(mmc: CMMCorePlus) -> bool:
@@ -208,6 +214,12 @@ class CameraWorkerService(QObject):
         self._liveFrameAvailable.connect(self._deliver_live_frame)
         self.hw = HardwareConstants()
         self._mmc: CMMCorePlus | None = None
+        #: Periodic worker health line; started once the pool is ready.
+        self._health_timer = QTimer(self)
+        self._health_timer.setInterval(_HEALTH_INTERVAL_MS)
+        self._health_timer.timeout.connect(self._health_tick)
+        #: Labels of dead workers already reported by _health_tick.
+        self._reported_dead: set[str] = set()
         #: Exposure read from the main-process core once, in begin_release,
         #: while a camera was still loaded there -- a best-effort fallback
         #: for code that would otherwise call the now-cameraless main-process
@@ -408,6 +420,8 @@ class CameraWorkerService(QObject):
             with self._lock:
                 self._pool = pool  # type: ignore[assignment]
                 self._state = CameraWorkerServiceState.IDLE
+            self._reported_dead.clear()
+            self._health_timer.start()
             logger.info(
                 f"Persistent camera worker pool ready: {snapshot.camera_labels}."
             )
@@ -494,6 +508,7 @@ class CameraWorkerService(QObject):
         and joins its drain thread *before* tearing down the pool -- see the
         module docstring's threading invariant for why that order matters.
         """
+        self._health_timer.stop()
         self.stop_live(timeout=timeout)
         with self._lock:
             pool = self._pool
@@ -520,11 +535,71 @@ class CameraWorkerService(QObject):
             logger.info("Persistent camera worker service shut down.")
 
     # ------------------------------------------------------------------
+    # Liveness
+    # ------------------------------------------------------------------
+
+    def check_workers_alive(self) -> None:
+        """Raise :class:`CameraWorkersDeadError` if any worker process is dead.
+
+        Dead workers are never respawned (a native PVCAM crash may leave the
+        driver unusable), so refuse clearly instead of failing later with a
+        generic arm error. No-op when there is no pool. Logs one error line.
+        """
+        with self._lock:
+            pool = self._pool
+        if pool is None:
+            return
+        dead = pool.dead_workers()
+        if not dead:
+            return
+        _pmp_logger.error(
+            "Camera worker(s) dead, refusing: "
+            + ", ".join(f"{label} (exit code {code})" for label, code in dead)
+        )
+        raise CameraWorkersDeadError(dead)
+
+    def _health_tick(self) -> None:
+        """Log one worker health line; report newly dead workers once. Never raises."""
+        try:
+            with self._lock:
+                pool = self._pool
+                state = self._state
+            if pool is None:
+                return
+            parts = []
+            for worker in pool.workers:
+                process = worker.process
+                if worker.is_dead():
+                    parts.append(
+                        f"{worker.camera_label} DEAD "
+                        f"exitcode={getattr(process, 'exitcode', None)}"
+                    )
+                else:
+                    parts.append(
+                        f"{worker.camera_label} alive "
+                        f"pid={getattr(process, 'pid', None)}"
+                    )
+            logger.info(f"camera workers: state={state.name} " + ", ".join(parts))
+            newly_dead = [
+                (label, code)
+                for label, code in pool.dead_workers()
+                if label not in self._reported_dead
+            ]
+            if newly_dead:
+                self._reported_dead.update(label for label, _ in newly_dead)
+                exc = CameraWorkersDeadError(newly_dead)
+                _pmp_logger.error(f"Camera worker(s) died: {exc}")
+                report_background_exception(exc, "Camera workers")
+        except Exception:
+            logger.exception("Camera worker health check failed.")
+
+    # ------------------------------------------------------------------
     # Live
     # ------------------------------------------------------------------
 
     def start_live(self) -> None:
         """Arm both workers for free-running acquisition and start the drain thread."""
+        self.check_workers_alive()
         with self._lock:
             state = self._state
             pool = self._pool
@@ -639,6 +714,7 @@ class CameraWorkerService(QObject):
         (a plain, same-thread Qt connection) as each frame arrives -- no
         cross-thread marshaling needed here, unlike the Live drain thread.
         """
+        self.check_workers_alive()
         with self._lock:
             if self._state is CameraWorkerServiceState.MDA:
                 raise RuntimeError("Cannot Snap while an MDA is running.")
@@ -680,6 +756,7 @@ class CameraWorkerService(QObject):
 
     def acquire_for_mda(self) -> CameraWorkerPool:
         """Return the persistent pool for exclusive MDA use, stopping Live first."""
+        self.check_workers_alive()
         with self._lock:
             if self._state is CameraWorkerServiceState.MDA:
                 raise RuntimeError(

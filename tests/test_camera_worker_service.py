@@ -22,6 +22,8 @@ from pymmcore_gui.asi_z_stack.camera_worker_service import (
 from pymmcore_gui.asi_z_stack.common import HardwareConstants
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from pymmcore_plus import CMMCorePlus
     from pytestqt.qtbot import QtBot
 
@@ -34,6 +36,9 @@ class _FakePool:
         self, camera_label: str, values: tuple[tuple[str, str], ...]
     ) -> None:
         self.calls.append((camera_label, values))
+
+    def dead_workers(self) -> list[tuple[str, int | None]]:
+        return []
 
 
 @pytest.fixture
@@ -222,6 +227,7 @@ def test_snap_arms_internal_trigger_and_drains(core: CMMCorePlus) -> None:
     import numpy as np
 
     pool = MagicMock()
+    pool.dead_workers.return_value = []
     frame = np.zeros((2, 2), dtype="uint16")
     pool.iter_frames.return_value = iter(
         [("Camera-1", 0, frame, {}, 0), ("Camera-2", 0, frame, {}, 0)]
@@ -518,3 +524,108 @@ def test_set_worker_group_validation(core: CMMCorePlus) -> None:
         svc.set_worker_group("G", {"A": _GAIN}, rename_from="Nope")
 
     assert list(svc.worker_config_groups) == ["Cameras", "Other"]
+
+
+def _dead_pool() -> object:
+    from unittest.mock import MagicMock
+
+    pool = MagicMock()
+    pool.dead_workers.return_value = [("Camera-1", -1073740791)]
+    return pool
+
+
+@pytest.mark.parametrize("entry", ["mda", "snap", "live"])
+def test_dead_pool_is_refused_with_clear_error(entry: str) -> None:
+    from unittest.mock import MagicMock
+
+    from pymmcore_gui.asi_z_stack.worker_pool import CameraWorkersDeadError
+
+    pool = _dead_pool()
+    svc = _service(MagicMock(), pool)  # type: ignore[arg-type]
+    calls: dict[str, Callable[[], object]] = {
+        "mda": svc.acquire_for_mda,
+        "snap": svc.snap,
+        "live": svc.start_live,
+    }
+    call = calls[entry]
+
+    with pytest.raises(CameraWorkersDeadError, match="Camera-1.*-1073740791"):
+        call()
+
+    assert svc._state is CameraWorkerServiceState.IDLE
+    pool.arm_all.assert_not_called()  # type: ignore[attr-defined]
+    pool.arm_live_all.assert_not_called()  # type: ignore[attr-defined]
+
+
+def test_check_workers_alive_noop_without_pool_or_with_live_pool() -> None:
+    from unittest.mock import MagicMock
+
+    svc = CameraWorkerService()
+    svc.check_workers_alive()  # no pool: no-op
+
+    pool = MagicMock()
+    pool.dead_workers.return_value = []
+    svc = _service(MagicMock(), pool)
+    svc.check_workers_alive()
+
+
+def test_health_tick_logs_state_and_reports_dead_worker_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from pymmcore_gui.asi_z_stack.worker_pool import (
+        CameraWorkerHandle,
+        CameraWorkerPool,
+        CameraWorkersDeadError,
+    )
+
+    def _handle(label: str, process: object) -> CameraWorkerHandle:
+        handle = CameraWorkerHandle(
+            label,
+            None,  # type: ignore[arg-type]
+            height=1,
+            width=1,
+            dtype="uint16",
+            n_slots=1,
+        )
+        handle.process = process  # type: ignore[assignment]
+        return handle
+
+    proc2 = SimpleNamespace(exitcode=None, pid=456)
+    pool = CameraWorkerPool(
+        [
+            _handle("Camera-1", SimpleNamespace(exitcode=None, pid=123)),
+            _handle("Camera-2", proc2),
+        ]
+    )
+    svc = _service(MagicMock(), pool)  # type: ignore[arg-type]
+    report = MagicMock()
+    try:
+        with (
+            patch(
+                "pymmcore_gui.asi_z_stack.camera_worker_service."
+                "report_background_exception",
+                report,
+            ),
+            caplog.at_level(logging.INFO),
+        ):
+            svc._health_tick()
+            assert "state=IDLE" in caplog.text
+            assert "Camera-1 alive pid=123" in caplog.text
+            assert "Camera-2 alive pid=456" in caplog.text
+            report.assert_not_called()
+
+            proc2.exitcode = -1073740791
+            svc._health_tick()
+            svc._health_tick()
+    finally:
+        svc.shutdown()
+
+    report.assert_called_once()
+    exc, context = report.call_args.args
+    assert isinstance(exc, CameraWorkersDeadError)
+    assert exc.dead == [("Camera-2", -1073740791)]
+    assert context == "Camera workers"

@@ -136,12 +136,45 @@ class WorkerDiedError(RuntimeError):
     (e.g. ``STATUS_STACK_BUFFER_OVERRUN``'s signed 32-bit form).
     """
 
+    #: The GUI shows exceptions carrying this attribute (on the exception or
+    #: its ``__cause__``) as a sticky toast: a dead worker stays dead until the
+    #: GUI is restarted, so the message must not time out.
+    persistent_notice = True
+
     def __init__(self, camera_label: str, exitcode: int | None) -> None:
         self.camera_label = camera_label
         self.exitcode = exitcode
         super().__init__(
             f"camera worker for {camera_label!r} died (exit code {exitcode})"
         )
+
+
+def _format_exitcode(exitcode: int | None) -> str:
+    """Decimal exit code, plus hex for a Windows NTSTATUS-style negative code."""
+    if exitcode is not None and exitcode < 0:
+        return f"{exitcode}, 0x{exitcode & 0xFFFFFFFF:08x}"
+    return str(exitcode)
+
+
+class CameraWorkersDeadError(WorkerDiedError):
+    """One or more camera worker processes are already dead when work is requested.
+
+    Raised up front (before arming anything) instead of letting a later arm
+    fail with a generic error. ``camera_label``/``exitcode`` are the first dead
+    worker's; ``dead`` lists every dead worker as ``(label, exitcode)``.
+    """
+
+    def __init__(self, dead: list[tuple[str, int | None]]) -> None:
+        label, exitcode = dead[0]
+        super().__init__(label, exitcode)
+        self.dead = list(dead)
+        described = "; ".join(
+            f"camera worker process for {lbl!r} is dead "
+            f"(exit code {_format_exitcode(code)})"
+            for lbl, code in dead
+        )
+        # Overwrite the message set by WorkerDiedError.__init__.
+        self.args = (f"{described}; restart the GUI to restart the camera workers",)
 
 
 class CameraWorkerHandle:
@@ -169,6 +202,19 @@ class CameraWorkerHandle:
         # Camera timing reported by the most recent ArmedMsg (see
         # worker_messages.ArmedMsg.timing); empty until the first arm.
         self.last_timing: dict[str, str] = {}
+
+    def is_dead(self) -> bool:
+        """Whether the worker process was started and has since exited.
+
+        A handle that was never spawned is not "dead". Cheap: no I/O.
+        """
+        process = self.process
+        if process is None:
+            return False
+        if getattr(process, "exitcode", None) is not None:
+            return True
+        is_alive = getattr(process, "is_alive", None)
+        return is_alive is not None and not is_alive()
 
     def spawn(self, ctx: SpawnContext) -> None:
         """Create this worker's shared memory and pipe, then start its process.
@@ -319,6 +365,14 @@ class CameraWorkerPool:
         self.workers = workers
         self._ctx = get_context("spawn")
         self._stop_token = 0
+
+    def dead_workers(self) -> list[tuple[str, int | None]]:
+        """``(camera_label, exitcode)`` of every worker whose process has exited."""
+        return [
+            (w.camera_label, getattr(w.process, "exitcode", None))
+            for w in self.workers
+            if w.is_dead()
+        ]
 
     def spawn_all(self, ready_timeout: float = 30.0) -> None:
         """Start every worker process and wait for all of them to report ready.
