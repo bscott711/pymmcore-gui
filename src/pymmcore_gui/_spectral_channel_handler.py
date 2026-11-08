@@ -395,6 +395,7 @@ class SpectralChannelHandler:
                 handler_for_path(path, zarr_compression=self._zarr_compression),
                 name=_sanitize(channel.name),
                 backlog_budget_bytes=self._backlog_budget_bytes,
+                finish_reason=lambda: self._mmc.mda.status.finish_reason,
             )
         writer = self._writers[channel.name]
         if channel.name not in self._started:
