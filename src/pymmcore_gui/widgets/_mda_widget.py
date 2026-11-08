@@ -144,6 +144,7 @@ class GuiMDAWidget(MDAWidget):
                             handler_for_path(output, zarr_compression=zarr_compression),
                             name="mda-save",
                             backlog_budget_bytes=backlog_budget_bytes,
+                            finish_reason=lambda: self._mmc.mda.status.finish_reason,
                         ),
                     )
         self._mmc.run_mda(sequence, output=output)

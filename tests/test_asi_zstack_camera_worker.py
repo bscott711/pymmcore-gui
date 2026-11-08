@@ -15,6 +15,8 @@ convention).
 
 from __future__ import annotations
 
+import re
+import sys
 import time
 from multiprocessing.shared_memory import SharedMemory
 from typing import TYPE_CHECKING
@@ -23,14 +25,19 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
+from pymmcore_gui.asi_z_stack import camera_worker as cw_module
 from pymmcore_gui.asi_z_stack.camera_worker import (
     _LIVE_MAX_IN_FLIGHT,
     CameraWorkerConfig,
     _drain_incoming,
     _drain_live,
+    _log,
     _wait_for_free_slot,
+    run_camera_worker,
 )
 from pymmcore_gui.asi_z_stack.worker_messages import (
+    ArmCmd,
+    ArmLiveCmd,
     ErrorMsg,
     FrameMsg,
     ShutdownCmd,
@@ -42,6 +49,7 @@ from pymmcore_gui.asi_z_stack.worker_messages import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
+    from pathlib import Path
 
 # A tiny frame shape keeps the shared-memory segment and every pixel
 # comparison below cheap -- the size/dtype aren't what's under test here.
@@ -614,3 +622,96 @@ def test_require_trigger_mode_and_set_exposure() -> None:
     core.setExposure.assert_not_called()
     _set_exposure(core, "Camera-1", 20.0)
     core.setExposure.assert_called_once_with("Camera-1", 20.0)
+
+
+def test_log_line_has_timestamp_and_worker_prefix(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _log("camA", "hello")
+    line = capsys.readouterr().err.rstrip("\n")
+    assert re.fullmatch(
+        r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3} \[worker:camA\] hello", line
+    )
+
+
+class _ScriptedConn:
+    """Hands back *cmds*, then ``EOFError`` (the parent closing the pipe)."""
+
+    def __init__(self, cmds: list[object]) -> None:
+        self._cmds = list(cmds)
+        self.sent: list[object] = []
+
+    def recv(self) -> object:
+        if not self._cmds:
+            raise EOFError
+        return self._cmds.pop(0)
+
+    def send(self, msg: object) -> None:
+        self.sent.append(msg)
+
+
+def test_run_camera_worker_logs_commands_and_enables_faulthandler(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # sys.stderr/stdout are reassigned by the worker; restore them afterwards
+    monkeypatch.setattr(sys, "stderr", sys.stderr)
+    monkeypatch.setattr(sys, "stdout", sys.stdout)
+    fh_enable = MagicMock()
+    monkeypatch.setattr("faulthandler.enable", fh_enable)
+    monkeypatch.setattr(cw_module, "CMMCorePlus", MagicMock())
+    for name in (
+        "_apply_snapshot",
+        "preferred_external_trigger_mode",
+        "_internal_trigger_mode",
+        "_expose_out_property",
+        "_set_trigger_mode",
+        "_set_expose_out",
+        "_set_exposure",
+        "_report_timing",
+    ):
+        monkeypatch.setattr(cw_module, name, MagicMock(return_value=None))
+    monkeypatch.setattr(cw_module, "_report_timing", MagicMock(return_value={}))
+    monkeypatch.setattr(cw_module, "_drain_sequence", MagicMock(return_value=False))
+    monkeypatch.setattr(cw_module, "_drain_live", MagicMock(return_value=False))
+
+    shm = SharedMemory(create=True, size=16)
+    log_path = tmp_path / "worker-stderr.log"
+    try:
+        config = CameraWorkerConfig(
+            camera_label="camA",
+            adapter_device_name="Fake",
+            shm_name=shm.name,
+            slot_nbytes=16,
+            n_slots=1,
+            stderr_log_file=str(log_path),
+        )
+        conn = _ScriptedConn(
+            [
+                ArmCmd(
+                    5,
+                    external_trigger=True,
+                    trigger_mode="Edge Trigger",
+                    exposure_ms=12.5,
+                ),
+                ArmLiveCmd(exposure_ms=7.0),
+                StopCmd(),
+            ]
+        )
+        run_camera_worker(config, conn)  # type: ignore[arg-type]
+        fh_enable.assert_called_once()
+        log_file = fh_enable.call_args.kwargs["file"]
+        assert fh_enable.call_args.kwargs["all_threads"] is True
+        text = log_path.read_text()
+        log_file.close()
+    finally:
+        shm.close()
+        shm.unlink()
+
+    assert re.search(
+        r"\[worker:camA\] ArmCmd n_images=5 external_trigger=True "
+        r"trigger_mode='Edge Trigger' exposure_ms=12.5",
+        text,
+    )
+    assert re.search(r"\[worker:camA\] ArmLiveCmd exposure_ms=7.0", text)
+    assert re.search(r"\[worker:camA\] StopCmd sequence_running=", text)
+    assert re.match(r"\d{4}-\d\d-\d\d \d\d:", text)

@@ -43,6 +43,7 @@ from superqt import QIconifyIcon
 from ._argus_stream import ArgusStreamSession, ArgusTunnelManager, StreamState
 from ._argus_stream import _log as argus_log
 from ._design import apply_dock_style
+from ._exceptions import is_persistent_notice
 from ._mmcore_shutdown import shutdown_mmcore, track_mda_thread
 from ._ndv_viewers import NDVViewersManager
 from ._notification_manager import NotificationManager
@@ -1005,5 +1006,8 @@ class MicroManagerGUI(QMainWindow):
                 log.show()
 
         self._notification_manager.show_error_message(
-            str(exc), see_tb, on_action=_open_traceback
+            str(exc),
+            see_tb,
+            on_action=_open_traceback,
+            sticky=is_persistent_notice(exc),
         )
