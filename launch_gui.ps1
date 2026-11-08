@@ -56,13 +56,33 @@ catch {
 # failure" even though the app ran and closed normally), and even under
 # 'Continue' it polluted info.log with PowerShell's error-record formatting
 # instead of the app's plain log text. Start-Process avoids both.
+#
+# Each launch writes its own logs\info-<yyyyMMdd-HHmmss>.log (a single info.log
+# was truncated at every launch, losing the evidence of the previous run's
+# crash). Files older than 30 days are deleted, best effort.
+$logDir = Join-Path $PSScriptRoot 'logs'
+$infoLog = Join-Path $logDir ("info-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+try {
+    New-Item -ItemType Directory -Path $logDir -Force -ErrorAction Stop | Out-Null
+    Get-ChildItem -Path $logDir -Filter 'info-*.log' -ErrorAction Stop |
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-30) } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+}
+catch {
+    # never block the launch over log housekeeping
+}
+if (-not (Test-Path $logDir)) {
+    # logs folder could not be created: fall back so the redirect target exists
+    $infoLog = Join-Path $PSScriptRoot 'info.log'
+}
+
 $uv = (Get-Command uv).Source
 $proc = Start-Process -FilePath $uv `
     -ArgumentList @('run', 'python', '-m', 'pymmcore_gui', 'run', '--debug') `
     -WorkingDirectory $PSScriptRoot `
-    -RedirectStandardError (Join-Path $PSScriptRoot 'info.log') `
+    -RedirectStandardError $infoLog `
     -NoNewWindow -Wait -PassThru
 
 if ($proc.ExitCode -ne 0) {
-    Show-ErrorBox "pymmcore-gui exited with code $($proc.ExitCode).`nSee info.log for details:`n$(Join-Path $PSScriptRoot 'info.log')"
+    Show-ErrorBox "pymmcore-gui exited with code $($proc.ExitCode).`nSee the log for details:`n$infoLog"
 }

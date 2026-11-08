@@ -116,6 +116,13 @@ def run(
 
         configure_asi_logging("DEBUG")
 
+    if not os.getenv("PYTEST_VERSION"):  # tests go through ``run`` too
+        from pymmcore_gui._gui_log import install_gui_file_log
+
+        # must run AFTER configure_asi_logging, which skips its stderr handler
+        # when the root logger already has handlers (``hasHandlers()``)
+        install_gui_file_log()
+
     mm_config = "MMConfig_demo.cfg" if demo_config else config
     create_mmgui(mm_config=mm_config, exec_app=True, install_sentry=not no_telemetry)
     sys.exit(0)

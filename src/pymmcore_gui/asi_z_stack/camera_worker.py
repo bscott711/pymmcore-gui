@@ -16,6 +16,7 @@ down one disposable worker process instead of the whole GUI application.
 
 from __future__ import annotations
 
+import faulthandler
 import sys
 import time
 import traceback
@@ -51,6 +52,7 @@ from .worker_messages import (
 
 if TYPE_CHECKING:
     from multiprocessing.connection import Connection
+    from typing import TextIO
 
 _ADAPTER_MODULE = "PVCAM"
 _STALL_TIMEOUT_S = 5.0
@@ -113,7 +115,7 @@ class CameraWorkerConfig:
 
 
 def _log(camera_label: str, message: str) -> None:
-    """Print a worker-prefixed diagnostic line to stderr, flushed immediately.
+    """Print a timestamped, worker-prefixed diagnostic line to stderr, flushed.
 
     Parameters
     ----------
@@ -122,7 +124,10 @@ def _log(camera_label: str, message: str) -> None:
     message : str
         The line to print.
     """
-    print(f"[worker:{camera_label}] {message}", file=sys.stderr, flush=True)
+    now = time.time()
+    stamp = f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now))}"
+    stamp += f".{int(now * 1000) % 1000:03d}"
+    print(f"{stamp} [worker:{camera_label}] {message}", file=sys.stderr, flush=True)
 
 
 def _apply_snapshot(mmc: CMMCorePlus, config: CameraWorkerConfig) -> None:
@@ -716,6 +721,7 @@ def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
         the main process.
     """
     label = config.camera_label
+    log_file: TextIO | None = None
     if config.stderr_log_file:
         # Redirect BEFORE anything else runs, so even a startup failure
         # (the except block just below) or a hang with zero further output
@@ -729,6 +735,18 @@ def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
             sys.stdout = log_file
         except OSError:
             pass
+    # A native crash (e.g. pvcam64.dll) kills the process without a Python
+    # traceback; this dumps every thread's stack into the worker's log file
+    # (kept alive by ``log_file``), or onto the original stderr without one.
+    # It does not dump for 0xc0000409 (fast-fail / stack buffer overrun) crashes;
+    # the exit code is still logged by the service.
+    try:
+        faulthandler.enable(
+            file=log_file if log_file is not None else sys.stderr,
+            all_threads=True,
+        )
+    except Exception:  # best-effort, e.g. no usable stderr under pythonw
+        pass
     try:
         mmc = CMMCorePlus()
         mmc.setCircularBufferMemoryFootprint(config.circular_buffer_mb)
@@ -773,6 +791,13 @@ def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
 
             if isinstance(cmd, ArmCmd):
                 shutdown_requested = False
+                _log(
+                    label,
+                    f"ArmCmd n_images={cmd.n_images} "
+                    f"external_trigger={cmd.external_trigger} "
+                    f"trigger_mode={cmd.trigger_mode!r} "
+                    f"exposure_ms={cmd.exposure_ms}",
+                )
                 try:
                     mode: str | None
                     if cmd.trigger_mode is not None:
@@ -808,6 +833,7 @@ def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
                     break
             elif isinstance(cmd, ArmLiveCmd):
                 shutdown_requested = False
+                _log(label, f"ArmLiveCmd exposure_ms={cmd.exposure_ms}")
                 try:
                     _set_trigger_mode(mmc, label, internal_mode)
                     _set_expose_out(mmc, label, expose_out_prop, normal_expose_out)
@@ -829,7 +855,9 @@ def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
                 if shutdown_requested:
                     break
             elif isinstance(cmd, StopCmd):
-                if mmc.isSequenceRunning(label):
+                running = mmc.isSequenceRunning(label)
+                _log(label, f"StopCmd sequence_running={running}")
+                if running:
                     mmc.stopSequenceAcquisition(label)
                 if cmd.token:
                     conn.send(StoppedMsg(label, 0, cmd.token))

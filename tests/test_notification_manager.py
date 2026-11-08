@@ -54,3 +54,36 @@ def test_notification_manager(qtbot: QtBot, monkeypatch: MonkeyPatch) -> None:
     assert child is not None
     child.click()
     action_mock.assert_called_with("Action")
+
+
+def test_sticky_error_toast_does_not_auto_hide(qtbot: QtBot) -> None:
+    parent = QWidget()
+    qtbot.addWidget(parent)
+    parent.show()
+    nm = NotificationManager(parent)
+
+    nm.show_error_message("sticky", sticky=True)
+    nm.show_error_message("plain")
+
+    plain, sticky = nm._notification_widgets  # newest first
+    assert nm.notifications()[0].sticky is True
+    assert nm.notifications()[1].sticky is False
+    assert not sticky.auto_hide_timer.isActive()
+    assert plain.auto_hide_timer.isActive()
+
+    # a sticky toast is still dismissed by its close button
+    with qtbot.waitSignal(sticky.destroyed, timeout=1000):
+        sticky.close_button.click()
+    plain.auto_hide_timer.stop()
+    nm.remove_widget(plain)
+
+
+def test_sticky_warning_message_sets_flag(qtbot: QtBot) -> None:
+    parent = QWidget()
+    qtbot.addWidget(parent)
+    nm = NotificationManager(parent)
+    nm.show_warning_message("w", sticky=True)
+    assert nm.notifications()[0].sticky is True
+    toast = nm._notification_widgets[0]
+    assert not toast.auto_hide_timer.isActive()
+    nm.remove_widget(toast)
