@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from pymmcore_plus import CMMCorePlus
+from pymmcore_plus._logger import logger as _pmp_logger
 from pymmcore_plus.mda import MDAEngine
 from pymmcore_plus.metadata import (
     FrameMetaV1,
@@ -472,6 +473,17 @@ class _ASITriggerEngineBase(MDAEngine):
             f"within one volume {max(within, key=abs):+.3f} um."
         )
 
+    def _refuse_dead_pool(self) -> None:
+        """Fail the run before any hardware moves if a camera worker is dead.
+
+        The persistent pool outlives a worker crash; without this check the
+        run would configure the PLogic/galvo and only time out at the arm.
+        ``check_workers_alive`` raises a ``WorkerDiedError`` subclass.
+        """
+        svc = CameraWorkerService.get_active()
+        if svc is not None:
+            svc.check_workers_alive()
+
     def _handoff_to_workers(self) -> None:
         """Acquire the session's persistent camera worker pool for this MDA run.
 
@@ -758,6 +770,43 @@ class _ASITriggerEngineBase(MDAEngine):
             meta["position"] = position(self.mmcore)
         return meta
 
+    def _log_exec_failure(
+        self, event: MDAEvent, frames_per_camera: dict[str, int]
+    ) -> None:
+        """Log ONE error line saying what state the run and its workers were in.
+
+        Goes through the pymmcore-plus logger so it lands in the same file as
+        the runner's "MDA Started/Finished" lines. Called from the active
+        ``except`` clause (``exc_info=True`` is that exception), before the
+        ``finally`` drains the pool. Never raises: a diagnostic must not mask
+        the original failure.
+        """
+        try:
+            status = getattr(self.mmcore.mda, "status", None)
+            finish_reason = getattr(status, "finish_reason", None)
+            cancel_requested = getattr(status, "cancel_requested", None)
+            workers = []
+            pool = self._worker_pool
+            for worker in getattr(pool, "workers", None) or []:
+                label = getattr(worker, "camera_label", "?")
+                proc = getattr(worker, "process", None)
+                try:
+                    alive = proc.is_alive() if proc is not None else None
+                except Exception:
+                    alive = None
+                exitcode = getattr(proc, "exitcode", None)
+                workers.append(f"{label}(alive={alive}, exitcode={exitcode})")
+            _pmp_logger.error(
+                f"exec_event failed: event index={dict(event.index)}, "
+                f"frames_per_camera={frames_per_camera}, "
+                f"finish_reason={finish_reason}, "
+                f"cancel_requested={cancel_requested}, "
+                f"workers=[{', '.join(workers)}]",
+                exc_info=True,
+            )
+        except Exception:
+            logger.debug("Could not log exec_event failure.", exc_info=True)
+
     def exec_event(
         self, event: MDAEvent
     ) -> Iterable[tuple[np.ndarray, MDAEvent, FrameMetaV1]]:
@@ -788,63 +837,79 @@ class _ASITriggerEngineBase(MDAEngine):
         assert self._worker_pool is not None and self._snapshot is not None
         n_cameras = self._snapshot.n_cameras
 
-        arm_options = self._prepare_volume(event)
-        self._worker_pool.arm_all(
-            self._num_slices, armed_timeout=self.hw.worker_arm_timeout_s, **arm_options
-        )
-        logger.info(f"{n_cameras} camera(s) armed for {self._num_slices} images each.")
-        self._after_arm()
-        if not self._volume_records:  # once per run: what the cameras armed with
-            for label, timing in self._worker_pool.camera_timing().items():
-                if isinstance(timing, dict) and timing:
-                    summary = ", ".join(f"{k}={v}" for k, v in sorted(timing.items()))
-                    logger.info(f"{label} timing: {summary}")
-
-        # Shutter-gated lasers (e.g. 561, a CW laser behind a physical
-        # shutter) can't follow per-frame TTL blanking reliably, so hold them
-        # open for the whole burst instead of pulsing them per slice. The
-        # channel's "Lasers" preset is already applied by this point (via
-        # setup_single_event -> _set_event_channel, before exec_event runs),
-        # so _shutter_gated_bncs() reflects the laser this burst will use.
-        gated_bncs = self._shutter_gated_bncs()
-        if gated_bncs:
-            set_laser_outputs(
-                self.hw.plogic_label,
-                self.hw.tiger_comm_hub_label,
-                gated_bncs,
-                True,
-                self.hw.plogic_always_on_cell,
-            )
-            if self.hw.shutter_open_settle_ms > 0:
-                time.sleep(self.hw.shutter_open_settle_ms / 1000.0)
-
-        # See _trigger_spim_state_value's docstring: currently always
-        # "Running" on the galvo (its NO_SCAN/SLICE_SCAN_ONLY trigger path)
-        # -- the piezo's SPIMState property has no "Running" value at all,
-        # so no engine here uses it as _master_axis_label. Both workers are
-        # already armed and waiting for the shared PLogic/TTL trigger below --
-        # that hardware signal, not software call order, is what actually
-        # synchronizes the two cameras' exposures.
-        mmc = self.mmcore
-        # Per-timepoint focus/position record (logged after the volume), so
-        # drift across a timelapse can be attributed. Never allowed to break
-        # an acquisition.
-        record: _VolumeRecord | None
-        try:
-            record = self._read_volume_state(event)
-        except Exception:
-            logger.debug("Could not read pre-volume state.", exc_info=True)
-            record = None
+        # Everything from here to the ``finally`` is inside one ``try`` so a
+        # failure at ANY point (arm, laser-on, start trigger) still drains the
+        # pool and switches a laser off. Without that a worker left armed
+        # discards its next ArmCmd and every later run/Live/Snap times out.
+        # What the ``finally`` and the failure log read is set up first.
+        gated_bncs: list[int] = []
+        streaming = False  # True once frames are being iterated
+        record: _VolumeRecord | None = None
         frames_per_camera: dict[str, int] = dict.fromkeys(
             self._snapshot.camera_labels, 0
         )
-
-        self._start_volume()
-        spim_state = mmc.getProperty(self._master_axis_label, "SPIMState")
-        logger.info(f"{self._master_axis_label} SPIMState readback: '{spim_state}'.")
-
-        runner_t0 = event.metadata.get("runner_t0")
         try:
+            arm_options = self._prepare_volume(event)
+            self._worker_pool.arm_all(
+                self._num_slices,
+                armed_timeout=self.hw.worker_arm_timeout_s,
+                **arm_options,
+            )
+            logger.info(
+                f"{n_cameras} camera(s) armed for {self._num_slices} images each."
+            )
+            self._after_arm()
+            if not self._volume_records:  # once per run: what the cameras armed with
+                for label, timing in self._worker_pool.camera_timing().items():
+                    if isinstance(timing, dict) and timing:
+                        summary = ", ".join(
+                            f"{k}={v}" for k, v in sorted(timing.items())
+                        )
+                        logger.info(f"{label} timing: {summary}")
+
+            # Shutter-gated lasers (e.g. 561, a CW laser behind a physical
+            # shutter) can't follow per-frame TTL blanking reliably, so hold them
+            # open for the whole burst instead of pulsing them per slice. The
+            # channel's "Lasers" preset is already applied by this point (via
+            # setup_single_event -> _set_event_channel, before exec_event runs),
+            # so _shutter_gated_bncs() reflects the laser this burst will use.
+            gated_bncs = self._shutter_gated_bncs()
+            if gated_bncs:
+                set_laser_outputs(
+                    self.hw.plogic_label,
+                    self.hw.tiger_comm_hub_label,
+                    gated_bncs,
+                    True,
+                    self.hw.plogic_always_on_cell,
+                )
+                if self.hw.shutter_open_settle_ms > 0:
+                    time.sleep(self.hw.shutter_open_settle_ms / 1000.0)
+
+            # See _trigger_spim_state_value's docstring: currently always
+            # "Running" on the galvo (its NO_SCAN/SLICE_SCAN_ONLY trigger path)
+            # -- the piezo's SPIMState property has no "Running" value at all,
+            # so no engine here uses it as _master_axis_label. Both workers are
+            # already armed and waiting for the shared PLogic/TTL trigger below --
+            # that hardware signal, not software call order, is what actually
+            # synchronizes the two cameras' exposures.
+            mmc = self.mmcore
+            # Per-timepoint focus/position record (logged after the volume), so
+            # drift across a timelapse can be attributed. Never allowed to break
+            # an acquisition.
+            try:
+                record = self._read_volume_state(event)
+            except Exception:
+                logger.debug("Could not read pre-volume state.", exc_info=True)
+                record = None
+
+            self._start_volume()
+            spim_state = mmc.getProperty(self._master_axis_label, "SPIMState")
+            logger.info(
+                f"{self._master_axis_label} SPIMState readback: '{spim_state}'."
+            )
+
+            runner_t0 = event.metadata.get("runner_t0")
+            streaming = True
             for (
                 camera_label,
                 slice_idx,
@@ -893,7 +958,8 @@ class _ASITriggerEngineBase(MDAEngine):
                 except Exception:
                     logger.debug("Could not log volume state.", exc_info=True)
         except TimeoutError as err:
-            if any(frames_per_camera.values()):
+            self._log_exec_failure(event, frames_per_camera)
+            if not streaming or any(frames_per_camera.values()):
                 raise
             # Not one frame from any camera: no trigger ever reached them.
             # Say what this run drove the galvo/PLogic with, so the log alone
@@ -907,6 +973,12 @@ class _ASITriggerEngineBase(MDAEngine):
             logger.error(
                 "A camera worker process died during acquisition.", exc_info=True
             )
+            self._log_exec_failure(event, frames_per_camera)
+            raise
+        except Exception:
+            # Anything else (arm/prepare/start failure, a worker's ErrorMsg as
+            # a RuntimeError). GeneratorExit/cancel are not Exceptions.
+            self._log_exec_failure(event, frames_per_camera)
             raise
         finally:
             # Guarantees every worker gets a StopCmd on every exit path from
@@ -923,19 +995,28 @@ class _ASITriggerEngineBase(MDAEngine):
             # so the extra call this now makes on ordinary per-event
             # completion (never called there before) is harmless: a StopCmd
             # against an already-idle worker.
-            if gated_bncs:
-                set_laser_outputs(
-                    self.hw.plogic_label,
-                    self.hw.tiger_comm_hub_label,
-                    gated_bncs,
-                    False,
-                    self.hw.plogic_always_on_cell,
-                )
-            # stop_and_drain, not stop_all: the pool is session-persistent,
-            # so frames left queued by a cancel/error would otherwise be read
-            # by the next Snap/Live/MDA as its own.
-            self._worker_pool.stop_and_drain(timeout=self.hw.worker_shutdown_timeout_s)
-            self._after_volume()
+            # Each step runs even if an earlier one raises (lasers off,
+            # then drain, then _after_volume).
+            try:
+                if gated_bncs:
+                    set_laser_outputs(
+                        self.hw.plogic_label,
+                        self.hw.tiger_comm_hub_label,
+                        gated_bncs,
+                        False,
+                        self.hw.plogic_always_on_cell,
+                    )
+            finally:
+                try:
+                    # stop_and_drain, not stop_all: the pool is
+                    # session-persistent, so frames left queued by a
+                    # cancel/error would otherwise be read by the next
+                    # Snap/Live/MDA as its own.
+                    self._worker_pool.stop_and_drain(
+                        timeout=self.hw.worker_shutdown_timeout_s
+                    )
+                finally:
+                    self._after_volume()
 
 
 class ASISPIMEngine(_ASITriggerEngineBase):
@@ -1321,6 +1402,8 @@ class ASISPIMEngine(_ASITriggerEngineBase):
         """Prepare hardware and calculate Z-stack parameters."""
         from pymmcore_gui._settings import SettingsV1
 
+        self._refuse_dead_pool()
+
         # 0. Force the sequence's first channel to get a real hardware
         # config switch -- see _reset_channel_config_cache's docstring.
         self._reset_channel_config_cache()
@@ -1616,6 +1699,7 @@ class ASIStationaryTriggerEngine(_ASITriggerEngineBase):
 
     def setup_sequence(self, sequence: MDASequence) -> SummaryMetaV1 | None:
         """Prepare hardware; both galvo and piezo stay stationary."""
+        self._refuse_dead_pool()
         # 0. Force the sequence's first channel to get a real hardware
         # config switch -- see _reset_channel_config_cache's docstring.
         self._reset_channel_config_cache()

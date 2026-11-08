@@ -1481,3 +1481,250 @@ def test_stationary_engine_never_parks() -> None:
     writes = _spim_state_core(core)
     _run_volumes(engine, pool, 1)
     assert writes == ["Running"]
+
+
+# --- failures before the first frame (arm / laser / start) must still clean up ---
+
+
+def _event(t: int) -> useq.MDAEvent:
+    """An event at timepoint ``t`` (validated, so the index type-checks)."""
+    return useq.MDAEvent.model_validate({"index": {"t": t}})
+
+
+def test_exec_event_arm_failure_stops_workers_and_reraises() -> None:
+    """``arm_all`` raising (outside the old ``try``) still drains the pool.
+
+    Without ``stop_and_drain`` a worker that did get its ``ArmCmd`` stays
+    armed and discards the next one, wedging every later run until restart.
+    """
+    _core, engine, pool = _make_engine(n_cameras=2, n_slices=3)
+    err = WorkerDiedError("cam0", -1073741819)
+    pool.arm_all.side_effect = err
+
+    with pytest.raises(WorkerDiedError) as excinfo:
+        list(engine.exec_event(_event(0)))
+
+    assert excinfo.value is err
+    pool.stop_and_drain.assert_called_once()
+
+
+def test_exec_event_prepare_volume_failure_stops_workers_and_reraises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _core, engine, pool = _make_engine(n_cameras=1, n_slices=2)
+    err = RuntimeError("prepare failed")
+
+    def boom(event: useq.MDAEvent) -> dict[str, object]:
+        raise err
+
+    monkeypatch.setattr(engine, "_prepare_volume", boom)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        list(engine.exec_event(_event(0)))
+
+    assert excinfo.value is err
+    pool.arm_all.assert_not_called()
+    pool.stop_and_drain.assert_called_once()
+
+
+def test_exec_event_start_failure_closes_laser_and_stops_workers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_start_volume`` raising after the gated laser went on switches it off."""
+    mock_set_laser_outputs = MagicMock()
+    monkeypatch.setattr(engine_module, "set_laser_outputs", mock_set_laser_outputs)
+    monkeypatch.setattr(time, "sleep", MagicMock())
+
+    core, engine, pool = _make_engine(n_cameras=1, n_slices=2)
+    core.getAvailableConfigGroups.return_value = ["Lasers"]
+    core.getCurrentConfig.return_value = "561nm"
+    err = RuntimeError("start failed")
+
+    def boom() -> None:
+        raise err
+
+    monkeypatch.setattr(engine, "_start_volume", boom)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        list(engine.exec_event(_event(0)))
+
+    assert excinfo.value is err
+    on_values = [call.args[3] for call in mock_set_laser_outputs.call_args_list]
+    assert on_values == [True, False]
+    pool.stop_and_drain.assert_called_once()
+
+
+def test_exec_event_pre_laser_failure_does_not_touch_laser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failing before the laser went on must not switch it off either."""
+    mock_set_laser_outputs = MagicMock()
+    monkeypatch.setattr(engine_module, "set_laser_outputs", mock_set_laser_outputs)
+
+    core, engine, pool = _make_engine(n_cameras=1, n_slices=2)
+    core.getAvailableConfigGroups.return_value = ["Lasers"]
+    core.getCurrentConfig.return_value = "561nm"
+    pool.arm_all.side_effect = RuntimeError("arm failed")
+
+    with pytest.raises(RuntimeError):
+        list(engine.exec_event(_event(0)))
+
+    mock_set_laser_outputs.assert_not_called()
+    pool.stop_and_drain.assert_called_once()
+
+
+def test_exec_event_failure_logs_one_diagnostic_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One ERROR line on the pymmcore-plus logger names the event and the workers."""
+    _core, engine, pool = _make_engine(n_cameras=2, n_slices=3)
+    alive = MagicMock()
+    alive.camera_label = "cam0"
+    alive.process.is_alive.return_value = True
+    alive.process.exitcode = None
+    dead = MagicMock()
+    dead.camera_label = "cam1"
+    dead.process.is_alive.return_value = False
+    dead.process.exitcode = -1073741819
+    pool.workers = [alive, dead]
+    pool.arm_all.side_effect = RuntimeError("arm blew up")
+
+    with caplog.at_level(logging.ERROR, logger="pymmcore-plus"):
+        with pytest.raises(RuntimeError, match="arm blew up"):
+            list(engine.exec_event(_event(7)))
+
+    records = [r for r in caplog.records if r.name == "pymmcore-plus"]
+    assert len(records) == 1
+    rec = records[0]
+    assert rec.levelno == logging.ERROR
+    assert rec.exc_info is not None
+    msg = rec.getMessage()
+    assert "{'t': 7}" in msg
+    assert "{'cam0': 0, 'cam1': 0}" in msg
+    assert "finish_reason" in msg
+    assert "cancel_requested" in msg
+    assert "cam0" in msg
+    assert "alive=True" in msg
+    assert "alive=False" in msg
+    assert "exitcode=-1073741819" in msg
+
+
+def test_exec_event_diagnostic_never_masks_original_error() -> None:
+    """Workers lacking ``process``/``is_alive`` don't break the re-raise."""
+    _core, engine, pool = _make_engine(n_cameras=1, n_slices=2)
+    pool.workers = [object(), MagicMock(camera_label="cam0", process=None)]
+    err = RuntimeError("arm blew up")
+    pool.arm_all.side_effect = err
+
+    with pytest.raises(RuntimeError) as excinfo:
+        list(engine.exec_event(_event(0)))
+
+    assert excinfo.value is err
+
+
+def test_exec_event_cancel_is_not_logged_as_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _core, engine, pool = _make_engine(n_cameras=1, n_slices=3)
+    _queue_frames(pool, [("cam0", i) for i in range(3)])
+    with caplog.at_level(logging.ERROR, logger="pymmcore-plus"):
+        gen = cast(
+            "Generator[object, str | None, None]",
+            engine.exec_event(_event(0)),
+        )
+        next(gen)
+        with pytest.raises(StopIteration):
+            gen.send("cancel")
+
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+def test_exec_event_arm_timeout_propagates_unchanged() -> None:
+    """An arm-ack ``TimeoutError`` is not the "no trigger reached" stall.
+
+    No frame iteration has started, so the zero-frame rewrite (which blames
+    PLogic BNC1) must not apply: the very same exception reaches the runner.
+    """
+    _core, engine, pool = _make_engine(n_cameras=2, n_slices=3)
+    err = TimeoutError("armed")
+    pool.arm_all.side_effect = err
+
+    with pytest.raises(TimeoutError) as excinfo:
+        list(engine.exec_event(_event(0)))
+
+    assert excinfo.value is err
+    assert str(excinfo.value) == "armed"
+    pool.stop_and_drain.assert_called_once()
+
+
+def test_exec_event_laser_off_failure_still_drains_and_runs_after_volume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``set_laser_outputs(..., False)`` raising must not skip the other cleanup."""
+    laser_off = RuntimeError("laser off failed")
+
+    def fake_laser(
+        _plogic: str, _hub: str, _bncs: list[int], on: bool, _cell: int
+    ) -> None:
+        if not on:
+            raise laser_off
+
+    monkeypatch.setattr(engine_module, "set_laser_outputs", fake_laser)
+    monkeypatch.setattr(time, "sleep", MagicMock())
+
+    core, engine, pool = _make_engine(n_cameras=1, n_slices=2)
+    core.getAvailableConfigGroups.return_value = ["Lasers"]
+    core.getCurrentConfig.return_value = "561nm"
+    after_volume = MagicMock()
+    monkeypatch.setattr(engine, "_after_volume", after_volume)
+
+    def boom() -> None:
+        raise RuntimeError("start failed")
+
+    monkeypatch.setattr(engine, "_start_volume", boom)
+
+    with pytest.raises(RuntimeError, match="laser off failed"):
+        list(engine.exec_event(_event(0)))
+
+    pool.stop_and_drain.assert_called_once()
+    after_volume.assert_called_once()
+
+
+@pytest.mark.parametrize("engine_cls", [ASISPIMEngine, ASIStationaryTriggerEngine])
+def test_setup_sequence_refuses_dead_pool_before_hardware(
+    monkeypatch: pytest.MonkeyPatch, engine_cls: type[_ASITriggerEngineBase]
+) -> None:
+    """A dead camera worker fails ``setup_sequence`` before any hardware call."""
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=2, engine_cls=engine_cls)
+    svc = MagicMock()
+    err = WorkerDiedError("Camera-1", -1)
+    svc.check_workers_alive.side_effect = err
+    monkeypatch.setattr(
+        "pymmcore_gui.asi_z_stack.engine.CameraWorkerService.get_active",
+        MagicMock(return_value=svc),
+    )
+    core.reset_mock()  # drop the constructor's reads; only setup_sequence counts
+
+    with pytest.raises(WorkerDiedError) as excinfo:
+        engine.setup_sequence(useq.MDASequence.model_validate({"channels": ["488nm"]}))
+
+    assert excinfo.value is err
+    svc.check_workers_alive.assert_called_once()
+    assert core.mock_calls == []
+
+
+def test_setup_sequence_dead_pool_generic_error_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=2)
+    svc = MagicMock()
+    svc.check_workers_alive.side_effect = RuntimeError("dead")
+    monkeypatch.setattr(
+        "pymmcore_gui.asi_z_stack.engine.CameraWorkerService.get_active",
+        MagicMock(return_value=svc),
+    )
+
+    with pytest.raises(RuntimeError, match="dead"):
+        engine.setup_sequence(useq.MDASequence())
+
+    core.setProperty.assert_not_called()
