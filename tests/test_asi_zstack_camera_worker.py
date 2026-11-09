@@ -715,3 +715,476 @@ def test_run_camera_worker_logs_commands_and_enables_faulthandler(
     assert re.search(r"\[worker:camA\] ArmLiveCmd exposure_ms=7.0", text)
     assert re.search(r"\[worker:camA\] StopCmd sequence_running=", text)
     assert re.match(r"\d{4}-\d\d-\d\d \d\d:", text)
+
+
+# ---------------------------------------------------------------------------
+# Commit-headroom guard (pymmcore's image-getter typemap crashes the process
+# when the allocation of the returned numpy array fails; see commit_headroom.py)
+# ---------------------------------------------------------------------------
+
+_GIB = 1024**3
+_LOW_COMMIT = 34 * 1024**2
+_OK_COMMIT = 64 * _GIB
+_CRASH = "allocating getter called with commit exhausted: native crash in pymmcore"
+
+
+class _Commit:
+    """The simulated system commit; both the probe and the fake core read it."""
+
+    def __init__(self, free: int | None) -> None:
+        self.free = free
+        self.calls = 0
+
+    def probe(self) -> int | None:
+        self.calls += 1
+        return self.free
+
+
+class _FakeSeqCore(_FakeLiveCore):
+    """``_FakeLiveCore`` plus a FIFO ``popNextImageAndMD`` that "crashes" when
+    the simulated commit is below the 2 GiB margin, like pymmcore would."""
+
+    def __init__(self, commit: _Commit, n_frames: int = 3) -> None:
+        super().__init__()
+        self.commit = commit
+        for value in range(n_frames):
+            self.push_frame(_frame(value))
+        self.getter_calls: list[str] = []
+        self.stop_calls = 0
+
+    def _check(self, name: str) -> None:
+        self.getter_calls.append(name)
+        if self.commit.free is not None and self.commit.free < 2 * _GIB:
+            raise AssertionError(_CRASH)
+
+    def popNextImageAndMD(
+        self, *args: object, **kwargs: object
+    ) -> tuple[np.ndarray, dict[str, int]]:
+        self._check("popNextImageAndMD")
+        return self.frames.pop(0), {}
+
+    def getLastImageAndMD(self) -> tuple[np.ndarray, dict[str, int]]:
+        self._check("getLastImageAndMD")
+        return super().getLastImageAndMD()
+
+    def stopSequenceAcquisition(self, *_: object) -> None:
+        self.stop_calls += 1
+        super().stopSequenceAcquisition()
+
+
+def _guard_setup(
+    monkeypatch: pytest.MonkeyPatch, commit: _Commit, wait_s: float = 0.2
+) -> None:
+    # raising=False: on code without the guard these names do not exist, which
+    # lets the negative-control run reach the (fake) crashing getter.
+    monkeypatch.setattr(
+        cw_module, "available_commit_bytes", commit.probe, raising=False
+    )
+    monkeypatch.setattr(cw_module, "COMMIT_HEADROOM_WAIT_S", wait_s, raising=False)
+
+
+def _sent(conn: _FakeConn, kind: type) -> list:
+    return [m for m in conn.sent if isinstance(m, kind)]
+
+
+def test_drain_sequence_never_pops_with_commit_exhausted(
+    shm: SharedMemory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NEGATIVE CONTROL: frames pending, commit gone: no pop, stop, typed error."""
+    commit = _Commit(_LOW_COMMIT)
+    _guard_setup(monkeypatch, commit)
+    core = _FakeSeqCore(commit)
+    conn = _FakeConn()
+
+    shutdown = cw_module._drain_sequence(
+        core,  # type: ignore[arg-type] # pyright: ignore[reportArgumentType]
+        conn,  # type: ignore[arg-type] # pyright: ignore[reportArgumentType]
+        shm,
+        _live_config(shm),
+        3,
+    )
+
+    assert core.getter_calls == []
+    assert core.stop_calls == 1
+    assert not core.running
+    assert shutdown is False  # worker is back at its idle command loop
+    (err,) = _sent(conn, ErrorMsg)
+    assert err.exc_type == "CommitHeadroomError"
+    assert "34 MiB free" in err.message
+    assert not _sent(conn, FrameMsg)
+
+
+def test_drain_live_never_gets_last_image_with_commit_exhausted(
+    shm: SharedMemory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NEGATIVE CONTROL: same for the Live getter."""
+    commit = _Commit(_LOW_COMMIT)
+    _guard_setup(monkeypatch, commit)
+    core = _FakeSeqCore(commit)
+    conn = _FakeConn()
+
+    shutdown = _drain_live(
+        core,  # type: ignore[arg-type] # pyright: ignore[reportArgumentType]
+        conn,  # type: ignore[arg-type] # pyright: ignore[reportArgumentType]
+        shm,
+        _live_config(shm),
+    )
+
+    assert core.getter_calls == []
+    assert core.stop_calls == 1
+    assert shutdown is False
+    (err,) = _sent(conn, ErrorMsg)
+    assert err.exc_type == "CommitHeadroomError"
+    assert not _sent(conn, FrameMsg)
+
+
+def test_drain_sequence_waits_and_continues_when_commit_recovers(
+    shm: SharedMemory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commit = _Commit(_LOW_COMMIT)
+    _guard_setup(monkeypatch, commit, wait_s=5.0)
+    real_sleep = time.sleep
+
+    def _recover(seconds: float) -> None:
+        commit.free = _OK_COMMIT  # the page file grew while we waited
+        real_sleep(0)
+
+    monkeypatch.setattr(time, "sleep", _recover)
+    core = _FakeSeqCore(commit, n_frames=2)
+    conn = _FakeConn()
+
+    cw_module._drain_sequence(
+        core,  # type: ignore[arg-type] # pyright: ignore[reportArgumentType]
+        conn,  # type: ignore[arg-type] # pyright: ignore[reportArgumentType]
+        shm,
+        _live_config(shm),
+        2,
+    )
+
+    assert core.getter_calls == ["popNextImageAndMD"] * 2
+    assert len(_sent(conn, FrameMsg)) == 2
+    assert not _sent(conn, ErrorMsg)
+
+
+def test_drain_live_waits_and_continues_when_commit_recovers(
+    shm: SharedMemory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commit = _Commit(_LOW_COMMIT)
+    _guard_setup(monkeypatch, commit, wait_s=5.0)
+
+    def _recover(seconds: float) -> None:
+        commit.free = _OK_COMMIT
+
+    monkeypatch.setattr(time, "sleep", _recover)
+    core = _FakeSeqCore(commit)
+    conn = _FakeConn(
+        on_send=lambda m: conn.inbox.append(StopCmd())
+        if isinstance(m, FrameMsg)
+        else None
+    )
+
+    _drain_live(
+        core,  # type: ignore[arg-type] # pyright: ignore[reportArgumentType]
+        conn,  # type: ignore[arg-type] # pyright: ignore[reportArgumentType]
+        shm,
+        _live_config(shm),
+    )
+
+    assert core.getter_calls == ["getLastImageAndMD"]
+    assert len(_sent(conn, FrameMsg)) == 1
+    assert not _sent(conn, ErrorMsg)
+
+
+def test_drain_unchanged_when_probe_is_unavailable(
+    shm: SharedMemory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Probe returns None (non-Windows): behaves exactly as before the guard."""
+    commit = _Commit(None)
+    _guard_setup(monkeypatch, commit)
+    core = _FakeSeqCore(commit, n_frames=2)
+    conn = _FakeConn()
+
+    cw_module._drain_sequence(
+        core,  # type: ignore[arg-type] # pyright: ignore[reportArgumentType]
+        conn,  # type: ignore[arg-type] # pyright: ignore[reportArgumentType]
+        shm,
+        _live_config(shm),
+        2,
+    )
+
+    assert core.getter_calls == ["popNextImageAndMD"] * 2
+    assert len(_sent(conn, FrameMsg)) == 2
+    assert not _sent(conn, ErrorMsg)
+
+
+def test_stop_during_commit_wait_is_honoured(
+    shm: SharedMemory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commit = _Commit(_LOW_COMMIT)
+    _guard_setup(monkeypatch, commit, wait_s=5.0)
+    core = _FakeSeqCore(commit)
+    conn = _FakeConn()
+    conn.inbox.append(StopCmd(token=7))
+    # the drain loop's own top-of-loop poll would eat the StopCmd; deliver it
+    # only once the guard is waiting
+    inbox, conn.inbox = list(conn.inbox), []
+    real_probe = commit.probe
+
+    def _probe() -> int | None:
+        if commit.calls == 1:  # first call is the guard's; the wait loop polls next
+            conn.inbox.extend(inbox)
+        return real_probe()
+
+    monkeypatch.setattr(cw_module, "available_commit_bytes", _probe, raising=False)
+
+    shutdown = cw_module._drain_sequence(
+        core,  # type: ignore[arg-type] # pyright: ignore[reportArgumentType]
+        conn,  # type: ignore[arg-type] # pyright: ignore[reportArgumentType]
+        shm,
+        _live_config(shm),
+        3,
+    )
+
+    assert shutdown is False
+    assert core.getter_calls == []
+    assert core.stop_calls == 1
+    (stopped,) = _sent(conn, StoppedMsg)
+    assert stopped.token == 7
+    assert not _sent(conn, ErrorMsg)
+
+
+_ALLOCATING_GETTER_ATTR = re.compile(
+    r"\.(popNextImageAndMD|getLastImageAndMD|getImage|popNextImage|getLastImage"
+    r"|getNBeforeLastImage|getNBeforeLastImageMD|getNBeforeLastImageAndMD"
+    r"|getTaggedImage|popNextTaggedImage|getLastTaggedImage|getLastImageMD"
+    r"|popNextImageMD)\b"
+)
+
+
+def test_allocating_getter_matcher_catches_calls_and_bare_attributes() -> None:
+    """Negative control for the structural test below: the matcher must fire."""
+    for bad in (
+        "mmc.popNextImageAndMD()",
+        "f = mmc.getLastImageAndMD",  # attribute taken without a call
+        "core.getTaggedImage(0)",
+        "x = self._mmc.popNextTaggedImage",
+        "mmc.getLastTaggedImage()",
+        "mmc.getNBeforeLastImageMD(1)",
+        "mmc.getNBeforeLastImageAndMD(1)",
+    ):
+        assert _ALLOCATING_GETTER_ATTR.search(bad), bad
+    assert not _ALLOCATING_GETTER_ATTR.search('getattr(mmc, "popNextImageAndMD")()')
+
+
+def test_every_allocating_getter_call_goes_through_fetch_image() -> None:
+    """Structural: the getters are reached in exactly one place, behind the guard."""
+    import inspect
+
+    src = inspect.getsource(cw_module)
+    # No attribute access at all (called or not): only via getattr(mmc, "<name>").
+    assert _ALLOCATING_GETTER_ATTR.findall(src) == []
+    for getter in ("popNextImageAndMD", "getLastImageAndMD"):
+        assert (
+            len(re.findall(rf'"{getter}"', src)) == 2
+        )  # the tuple + its one call site
+    fetch_src = inspect.getsource(cw_module._fetch_image)
+    assert "_wait_for_commit_headroom(" in fetch_src
+    assert fetch_src.index("_wait_for_commit_headroom(") < fetch_src.index(
+        "getattr(mmc"
+    )
+
+
+class _ArmCore:
+    """Fake core for the Arm handlers: ``isSequenceRunning`` follows start/stop."""
+
+    def __init__(self) -> None:
+        self.running = False
+        self.calls: list[str] = []
+
+    def startSequenceAcquisition(self, *args: object) -> None:
+        self.calls.append("startSequenceAcquisition")
+        if self.running:
+            raise RuntimeError(
+                "can not be executed while sequence acquisition is running"
+            )
+        self.running = True
+
+    def startContinuousSequenceAcquisition(self, *args: object) -> None:
+        self.calls.append("startContinuousSequenceAcquisition")
+        if self.running:
+            raise RuntimeError(
+                "can not be executed while sequence acquisition is running"
+            )
+        self.running = True
+
+    def isSequenceRunning(self, *_: object) -> bool:
+        return self.running
+
+    def stopSequenceAcquisition(self, *_: object) -> None:
+        self.calls.append("stopSequenceAcquisition")
+        self.running = False
+
+    def clearCircularBuffer(self) -> None:
+        self.calls.append("clearCircularBuffer")
+
+    def getProperty(self, *_: object) -> str:
+        return ""
+
+    def setCircularBufferMemoryFootprint(self, *_: object) -> None:
+        pass
+
+    def loadDevice(self, *_: object) -> None:
+        pass
+
+    def initializeDevice(self, *_: object) -> None:
+        pass
+
+    def setCameraDevice(self, *_: object) -> None:
+        pass
+
+    def unloadDevice(self, *_: object) -> None:
+        pass
+
+
+def _run_worker_with(
+    monkeypatch: pytest.MonkeyPatch,
+    core: object,
+    cmds: list[object],
+    *,
+    report_timing: object = None,
+) -> _ScriptedConn:
+    monkeypatch.setattr(sys, "stderr", sys.stderr)
+    monkeypatch.setattr(sys, "stdout", sys.stdout)
+    monkeypatch.setattr("faulthandler.enable", MagicMock())
+    monkeypatch.setattr(cw_module, "CMMCorePlus", MagicMock(return_value=core))
+    for name in (
+        "_apply_snapshot",
+        "preferred_external_trigger_mode",
+        "_internal_trigger_mode",
+        "_expose_out_property",
+        "_set_trigger_mode",
+        "_set_expose_out",
+        "_set_exposure",
+    ):
+        monkeypatch.setattr(cw_module, name, MagicMock(return_value=None))
+    monkeypatch.setattr(
+        cw_module,
+        "_report_timing",
+        report_timing if report_timing is not None else MagicMock(return_value={}),
+    )
+    monkeypatch.setattr(cw_module, "_drain_sequence", MagicMock(return_value=False))
+    monkeypatch.setattr(cw_module, "_drain_live", MagicMock(return_value=False))
+    shm = SharedMemory(create=True, size=16)
+    try:
+        config = CameraWorkerConfig(
+            camera_label="camA",
+            adapter_device_name="Fake",
+            shm_name=shm.name,
+            slot_nbytes=16,
+            n_slots=1,
+        )
+        conn = _ScriptedConn(cmds)
+        # The worker's shutdown path stops a still-running camera, which would
+        # hide a missing stop; record the camera state when each ErrorMsg goes out.
+        conn.running_at_error = []  # type: ignore[attr-defined]
+        plain_send = conn.send
+
+        def _send(msg: object) -> None:
+            if isinstance(msg, ErrorMsg):
+                conn.running_at_error.append(core.isSequenceRunning())  # type: ignore[attr-defined]
+            plain_send(msg)
+
+        conn.send = _send  # type: ignore[method-assign]
+        run_camera_worker(config, conn)  # type: ignore[arg-type]
+    finally:
+        shm.close()
+        shm.unlink()
+    return conn
+
+
+def test_arm_refused_below_margin_never_starts_the_camera(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commit = _Commit(_LOW_COMMIT)
+    _guard_setup(monkeypatch, commit)
+    core = _ArmCore()
+    conn = _run_worker_with(monkeypatch, core, [ArmCmd(5), ArmLiveCmd()])
+
+    assert "startSequenceAcquisition" not in core.calls
+    assert "startContinuousSequenceAcquisition" not in core.calls
+    errors = [m for m in conn.sent if isinstance(m, ErrorMsg)]
+    assert [e.exc_type for e in errors] == ["CommitHeadroomError"] * 2
+    assert not [m for m in conn.sent if type(m).__name__ == "ArmedMsg"]
+    cw_module._drain_sequence.assert_not_called()  # type: ignore[attr-defined]
+    cw_module._drain_live.assert_not_called()  # type: ignore[attr-defined]
+
+
+def test_arm_proceeds_when_probe_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    _guard_setup(monkeypatch, _Commit(None))
+    core = _ArmCore()
+    conn = _run_worker_with(monkeypatch, core, [ArmCmd(5), StopCmd()])
+
+    assert core.calls[0] == "startSequenceAcquisition"
+    assert not [m for m in conn.sent if isinstance(m, ErrorMsg)]
+
+
+def test_arm_logs_available_commit(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _guard_setup(monkeypatch, _Commit(8 * _GIB))
+    _run_worker_with(monkeypatch, _ArmCore(), [ArmCmd(5), ArmLiveCmd()])
+    err = capsys.readouterr().err
+    assert re.search(r"ArmCmd .*commit_avail=8\.0 GiB", err)
+    assert re.search(r"ArmLiveCmd .*commit_avail=8\.0 GiB", err)
+
+
+def test_arm_failure_after_start_stops_the_camera(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """09-28: an Arm that fails after the camera started used to leave it running,
+    so the next arm failed with "can not be executed while sequence acquisition
+    is running". NEGATIVE CONTROL (fails on code without the stop)."""
+    _guard_setup(monkeypatch, _Commit(None))
+    core = _ArmCore()
+    boom = MagicMock(side_effect=ValueError("timing read failed"))
+    conn = _run_worker_with(
+        monkeypatch, core, [ArmCmd(5), ArmCmd(5)], report_timing=boom
+    )
+
+    assert conn.running_at_error == [False, False]  # type: ignore[attr-defined]
+    errors = [m for m in conn.sent if isinstance(m, ErrorMsg)]
+    # both arms reached "start" (the second did not hit "already running")
+    assert [e.exc_type for e in errors] == ["AcquisitionError"] * 2
+    assert all("is running" not in e.traceback_text for e in errors)
+    assert core.calls.count("startSequenceAcquisition") == 2
+
+
+def test_arm_live_failure_after_start_stops_the_camera(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _guard_setup(monkeypatch, _Commit(None))
+    core = _ArmCore()
+    boom = MagicMock(side_effect=ValueError("timing read failed"))
+    conn = _run_worker_with(
+        monkeypatch, core, [ArmLiveCmd(), ArmLiveCmd()], report_timing=boom
+    )
+
+    assert conn.running_at_error == [False, False]  # type: ignore[attr-defined]
+    errors = [m for m in conn.sent if isinstance(m, ErrorMsg)]
+    assert [e.exc_type for e in errors] == ["AcquisitionError"] * 2
+    assert all("is running" not in e.traceback_text for e in errors)
+    assert core.calls.count("startContinuousSequenceAcquisition") == 2
+
+
+def test_failure_while_stopping_does_not_mask_the_original_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _guard_setup(monkeypatch, _Commit(None))
+    core = _ArmCore()
+    core.stopSequenceAcquisition = MagicMock(side_effect=OSError("stop failed"))  # type: ignore[method-assign]
+    boom = MagicMock(side_effect=ValueError("timing read failed"))
+    conn = _run_worker_with(monkeypatch, core, [ArmCmd(5)], report_timing=boom)
+
+    (err,) = [m for m in conn.sent if isinstance(m, ErrorMsg)]
+    assert err.exc_type == "AcquisitionError"
+    assert "timing read failed" in err.traceback_text

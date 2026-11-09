@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -629,3 +629,346 @@ def test_health_tick_logs_state_and_reports_dead_worker_once(
     assert isinstance(exc, CameraWorkersDeadError)
     assert exc.dead == [("Camera-2", -1073740791)]
     assert context == "Camera workers"
+
+
+def _tick_service(pool: object) -> CameraWorkerService:
+    return _service(MagicMock(), pool)  # type: ignore[arg-type]
+
+
+def _live_pool() -> object:
+    from types import SimpleNamespace
+
+    from pymmcore_gui.asi_z_stack.worker_pool import (
+        CameraWorkerHandle,
+        CameraWorkerPool,
+    )
+
+    handle = CameraWorkerHandle(
+        "Camera-1",
+        None,  # type: ignore[arg-type]
+        height=1,
+        width=1,
+        dtype="uint16",
+        n_slots=1,
+    )
+    handle.process = SimpleNamespace(exitcode=None, pid=123)  # type: ignore[assignment]
+    return CameraWorkerPool([handle])
+
+
+def test_health_tick_logs_commit_numbers(caplog: pytest.LogCaptureFixture) -> None:
+    import logging
+
+    gib = 1024**3
+    svc = _tick_service(_live_pool())
+    try:
+        with (
+            patch(
+                "pymmcore_gui.asi_z_stack.camera_worker_service.available_commit_bytes",
+                return_value=40 * gib,
+            ),
+            patch(
+                "pymmcore_gui.asi_z_stack.camera_worker_service.process_private_bytes",
+                return_value=3 * gib,
+            ),
+            caplog.at_level(logging.INFO),
+        ):
+            svc._health_tick()
+        assert "main private=3.0 GiB" in caplog.text
+        assert "system commit available=40.0 GiB" in caplog.text
+
+        caplog.clear()
+        with (
+            patch(
+                "pymmcore_gui.asi_z_stack.camera_worker_service.available_commit_bytes",
+                return_value=None,
+            ),
+            patch(
+                "pymmcore_gui.asi_z_stack.camera_worker_service.process_private_bytes",
+                return_value=None,
+            ),
+            caplog.at_level(logging.INFO),
+        ):
+            svc._health_tick()
+        assert "main private=n/a" in caplog.text
+        assert "system commit available=n/a" in caplog.text
+    finally:
+        svc.shutdown()
+
+
+def test_health_tick_low_commit_warning_once_and_rearms() -> None:
+    from pymmcore_gui._exceptions import is_persistent_notice
+
+    gib = 1024**3
+    svc = _tick_service(_live_pool())
+    report = MagicMock()
+    commit = {"free": 100 * gib}
+    try:
+        with (
+            patch(
+                "pymmcore_gui.asi_z_stack.camera_worker_service."
+                "report_background_exception",
+                report,
+            ),
+            patch(
+                "pymmcore_gui.asi_z_stack.camera_worker_service.available_commit_bytes",
+                side_effect=lambda: commit["free"],
+            ),
+        ):
+
+            def tick(free: int | None) -> None:
+                commit["free"] = free  # type: ignore[assignment]
+                svc._health_tick()
+
+            tick(20 * gib)  # above the 16 GiB low mark: no warning
+            report.assert_not_called()
+            tick(15 * gib)  # below: one warning
+            assert report.call_count == 1
+            exc, context = report.call_args.args
+            assert is_persistent_notice(exc)
+            assert "15.0 GiB" in str(exc)
+            assert context == "System memory"
+            tick(10 * gib)  # still low: not repeated
+            tick(None)  # probe unavailable: neither warns nor re-arms
+            tick(25 * gib)  # recovered, but below the 32 GiB re-arm mark
+            tick(12 * gib)  # low again without re-arm: still silent
+            assert report.call_count == 1
+            tick(40 * gib)  # above 32 GiB: re-armed
+            tick(8 * gib)
+            assert report.call_count == 2
+    finally:
+        svc.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Recovery after a worker error (Live drain, Live/Snap arm)
+# ---------------------------------------------------------------------------
+
+
+class _FakeWorker:
+    """Scripted worker end of a pipe: answers commands, records what it got.
+
+    ``trip_after_arm``: after a successful Arm/ArmLive reply, send the commit
+    ``ErrorMsg`` (the worker's guard fired) and stay idle. ``arm_error``: answer
+    the Arm/ArmLive with that ``ErrorMsg`` instead of ``ArmedMsg``. Otherwise
+    the worker "free-runs" silently. A ``StopCmd`` is always acknowledged.
+    """
+
+    def __init__(
+        self, label: str, *, trip_after_arm: bool = False, arm_error: bool = False
+    ) -> None:
+        import threading
+        from multiprocessing import Pipe
+        from types import SimpleNamespace
+
+        from pymmcore_gui.asi_z_stack.worker_pool import CameraWorkerHandle
+
+        self.label = label
+        self.trip_after_arm = trip_after_arm
+        self.arm_error = arm_error
+        self.received: list[object] = []
+        parent, self._child = Pipe(duplex=True)
+        self._never_ready, self._keep_open = Pipe(duplex=False)
+        self.handle = CameraWorkerHandle(
+            label,
+            None,  # type: ignore[arg-type]
+            height=1,
+            width=1,
+            dtype="uint16",
+            n_slots=1,
+        )
+        self.handle.conn = parent
+        self.handle.process = SimpleNamespace(  # type: ignore[assignment]
+            sentinel=self._never_ready, exitcode=None
+        )
+        self._done = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        from pymmcore_gui.asi_z_stack.worker_messages import (
+            ArmCmd,
+            ArmedMsg,
+            ArmLiveCmd,
+            ErrorMsg,
+            StopCmd,
+            StoppedMsg,
+        )
+
+        err = ErrorMsg(self.label, "CommitHeadroomError", "commit low", "")
+        while not self._done.is_set():
+            if not self._child.poll(0.05):
+                continue
+            cmd = self._child.recv()
+            self.received.append(cmd)
+            if isinstance(cmd, ArmCmd | ArmLiveCmd):
+                if self.arm_error:
+                    self._child.send(err)
+                    continue
+                self._child.send(ArmedMsg(self.label))
+                if self.trip_after_arm:
+                    self._child.send(err)
+            elif isinstance(cmd, StopCmd):
+                self._child.send(StoppedMsg(self.label, 0, cmd.token))
+
+    def n_stops(self) -> int:
+        from pymmcore_gui.asi_z_stack.worker_messages import StopCmd
+
+        return sum(isinstance(c, StopCmd) for c in self.received)
+
+    def close(self) -> None:
+        self._done.set()
+        self._thread.join(2.0)
+
+
+@pytest.fixture
+def fake_workers():  # type: ignore[no-untyped-def]
+    made: list[_FakeWorker] = []
+
+    def _make(label: str, **kw: bool) -> _FakeWorker:
+        w = _FakeWorker(label, **kw)
+        made.append(w)
+        return w
+
+    yield _make
+    for w in made:
+        w.close()
+
+
+def _real_pool_service(
+    workers: list[_FakeWorker],
+) -> tuple[CameraWorkerService, object]:
+    from pymmcore_gui.asi_z_stack.worker_pool import CameraWorkerPool
+
+    pool = CameraWorkerPool([w.handle for w in workers])
+    svc = _service(MagicMock(), pool)  # type: ignore[arg-type]
+    svc.hw = HardwareConstants(worker_arm_timeout_s=2.0, worker_shutdown_timeout_s=2.0)
+    return svc, pool
+
+
+def _join_live(svc: CameraWorkerService) -> None:
+    thread = svc._live_thread
+    assert thread is not None
+    thread.join(5.0)
+    assert not thread.is_alive()
+    assert svc._state is CameraWorkerServiceState.IDLE
+
+
+def test_live_commit_error_on_both_workers_leaves_pool_clean(fake_workers) -> None:  # type: ignore[no-untyped-def]
+    """Both workers trip in Live: the 2nd ErrorMsg must not poison the next arm."""
+    from pymmcore_gui.asi_z_stack.worker_pool import CameraCommitExhaustedError
+
+    w1 = fake_workers("Camera-1", trip_after_arm=True)
+    w2 = fake_workers("Camera-2", trip_after_arm=True)
+    svc, pool = _real_pool_service([w1, w2])
+    with patch(
+        "pymmcore_gui.asi_z_stack.camera_worker_service.report_background_exception"
+    ) as report:
+        svc.start_live()
+        _join_live(svc)
+    report.assert_called_once()
+    assert isinstance(report.call_args.args[0], CameraCommitExhaustedError)
+    assert w1.n_stops() == 1
+    assert w2.n_stops() == 1
+    # The stale second ErrorMsg was drained: a fresh arm succeeds.
+    w1.trip_after_arm = w2.trip_after_arm = False
+    pool.arm_live_all(armed_timeout=2.0)  # type: ignore[attr-defined]
+
+
+def test_live_commit_error_on_one_worker_stops_the_other(fake_workers) -> None:  # type: ignore[no-untyped-def]
+    w1 = fake_workers("Camera-1", trip_after_arm=True)
+    w2 = fake_workers("Camera-2")  # keeps free-running
+    svc, pool = _real_pool_service([w1, w2])
+    with patch(
+        "pymmcore_gui.asi_z_stack.camera_worker_service.report_background_exception"
+    ):
+        svc.start_live()
+        _join_live(svc)
+    assert w1.n_stops() == 1
+    assert w2.n_stops() == 1
+    pool.arm_live_all(armed_timeout=2.0)  # type: ignore[attr-defined]
+
+
+def test_live_drain_recovery_failure_does_not_mask_original_error() -> None:
+    from pymmcore_gui.asi_z_stack.worker_pool import CameraCommitExhaustedError
+
+    pool = MagicMock()
+    pool.dead_workers.return_value = []
+    boom = CameraCommitExhaustedError("commit gone")
+    pool.iter_frames.side_effect = boom
+    pool.stop_and_drain.side_effect = OSError("pipe closed")
+    svc = _service(MagicMock(), pool)
+    svc._state = CameraWorkerServiceState.LIVE
+    errored: list[str] = []
+    svc.liveErrored.connect(errored.append)
+    with patch(
+        "pymmcore_gui.asi_z_stack.camera_worker_service.report_background_exception"
+    ) as report:
+        svc._run_live_drain(pool)
+    pool.stop_and_drain.assert_called_once()
+    assert errored == ["commit gone"]
+    report.assert_called_once_with(boom, "Live view")
+    assert svc._state is CameraWorkerServiceState.IDLE
+
+
+@pytest.mark.parametrize("entry", ["live", "snap"])
+def test_arm_error_from_one_worker_stops_pool_and_reraises(  # type: ignore[no-untyped-def]
+    entry: str, fake_workers
+) -> None:
+    from pymmcore_gui.asi_z_stack.worker_pool import CameraCommitExhaustedError
+
+    w1 = fake_workers("Camera-1", arm_error=True)
+    w2 = fake_workers("Camera-2")  # armed fine and now free-running
+    svc, pool = _real_pool_service([w1, w2])
+    call = svc.start_live if entry == "live" else svc.snap
+    with pytest.raises(CameraCommitExhaustedError, match="commit low"):
+        call()
+    assert svc._state is CameraWorkerServiceState.IDLE
+    assert svc._live_thread is None
+    assert w1.n_stops() == 1
+    assert w2.n_stops() == 1
+    # Both pipes are clean: the next arm works.
+    w1.arm_error = False
+    pool.arm_live_all(armed_timeout=2.0)  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("entry", ["live", "snap"])
+def test_arm_exception_calls_stop_and_drain_and_reraises(entry: str) -> None:
+    pool = MagicMock()
+    pool.dead_workers.return_value = []
+    pool.arm_live_all.side_effect = TimeoutError("armed?")
+    pool.arm_all.side_effect = TimeoutError("armed?")
+    # A failing recovery is logged, not raised over the original error.
+    pool.stop_and_drain.side_effect = OSError("pipe closed")
+    svc = _service(MagicMock(), pool)
+    call = svc.start_live if entry == "live" else svc.snap
+    with pytest.raises(TimeoutError, match="armed\\?"):
+        call()
+    pool.stop_and_drain.assert_called_once()
+    # GUI-thread recovery uses the short timeout, not worker_shutdown_timeout_s.
+    assert pool.stop_and_drain.call_args.kwargs["timeout"] == 3.0
+    assert svc._state is CameraWorkerServiceState.IDLE
+
+
+def test_snap_refuses_to_arm_while_live_drain_thread_is_stuck() -> None:
+    """A drain thread that outlives stop_live still reads the pipes: no 2nd reader."""
+    import threading
+
+    pool = MagicMock()
+    pool.dead_workers.return_value = []
+    svc = _service(MagicMock(), pool)
+    svc.hw = HardwareConstants(worker_shutdown_timeout_s=0.1)
+    release = threading.Event()
+    stuck = threading.Thread(target=release.wait, daemon=True)
+    stuck.start()
+    svc._state = CameraWorkerServiceState.LIVE
+    svc._live_thread = stuck
+    try:
+        with pytest.raises(RuntimeError, match="Live did not stop"):
+            svc.snap()
+        pool.arm_all.assert_not_called()
+        pool.iter_frames.assert_not_called()
+        pool.stop_and_drain.assert_not_called()
+        assert svc._state is CameraWorkerServiceState.LIVE
+    finally:
+        release.set()
+        stuck.join(2.0)

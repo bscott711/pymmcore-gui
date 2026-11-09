@@ -55,8 +55,14 @@ from .camera_handoff import (
     reload_cameras_after_handoff,
 )
 from .camera_worker import CameraWorkerConfig
+from .commit_headroom import available_commit_bytes, format_gib, process_private_bytes
 from .common import HardwareConstants
-from .worker_pool import CameraWorkerHandle, CameraWorkerPool, CameraWorkersDeadError
+from .worker_pool import (
+    CameraCommitExhaustedError,
+    CameraWorkerHandle,
+    CameraWorkerPool,
+    CameraWorkersDeadError,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -70,6 +76,23 @@ logger = logging.getLogger(__name__)
 
 #: Interval of the worker health log line (see CameraWorkerService._health_tick).
 _HEALTH_INTERVAL_MS = 60_000
+
+#: _health_tick reports one sticky warning when the system's available commit
+#: (RAM + page file) drops below the low mark, and re-arms it only once it has
+#: risen above the high mark.
+_COMMIT_WARN_LOW_BYTES = 16 * 1024**3
+_COMMIT_WARN_REARM_BYTES = 32 * 1024**3
+
+#: Recovery wait (s) for ``_recover_pool`` calls made on the GUI thread
+#: (Live start, Snap): short, so a hung worker stalls the GUI for the arm
+#: timeout plus this, not plus ``worker_shutdown_timeout_s``.
+_GUI_RECOVERY_TIMEOUT_S = 3.0
+
+
+class LowSystemCommitWarning(RuntimeError):
+    """The system is close to running out of commit (RAM + page file)."""
+
+    persistent_notice = True
 
 
 def has_camera(mmc: CMMCorePlus) -> bool:
@@ -220,6 +243,8 @@ class CameraWorkerService(QObject):
         self._health_timer.timeout.connect(self._health_tick)
         #: Labels of dead workers already reported by _health_tick.
         self._reported_dead: set[str] = set()
+        #: True while the low-commit warning has been shown and not yet re-armed.
+        self._commit_warned = False
         #: Exposure read from the main-process core once, in begin_release,
         #: while a camera was still loaded there -- a best-effort fallback
         #: for code that would otherwise call the now-cameraless main-process
@@ -579,7 +604,14 @@ class CameraWorkerService(QObject):
                         f"{worker.camera_label} alive "
                         f"pid={getattr(process, 'pid', None)}"
                     )
-            logger.info(f"camera workers: state={state.name} " + ", ".join(parts))
+            commit_free = available_commit_bytes()
+            logger.info(
+                f"camera workers: state={state.name} "
+                + ", ".join(parts)
+                + f"; main private={format_gib(process_private_bytes())}"
+                + f", system commit available={format_gib(commit_free)}"
+            )
+            self._check_commit_warning(commit_free)
             newly_dead = [
                 (label, code)
                 for label, code in pool.dead_workers()
@@ -592,6 +624,22 @@ class CameraWorkerService(QObject):
                 report_background_exception(exc, "Camera workers")
         except Exception:
             logger.exception("Camera worker health check failed.")
+
+    def _check_commit_warning(self, commit_free: int | None) -> None:
+        """One sticky warning below the low mark; re-armed above the high mark."""
+        if commit_free is None:
+            return
+        if commit_free >= _COMMIT_WARN_REARM_BYTES:
+            self._commit_warned = False
+        elif commit_free < _COMMIT_WARN_LOW_BYTES and not self._commit_warned:
+            self._commit_warned = True
+            exc = LowSystemCommitWarning(
+                f"System commit (RAM + page file) is low: {format_gib(commit_free)} "
+                "available. Camera acquisition will be stopped if it runs out; "
+                "close MDA viewer tabs or other memory-heavy programs."
+            )
+            _pmp_logger.error(str(exc))
+            report_background_exception(exc, "System memory")
 
     # ------------------------------------------------------------------
     # Live
@@ -611,10 +659,16 @@ class CameraWorkerService(QObject):
             )
         # Explicit exposure: an MDA may have left the cameras at a channel's
         # exposure (All Rows mode sets it per channel).
-        pool.arm_live_all(
-            armed_timeout=self.hw.worker_arm_timeout_s,
-            exposure_ms=self.last_known_exposure_ms,
-        )
+        try:
+            pool.arm_live_all(
+                armed_timeout=self.hw.worker_arm_timeout_s,
+                exposure_ms=self.last_known_exposure_ms,
+            )
+        except BaseException:
+            # A worker may have armed (or errored) while another did not: stop
+            # and drain so the next attempt starts from idle, empty pipes.
+            self._recover_pool(pool, _GUI_RECOVERY_TIMEOUT_S)
+            raise
         with self._lock:
             self._state = CameraWorkerServiceState.LIVE
             self._live_thread = threading.Thread(
@@ -648,6 +702,26 @@ class CameraWorkerService(QObject):
             logger.warning("Live drain thread did not exit; pipes left undrained.")
         with self._lock:
             self._live_thread = None
+
+    def _recover_pool(
+        self, pool: CameraWorkerPool, timeout: float | None = None
+    ) -> None:
+        """Best-effort ``stop_and_drain`` after a failure; never raises.
+
+        Only call from the thread that owns the pool's pipes. A failure here
+        is logged so it cannot mask the error being handled. *timeout*
+        defaults to ``worker_shutdown_timeout_s``.
+        """
+        try:
+            pool.stop_and_drain(
+                timeout=(
+                    timeout
+                    if timeout is not None
+                    else self.hw.worker_shutdown_timeout_s
+                )
+            )
+        except Exception:
+            logger.warning("Camera worker pool recovery failed.", exc_info=True)
 
     def _run_live_drain(self, pool: CameraWorkerPool) -> None:
         """Background-thread body: drain frames until stopped, then flip to IDLE.
@@ -685,7 +759,16 @@ class CameraWorkerService(QObject):
                     self._liveFrameAvailable.emit(camera_label)
         except Exception as exc:
             logger.error("Live streaming stopped unexpectedly.", exc_info=True)
+            # Both workers usually hit the same error (shared system commit):
+            # stop the survivor and discard the second, still-queued ErrorMsg
+            # so the next Live/Snap/MDA arm is not refused by a stale error.
+            # This thread is the pipes' only reader here.
+            self._recover_pool(pool)
             self.liveErrored.emit(str(exc))
+            if isinstance(exc, CameraCommitExhaustedError):
+                # liveErrored has no listener; without this the live view would
+                # just stop with no visible reason.
+                report_background_exception(exc, "Live view")
         finally:
             with self._lock:
                 if self._state is CameraWorkerServiceState.LIVE:
@@ -724,17 +807,30 @@ class CameraWorkerService(QObject):
             raise RuntimeError("Camera worker service has no active pool.")
         if was_live:
             self.stop_live()
+            with self._lock:
+                still_live = self._state is CameraWorkerServiceState.LIVE
+            if still_live:
+                # The drain thread did not finish: it still reads the pipes,
+                # and a second reader would corrupt both streams.
+                raise RuntimeError(
+                    "Cannot Snap: Live did not stop (the drain thread is still "
+                    "running). Try again in a moment."
+                )
 
         frames: dict[str, np.ndarray] = {}
         needed = set(self.camera_labels)
         # Internal trigger: outside an MDA nothing fires the external one, so
         # an externally-triggered Snap just times out with zero frames.
-        pool.arm_all(
-            1,
-            armed_timeout=self.hw.worker_arm_timeout_s,
-            external_trigger=False,
-            exposure_ms=self.last_known_exposure_ms,
-        )
+        try:
+            pool.arm_all(
+                1,
+                armed_timeout=self.hw.worker_arm_timeout_s,
+                external_trigger=False,
+                exposure_ms=self.last_known_exposure_ms,
+            )
+        except BaseException:
+            self._recover_pool(pool, _GUI_RECOVERY_TIMEOUT_S)
+            raise
         try:
             for camera_label, slice_idx, img, meta, remaining in pool.iter_frames(
                 stall_timeout_s=timeout

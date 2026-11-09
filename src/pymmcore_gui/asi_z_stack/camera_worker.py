@@ -22,7 +22,7 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from multiprocessing.shared_memory import SharedMemory
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from pymmcore_plus import CMMCorePlus
@@ -30,6 +30,12 @@ from pymmcore_plus import CMMCorePlus
 from .asi_controller import (
     EXTERNAL_TRIGGER_MODES,
     preferred_external_trigger_mode,
+)
+from .commit_headroom import (
+    CommitHeadroomError,
+    available_commit_bytes,
+    format_gib,
+    required_headroom_bytes,
 )
 from .worker_messages import (
     ArmCmd,
@@ -84,6 +90,20 @@ _LIVE_MAX_IN_FLIGHT = 2
 # How often (seconds of worker wall-clock time) _drain_live logs a one-line
 # sent/skipped throughput summary while Live is running.
 _LIVE_STATUS_REPORT_INTERVAL_S = 10.0
+
+# pymmcore's image getters allocate their numpy result in a SWIG typemap that
+# does not check for failure, so with the system commit exhausted they crash the
+# process instead of raising MemoryError (see commit_headroom.py). The worker
+# therefore waits up to COMMIT_HEADROOM_WAIT_S (a system-managed page file grows
+# on demand), polling every _COMMIT_HEADROOM_POLL_S, for the required headroom
+# to appear before every such call and before arming, and gives up with a
+# CommitHeadroomError otherwise.
+COMMIT_HEADROOM_WAIT_S = 2.0
+_COMMIT_HEADROOM_POLL_S = 0.05
+
+#: The only image getters the drains may use; each allocates its result in the
+#: unchecked typemap, so each goes through :func:`_fetch_image`.
+_ALLOCATING_GETTERS = ("popNextImageAndMD", "getLastImageAndMD")
 
 
 @dataclass(frozen=True)
@@ -400,6 +420,109 @@ def _stop_and_clear(mmc: CMMCorePlus, label: str) -> None:
     mmc.clearCircularBuffer()
 
 
+def _stop_after_failure(mmc: CMMCorePlus, label: str) -> None:
+    """:func:`_stop_and_clear` after an error; a failure here is logged, not raised."""
+    try:
+        _stop_and_clear(mmc, label)
+    except Exception:
+        _log(
+            label,
+            f"stopping the camera after an error also failed:\n"
+            f"{traceback.format_exc()}",
+        )
+
+
+def _wait_for_commit_headroom(
+    frame_bytes: int,
+    label: str,
+    *,
+    conn: Connection | None = None,
+    free_slots: list[int] | None = None,
+) -> StopCmd | ShutdownCmd | None:
+    """Return once enough system commit is free for *frame_bytes*, else raise.
+
+    Returns ``None`` immediately when the probe is unavailable
+    (:func:`available_commit_bytes` is ``None``) or headroom is sufficient.
+    Otherwise polls for up to ``COMMIT_HEADROOM_WAIT_S``; with *conn* and
+    *free_slots* given, a Stop/Shutdown arriving meanwhile is returned (and
+    handled by the caller as in the drain loops).
+
+    Raises
+    ------
+    CommitHeadroomError
+        Headroom did not recover within the wait.
+    """
+    required = required_headroom_bytes(frame_bytes)
+    free = available_commit_bytes()
+    if free is None or free >= required:
+        return None
+    _log(
+        label,
+        f"commit headroom low: {free // 2**20} MiB free, {required // 2**20} MiB "
+        f"needed; waiting up to {COMMIT_HEADROOM_WAIT_S:g}s",
+    )
+    deadline = time.monotonic() + COMMIT_HEADROOM_WAIT_S
+    while True:
+        if conn is not None and free_slots is not None:
+            stop_signal = _drain_incoming(conn, free_slots)
+            if stop_signal is not None:
+                return stop_signal
+        if time.monotonic() >= deadline:
+            raise CommitHeadroomError(free, required)
+        time.sleep(_COMMIT_HEADROOM_POLL_S)
+        free = available_commit_bytes()
+        if free is None or free >= required:
+            _log(label, "commit headroom recovered")
+            return None
+
+
+def _fetch_image(
+    mmc: CMMCorePlus,
+    getter: str,
+    *,
+    conn: Connection,
+    free_slots: list[int],
+    frame_bytes: int,
+    label: str,
+) -> tuple[np.ndarray, Any] | StopCmd | ShutdownCmd:
+    """The ONLY place the worker calls an allocating pymmcore image getter.
+
+    Runs the commit-headroom guard, then ``mmc.<getter>()``. Every call of
+    ``popNextImageAndMD``/``getLastImageAndMD`` in this module goes through
+    here, so none can skip the guard (a test enforces that no other call site
+    exists).
+
+    Returns
+    -------
+    tuple | StopCmd | ShutdownCmd
+        ``(image, metadata)``, or the Stop/Shutdown that arrived while waiting
+        for headroom (no getter call was made).
+
+    Raises
+    ------
+    CommitHeadroomError
+        Not enough commit, even after waiting; no getter call was made.
+    """
+    if getter not in _ALLOCATING_GETTERS:
+        raise ValueError(f"unknown image getter {getter!r}")
+    stop_signal = _wait_for_commit_headroom(
+        frame_bytes, label, conn=conn, free_slots=free_slots
+    )
+    if stop_signal is not None:
+        return stop_signal
+    result: tuple[np.ndarray, Any] = getattr(mmc, getter)()
+    return result
+
+
+def _commit_error_msg(label: str, exc: CommitHeadroomError) -> ErrorMsg:
+    return ErrorMsg(
+        camera_label=label,
+        exc_type="CommitHeadroomError",
+        message=str(exc),
+        traceback_text="",
+    )
+
+
 def _drain_sequence(
     mmc: CMMCorePlus,
     conn: Connection,
@@ -455,8 +578,26 @@ def _drain_sequence(
                     conn.send(StoppedMsg(label, images_collected, _token(stop_signal)))
                     return isinstance(stop_signal, ShutdownCmd)
 
+            try:
+                fetched = _fetch_image(
+                    mmc,
+                    "popNextImageAndMD",
+                    conn=conn,
+                    free_slots=free_slots,
+                    frame_bytes=config.slot_nbytes,
+                    label=label,
+                )
+            except CommitHeadroomError as exc:
+                _log(label, f"stopping acquisition: {exc}")
+                _stop_after_failure(mmc, label)
+                conn.send(_commit_error_msg(label, exc))
+                return False
+            if isinstance(fetched, StopCmd | ShutdownCmd):
+                _stop_and_clear(mmc, label)
+                conn.send(StoppedMsg(label, images_collected, _token(fetched)))
+                return isinstance(fetched, ShutdownCmd)
+            img, mm_meta = fetched
             slot = free_slots.pop(0)
-            img, mm_meta = mmc.popNextImageAndMD()
             try:
                 camera_metadata = dict(mm_meta.items())
             except Exception:
@@ -631,8 +772,26 @@ def _drain_live(
         in_flight = config.n_slots - len(free_slots)
         due = min_send_interval <= 0.0 or (now - last_send_time) >= min_send_interval
         if remaining > 0 and due and in_flight < max_in_flight:
+            try:
+                fetched = _fetch_image(
+                    mmc,
+                    "getLastImageAndMD",
+                    conn=conn,
+                    free_slots=free_slots,
+                    frame_bytes=config.slot_nbytes,
+                    label=label,
+                )
+            except CommitHeadroomError as exc:
+                _log(label, f"stopping live view: {exc}")
+                _stop_after_failure(mmc, label)
+                conn.send(_commit_error_msg(label, exc))
+                return False
+            if isinstance(fetched, StopCmd | ShutdownCmd):
+                _stop_and_clear(mmc, label)
+                conn.send(StoppedMsg(label, images_collected, _token(fetched)))
+                return isinstance(fetched, ShutdownCmd)
+            img, mm_meta = fetched
             slot = free_slots.pop(0)
-            img, mm_meta = mmc.getLastImageAndMD()
             try:
                 camera_metadata = dict(mm_meta.items())
             except Exception:
@@ -796,9 +955,11 @@ def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
                     f"ArmCmd n_images={cmd.n_images} "
                     f"external_trigger={cmd.external_trigger} "
                     f"trigger_mode={cmd.trigger_mode!r} "
-                    f"exposure_ms={cmd.exposure_ms}",
+                    f"exposure_ms={cmd.exposure_ms} "
+                    f"commit_avail={format_gib(available_commit_bytes())}",
                 )
                 try:
+                    _wait_for_commit_headroom(config.slot_nbytes, label)
                     mode: str | None
                     if cmd.trigger_mode is not None:
                         mode = _require_trigger_mode(mmc, label, cmd.trigger_mode)
@@ -819,8 +980,16 @@ def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
                     shutdown_requested = _drain_sequence(
                         mmc, conn, shm, config, cmd.n_images
                     )
+                except CommitHeadroomError as exc:
+                    _log(label, f"arm refused: {exc}")
+                    _stop_after_failure(mmc, label)
+                    conn.send(_commit_error_msg(label, exc))
                 except Exception:
                     _log(label, f"arm/drain failed:\n{traceback.format_exc()}")
+                    # Never leave a half-armed camera running: the next arm
+                    # would fail with "can not be executed while sequence
+                    # acquisition is running".
+                    _stop_after_failure(mmc, label)
                     conn.send(
                         ErrorMsg(
                             camera_label=label,
@@ -833,8 +1002,13 @@ def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
                     break
             elif isinstance(cmd, ArmLiveCmd):
                 shutdown_requested = False
-                _log(label, f"ArmLiveCmd exposure_ms={cmd.exposure_ms}")
+                _log(
+                    label,
+                    f"ArmLiveCmd exposure_ms={cmd.exposure_ms} "
+                    f"commit_avail={format_gib(available_commit_bytes())}",
+                )
                 try:
+                    _wait_for_commit_headroom(config.slot_nbytes, label)
                     _set_trigger_mode(mmc, label, internal_mode)
                     _set_expose_out(mmc, label, expose_out_prop, normal_expose_out)
                     _set_exposure(mmc, label, cmd.exposure_ms)
@@ -842,8 +1016,13 @@ def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
                     last_timing = _report_timing(mmc, label, last_timing)
                     conn.send(ArmedMsg(label, last_timing))
                     shutdown_requested = _drain_live(mmc, conn, shm, config)
+                except CommitHeadroomError as exc:
+                    _log(label, f"live arm refused: {exc}")
+                    _stop_after_failure(mmc, label)
+                    conn.send(_commit_error_msg(label, exc))
                 except Exception:
                     _log(label, f"live arm/drain failed:\n{traceback.format_exc()}")
+                    _stop_after_failure(mmc, label)
                     conn.send(
                         ErrorMsg(
                             camera_label=label,
