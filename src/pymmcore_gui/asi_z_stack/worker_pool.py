@@ -149,6 +149,27 @@ class WorkerDiedError(RuntimeError):
         )
 
 
+class CameraCommitExhaustedError(RuntimeError):
+    """A camera worker stopped because the system commit (RAM + page file) ran out.
+
+    Raised from a worker's ``ErrorMsg`` with ``exc_type == "CommitHeadroomError"``.
+    The worker is alive and idle (it refused to call a pymmcore image getter that
+    would have crashed it), but the situation persists until memory is freed, so
+    the GUI keeps the message on screen.
+    """
+
+    persistent_notice = True
+
+
+def _worker_error(msg: ErrorMsg) -> RuntimeError:
+    """The exception for a worker's ``ErrorMsg`` (typed for commit exhaustion)."""
+    if msg.exc_type == "CommitHeadroomError":
+        return CameraCommitExhaustedError(f"{msg.camera_label}: {msg.message}")
+    return RuntimeError(
+        f"{msg.camera_label} worker error: {msg.message}\n{msg.traceback_text}"
+    )
+
+
 def _format_exitcode(exitcode: int | None) -> str:
     """Decimal exit code, plus hex for a Windows NTSTATUS-style negative code."""
     if exitcode is not None and exitcode < 0:
@@ -562,10 +583,7 @@ class CameraWorkerPool:
                     pass
                 elif isinstance(msg, ErrorMsg):
                     active.pop(worker.camera_label, None)
-                    raise RuntimeError(
-                        f"{msg.camera_label} worker error: {msg.message}\n"
-                        f"{msg.traceback_text}"
-                    )
+                    raise _worker_error(msg)
 
     def stop_all(self) -> None:
         """Send every worker a ``StopCmd`` (best-effort, non-blocking)."""
@@ -707,10 +725,7 @@ class CameraWorkerPool:
                 worker = conn_map[obj]
                 msg = worker.conn.recv()  # type: ignore[union-attr]
                 if isinstance(msg, ErrorMsg):
-                    raise RuntimeError(
-                        f"{msg.camera_label} worker error: {msg.message}\n"
-                        f"{msg.traceback_text}"
-                    )
+                    raise _worker_error(msg)
                 if isinstance(msg, expected):
                     if isinstance(msg, ArmedMsg):
                         worker.last_timing = dict(msg.timing)

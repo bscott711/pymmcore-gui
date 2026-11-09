@@ -312,3 +312,65 @@ def test_dead_workers_reports_dead_and_ignores_alive_and_unspawned() -> None:
     assert "-1073740791" in str(err)
     assert "'Camera-4'" in str(err)
     assert "restart the GUI" in str(err)
+
+
+def test_error_msg_commit_headroom_raises_typed_persistent_error() -> None:
+    """A worker that refused to allocate (commit exhausted) surfaces as a typed,
+    sticky-toast exception; every other ErrorMsg stays a plain RuntimeError."""
+    import threading
+
+    from pymmcore_gui._exceptions import is_persistent_notice
+    from pymmcore_gui.asi_z_stack.worker_messages import ErrorMsg
+    from pymmcore_gui.asi_z_stack.worker_pool import (
+        CameraCommitExhaustedError,
+        CameraWorkerPool,
+    )
+
+    def _run(exc_type: str, message: str) -> BaseException:
+        handle, child, _keep = _pipe_handle("Camera-1")
+        child.send(ErrorMsg("Camera-1", exc_type, message, "tb-text"))
+        pool = CameraWorkerPool([handle])
+        out: list[BaseException] = []
+
+        def _consume() -> None:
+            try:
+                list(pool.iter_frames(stall_timeout_s=2.0))
+            except BaseException as exc:
+                out.append(exc)
+
+        t = threading.Thread(target=_consume)
+        t.start()
+        t.join(5.0)
+        assert out, "iter_frames did not raise"
+        return out[0]
+
+    typed = _run(
+        "CommitHeadroomError", "System commit is nearly exhausted: 34 MiB free"
+    )
+    assert isinstance(typed, CameraCommitExhaustedError)
+    assert is_persistent_notice(typed)
+    assert "34 MiB free" in str(typed)
+    assert "Camera-1" in str(typed)
+
+    other = _run("AcquisitionError", "worker failed during arm/drain")
+    assert type(other) is RuntimeError
+    assert not is_persistent_notice(other)
+    assert (
+        str(other) == "Camera-1 worker error: worker failed during arm/drain\ntb-text"
+    )
+
+
+def test_wait_for_all_commit_headroom_error_is_typed() -> None:
+    import pytest
+
+    from pymmcore_gui.asi_z_stack.worker_messages import ArmedMsg, ErrorMsg
+    from pymmcore_gui.asi_z_stack.worker_pool import (
+        CameraCommitExhaustedError,
+        CameraWorkerPool,
+    )
+
+    handle, child, _keep = _pipe_handle("Camera-1")
+    child.send(ErrorMsg("Camera-1", "CommitHeadroomError", "low commit", ""))
+    pool = CameraWorkerPool([handle])
+    with pytest.raises(CameraCommitExhaustedError, match="low commit"):
+        pool._wait_for_all(ArmedMsg, timeout=2.0)
