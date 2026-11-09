@@ -9,6 +9,7 @@ from weakref import WeakSet, WeakValueDictionary
 import ndv
 import numpy as np
 import useq
+from psygnal import EmitLoopError
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QWidget
 from PyQt6Ads import CDockWidget
@@ -204,6 +205,10 @@ class NDVViewersManager(QObject):
         self._preview_dock_widgets = WeakSet[CDockWidget]()
         # currently active viewer
         self._active_mda_viewer: ndv.ArrayViewer | None = None
+        # Counts ``sequenceStarted`` events: every MDA run gets its own serial, so
+        # viewers/docks of one run can be told apart from a rerun of the same
+        # ``MDASequence`` (same uid). Read it from an ``mdaViewerCreated`` slot.
+        self._run_serial = 0
 
         # Private, in-RAM display-only store for the single-camera case --
         # always created fresh per sequence (see _on_sequence_started),
@@ -651,6 +656,44 @@ class NDVViewersManager(QObject):
         self._lock_listeners.clear()
         self._locked_axes.clear()
 
+    @property
+    def run_serial(self) -> int:
+        """Serial of the most recently started MDA run (0 before the first)."""
+        return self._run_serial
+
+    def forget_viewer(self, viewer: ndv.ArrayViewer) -> None:
+        """Drop every reference this manager keeps to *viewer* (its dock is gone).
+
+        This also applies while an MDA runs (the user closed the current run's
+        tab): the viewer and its display-only store are dropped, so later frames
+        for that camera are skipped quietly in ``_on_frame_ready`` instead of
+        reaching a destroyed widget. Saving is unaffected: writers get frames
+        from the MDA runner, not from these display stores.
+        """
+        # A data request still in flight when the dock closes would answer into a
+        # destroyed widget; the resulting error (traceback -> future -> request ->
+        # display store) pins the whole camera store for good. ndv is an upstream
+        # fork we must not modify, so invalidate its pending requests from here.
+        # These are private ndv attributes, hence the guards.
+        with suppress(Exception):
+            viewer._current_gen = -1  # late responses then return early
+        cancel = getattr(viewer, "_cancel_futures", None)
+        if cancel is not None:
+            with suppress(Exception):
+                cancel()
+        self._pending_viewer_updates.pop(viewer, None)
+        self._locked_axes.pop(viewer, None)
+        listener = self._lock_listeners.pop(viewer, None)
+        if listener is not None:
+            with suppress(Exception):  # viewer may already be gone/destroyed
+                viewer.display_model.current_index.item_changed.disconnect(listener)
+        if self._active_mda_viewer is viewer:
+            self._active_mda_viewer = None
+            self._own_handler = None
+        for label in [k for k, v in self._mda_camera_viewers.items() if v is viewer]:
+            del self._mda_camera_viewers[label]
+            self._mda_camera_handlers.pop(label, None)
+
     def _make_lock_listener(self, viewer: ndv.ArrayViewer) -> Callable[..., None]:
         """Return a listener that keeps ``_locked_axes[viewer]`` in sync.
 
@@ -715,6 +758,7 @@ class NDVViewersManager(QObject):
         Then we create a new ndv viewer and show it.
         """
         self._is_mda_running = True
+        self._run_serial += 1
 
         self._own_handler = None
         self._mda_camera_handlers.clear()
@@ -752,7 +796,7 @@ class NDVViewersManager(QObject):
             handler = self._mda_camera_handlers.get(label)
             viewer = self._mda_camera_viewers.get(label)
             if handler is None or viewer is None:
-                return  # pragma: no cover
+                return
             # Each per-camera store is built from ``seq.sizes`` (no ``cam`` axis),
             # so drop the engine's redundant ``cam`` index before writing/indexing.
             event = without_cam_index(event)
@@ -765,7 +809,7 @@ class NDVViewersManager(QObject):
             self._own_handler.frameReady(frame, event, meta)
 
         if (viewer := self._active_mda_viewer) is None:
-            return  # pragma: no cover
+            return
 
         self._update_mda_viewer(viewer, self._own_handler, event)
 
@@ -784,6 +828,17 @@ class NDVViewersManager(QObject):
             if not (key == "c" and multichannel)
         )
 
+    @staticmethod
+    def _notify_frame_written(viewer: ndv.ArrayViewer) -> None:
+        """Tell *viewer*'s wrapper a frame was written (grows the "t" slider)."""
+        if isinstance(wrapper := viewer.data_wrapper, _LabeledArrayWrapper):
+            try:
+                wrapper.notify_frame_written()
+            except (RuntimeError, EmitLoopError):
+                # the viewer's widgets were deleted (the slot error arrives
+                # wrapped in an EmitLoopError) -- its tab was closed meanwhile
+                pass
+
     def _update_mda_viewer(
         self,
         viewer: ndv.ArrayViewer,
@@ -800,7 +855,10 @@ class NDVViewersManager(QObject):
         # (see _LabeledArrayWrapper docstring for why this can't just be a
         # bare `viewer.data = handler.array`).
         if viewer.data_wrapper is None:
-            viewer.data = _LabeledArrayWrapper(handler)
+            try:
+                viewer.data = _LabeledArrayWrapper(handler)
+            except (RuntimeError, EmitLoopError):
+                pass  # the viewer's widgets were deleted (its tab was closed)
             return
 
         # Otherwise, move the viewer's slider to the most recently acquired
@@ -820,8 +878,7 @@ class NDVViewersManager(QObject):
         # locked plane's frame and it would never be shown.
         if self._locked_out(viewer, event):
             # the "t" slider must still grow as new timepoints are written.
-            if isinstance(wrapper := viewer.data_wrapper, _LabeledArrayWrapper):
-                wrapper.notify_frame_written()
+            self._notify_frame_written(viewer)
             return
         already_pending = viewer in self._pending_viewer_updates
         self._pending_viewer_updates[viewer] = event
@@ -832,8 +889,7 @@ class NDVViewersManager(QObject):
             latest = self._pending_viewer_updates.pop(v, None)
             if latest is None:
                 return  # pragma: no cover
-            if isinstance(wrapper := v.data_wrapper, _LabeledArrayWrapper):
-                wrapper.notify_frame_written()
+            self._notify_frame_written(v)
             # re-check: the lock may have been toggled/moved since queuing.
             if self._locked_out(v, latest):
                 return

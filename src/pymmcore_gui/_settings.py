@@ -161,6 +161,14 @@ class WindowSettingsV1(BaseMMSettings):
     """State of dock_manager dockwidgets"""
     open_widgets: WidgetNames = Field(default_factory=_default_widgets)
     """Set of widgets to load on startup, or when restoring settings."""
+    mda_viewer_keep_runs: int = Field(default=2, ge=1)
+    """Number of newest MDA runs whose viewer tabs are kept open.
+
+    Each run adds one viewer tab per camera, and each tab holds that run's
+    in-RAM display data. When a new run starts, the tabs of older runs beyond
+    this many are deleted (closing a tab also deletes it). The run being
+    acquired always counts, so 2 keeps the current and the previous run.
+    """
 
     @model_validator(mode="before")
     @classmethod
