@@ -111,7 +111,21 @@ class CameraWorkerConfig:
     """Everything :func:`run_camera_worker` needs, picklable across the spawn."""
 
     camera_label: str
-    adapter_device_name: str
+    adapter_device_name: str | None = None
+    """Device name passed to ``loadDevice``. ``None`` means "same as
+    :attr:`camera_label`" (what every PVCAM worker uses today)."""
+    adapter_module: str = _ADAPTER_MODULE
+    """Micro-Manager device-adapter module the camera is loaded from. Defaults
+    to ``"PVCAM"``; another adapter (the Orca, PLACEHOLDER (U1)) overrides it."""
+    pre_init_props: tuple[tuple[str, str], ...] = ()
+    """``(property, value)`` pairs set after ``loadDevice`` but before
+    ``initializeDevice`` (PLACEHOLDER (U1): the Orca's pre-init properties are
+    not known). Empty for PVCAM."""
+    geometry: tuple[int, int, str] | None = None
+    """Optional ``(height, width, dtype)`` of this camera's frames, for callers
+    that cannot snapshot it before spawn (``ReadyMsg`` carries none); consumed
+    by :meth:`~pymmcore_gui.asi_z_stack.worker_pool.CameraWorkerHandle.from_config`.
+    ``None`` means the caller supplies the geometry to the handle itself."""
     property_snapshot: dict[str, str] = field(default_factory=dict)
     roi: tuple[int, int, int, int] | None = None
     circular_buffer_mb: int = 4096
@@ -909,7 +923,11 @@ def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
     try:
         mmc = CMMCorePlus()
         mmc.setCircularBufferMemoryFootprint(config.circular_buffer_mb)
-        mmc.loadDevice(label, _ADAPTER_MODULE, config.adapter_device_name)
+        mmc.loadDevice(
+            label, config.adapter_module, config.adapter_device_name or label
+        )
+        for prop, value in config.pre_init_props:
+            mmc.setProperty(label, prop, value)
         mmc.initializeDevice(label)
         _apply_snapshot(mmc, config)
         mmc.setCameraDevice(label)

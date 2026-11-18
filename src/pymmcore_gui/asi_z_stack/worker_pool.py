@@ -224,6 +224,39 @@ class CameraWorkerHandle:
         # worker_messages.ArmedMsg.timing); empty until the first arm.
         self.last_timing: dict[str, str] = {}
 
+    @classmethod
+    def from_config(
+        cls, config: CameraWorkerConfig, n_slots: int
+    ) -> CameraWorkerHandle:
+        """Build a handle whose frame geometry comes from ``config.geometry``.
+
+        For cameras whose geometry is known up front rather than snapshotted
+        from the main core (``ReadyMsg`` carries none).
+
+        Parameters
+        ----------
+        config : CameraWorkerConfig
+            Must have ``geometry`` set.
+        n_slots : int
+            Number of shared-memory frame slots.
+
+        Returns
+        -------
+        CameraWorkerHandle
+            An unspawned handle for ``config.camera_label``.
+
+        Raises
+        ------
+        ValueError
+            If ``config.geometry`` is ``None``.
+        """
+        if config.geometry is None:
+            raise ValueError(
+                f"CameraWorkerConfig for {config.camera_label!r} has no geometry"
+            )
+        height, width, dtype = config.geometry
+        return cls(config.camera_label, config, height, width, dtype, n_slots)
+
     def is_dead(self) -> bool:
         """Whether the worker process was started and has since exited.
 

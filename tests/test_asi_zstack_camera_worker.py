@@ -1052,6 +1052,7 @@ def _run_worker_with(
     cmds: list[object],
     *,
     report_timing: object = None,
+    config_overrides: dict[str, object] | None = None,
 ) -> _ScriptedConn:
     monkeypatch.setattr(sys, "stderr", sys.stderr)
     monkeypatch.setattr(sys, "stdout", sys.stdout)
@@ -1076,13 +1077,15 @@ def _run_worker_with(
     monkeypatch.setattr(cw_module, "_drain_live", MagicMock(return_value=False))
     shm = SharedMemory(create=True, size=16)
     try:
-        config = CameraWorkerConfig(
-            camera_label="camA",
-            adapter_device_name="Fake",
-            shm_name=shm.name,
-            slot_nbytes=16,
-            n_slots=1,
-        )
+        config_kwargs: dict[str, object] = {
+            "camera_label": "camA",
+            "adapter_device_name": "Fake",
+            "shm_name": shm.name,
+            "slot_nbytes": 16,
+            "n_slots": 1,
+            **(config_overrides or {}),
+        }
+        config = CameraWorkerConfig(**config_kwargs)  # type: ignore[arg-type]
         conn = _ScriptedConn(cmds)
         # The worker's shutdown path stops a still-running camera, which would
         # hide a missing stop; record the camera state when each ErrorMsg goes out.
@@ -1174,6 +1177,81 @@ def test_arm_live_failure_after_start_stops_the_camera(
     assert [e.exc_type for e in errors] == ["AcquisitionError"] * 2
     assert all("is running" not in e.traceback_text for e in errors)
     assert core.calls.count("startContinuousSequenceAcquisition") == 2
+
+
+class _LoadRecordingCore(_ArmCore):
+    """``_ArmCore`` that also records the load/pre-init/initialise sequence."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.order: list[tuple[str, ...]] = []
+
+    def loadDevice(self, *args: object) -> None:
+        self.order.append(("loadDevice", *map(str, args)))
+
+    def setProperty(self, *args: object) -> None:
+        self.order.append(("setProperty", *map(str, args)))
+
+    def initializeDevice(self, *args: object) -> None:
+        self.order.append(("initializeDevice", *map(str, args)))
+
+
+def test_config_defaults_reproduce_the_pvcam_load_call() -> None:
+    config = CameraWorkerConfig(camera_label="camA")
+    assert config.adapter_module == "PVCAM"
+    assert config.adapter_device_name is None
+    assert config.pre_init_props == ()
+    assert config.geometry is None
+
+
+def test_default_config_loads_pvcam_under_the_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _guard_setup(monkeypatch, _Commit(None))
+    core = _LoadRecordingCore()
+    # adapter_device_name=None: the label doubles as the device name, as the
+    # service passes today (adapter_device_name=label).
+    _run_worker_with(
+        monkeypatch, core, [], config_overrides={"adapter_device_name": None}
+    )
+    assert core.order == [
+        ("loadDevice", "camA", "PVCAM", "camA"),
+        ("initializeDevice", "camA"),
+    ]
+
+
+def test_explicit_label_as_device_name_loads_identically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _guard_setup(monkeypatch, _Commit(None))
+    core = _LoadRecordingCore()
+    _run_worker_with(
+        monkeypatch, core, [], config_overrides={"adapter_device_name": "camA"}
+    )
+    assert core.order[0] == ("loadDevice", "camA", "PVCAM", "camA")
+
+
+def test_non_pvcam_adapter_and_pre_init_props_applied_before_initialize(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _guard_setup(monkeypatch, _Commit(None))
+    core = _LoadRecordingCore()
+    _run_worker_with(
+        monkeypatch,
+        core,
+        [],
+        config_overrides={
+            "adapter_module": "FakeModule",
+            "adapter_device_name": "FakeDevice",
+            "pre_init_props": (("FakeProp", "1"), ("OtherProp", "x")),
+        },
+    )
+    assert core.order == [
+        ("loadDevice", "camA", "FakeModule", "FakeDevice"),
+        ("setProperty", "camA", "FakeProp", "1"),
+        ("setProperty", "camA", "OtherProp", "x"),
+        ("initializeDevice", "camA"),
+    ]
 
 
 def test_failure_while_stopping_does_not_mask_the_original_error(

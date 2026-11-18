@@ -374,3 +374,27 @@ def test_wait_for_all_commit_headroom_error_is_typed() -> None:
     pool = CameraWorkerPool([handle])
     with pytest.raises(CameraCommitExhaustedError, match="low commit"):
         pool._wait_for_all(ArmedMsg, timeout=2.0)
+
+
+def test_handle_from_config_uses_supplied_geometry() -> None:
+    from pymmcore_gui.asi_z_stack.camera_worker import CameraWorkerConfig
+    from pymmcore_gui.asi_z_stack.worker_pool import CameraWorkerHandle
+
+    config = CameraWorkerConfig(camera_label="FakeCam", geometry=(6, 10, "uint16"))
+    handle = CameraWorkerHandle.from_config(config, n_slots=3)
+
+    assert handle.camera_label == "FakeCam"
+    assert handle.config is config
+    assert (handle.height, handle.width, handle.dtype) == (6, 10, "uint16")
+    assert handle.n_slots == 3
+    assert handle.slot_nbytes == 6 * 10 * 2
+
+
+def test_handle_from_config_without_geometry_raises() -> None:
+    import pytest
+
+    from pymmcore_gui.asi_z_stack.camera_worker import CameraWorkerConfig
+    from pymmcore_gui.asi_z_stack.worker_pool import CameraWorkerHandle
+
+    with pytest.raises(ValueError, match="no geometry"):
+        CameraWorkerHandle.from_config(CameraWorkerConfig(camera_label="X"), n_slots=2)
