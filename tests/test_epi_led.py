@@ -11,7 +11,7 @@ import pytest
 from pydantic import ValidationError
 
 from pymmcore_gui._mmcore_shutdown import shutdown_mmcore
-from pymmcore_gui._settings import EpiLedChannel, SettingsV1
+from pymmcore_gui._settings import EpiLedChannel, SettingsV1, _default_epi_leds
 from pymmcore_gui.epi import _mode
 from pymmcore_gui.epi._led import (
     LED_INTENSITY_PROP,
@@ -402,6 +402,18 @@ def test_default_epi_settings() -> None:
         (3, "642", True, 50),
         (4, "405", False, 50),
     ]
+
+
+def test_default_led_map_is_the_confirmed_one() -> None:
+    # ASI X/Y/Z/F = channel 1..4; user-confirmed X=488, Y=561, Z=642; 405 unused.
+    leds = _default_epi_leds()
+    assert {c.channel: c.name for c in leds} == {
+        1: "488",
+        2: "561",
+        3: "642",
+        4: "405",
+    }
+    assert [c.visible for c in leds] == [True, True, True, False]
 
 
 def test_default_settings_dump_is_still_empty() -> None:

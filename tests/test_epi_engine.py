@@ -308,6 +308,8 @@ def test_setup_refuses_without_the_epi_service(rig: Rig, epi_mode: None) -> None
 
 
 def test_setup_refuses_an_unconfigured_orca(rig: Rig, epi_mode: None) -> None:
+    # the default is the Orca identity, so blank the camera explicitly
+    SettingsV1.instance().epi.camera = EpiCameraSettingsV1(adapter_module="")
     with pytest.raises(EpiSequenceRefused, match=re.escape(NOT_CONFIGURED)):
         EpiMDAEngine(rig.core).setup_sequence(_seq())
 

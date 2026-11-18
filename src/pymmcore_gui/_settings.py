@@ -514,7 +514,9 @@ class EpiLedChannel(BaseModel):
 
 
 def _default_epi_leds() -> list[EpiLedChannel]:
-    # PLACEHOLDER (O1): channel -> band map unconfirmed; the user sets it.
+    # Confirmed mapping: ASI LED command letters X/Y/Z/F = card channel 1..4;
+    # user-confirmed X=488, Y=561, Z=642 (2026-11-18). Channel 4 (405) is not
+    # hooked up, so it is hidden.
     return [
         EpiLedChannel(channel=1, name="488"),
         EpiLedChannel(channel=2, name="561"),
@@ -526,26 +528,25 @@ def _default_epi_leds() -> list[EpiLedChannel]:
 class EpiCameraSettingsV1(BaseModel):
     """Identity and geometry of the EPI (Orca) camera, which lives in no cfg.
 
-    Every field is empty until the user fills it in: EPI entry is refused with
-    "Set the Orca camera in settings" while :meth:`is_configured` is false. Nothing
-    here is guessed.
+    Defaults describe the rig's Orca (Hamamatsu C11440-22C, ORCA-Flash4.0 V2,
+    Camera Link, software / internal trigger). Every field stays overridable; EPI
+    entry is refused with "Set the Orca camera in settings" while
+    :meth:`is_configured` is false (e.g. a field was blanked).
     """
 
-    # PLACEHOLDER (U1): the Orca's Micro-Manager adapter, device name, label,
-    # geometry and pre-init properties are not known yet.
-    label: str = ""  # PLACEHOLDER (U1)
+    # Source: Orca Flash4.0 V2 C11440-22C, S/N 100201, user-confirmed 2026-11-18.
+    label: str = "Orca"
     """Device label the camera worker loads the camera under."""
-    adapter_module: str = ""  # PLACEHOLDER (U1)
+    adapter_module: str = "HamamatsuHam"
     """Micro-Manager device-adapter module (library) the camera is loaded from."""
-    device_name: str = ""  # PLACEHOLDER (U1)
+    device_name: str = "HamamatsuHam_DCAM"
     """Device name inside that adapter, passed to ``loadDevice``."""
-    width: int = 0  # PLACEHOLDER (U1)
+    width: int = 2048
     """Frame width in pixels."""
-    height: int = 0  # PLACEHOLDER (U1)
+    height: int = 2048
     """Frame height in pixels."""
-    dtype: str = ""  # PLACEHOLDER (U1)
+    dtype: str = "uint16"
     """Numpy dtype of a frame, e.g. ``"uint16"``."""
-    # PLACEHOLDER (U1)
     pre_init_props: list[tuple[str, str]] = Field(default_factory=list)
     """``(property, value)`` pairs set after ``loadDevice``, before
     ``initializeDevice``."""
@@ -570,7 +571,7 @@ class EpiSettingsV1(BaseMMSettings):
     for EPI; ``LED:X:31`` (an X-axis LED on the XY card) is never touched."""
     leds: list[EpiLedChannel] = Field(default_factory=_default_epi_leds)
     camera: EpiCameraSettingsV1 = Field(default_factory=EpiCameraSettingsV1)
-    """The Orca camera identity (PLACEHOLDER (U1): empty until configured)."""
+    """The Orca camera identity (defaults to the rig's Orca Flash4.0 V2)."""
 
 
 class SettingsV1(BaseMMSettings):

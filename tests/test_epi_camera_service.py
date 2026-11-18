@@ -78,7 +78,7 @@ def _camera(**overrides: Any) -> EpiCameraSettingsV1:
 
 
 def _configure(**overrides: Any) -> EpiCameraSettingsV1:
-    """Fill ``settings.epi.camera`` (test values; the real ones are U1)."""
+    """Fill ``settings.epi.camera`` (test values, not the real Orca defaults)."""
     camera = _camera(**overrides)
     SettingsV1.instance().epi.camera = camera
     return camera
@@ -145,13 +145,21 @@ def _idle_service(owner: QObject, pool: object) -> EpiCameraWorkerService:
 # ------------------------------------------------------------------- settings
 
 
-def test_camera_settings_default_to_empty_placeholders() -> None:
+def test_camera_settings_default_to_the_orca_identity() -> None:
     cam = EpiCameraSettingsV1()
-    assert (cam.label, cam.adapter_module, cam.device_name, cam.dtype) == ("",) * 4
-    assert (cam.width, cam.height) == (0, 0)
+    assert cam.label == "Orca"
+    assert cam.adapter_module == "HamamatsuHam"
+    assert cam.device_name == "HamamatsuHam_DCAM"
+    assert (cam.width, cam.height, cam.dtype) == (2048, 2048, "uint16")
     assert cam.pre_init_props == []
-    assert not cam.is_configured()
+    assert cam.is_configured()
     assert SettingsV1.instance().epi.camera == cam
+
+
+def test_a_blanked_default_field_is_not_configured() -> None:
+    cam = EpiCameraSettingsV1(adapter_module="")
+    assert not cam.is_configured()
+    assert not EpiCameraSettingsV1(width=0).is_configured()
 
 
 def test_default_settings_dump_is_still_empty() -> None:
@@ -189,8 +197,10 @@ def test_is_configured_needs_every_field(empty: dict[str, Any]) -> None:
 
 
 def test_precondition_refuses_until_the_camera_is_configured() -> None:
-    assert epi_camera_precondition() == NOT_CONFIGURED
+    assert epi_camera_precondition() is None  # the default is the Orca identity
     assert "Set the Orca camera in settings (epi.camera) first" in NOT_CONFIGURED
+    _configure(adapter_module="")
+    assert epi_camera_precondition() == NOT_CONFIGURED
     _configure()
     assert epi_camera_precondition() is None
 
@@ -208,6 +218,7 @@ def test_entry_refused_when_the_camera_is_not_configured(
     spawned: list[EpiCameraWorkerService],
     owner: QObject,
 ) -> None:
+    _configure(adapter_module="")  # blank the (default-configured) camera
     fake = FakeTigerCore(mmcore)
     ctrl = _controller(mmcore, fake)
     ctrl.epi_service_provider = epi_service_provider(owner)
@@ -397,7 +408,7 @@ def test_begin_refuses_unconfigured_or_bad_settings(
 ) -> None:
     svc = EpiCameraWorkerService(owner)
     with pytest.raises(ValueError, match="Orca camera"):
-        svc.begin(EpiCameraSettingsV1())
+        svc.begin(EpiCameraSettingsV1(adapter_module=""))
     with pytest.raises(ValueError, match="dtype"):
         svc.begin(_camera(dtype="nope"))
     assert svc.state is CameraWorkerServiceState.INACTIVE

@@ -123,7 +123,8 @@ def test_comment_block_records_the_placeholders() -> None:
     comments = "\n".join(
         line for line in _lines(EPI_CFG) if line.startswith(_ADDED_COMMENT)
     )
-    assert "PLACEHOLDER (O1)" in comments
+    assert "Confirmed channel map" in comments
+    assert "1/X = 488, 2/Y = 561, 3/Z = 642, 4/F = 405" in comments
     assert "PLACEHOLDER (O2)" in comments
     assert "20260630-OPM.cfg" in comments
 
