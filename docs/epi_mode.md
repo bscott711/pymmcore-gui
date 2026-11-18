@@ -31,35 +31,33 @@ when the two drift apart.
 Without the EPI profile loaded, switching to EPI is refused with a message
 telling you to load it.
 
-### Fill in the Orca camera settings
+### Orca camera settings
 
 The Orca is in no cfg file. The app starts its own camera process for it on the
 first switch to EPI, then keeps it for the rest of the session. Its identity
 comes from the app settings, section `epi.camera` of `pmm_settings.json` in the
-app's user data folder. There is no settings dialog for it yet, so edit the
-JSON with the app closed. Every field is empty until you fill it in, and EPI
-entry is refused ("Set the Orca camera in settings") until all of the first six
-are set:
+app's user data folder. The section is pre-filled with the rig's Orca (see
+[Confirmed hardware](#confirmed-hardware)), so there is nothing to enter. Edit
+the JSON, with the app closed, only to override a value. There is no settings
+dialog for it yet. EPI entry is refused ("Set the Orca camera in settings") if
+any of the first six fields is emptied:
 
-| Field            | Meaning                                                                         |
-| ---------------- | ------------------------------------------------------------------------------- |
-| `label`          | Device label the camera is loaded under                                         |
-| `adapter_module` | Micro-Manager device adapter (library) for the Orca                             |
-| `device_name`    | Device name inside that adapter                                                 |
-| `width`          | Frame width in pixels                                                           |
-| `height`         | Frame height in pixels                                                          |
-| `dtype`          | Numpy dtype of a frame, for example `uint16`                                    |
-| `pre_init_props` | Optional list of `[property, value]` pairs set before the camera is initialised |
+| Field            | Meaning                                                                         | Default             |
+| ---------------- | ------------------------------------------------------------------------------- | ------------------- |
+| `label`          | Device label the camera is loaded under                                         | `Orca`              |
+| `adapter_module` | Micro-Manager device adapter (library) for the Orca                             | `HamamatsuHam`      |
+| `device_name`    | Device name inside that adapter                                                 | `HamamatsuHam_DCAM` |
+| `width`          | Frame width in pixels                                                           | `2048`              |
+| `height`         | Frame height in pixels                                                          | `2048`              |
+| `dtype`          | Numpy dtype of a frame                                                          | `uint16`            |
+| `pre_init_props` | Optional list of `[property, value]` pairs set before the camera is initialised | none                |
 
-These values are not known yet (see [Needs rig or user input](#needs-rig-or-user-input)).
-
-### Name the LED channels
+### LED channel names
 
 Settings section `epi.leds` has one entry per card channel (1 to 4) with a
 `name` (band, for example `488`), `visible` and the remembered `percent`. The
-defaults are `488`, `561`, `642` and a hidden `405`. Which physical card channel
-carries which band is a placeholder until it is checked on the rig, so set the
-names to match the hardware.
+defaults match the confirmed channel map (`488`, `561`, `642` and a hidden
+`405`), so there is nothing to set. Change them only to override.
 
 ## Using EPI mode
 
@@ -157,19 +155,53 @@ The Property Browser, the Console and the stage "set as default" action have no
 guard. They are for experts: if they change Core Focus, Core Shutter or the
 channel group, the app restores the old values when you leave EPI and logs it.
 
-## Needs rig or user input
+## Confirmed hardware
 
-These are placeholders. Nothing in the app guesses them.
+The TGLED card is at Tiger address 37. The ASI LED command letters are X for
+channel 1, Y for channel 2, Z for channel 3 and F for channel 4 (see the ASI
+docs for the [TGLED](https://docs.asiimaging.com/tgled) and its
+[LED command](https://docs.asiimaging.com/commands/led)). These are the serial
+command letters, not the axis letter in the Micro-Manager device label.
 
-| Id | What is missing                                                              | Where it shows up                                      |
-| -- | ---------------------------------------------------------------------------- | ------------------------------------------------------ |
-| O1 | Which card channel carries 488, 561 and 642 nm                               | `epi.leds` names, `EPI LEDs` presets in the EPI cfg    |
-| O2 | Exact LED labels, axis letter, channel count, `LED Intensity(%)` limits      | `LED:L:37:1` to `4` in the cfg                         |
-| U1 | The Orca's adapter module, device name, label, geometry, pre-init properties | `epi.camera` in settings (also exposure property name) |
+| Channel | ASI letter | Band | Preset   | Visible            |
+| ------- | ---------- | ---- | -------- | ------------------ |
+| 1       | X          | 488  | `LED488` | yes                |
+| 2       | Y          | 561  | `LED561` | yes                |
+| 3       | Z          | 642  | `LED642` | yes                |
+| 4       | F          | 405  | `LED405` | no (not connected) |
 
-For O2, close the app and run `scripts/discover_tgled.py` (see the LED doc).
-The percent response of the LEDs is also unmeasured: the rig checklist records
-it.
+Micro-Manager exposes the card as four shutter devices under ASITiger.
+Intensity is set through `LED Intensity(%)`, on/off through the shutter
+`State`. The ASI docs treat 0 % as off, but the app keeps 1 to 100 percent plus
+a separate on/off and never writes 0.
+
+The Orca is a Hamamatsu C11440-22C (ORCA-Flash4.0 V2), S/N 100201, DCAM 4.00,
+Camera Link. Defaults in `settings.epi.camera`:
+
+| Setting        | Value                                        |
+| -------------- | -------------------------------------------- |
+| Adapter        | `HamamatsuHam` (`mmgr_dal_HamamatsuHam.dll`) |
+| Device         | `HamamatsuHam_DCAM`                          |
+| Label          | `Orca`                                       |
+| Frame          | 2048 x 2048, `uint16`                        |
+| Pre-init props | none                                         |
+| Exposure       | standard `Exposure` property                 |
+| Trigger        | camera default; the app never sets a trigger |
+
+## Needs rig confirmation
+
+Nothing in the app guesses these.
+
+| Id | What is missing                                                       | Where it shows up              |
+| -- | --------------------------------------------------------------------- | ------------------------------ |
+| O2 | Label letter (`LED:L:37:n`), channel count, `LED Intensity(%)` limits | `LED:L:37:1` to `4` in the cfg |
+
+The app looks the card up by address 37 plus channel number with any axis
+letter, so a different letter still works. Also to confirm on the rig:
+`HamamatsuHam_DCAM` exposes `Exposure` under that name, and frames come back
+2048 x 2048 `uint16`. For O2, close the app and run `scripts/discover_tgled.py`
+(see the LED doc). The percent response of the LEDs is also unmeasured: the rig
+checklist records it.
 
 ## Rig checklist
 
@@ -185,9 +217,13 @@ note the BNC1 trigger count, frame counts and zarr shape each time.
 4. Toggle to EPI and straight back without acquiring. CRISP Z and CRISP P
    states are the same before and after. Repeat step 2.
 5. In EPI:
-   - confirm the LED labels, N, the axis letter and the intensity limits with
-     `scripts/discover_tgled.py` or the load log, and note which channel is
-     488, 561 and 642 (O1, O2). The script must list `LED:X:31` as "other LED";
+   - with the app closed, confirm the `LED:L:37:n` labels, the channel count
+     and the intensity limits with `scripts/discover_tgled.py` (O2). The script
+     must list `LED:X:31` as "other LED";
+   - confirm channel 1, 2 and 3 light 488, 561 and 642 at a low percent;
+   - confirm the Orca loads as `HamamatsuHam_DCAM`, exposes `Exposure`, and
+     returns 2048 x 2048 `uint16` on Snap and Live. Its trigger setting stays
+     at the camera default (the app never changes it);
    - LED panel on and off; Orca Live and Snap; the exposure spinbox changes the
      Orca, not the OPM cameras;
    - for each channel, set 10, 50 and 100 percent and Snap: the image mean (or a

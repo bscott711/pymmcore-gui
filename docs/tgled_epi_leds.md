@@ -35,8 +35,10 @@ channels are marked `# TGLED channel <n>`; any other `LED*` device is marked
 
 The profile `hardware_profiles/20261118-OPM_EPI.cfg` is a generated superset of
 `20260630-OPM.cfg` that adds the four `LED:L:37:<n>` devices and an `EPI LEDs`
-config group (`LED488`, `LED561`, `LED642`). The labels are placeholders taken
-from the rig log: confirm them with the script. Edit `20260630-OPM.cfg` and
+config group (`LED488`, `LED561`, `LED642`). The label letter `L` is taken from
+the rig log and is still to be confirmed on the rig with the script (O2, along
+with the channel count and the `LED Intensity(%)` limits). The app looks the
+card up by address 37 plus channel number with any letter. Edit `20260630-OPM.cfg` and
 regenerate the EPI profile, never edit only one of the two.
 
 ## Intensity
@@ -49,10 +51,27 @@ regenerate the EPI profile, never edit only one of the two.
   restarts, but is never applied automatically. It is written to the card only
   just before a channel is switched on, so opening the panel or changing a
   percent while a channel is off never emits light.
-- Channel names (`488`, `561`, `642`, `405`) and which card channel carries
-  which band are placeholders until confirmed on the rig; set them in the
-  settings. Channel 4 (`405`) is hidden by default. It is still closed by "All
-  off" and at shutdown.
+- Channel names (`488`, `561`, `642`, `405`) match the confirmed channel map
+  below and can be overridden in the settings. Channel 4 (`405`) is hidden by
+  default (not connected). It is still closed by "All off" and at shutdown.
+
+### Channel map
+
+The ASI LED command letters are X for channel 1, Y for channel 2, Z for
+channel 3 and F for channel 4 (ASI docs: <https://docs.asiimaging.com/tgled>
+and <https://docs.asiimaging.com/commands/led>). These are the serial command
+letters, **not** the axis letter in the Micro-Manager device label.
+
+| Channel | ASI letter | Band | Preset   | Visible            |
+| ------- | ---------- | ---- | -------- | ------------------ |
+| 1       | X          | 488  | `LED488` | yes                |
+| 2       | Y          | 561  | `LED561` | yes                |
+| 3       | Z          | 642  | `LED642` | yes                |
+| 4       | F          | 405  | `LED405` | no (not connected) |
+
+Micro-Manager exposes the card as four shutter devices under ASITiger. The ASI
+docs treat 0 % as off; the app keeps 1 to 100 percent plus a separate on/off
+and never writes 0.
 
 ## Notes
 
