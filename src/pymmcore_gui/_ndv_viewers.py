@@ -256,6 +256,8 @@ class NDVViewersManager(QObject):
         # see _sync_worker_service_connection for why this is re-evaluated
         # on every config load rather than connected once here.
         self._connected_worker_service: CameraWorkerService | None = None
+        # The EPI (Orca) camera service, connected when it is first created.
+        self._epi_service: CameraWorkerService | None = None
 
         ev = self._mmc.events
         ev.imageSnapped.connect(self._on_image_snapped)
@@ -491,6 +493,37 @@ class NDVViewersManager(QObject):
             svc.frameReady.connect(self._on_worker_frame)
             svc.roiChanged.connect(self._on_camera_roi_changed)
         self._connected_worker_service = svc
+
+    def connect_epi_service(self, svc: CameraWorkerService) -> None:
+        """Show the EPI (Orca) camera service's Live/Snap frames.
+
+        Called once, when the service is created on the first EPI entry. The
+        service is cfg-independent and lives for the whole session, so this is
+        not re-evaluated on config loads. Docks are keyed by camera label, so
+        the Orca's dock appears on its first frame.
+        """
+        self._epi_service = svc
+        svc.frameReady.connect(self._on_epi_frame)
+        svc.roiChanged.connect(self._on_camera_roi_changed)
+
+    def _on_epi_frame(
+        self,
+        camera_label: str,
+        slice_idx: int,
+        frame: np.ndarray,
+        camera_metadata: dict[str, Any],
+        images_remaining: int,
+    ) -> None:
+        """Display one Live or Snap frame delivered by the EPI camera worker."""
+        if self._is_mda_running:
+            return
+        preview, _ = self._get_or_create_camera_preview(camera_label)
+        preview.append(frame)
+        svc = self._epi_service
+        live = svc is not None and svc.state is CameraWorkerServiceState.LIVE
+        self._remember_frame(
+            camera_label, frame, "live" if live else "snap", camera_metadata
+        )
 
     def _on_camera_roi_changed(self, camera_label: str) -> None:
         """Re-place overlays (and the default zoom) after a camera's ROI changed."""

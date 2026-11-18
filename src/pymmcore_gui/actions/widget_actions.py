@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Annotated, TypeVar, cast
 from pymmcore_plus import CMMCorePlus
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction
-from PyQt6.QtWidgets import QDialog, QWidget
+from PyQt6.QtWidgets import QDialog, QVBoxLayout, QWidget
 from PyQt6Ads import CDockWidget, DockWidgetArea, SideBarLocation
 
 from ._action_info import ActionKey, WidgetActionInfo, _ensure_isinstance
@@ -102,8 +102,46 @@ def create_mda_widget(parent: QWidget) -> pmmw.MDAWidget:
     return GuiMDAWidget(parent=parent, mmcore=_get_core(parent))
 
 
+class _ModeFollowingRoi(QWidget):
+    """Hosts the Camera ROI widget of the active service; rebuilt on a mode change.
+
+    The widget action is a cached singleton, but the service it must drive changes
+    between OPM (the PVCAM workers) and EPI (the Orca worker).
+    """
+
+    def __init__(self, parent: QWidget, controller: QObject) -> None:
+        super().__init__(parent)
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._child: QWidget | None = None
+        self._rebuild()
+        controller.modeChanged.connect(self._rebuild)
+
+    def _rebuild(self, _mode: object = None) -> None:
+        old, self._child = self._child, _build_camera_roi(self)
+        self._layout.addWidget(self._child)
+        if old is not None:
+            self._layout.removeWidget(old)
+            old.setParent(None)
+            old.deleteLater()
+
+
 def create_camera_roi(parent: QWidget) -> QWidget:
     """Create the Camera ROI widget.
+
+    In the app (a mode controller exists) it follows the active service across
+    OPM/EPI mode changes; otherwise it is :func:`_build_camera_roi` directly.
+    """
+    from pymmcore_gui.epi._mode import active_controller
+
+    ctrl = active_controller()
+    if hasattr(ctrl, "modeChanged"):
+        return _ModeFollowingRoi(parent, cast("QObject", ctrl))
+    return _build_camera_roi(parent)
+
+
+def _build_camera_roi(parent: QWidget) -> QWidget:
+    """Build the Camera ROI widget for the active camera service.
 
     Camera-1/Camera-2 are never loaded on the main-process core once a
     persistent :class:`~pymmcore_gui.asi_z_stack.camera_worker_service.
@@ -111,11 +149,12 @@ def create_camera_roi(parent: QWidget) -> QWidget:
     CameraRoiWidget`` (which calls ``mmcore.setROI``/``getROI`` directly)
     would go permanently inert for them. Swap in a small worker-aware
     replacement in that case; fall back to the stock widget otherwise
-    (demo/single-camera/non-ASI configs -- unaffected, unchanged).
+    (demo/single-camera/non-ASI configs -- unaffected, unchanged). In EPI mode
+    the active service is the Orca's.
     """
-    from pymmcore_gui.asi_z_stack.camera_worker_service import CameraWorkerService
+    from pymmcore_gui.epi._camera_service import active_camera_service
 
-    if (svc := CameraWorkerService.get_active()) is not None:
+    if (svc := active_camera_service()) is not None:
         from pymmcore_gui.widgets._worker_camera_roi_widget import (
             WorkerCameraRoiWidget,
         )

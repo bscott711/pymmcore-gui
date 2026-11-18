@@ -90,6 +90,9 @@ def shutdown_mmcore(
     before ``_stop_live``, whose ``mmc.isSequenceRunning()`` checks are
     no-ops for cameras owned by worker processes (``mmc`` never sees them
     running).
+
+    The EPI (Orca) camera service, if EPI mode ever created one, is shut down
+    after the LEDs are closed.
     """
     if mda_thread is None:
         mda_thread = getattr(mmc, _LAST_MDA_THREAD_ATTR, None)
@@ -101,6 +104,7 @@ def shutdown_mmcore(
     _cancel_mda_and_wait(mmc, mda_thread, mda_cancel_timeout)
     _close_lasers()
     _close_leds(mmc)
+    _shutdown_epi_camera_service(camera_service_shutdown_timeout)
     _quiesce_background_reads(worker_quiesce_timeout)
     _run_with_timeout(mmc.unloadAllDevices, unload_timeout, "unloadAllDevices")
 
@@ -112,6 +116,16 @@ def _shutdown_camera_worker_service(
         camera_worker_service.shutdown(timeout=timeout_s)
     except Exception:
         logger.exception("Error shutting down persistent camera worker service")
+
+
+def _shutdown_epi_camera_service(timeout_s: float) -> None:
+    """Shut the EPI (Orca) camera service down, if EPI ever created one."""
+    try:
+        from pymmcore_gui.epi._camera_service import shutdown_epi_service
+
+        shutdown_epi_service(timeout_s)
+    except Exception:
+        logger.exception("Error shutting down the EPI camera worker service")
 
 
 def _stop_live(mmc: CMMCorePlus, timeout_s: float) -> None:

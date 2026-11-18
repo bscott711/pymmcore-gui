@@ -34,7 +34,7 @@ from pymmcore_plus import CMMCorePlus
 from PyQt6.QtWidgets import QVBoxLayout, QWidget
 
 from pymmcore_gui._settings import TESTING, USER_DATA_DIR, SettingsV1
-from pymmcore_gui.epi._mode import EpiModeRefusal, ScopeMode, current_mode
+from pymmcore_gui.epi._mode import ScopeMode, current_mode
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -60,8 +60,12 @@ def snap_for_crispy(mmc: CMMCorePlus) -> dict[str, np.ndarray]:
     from pymmcore_gui.asi_z_stack.camera_worker_service import CameraWorkerService
 
     if current_mode() is ScopeMode.EPI:
-        # EPI snap arrives with the Orca service (Step 3b): no lasers, no PVCAM.
-        raise EpiModeRefusal("Snap is not available in EPI yet.")
+        # The Orca lit by the current preset's LED, closed again afterwards: no
+        # lasers, no PVCAM. A refusal (no LED selected, Orca not ready) raises
+        # ``EpiModeRefusal`` into CRISPy.
+        from pymmcore_gui.epi._camera_service import epi_snap
+
+        return epi_snap(mmc)
 
     svc = CameraWorkerService.get_active()
     if svc is None and mmc.isSequenceRunning():

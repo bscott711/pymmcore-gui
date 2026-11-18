@@ -7,12 +7,21 @@ from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from pymmcore_gui.epi._mode import ScopeMode, current_mode, force_opm_if_epi
+from pymmcore_gui.epi._mode import (
+    ScopeMode,
+    active_controller,
+    current_mode,
+    force_opm_if_epi,
+)
 
 from ._action_info import ActionInfo, ActionKey
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from pymmcore_plus import CMMCorePlus
+
+    from pymmcore_gui.asi_z_stack.camera_worker_service import CameraWorkerService
 
     from ._core_qaction import QCoreAction
 
@@ -33,13 +42,43 @@ class CoreAction(ActionKey):
     SAVE_CONFIG = "pymmcore_gui.save_config"
 
 
-def _epi_not_available(action: QCoreAction, what: str) -> None:
-    """Tell the user *what* is not available in EPI yet (no hardware is touched)."""
-    message = f"{what} is not available in EPI yet."
+def _epi_notice(action: QCoreAction, message: str) -> None:
+    """Tell the user why an EPI Snap/Live was refused (no hardware is touched)."""
     logger.warning(message)
     window = action.parent() if callable(getattr(action, "parent", None)) else None
     if (nm := getattr(window, "nm", None)) is not None:
         nm.show_warning_message(message)
+
+
+def _epi_snap(action: QCoreAction) -> None:
+    """EPI Snap: light the current ``EPI LEDs`` preset's LED, snap the Orca."""
+    from pymmcore_gui.epi._camera_service import epi_snap
+    from pymmcore_gui.epi._mode import EpiModeRefusal
+
+    try:
+        epi_snap(action.mmc)
+    except EpiModeRefusal as exc:
+        _epi_notice(action, str(exc))
+
+
+def _epi_toggle_live(action: QCoreAction) -> None:
+    """EPI Live: light the current preset's LED and start the Orca, or stop both."""
+    from pymmcore_gui.asi_z_stack.camera_worker_service import CameraWorkerServiceState
+    from pymmcore_gui.epi import _camera_service as epi_cam
+    from pymmcore_gui.epi._mode import EpiModeRefusal
+
+    svc = epi_cam.get_epi_service()
+    if svc is not None and svc.state is CameraWorkerServiceState.LIVE:
+        epi_cam.epi_stop_live()
+        return
+    try:
+        epi_cam.epi_start_live(action.mmc)
+    except EpiModeRefusal as exc:
+        action.setChecked(False)
+        _epi_notice(action, str(exc))
+    except Exception:
+        action.setChecked(False)
+        raise
 
 
 # TODO: perhaps have alternate signatures for these functions that take a
@@ -55,8 +94,8 @@ def snap_image(action: QCoreAction, checked: bool) -> None:
     mmc = action.mmc
 
     if current_mode() is ScopeMode.EPI:
-        # EPI Snap arrives with the Orca service (Step 3b); never fire lasers.
-        _epi_not_available(action, "Snap")
+        # The Orca and the current preset's LED (D12); never fire lasers.
+        _epi_snap(action)
         return
 
     if (svc := CameraWorkerService.get_active()) is not None:
@@ -96,9 +135,8 @@ def toggle_live(action: QCoreAction, checked: bool) -> None:
     mmc = action.mmc
 
     if current_mode() is ScopeMode.EPI:
-        # EPI Live arrives with the Orca service (Step 3b); never fire lasers.
-        action.setChecked(False)
-        _epi_not_available(action, "Live")
+        # The Orca and the current preset's LED (D12); never fire lasers.
+        _epi_toggle_live(action)
         return
 
     if (svc := CameraWorkerService.get_active()) is not None:
@@ -183,27 +221,39 @@ def save_image_as(action: QCoreAction, checked: bool) -> None:
     _save_latest_frames(action, ask_for_folder=True)
 
 
-def _init_snap_image(action: QCoreAction) -> None:
+def _has_camera_in_mode(mmc: CMMCorePlus) -> bool:
+    """Whether Snap/Live have a camera: the OPM rule, or the Orca service in EPI."""
     from pymmcore_gui.asi_z_stack.camera_worker_service import has_camera
+    from pymmcore_gui.epi._camera_service import active_camera_service
 
+    if current_mode() is ScopeMode.EPI:
+        return active_camera_service() is not None
+    return has_camera(mmc)
+
+
+def _follow_mode(callback: Callable[[], None]) -> None:
+    """Call *callback* on every OPM/EPI mode change (no-op without a controller)."""
+    if (signal := getattr(active_controller(), "modeChanged", None)) is not None:
+        signal.connect(lambda _mode: callback())
+
+
+def _init_snap_image(action: QCoreAction) -> None:
     mmc = action.mmc
 
     def _on_load() -> None:
         # the action's underlying Qt widget may already be gone (e.g. a core
         # event fired during app shutdown, after this action's window closed)
         with suppress(RuntimeError):
-            action.setEnabled(has_camera(mmc))
+            action.setEnabled(_has_camera_in_mode(mmc))
 
     mmc.events.systemConfigurationLoaded.connect(_on_load)
+    _follow_mode(_on_load)
 
     _on_load()
 
 
 def _init_toggle_live(action: QCoreAction) -> None:
-    from pymmcore_gui.asi_z_stack.camera_worker_service import (
-        CameraWorkerService,
-        has_camera,
-    )
+    from pymmcore_gui.epi._camera_service import active_camera_service
 
     mmc = action.mmc
     connected_service: CameraWorkerService | None = None
@@ -217,7 +267,7 @@ def _init_toggle_live(action: QCoreAction) -> None:
         # reload). Re-evaluated on every config load since the active
         # service instance can change across a reload.
         nonlocal connected_service
-        svc = CameraWorkerService.get_active()
+        svc = active_camera_service()
         if svc is connected_service:
             return
         if connected_service is not None:
@@ -229,10 +279,11 @@ def _init_toggle_live(action: QCoreAction) -> None:
 
     def _on_load() -> None:
         with suppress(RuntimeError):
-            action.setEnabled(has_camera(mmc))
+            action.setEnabled(_has_camera_in_mode(mmc))
         _sync_service_connection()
 
     mmc.events.systemConfigurationLoaded.connect(_on_load)
+    _follow_mode(_on_load)
 
     def _on_change() -> None:
         with suppress(RuntimeError):

@@ -523,6 +523,45 @@ def _default_epi_leds() -> list[EpiLedChannel]:
     ]
 
 
+class EpiCameraSettingsV1(BaseModel):
+    """Identity and geometry of the EPI (Orca) camera, which lives in no cfg.
+
+    Every field is empty until the user fills it in: EPI entry is refused with
+    "Set the Orca camera in settings" while :meth:`is_configured` is false. Nothing
+    here is guessed.
+    """
+
+    # PLACEHOLDER (U1): the Orca's Micro-Manager adapter, device name, label,
+    # geometry and pre-init properties are not known yet.
+    label: str = ""  # PLACEHOLDER (U1)
+    """Device label the camera worker loads the camera under."""
+    adapter_module: str = ""  # PLACEHOLDER (U1)
+    """Micro-Manager device-adapter module (library) the camera is loaded from."""
+    device_name: str = ""  # PLACEHOLDER (U1)
+    """Device name inside that adapter, passed to ``loadDevice``."""
+    width: int = 0  # PLACEHOLDER (U1)
+    """Frame width in pixels."""
+    height: int = 0  # PLACEHOLDER (U1)
+    """Frame height in pixels."""
+    dtype: str = ""  # PLACEHOLDER (U1)
+    """Numpy dtype of a frame, e.g. ``"uint16"``."""
+    # PLACEHOLDER (U1)
+    pre_init_props: list[tuple[str, str]] = Field(default_factory=list)
+    """``(property, value)`` pairs set after ``loadDevice``, before
+    ``initializeDevice``."""
+
+    def is_configured(self) -> bool:
+        """Whether every field needed to spawn the camera worker is set."""
+        return bool(
+            self.label
+            and self.adapter_module
+            and self.device_name
+            and self.width > 0
+            and self.height > 0
+            and self.dtype
+        )
+
+
 class EpiSettingsV1(BaseMMSettings):
     """Epifluorescence (EPI) mode settings: the TGLED card's LED channels."""
 
@@ -530,6 +569,8 @@ class EpiSettingsV1(BaseMMSettings):
     """Tiger card address of the TGLED. Only devices at this address are LEDs
     for EPI; ``LED:X:31`` (an X-axis LED on the XY card) is never touched."""
     leds: list[EpiLedChannel] = Field(default_factory=_default_epi_leds)
+    camera: EpiCameraSettingsV1 = Field(default_factory=EpiCameraSettingsV1)
+    """The Orca camera identity (PLACEHOLDER (U1): empty until configured)."""
 
 
 class SettingsV1(BaseMMSettings):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import weakref
 from collections import deque
 from collections.abc import Callable
 from contextlib import suppress
@@ -71,6 +72,7 @@ if TYPE_CHECKING:
     )
     from useq import MDASequence
 
+    from pymmcore_gui.asi_z_stack.camera_worker_service import CameraWorkerService
     from pymmcore_gui.widgets._about_widget import AboutWidget
     from pymmcore_gui.widgets._exception_log import ExceptionLog
     from pymmcore_gui.widgets._mm_console import MMConsole
@@ -294,6 +296,7 @@ class MicroManagerGUI(QMainWindow):
         self._viewers_manager = NDVViewersManager(self, self._mmc)
         self._viewers_manager.mdaViewerCreated.connect(self._on_mda_viewer_created)
         self._viewers_manager.previewViewerCreated.connect(self._on_previewer_created)
+        self._wire_epi_camera_service()
         self._notification_manager = NotificationManager(self)
         if app := QApplication.instance():
             if hasattr(app, "exceptionRaised"):
@@ -741,6 +744,31 @@ class MicroManagerGUI(QMainWindow):
                 else:
                     tb.addAction(self.get_action(action))
         tb.setObjectName(name)
+
+    def _wire_epi_camera_service(self) -> None:
+        """Hook the EPI (Orca) camera service into the mode controller.
+
+        The service is created and spawned lazily on the first successful EPI
+        entry (the provider), reused afterwards, and never touched by config
+        reloads. Entry is refused while the Orca settings are empty. Only weak
+        references to this window are kept: it owns the controller.
+        """
+        from pymmcore_gui.epi._camera_service import (
+            epi_camera_precondition,
+            epi_service_provider,
+            get_epi_service,
+        )
+
+        window = weakref.ref(self)
+
+        def _on_created(svc: CameraWorkerService) -> None:
+            if (win := window()) is not None:
+                win._viewers_manager.connect_epi_service(svc)
+
+        ctrl = self.mode_controller
+        ctrl.epi_service_provider = epi_service_provider(self, _on_created)
+        ctrl.epi_service_peek = get_epi_service
+        ctrl.extra_preconditions.append(epi_camera_precondition)
 
     def _add_menubar(self, name: str, menu_entry: MenuDictValue) -> None:
         mb = cast("QMenuBar", self.menuBar())

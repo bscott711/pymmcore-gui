@@ -757,9 +757,12 @@ def _action(window: object | None = None) -> SimpleNamespace:
     )
 
 
-def test_snap_refused_in_epi_without_lasers_or_cameras(
+def test_snap_in_epi_without_an_orca_service_is_refused_and_never_uses_opm(
     lasers: list[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Step 3b replaced the "not available in EPI yet" refusal: Snap now goes to the
+    # Orca service. With none running it is refused, and the OPM service, the
+    # lasers and the main core are still never touched.
     svc = MagicMock()
     monkeypatch.setattr(CameraWorkerService, "_active", svc)
     window = SimpleNamespace(nm=MagicMock())
@@ -770,12 +773,13 @@ def test_snap_refused_in_epi_without_lasers_or_cameras(
     svc.snap.assert_not_called()
     action.mmc.snapImage.assert_not_called()
     window.nm.show_warning_message.assert_called_once()
-    assert "EPI" in window.nm.show_warning_message.call_args.args[0]
+    assert "Orca" in window.nm.show_warning_message.call_args.args[0]
 
 
-def test_live_refused_in_epi_and_the_button_is_unchecked(
+def test_live_in_epi_without_an_orca_service_is_refused_and_never_uses_opm(
     lasers: list[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Replaces the Step 2 "not available in EPI yet" refusal (see Snap above).
     svc = MagicMock()
     monkeypatch.setattr(CameraWorkerService, "_active", svc)
     window = SimpleNamespace(nm=MagicMock())
@@ -787,6 +791,7 @@ def test_live_refused_in_epi_and_the_button_is_unchecked(
     action.mmc.startContinuousSequenceAcquisition.assert_not_called()
     action.setChecked.assert_called_once_with(False)
     window.nm.show_warning_message.assert_called_once()
+    assert "Orca" in window.nm.show_warning_message.call_args.args[0]
 
 
 def test_snap_and_live_still_use_the_lasers_in_opm_with_a_controller(
@@ -806,14 +811,16 @@ def test_snap_and_live_still_use_the_lasers_in_opm_with_a_controller(
     assert calls == ["snap", "live"]
 
 
-def test_crispy_snap_refused_in_epi(
+def test_crispy_snap_in_epi_without_an_orca_service_is_refused(
     lasers: list[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Replaces the Step 2 "not available in EPI yet" refusal; the working EPI
+    # branch is tested in test_epi_camera_service.py.
     svc = MagicMock()
     monkeypatch.setattr(CameraWorkerService, "get_active", lambda: svc)
     mmc = MagicMock()
     set_active_controller(_EpiCtrl())
-    with pytest.raises(EpiModeRefusal):
+    with pytest.raises(EpiModeRefusal, match="Orca"):
         _crisp_widget.snap_for_crispy(mmc)
     assert lasers == []
     svc.snap.assert_not_called()

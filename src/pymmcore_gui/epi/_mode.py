@@ -127,6 +127,9 @@ class ModeController(QObject):
     epi_service_provider : Callable[[], object | None] | None
         Step 3b sets this to return the EPI camera service (spawning it on first
         use). Called on entry, and on exit to stop EPI Live.
+    epi_service_peek : Callable[[], object | None] | None
+        Returns the EPI camera service if it already exists, without creating or
+        spawning it. Used when leaving EPI (falls back to ``epi_service_provider``).
     extra_preconditions : list[Callable[[], str | None]]
         Extra EPI-entry checks; each returns a refusal reason or ``None``
         (Step 3b adds "Orca settings missing").
@@ -157,6 +160,7 @@ class ModeController(QObject):
         self._busy = False
         self.epi_engine_factory: Callable[[CMMCorePlus], MDAEngine] | None = None
         self.epi_service_provider: Callable[[], object | None] | None = None
+        self.epi_service_peek: Callable[[], object | None] | None = None
         self.extra_preconditions: list[Callable[[], str | None]] = []
         set_active_controller(self)
 
@@ -183,13 +187,18 @@ class ModeController(QObject):
         return reason
 
     def _epi_service(self) -> object | None:
-        if self.epi_service_provider is None:
+        """The EPI service to check on exit; ``None`` if absent or never spawned."""
+        getter = self.epi_service_peek or self.epi_service_provider
+        if getter is None:
             return None
         try:
-            return self.epi_service_provider()
+            svc = getter()
         except Exception:
             logger.exception("EPI camera service provider failed")
             return None
+        # No pool, nothing to stop: a failed spawn must not block leaving EPI.
+        state = getattr(getattr(svc, "state", None), "name", None)
+        return None if state == "INACTIVE" else svc
 
     def _enter_epi(self) -> str | None:
         from pymmcore_gui.epi import _tiger_guard
