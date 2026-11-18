@@ -51,7 +51,9 @@ from ._notification_manager import NotificationManager
 from ._settings import USER_DATA_DIR, Settings
 from .actions import CoreAction, QCoreAction, WidgetAction, WidgetActionInfo
 from .actions._action_info import ActionInfo
+from .epi._mode import ModeController, ScopeMode, current_mode
 from .widgets._camera_toolbar import CameraToolBar
+from .widgets._mode_toolbar import ModeToolBar
 from .widgets._toolbars import OCToolBar
 
 if TYPE_CHECKING:
@@ -103,6 +105,7 @@ class Toolbar(str, Enum):
     OPTICAL_CONFIGS = "Optical Configs"
     WIDGETS = "Widgets"
     SHUTTERS = "Shutters"
+    MODE = "Mode"
 
     def __str__(self) -> str:
         return str(self.value)
@@ -218,6 +221,7 @@ class MicroManagerGUI(QMainWindow):
             WidgetAction.STAGE_CONTROL,
             WidgetAction.CAMERA_ROI,
         ],
+        Toolbar.MODE: ModeToolBar,
     }
     # Menus are a mapping of strings to either a list of ActionKeys or a callable
     # that takes a CMMCorePlus instance and QMainWindow and returns a QMenu.
@@ -272,6 +276,13 @@ class MicroManagerGUI(QMainWindow):
         from pymmcore_gui.asi_z_stack.camera_worker_service import CameraWorkerService
 
         self._camera_worker_service = CameraWorkerService(self)
+
+        # OPM / EPI mode: always starts in OPM, is never persisted, and returns
+        # to OPM on every config load (see _on_system_config_loaded). The OPM
+        # engine is reinstalled with the unchanged _register_mda_engine.
+        self.mode_controller = ModeController(
+            self._mmc, register_opm_engine=self._register_mda_engine, parent=self
+        )
 
         self._mmc.events.systemConfigurationLoaded.connect(
             self._on_system_config_loaded
@@ -594,6 +605,12 @@ class MicroManagerGUI(QMainWindow):
     # -----------------------------------------------------------
 
     def _on_system_config_loaded(self) -> None:
+        # Menu loads were already reset in _prepare_for_reload; this covers the
+        # Config Wizard and Console, which call loadSystemConfiguration directly.
+        # Must run first: the handler below re-runs OPM-only hardware writers.
+        if current_mode() is ScopeMode.EPI:
+            self.mode_controller.force_opm()
+
         settings = Settings.instance()
         if cfg := self._mmc.systemConfigurationFile():
             settings.last_config = Path(cfg)

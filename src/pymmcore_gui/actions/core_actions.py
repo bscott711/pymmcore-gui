@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from pymmcore_gui.epi._mode import ScopeMode, current_mode, force_opm_if_epi
 
 from ._action_info import ActionInfo, ActionKey
 
@@ -12,6 +15,9 @@ if TYPE_CHECKING:
     from pymmcore_plus import CMMCorePlus
 
     from ._core_qaction import QCoreAction
+
+
+logger = logging.getLogger(__name__)
 
 
 # ######################## Functions acting on the Core #########################
@@ -27,6 +33,15 @@ class CoreAction(ActionKey):
     SAVE_CONFIG = "pymmcore_gui.save_config"
 
 
+def _epi_not_available(action: QCoreAction, what: str) -> None:
+    """Tell the user *what* is not available in EPI yet (no hardware is touched)."""
+    message = f"{what} is not available in EPI yet."
+    logger.warning(message)
+    window = action.parent() if callable(getattr(action, "parent", None)) else None
+    if (nm := getattr(window, "nm", None)) is not None:
+        nm.show_warning_message(message)
+
+
 # TODO: perhaps have alternate signatures for these functions that take a
 # CMMCorePlus instance, rather than needing to extract it from the QCoreAction.
 def snap_image(action: QCoreAction, checked: bool) -> None:
@@ -38,6 +53,11 @@ def snap_image(action: QCoreAction, checked: bool) -> None:
     from pymmcore_gui.asi_z_stack.camera_worker_service import CameraWorkerService
 
     mmc = action.mmc
+
+    if current_mode() is ScopeMode.EPI:
+        # EPI Snap arrives with the Orca service (Step 3b); never fire lasers.
+        _epi_not_available(action, "Snap")
+        return
 
     if (svc := CameraWorkerService.get_active()) is not None:
         # Camera-1/Camera-2 live permanently in worker processes -- route
@@ -74,6 +94,12 @@ def toggle_live(action: QCoreAction, checked: bool) -> None:
     )
 
     mmc = action.mmc
+
+    if current_mode() is ScopeMode.EPI:
+        # EPI Live arrives with the Orca service (Step 3b); never fire lasers.
+        action.setChecked(False)
+        _epi_not_available(action, "Live")
+        return
 
     if (svc := CameraWorkerService.get_active()) is not None:
         # Camera-1/Camera-2 live permanently in worker processes -- route
@@ -232,6 +258,9 @@ def _prepare_for_reload(mmc: CMMCorePlus) -> bool:
     """
     from pymmcore_gui.asi_z_stack.camera_worker_service import CameraWorkerService
 
+    # A reload always returns to OPM (D3); do it before the OPM workers are torn
+    # down. A no-op in OPM, and while an MDA runs (the load is refused below).
+    force_opm_if_epi()
     try:
         CameraWorkerService.prepare_for_reload(mmc)
     except RuntimeError as exc:

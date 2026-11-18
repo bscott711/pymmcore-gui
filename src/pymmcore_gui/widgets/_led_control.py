@@ -38,7 +38,7 @@ from pymmcore_gui.epi._led import (
     apply_led,
     resolve_led_channels,
 )
-from pymmcore_gui.epi._mode import ScopeMode, current_mode
+from pymmcore_gui.epi._mode import ScopeMode, active_controller, current_mode
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -134,6 +134,9 @@ class LedControlWidget(QWidget):
         mmc.mda.events.sequenceStarted.connect(self._on_mda_started)
         mmc.mda.events.sequenceFinished.connect(self._on_mda_finished)
         self.destroyed.connect(self._disconnect)
+        # Follow the app's OPM/EPI switch (the controller outlives this panel).
+        if (ctrl := active_controller()) is not None and hasattr(ctrl, "modeChanged"):
+            ctrl.modeChanged.connect(self._on_mode_changed)
         self.rebuild()
 
     # ------------------------------------------------------------------ build
@@ -192,6 +195,9 @@ class LedControlWidget(QWidget):
         self._update_enabled()
         if self._epi_active_now():
             self.refresh()
+
+    def _on_mode_changed(self, mode: object) -> None:
+        self.set_epi_active(mode is ScopeMode.EPI)
 
     def _update_enabled(self) -> None:
         epi = self._epi_active_now()

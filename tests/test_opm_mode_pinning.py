@@ -38,6 +38,8 @@ from pymmcore_gui.asi_z_stack.camera_worker_service import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from pymmcore_plus import CMMCorePlus
 
 
@@ -658,3 +660,86 @@ def test_shutdown_mmcore_shuts_service_down_first() -> None:
 
     assert order[:2] == ["service.shutdown", "isSequenceRunning"]
     svc.shutdown.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# The same pins with a mode controller present, in OPM (EPI mode step 2)
+#
+# The mode controller now exists. With it registered and the mode OPM, every
+# pin above must hold exactly as it does with no controller at all.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def opm_controller(mmcore: CMMCorePlus) -> Iterator[object]:
+    from pymmcore_gui.epi._mode import ModeController, ScopeMode, set_active_controller
+
+    controller = ModeController(mmcore)
+    assert controller.mode is ScopeMode.OPM
+    yield controller
+    set_active_controller(None)
+
+
+def test_with_controller_physical_camera_labels_unchanged(
+    opm_controller: object,
+) -> None:
+    test_physical_camera_labels_service_active_uses_service_labels()
+    test_physical_camera_labels_no_service_single_camera()
+    test_physical_camera_labels_no_service_multi_camera()
+
+
+def test_with_controller_register_mda_engine_unchanged(
+    opm_controller: object, mmcore: CMMCorePlus
+) -> None:
+    test_register_mda_engine_installs_asi_spim_engine(mmcore)
+    test_register_mda_engine_keeps_stock_engine_without_asi_hardware(mmcore)
+
+
+def test_with_controller_snap_lasers_unchanged(
+    opm_controller: object, laser_calls: list[str]
+) -> None:
+    test_snap_without_service_brackets_snap_with_selected_lasers(laser_calls)
+    laser_calls.clear()
+    test_snap_with_service_routes_through_pool_not_core(laser_calls)
+    laser_calls.clear()
+    test_snap_with_service_closes_lasers_when_snap_fails(laser_calls)
+
+
+def test_with_controller_live_lasers_unchanged(
+    opm_controller: object,
+    laser_calls: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    test_live_without_service_start_then_stop(laser_calls, monkeypatch)
+    laser_calls.clear()
+    test_live_with_service_idle_opens_lasers_then_starts_live(laser_calls)
+    laser_calls.clear()
+    test_live_with_service_live_stops_then_closes_all_lasers(laser_calls)
+    laser_calls.clear()
+    test_live_with_service_busy_unchecks_and_leaves_lasers_alone(
+        laser_calls, CameraWorkerServiceState.SPAWNING
+    )
+
+
+def test_with_controller_service_methods_unchanged(opm_controller: object) -> None:
+    test_service_snap_arms_internal_trigger_and_emits_each_frame()
+    test_service_acquire_for_mda_claims_pool_and_release_returns_to_idle()
+    test_service_set_roi_goes_to_pool_and_tracks_crop()
+    test_service_exposure_and_property_path_drives_every_worker()
+    test_service_property_change_refused_during_mda()
+    test_service_set_roi_refused_unless_idle(CameraWorkerServiceState.LIVE)
+
+
+def test_with_controller_start_live_unchanged(opm_controller: object) -> None:
+    test_service_start_live_arms_pool_with_last_exposure_and_stop_live()
+
+
+def test_with_controller_shutdown_closes_lasers(opm_controller: object) -> None:
+    test_shutdown_mmcore_closes_all_lasers_between_mda_cancel_and_unload()
+    test_shutdown_mmcore_still_unloads_when_laser_close_fails()
+    test_shutdown_mmcore_shuts_service_down_first()
+
+
+def test_with_controller_settings_json_unchanged(opm_controller: object) -> None:
+    test_default_settings_exclude_defaults_json_is_empty()
+    test_default_settings_top_level_keys_are_pinned()

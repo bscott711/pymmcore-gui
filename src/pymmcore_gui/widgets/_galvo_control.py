@@ -35,6 +35,7 @@ from pymmcore_gui.asi_z_stack.galvo_position import (
     read_galvo_position,
 )
 from pymmcore_gui.asi_z_stack.live_offset import OFFSET_PROP, save_live_offset_deg
+from pymmcore_gui.epi._mode import ScopeMode, current_mode
 
 logger = logging.getLogger(__name__)
 
@@ -204,7 +205,16 @@ class GalvoControlWidget(QWidget):
 
         The property write is skipped when the value is unchanged, but the
         static move is not: the mirror may not be at the offset yet.
+
+        Refused in EPI mode: nothing is written or saved (it would overwrite the
+        saved OPM Live plane), and the display snaps back to the card's value.
         """
+        if current_mode() is ScopeMode.EPI:
+            logger.warning("The galvo offset cannot be changed in EPI mode")
+            self._refresh_offset()
+            self.mirror.setText("offset locked in EPI mode")
+            self.mirror.setToolTip("Switch to OPM to change the galvo Live offset")
+            return
         deg = self.clamp_deg(deg)
         mmc = self._mmc
         if self._device not in mmc.getLoadedDevices():

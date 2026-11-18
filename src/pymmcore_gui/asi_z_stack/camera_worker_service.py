@@ -48,6 +48,7 @@ from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from superqt.utils import create_worker
 
 from pymmcore_gui._exceptions import report_background_exception
+from pymmcore_gui.epi._mode import EpiModeRefusal, ScopeMode, current_mode
 
 from .camera_handoff import (
     CameraHandoffSnapshot,
@@ -197,6 +198,11 @@ class CameraWorkerService(QObject):
     """
 
     _active: ClassVar[CameraWorkerService | None] = None
+
+    #: False for this OPM service: its camera operations are refused while the app
+    #: is in EPI mode (the OPM cameras are idle then, see ``_refuse_in_epi``). A
+    #: subclass that serves EPI (the Orca service) sets it True.
+    _ALLOW_IN_EPI: ClassVar[bool] = False
 
     #: (camera_label, slice_idx, frame, camera_metadata, images_remaining).
     #: Emitted for both Live streaming (from the background drain thread,
@@ -645,8 +651,20 @@ class CameraWorkerService(QObject):
     # Live
     # ------------------------------------------------------------------
 
+    def _refuse_in_epi(self) -> None:
+        """Raise `EpiModeRefusal` if this OPM service is driven while in EPI mode.
+
+        Does nothing in OPM, and nothing for a subclass with ``_ALLOW_IN_EPI``.
+        """
+        if self._ALLOW_IN_EPI or current_mode() is not ScopeMode.EPI:
+            return
+        raise EpiModeRefusal(
+            "The OPM cameras are not available in EPI mode. Switch to OPM first."
+        )
+
     def start_live(self) -> None:
         """Arm both workers for free-running acquisition and start the drain thread."""
+        self._refuse_in_epi()
         self.check_workers_alive()
         with self._lock:
             state = self._state
@@ -797,6 +815,7 @@ class CameraWorkerService(QObject):
         (a plain, same-thread Qt connection) as each frame arrives -- no
         cross-thread marshaling needed here, unlike the Live drain thread.
         """
+        self._refuse_in_epi()
         self.check_workers_alive()
         with self._lock:
             if self._state is CameraWorkerServiceState.MDA:
@@ -852,6 +871,7 @@ class CameraWorkerService(QObject):
 
     def acquire_for_mda(self) -> CameraWorkerPool:
         """Return the persistent pool for exclusive MDA use, stopping Live first."""
+        self._refuse_in_epi()
         self.check_workers_alive()
         with self._lock:
             if self._state is CameraWorkerServiceState.MDA:
@@ -1132,6 +1152,7 @@ class CameraWorkerService(QObject):
         takes property commands while idle and PVCAM rejects settings like
         ``Port`` mid-acquisition. Refused while an MDA holds the pool.
         """
+        self._refuse_in_epi()
         with self._lock:
             state = self._state
             pool = self._pool
@@ -1169,6 +1190,7 @@ class CameraWorkerService(QObject):
         self, camera_label: str, x: int, y: int, w: int, h: int, timeout: float = 5.0
     ) -> tuple[int, int, int, int]:
         """Set *camera_label*'s hardware ROI. Only valid while idle."""
+        self._refuse_in_epi()
         with self._lock:
             if self._state is not CameraWorkerServiceState.IDLE:
                 raise RuntimeError(

@@ -26,6 +26,8 @@ from pymmcore_gui._spectral_channel_handler import (
     regions_outside_roi,
 )
 from pymmcore_gui._vendored.mda_handlers import handler_for_path
+from pymmcore_gui.epi._mode import ScopeMode, current_mode, epi_engine_available
+from pymmcore_gui.epi._tiger_guard import EPI_CHANNEL_GROUP
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -41,6 +43,25 @@ if TYPE_CHECKING:
 # Trailing ``_<3+ digits>`` generation counter, as inserted by
 # :meth:`GuiMDAWidget.get_next_available_path` (mirrors the base widget's format).
 _GENERATION = re.compile(r"^(.*?)(?:_(\d{3,}))?$")
+
+
+def _epi_precheck(sequence: useq.MDASequence) -> str | None:
+    """Return why *sequence* may not run in the current mode, or ``None``.
+
+    In OPM, a sequence with an ``EPI LEDs`` channel is refused (the OPM engine
+    would run it against the lasers). In EPI, every MDA is refused until the EPI
+    engine is hooked up. Step 4 fills in the EPI-side sequence validation.
+    """
+    if current_mode() is ScopeMode.OPM:
+        if any(ch.group == EPI_CHANNEL_GROUP for ch in sequence.channels):
+            return (
+                f"Channels from the {EPI_CHANNEL_GROUP!r} group can only be "
+                "acquired in EPI mode. Switch to EPI, or pick OPM channels."
+            )
+        return None
+    if not epi_engine_available():
+        return "EPI MDA is not available yet."
+    return None
 
 
 def _with_generation(base: Path, n: int) -> Path:
@@ -90,6 +111,9 @@ class GuiMDAWidget(MDAWidget):
         ),
     ) -> None:
         sequence = self.value()
+        if (problem := _epi_precheck(sequence)) is not None:
+            QMessageBox.warning(self, "Cannot start the acquisition", problem)
+            return
         if isinstance(output, str | Path):
             writer_cfg = SettingsV1.instance().mda_writer
             zarr_compression = writer_cfg.zarr_compression
