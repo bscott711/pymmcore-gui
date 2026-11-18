@@ -24,7 +24,8 @@ This page covers the mode as a whole.
 
 `hardware_profiles/20260630-OPM.cfg` is untouched and stays the fallback: load it
 to run without any EPI devices. The EPI profile is a superset of the OPM one
-(it adds the `LED:L:37:<n>` devices and the `EPI LEDs` config group). Keep both
+(it adds the `LED:L:37:<n>` devices, the `EPI LED Selector` device and the
+`EPI LEDs` config group). Keep both
 in sync: after editing the OPM profile, regenerate the EPI one. A test fails
 when the two drift apart.
 
@@ -102,8 +103,10 @@ Open **Plugins > Epi LEDs (TGLED)**. Each channel has an on/off toggle and a
 Snap and Live use the Orca and light only the LED of the currently selected
 `EPI LEDs` preset (for example `LED488`) at its stored percent. The LED is
 closed again when Snap or Live ends. Pick the preset in the Optical Configs
-toolbar. If an LED is left on from the LED panel, the group matches no preset
-and Snap and Live ask you to select one first. The exposure widget and the
+toolbar; the preset is read from the `EPI LED Selector`, so it does not depend
+on which LEDs are on. If the selector has no matching preset, Snap and Live ask
+you to select one first. Known limit: changing the preset during Live does not
+switch the lit LED; it takes effect when Live is restarted. The exposure widget and the
 camera ROI widget follow the Orca while in EPI. Right after switching, the Orca
 may still be starting: a Snap in that moment is refused, so retry.
 
@@ -175,6 +178,35 @@ Intensity is set through `LED Intensity(%)`, on/off through the shutter
 `State`. The ASI docs treat 0 % as off, but the app keeps 1 to 100 percent plus
 a separate on/off and never writes 0.
 
+The `State` property is a string, not a number (driver source `ASILED.cpp`).
+Its only legal values are `Open` and `Closed`. `0` and `1` are rejected by the
+driver with `Invalid property value: State`. The app never writes `State`
+directly: it uses the shutter API (`setShutterOpen`), which sends the card
+`LED <letter>=0` on close and `LED <letter>=<cached percent>` on open.
+`LED Intensity(%)` is an integer limited to 1 to 100; writing it while the LED
+is closed only updates the cached value and shows no light.
+
+The `EPI LEDs` presets (`LED488`, `LED561`, `LED642`) all set the same single
+property: `Physical Shutter 1` of the `EPI LED Selector`, a Micro-Manager
+`Utilities` `Multi Shutter` device, to the label `LED:L:37:1`, `:2` or `:3`.
+The selector is used only to record which LED a channel uses. Setting that
+property only stores the label (driver source `MultiShutter.cpp`); it does no
+device I/O, so a preset never lights or darkens an LED, whatever else is
+running. The app maps preset to LED by preset name (settings `epi.leds`), then
+opens the LED itself (percent first) for Snap, Live and each MDA frame. A
+preset never sets Core Shutter, an LED `State`, `LED Intensity(%)` or any other
+device, and channel 4 (405) has no preset. The app never opens
+`EPI LED Selector`; do not open it by hand, because it would open the selected
+LED at its cached intensity.
+
+Why not one preset per LED (for example `LED:L:37:1,State,Closed`)? The Optical
+Configs widget (`PresetsWidget`) requires every preset of a group to set the
+same (device, property) and deletes rows that differ, so the second and third
+presets were stripped when the toolbar was built. And with every LED closed all
+three presets matched, so `getCurrentConfig` always returned the first one and
+Snap and Live always lit LED 1. A shared selector property gives each preset a
+distinct, readable value.
+
 The Orca is a Hamamatsu C11440-22C (ORCA-Flash4.0 V2), S/N 100201, DCAM 4.00,
 Camera Link. Defaults in `settings.epi.camera`:
 
@@ -194,7 +226,13 @@ Nothing in the app guesses these.
 
 | Id | What is missing                                                       | Where it shows up              |
 | -- | --------------------------------------------------------------------- | ------------------------------ |
-| O2 | Label letter (`LED:L:37:n`), channel count, `LED Intensity(%)` limits | `LED:L:37:1` to `4` in the cfg |
+| O2 | Channel count (`LED:L:37:1` to `4`)                                   | `LED:L:37:1` to `4` in the cfg |
+
+O2 is mostly settled. The label letter `L` is confirmed by the rig: an
+`EPI LEDs` preset error named `LED:L:37:1`. The `LED Intensity(%)` limits
+(1 to 100), the `State` strings (`Open` / `Closed`) and the ASI letters X/Y/Z/F
+per channel are confirmed from the driver source (`ASILED.cpp`). Still to
+confirm on the rig: that all four channels (`LED:L:37:1` to `4`) load.
 
 The app looks the card up by address 37 plus channel number with any axis
 letter, so a different letter still works. Also to confirm on the rig:
@@ -220,6 +258,11 @@ note the BNC1 trigger count, frame counts and zarr shape each time.
    - with the app closed, confirm the `LED:L:37:n` labels, the channel count
      and the intensity limits with `scripts/discover_tgled.py` (O2). The script
      must list `LED:X:31` as "other LED";
+   - after loading the EPI cfg, the `EPI LEDs` combo in Optical Configs lists
+     all 3 presets (`LED488`, `LED561`, `LED642`); switching between them
+     changes `EPI LED Selector` / `Physical Shutter 1` (Property Browser) and
+     lights no LED, and Snap lights the LED of the selected preset. Changing
+     the preset during Live does not switch the lit LED until Live restarts;
    - confirm channel 1, 2 and 3 light 488, 561 and 642 at a low percent;
    - confirm the Orca loads as `HamamatsuHam_DCAM`, exposes `Exposure`, and
      returns 2048 x 2048 `uint16` on Snap and Live. Its trigger setting stays

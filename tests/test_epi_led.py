@@ -32,6 +32,12 @@ if TYPE_CHECKING:
 TGLED = ["LED:L:37:1", "LED:L:37:2", "LED:L:37:3", "LED:L:37:4"]
 DECOY_X = "LED:X:31"  # unrelated X-axis LED on the XY card
 DECOY_OTHER_CARD = "LED:L:38:1"
+#: The only values the ASITiger LED ``State`` property accepts (ASILED.cpp).
+LED_STATE_VALUES = ("Open", "Closed")
+EPI_CFG = Path(__file__).parent.parent / "hardware_profiles" / "20261118-OPM_EPI.cfg"
+#: Multi Shutter (Utilities) used only as a preset selector; never opened by the app.
+SELECTOR = "EPI LED Selector"
+SELECTOR_PROP = "Physical Shutter 1"
 
 
 class FakeLedCore:
@@ -42,6 +48,8 @@ class FakeLedCore:
       ``20261103-LED_Only.cfg``).
     - ``LED Intensity(%)`` is an Integer property limited to 1..100; floats are
       truncated like the adapter's ``atol``.
+    - ``State`` is a string property that accepts only ``"Open"`` / ``"Closed"``
+      and raises ``RuntimeError`` for anything else, like MMCore does.
     - Writing the intensity while the shutter is closed only updates a cache
       (``cache``); the card (``on_card``) takes it when the shutter opens.
     - ``events`` / ``mda`` come from a real core when one is given, so widgets
@@ -58,6 +66,10 @@ class FakeLedCore:
             self.mda = real.mda
         self.labels = [*TGLED, DECOY_X, DECOY_OTHER_CARD] if labels is None else labels
         self.library: dict[str, str] = dict.fromkeys(self.labels, "ASITiger")
+        if SELECTOR in self.library:
+            self.library[SELECTOR] = "Utilities"
+        #: ``Physical Shutter 1`` of the selector: allowed = Undefined + LED labels
+        self.selected = "Undefined"
         self.open = dict.fromkeys(self.labels, False)
         self.cache = dict.fromkeys(self.labels, 50)
         self.on_card = dict.fromkeys(self.labels, 0)  # 0 = dark
@@ -91,16 +103,32 @@ class FakeLedCore:
 
     def getProperty(self, label: str, prop: str) -> str:
         self.calls.append(("getProperty", label, prop))
+        if label == SELECTOR and prop == SELECTOR_PROP:
+            return self.selected
         if prop == LED_INTENSITY_PROP:
             return str(self.cache[label])
         if prop == "State":
-            return "1" if self.open[label] else "0"
+            return "Open" if self.open[label] else "Closed"
         raise KeyError(prop)
 
     def setProperty(self, label: str, prop: str, value: Any) -> None:
         self.calls.append(("setProperty", label, prop, value))
+        if label == SELECTOR:
+            # MultiShutter.cpp: AfterSet only stores the label, no device I/O
+            allowed = ["Undefined", *[lb for lb in self.labels if lb != SELECTOR]]
+            if prop != SELECTOR_PROP or value not in allowed:
+                raise RuntimeError(f"Invalid property value: {prop}")
+            self.selected = value
+            return
         if prop == "State":
-            self.setShutterOpen(label, bool(int(value)))
+            # ASILED.cpp: MM::String limited to "Open" / "Closed". Like MMCore, any
+            # other value (0, 1, "0", "1", True ...) is "Invalid property value".
+            if not isinstance(value, str) or value not in LED_STATE_VALUES:
+                raise RuntimeError(
+                    f'Cannot set property "State" to "{value}" [ Error in device '
+                    f'"{label}": Invalid property value: State (3) ]'
+                )
+            self.setShutterOpen(label, value == "Open")
             return
         if prop != LED_INTENSITY_PROP:
             raise KeyError(prop)
@@ -293,6 +321,138 @@ def test_fake_intensity_write_while_closed_only_updates_cache(
     assert fake.on_card["LED:L:37:1"] == 0  # still dark
     fake.setShutterOpen("LED:L:37:1", True)
     assert fake.on_card["LED:L:37:1"] == 30
+
+
+@pytest.mark.parametrize("bad", ["0", "1", 0, 1, True, False, "open", "", None])
+def test_fake_state_rejects_anything_but_open_or_closed(
+    fake: FakeLedCore, bad: Any
+) -> None:
+    # guards the fake itself: the driver accepts only "Open" / "Closed"
+    with pytest.raises(RuntimeError, match="Invalid property value"):
+        fake.setProperty("LED:L:37:1", "State", bad)
+    assert fake.open["LED:L:37:1"] is False
+    assert fake.on_card["LED:L:37:1"] == 0
+
+
+def test_fake_state_uses_the_driver_strings(fake: FakeLedCore) -> None:
+    assert fake.getProperty("LED:L:37:1", "State") == "Closed"
+    fake.setProperty("LED:L:37:1", "State", "Open")
+    assert fake.getProperty("LED:L:37:1", "State") == "Open"
+    assert fake.on_card["LED:L:37:1"] == 50  # lit at the cached percent
+    fake.setProperty("LED:L:37:1", "State", "Closed")
+    assert fake.getProperty("LED:L:37:1", "State") == "Closed"
+    assert fake.on_card["LED:L:37:1"] == 0
+
+
+def _epi_cfg_preset_rows() -> list[tuple[str, str, str, str]]:
+    """``(preset, device, property, value)`` for every ``EPI LEDs`` cfg row."""
+    rows = []
+    for line in EPI_CFG.read_text(encoding="ascii").splitlines():
+        if line.startswith("ConfigGroup,EPI LEDs,"):
+            _, _group, preset, device, prop, value = line.split(",")
+            rows.append((preset, device, prop, value))
+    return rows
+
+
+def test_cfg_has_one_preset_row_per_visible_led() -> None:
+    rows = _epi_cfg_preset_rows()
+    assert [(r[0], r[3]) for r in rows] == [
+        ("LED488", "LED:L:37:1"),
+        ("LED561", "LED:L:37:2"),
+        ("LED642", "LED:L:37:3"),
+    ]
+    # every preset sets the same (device, property): the selector
+    assert {(r[1], r[2]) for r in rows} == {(SELECTOR, SELECTOR_PROP)}
+
+
+@pytest.fixture
+def selector_fake() -> FakeLedCore:
+    return FakeLedCore(labels=[*TGLED, DECOY_X, SELECTOR])
+
+
+@pytest.mark.parametrize("was_open", [False, True])
+@pytest.mark.parametrize(
+    ("preset", "device", "prop", "value"),
+    _epi_cfg_preset_rows(),
+    ids=lambda v: str(v),
+)
+def test_cfg_epi_preset_rows_select_an_led_without_touching_any_led(
+    selector_fake: FakeLedCore,
+    preset: str,
+    device: str,
+    prop: str,
+    value: str,
+    was_open: bool,
+) -> None:
+    # What MMCore.setConfig does for one preset row: it only records the label on
+    # the selector. No LED property is written and nothing is opened or closed, so
+    # re-applying the preset during Live cannot darken the lit LED.
+    fake = selector_fake
+    fake.open[TGLED[0]] = was_open
+    fake.on_card[TGLED[0]] = 50 if was_open else 0
+    fake.setProperty(device, prop, value)
+    assert fake.selected == value
+    assert fake.writes() == [("setProperty", SELECTOR, SELECTOR_PROP, value)]
+    assert all(c[0] != "setShutterOpen" for c in fake.calls)
+    assert [lb for lb in TGLED if fake.touched(lb)] == []
+    assert fake.open[TGLED[0]] is was_open
+    assert fake.on_card[TGLED[0]] == (50 if was_open else 0)
+    assert fake.cache == dict.fromkeys(fake.labels, 50)
+
+
+def test_cfg_epi_presets_each_select_a_different_led(
+    selector_fake: FakeLedCore,
+) -> None:
+    seen = []
+    for _preset, device, prop, value in _epi_cfg_preset_rows():
+        selector_fake.setProperty(device, prop, value)
+        seen.append(selector_fake.getProperty(SELECTOR, SELECTOR_PROP))
+    assert seen == TGLED[:3]
+
+
+def test_cfg_epi_preset_rows_touch_only_the_selector() -> None:
+    rows = _epi_cfg_preset_rows()
+    assert rows
+    for _preset, device, prop, value in rows:
+        assert device == SELECTOR, device
+        assert prop == SELECTOR_PROP
+        assert prop not in ("State", LED_INTENSITY_PROP)
+        assert device != "Core"
+        assert value in TGLED[:3]  # never LED:X:31, LED:L:38:1 or LED:L:37:4
+
+
+def test_apply_led_then_a_state_closed_write_darkens_the_led(
+    fake: FakeLedCore, epi_mode: None
+) -> None:
+    # Documents the hazard the old per-LED "State,Closed" presets had (a preset
+    # applied while Live is lit darkened it); the selector presets never write State.
+    apply_led(fake, "LED:L:37:1", 50)  # type: ignore[arg-type]
+    assert fake.on_card["LED:L:37:1"] == 50
+    fake.setProperty("LED:L:37:1", "State", "Closed")
+    assert fake.on_card["LED:L:37:1"] == 0
+
+
+# ------------------------------------------------- selector is never an LED
+
+
+def test_selector_is_ignored_by_discovery_panel_resolution_and_all_leds_off(
+    selector_fake: FakeLedCore, epi_mode: None
+) -> None:
+    fake = selector_fake
+    # the selector is a loaded shutter device from library Utilities ...
+    assert SELECTOR in fake.getLoadedDevicesOfType(None)
+    assert fake.getDeviceLibrary(SELECTOR) == "Utilities"
+    # ... but is never classified as a TGLED channel
+    assert classify_led_label(SELECTOR) is None
+    assert resolve_led_channels(fake) == dict(zip((1, 2, 3, 4), TGLED, strict=False))  # type: ignore[arg-type]
+    assert resolve_led_channels(fake, "38") == {}  # type: ignore[arg-type]
+    # all_leds_off closes the four LEDs only and never touches the selector
+    for lbl in TGLED:
+        fake.open[lbl] = True
+    all_leds_off(fake)  # type: ignore[arg-type]
+    assert fake.writes() == [("setShutterOpen", lbl, False) for lbl in TGLED]
+    assert fake.touched(SELECTOR) == []
+    assert fake.selected == "Undefined"
 
 
 # ------------------------------------------------------------- all_leds_off

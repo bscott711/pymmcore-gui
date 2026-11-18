@@ -25,7 +25,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("pymmcore_gui")
 
-#: Config group holding the ``LED488`` / ``LED561`` / ``LED642`` presets.
+#: Config group holding the ``LED488`` / ``LED561`` / ``LED642`` presets. Each sets
+#: ``EPI LED Selector`` / ``Physical Shutter 1`` to an LED label (never an LED).
 EPI_CHANNEL_GROUP = "EPI LEDs"
 #: CRISP that servos the EPI objective's stage Z (logged only, never written).
 CRISP_Z_LABEL = "CRISPAFocus:Z:32"

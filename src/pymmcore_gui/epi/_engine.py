@@ -4,11 +4,12 @@
 ``EPI LEDs`` channels, one Orca frame per event. It is installed by the mode
 controller on entering EPI mode and replaced by the OPM engine on leaving it.
 
-Per event it applies the ``EPI LEDs`` preset (which closes that LED), writes the
-run's LED percent, opens the LED, snaps one frame through the EPI camera
-service's pool (the same arm as ``CameraWorkerService.snap``), and closes the
-LED again. It never touches the lasers, PLogic, the BNC outputs, the galvo, the
-OPM pool, any CRISP write or ``setZPosition``.
+Per event it applies the ``EPI LEDs`` preset (which only sets the ``EPI LED
+Selector``, never an LED), writes the run's LED percent, opens the LED, snaps one
+frame through the EPI camera service's pool (the same arm as
+``CameraWorkerService.snap``), and closes the LED again. It never touches the
+lasers, PLogic, the BNC outputs, the galvo, the OPM pool, any CRISP write or
+``setZPosition``.
 
 :func:`check_epi_sequence` is the one validation, used by the engine
 (``setup_sequence``, which also covers Console ``run_mda``) and by the MDA

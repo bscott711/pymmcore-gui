@@ -14,6 +14,8 @@ spawned per use, left alone by config reloads, and shut down once at app exit
 
 The Snap / Live helpers light only the LED of the current ``EPI LEDs`` preset at its
 stored percent (D12) and close it again; they never call ``open_selected_lasers``.
+The preset only sets the ``EPI LED Selector`` (a Multi Shutter used as a label
+store), so applying it never lights or darkens an LED.
 """
 
 from __future__ import annotations
