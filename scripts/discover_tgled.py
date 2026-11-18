@@ -1,5 +1,9 @@
 """List the devices a Tiger controller reports, flagging TGLED LED devices.
 
+Only address-37 four-token labels (``LED:<axis>:37:<n>``) are marked as TGLED
+channels. Any other ``LED*`` device (e.g. the X-axis ``LED:X:31``) is marked
+"other LED, not the TGLED".
+
 Usage: ``uv run python scripts/discover_tgled.py COM4``
 
 Read-only: loads the ASITiger hub on the given port and asks it which devices
@@ -11,6 +15,20 @@ from __future__ import annotations
 import sys
 
 from pymmcore_plus import CMMCorePlus
+
+from pymmcore_gui.epi._led import classify_led_label
+
+
+def device_line(name: str, card_address: str = "37") -> str:
+    """Return the ``Device,...`` config line for *name*, with an LED comment."""
+    mark = ""
+    if name.startswith("LED"):
+        channel = classify_led_label(name, card_address)
+        if channel is not None:
+            mark = f"  # TGLED channel {channel}"
+        else:
+            mark = "  # other LED, not the TGLED"
+    return f"Device,{name},ASITiger,{name}{mark}"
 
 
 def main(port: str) -> None:
@@ -44,10 +62,9 @@ def main(port: str) -> None:
     installed = mmc.getInstalledDevices("TigerCommHub")
     print(f"{len(installed)} devices reported by TigerCommHub on {port}:")
     for name in installed:
-        mark = "  # LED" if name.startswith("LED") else ""
-        print(f"Device,{name},ASITiger,{name}{mark}")
-    if not any(n.startswith("LED") for n in installed):
-        print("No LED* devices found; check the card is powered and addressed.")
+        print(device_line(name))
+    if not any(classify_led_label(n) is not None for n in installed):
+        print("No TGLED (address 37) channels found; check the card is powered.")
 
 
 if __name__ == "__main__":

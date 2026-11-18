@@ -498,6 +498,40 @@ class SnapshotSettingsV1(BaseMMSettings):
     """Destination folder; ``None`` means ask on the next save."""
 
 
+class EpiLedChannel(BaseModel):
+    """One TGLED card channel as the EPI panel and engine see it."""
+
+    channel: int = Field(ge=1, le=4)
+    """Card channel number, the ``<n>`` in ``LED:<axis>:37:<n>``."""
+    name: str
+    """Band name, e.g. ``"488"``; the config preset is ``LED<name>``."""
+    visible: bool = True
+    """Whether the panel shows this channel. Hidden channels are still closed
+    by ``all_leds_off``."""
+    percent: int = Field(default=50, ge=1, le=100)
+    """Remembered intensity in the card's native 1-100 unit (uncalibrated).
+    Written to the card only just before the channel is opened."""
+
+
+def _default_epi_leds() -> list[EpiLedChannel]:
+    # PLACEHOLDER (O1): channel -> band map unconfirmed; the user sets it.
+    return [
+        EpiLedChannel(channel=1, name="488"),
+        EpiLedChannel(channel=2, name="561"),
+        EpiLedChannel(channel=3, name="642"),
+        EpiLedChannel(channel=4, name="405", visible=False),
+    ]
+
+
+class EpiSettingsV1(BaseMMSettings):
+    """Epifluorescence (EPI) mode settings: the TGLED card's LED channels."""
+
+    card_address: str = "37"
+    """Tiger card address of the TGLED. Only devices at this address are LEDs
+    for EPI; ``LED:X:31`` (an X-axis LED on the XY card) is never touched."""
+    leds: list[EpiLedChannel] = Field(default_factory=_default_epi_leds)
+
+
 class SettingsV1(BaseMMSettings):
     """Global settings for the PyMMCore GUI."""
 
@@ -518,6 +552,7 @@ class SettingsV1(BaseMMSettings):
     snapshot: SnapshotSettingsV1 = Field(default_factory=SnapshotSettingsV1)
     spim_timing: SpimTimingSettingsV1 = Field(default_factory=SpimTimingSettingsV1)
     galvo: GalvoSettingsV1 = Field(default_factory=GalvoSettingsV1)
+    epi: EpiSettingsV1 = Field(default_factory=EpiSettingsV1)
 
     send_error_reports: bool | None = None
     """Whether to send error reports to the developers, None means undecided."""

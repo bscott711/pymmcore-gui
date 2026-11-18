@@ -347,6 +347,7 @@ _SETTINGS_TOP_LEVEL_KEYS = [
     "snapshot",
     "spim_timing",
     "galvo",
+    "epi",
     "send_error_reports",
     "last_config",
     "auto_load_last_config",

@@ -100,6 +100,7 @@ def shutdown_mmcore(
     _stop_live(mmc, live_stop_timeout)
     _cancel_mda_and_wait(mmc, mda_thread, mda_cancel_timeout)
     _close_lasers()
+    _close_leds(mmc)
     _quiesce_background_reads(worker_quiesce_timeout)
     _run_with_timeout(mmc.unloadAllDevices, unload_timeout, "unloadAllDevices")
 
@@ -178,6 +179,17 @@ def _close_lasers() -> None:
         close_all_lasers()
     except Exception:
         logger.exception("Error closing lasers during shutdown")
+
+
+def _close_leds(mmc: CMMCorePlus) -> None:
+    """Close every TGLED channel, in every mode (never blocks the rest of shutdown)."""
+    try:
+        from pymmcore_gui._settings import SettingsV1
+        from pymmcore_gui.epi._led import all_leds_off
+
+        all_leds_off(mmc, SettingsV1.instance().epi.card_address)
+    except Exception:
+        logger.exception("Error closing LEDs during shutdown")
 
 
 def _wait_until(predicate: Callable[[], bool], timeout_s: float) -> None:
