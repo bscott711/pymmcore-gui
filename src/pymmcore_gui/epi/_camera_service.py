@@ -136,6 +136,10 @@ class EpiCameraWorkerService(CameraWorkerService):
                     (str(p), str(v)) for p, v in camera.pre_init_props
                 ),
                 geometry=(camera.height, camera.width, camera.dtype),
+                # The Orca runs on its own default (internal/software) trigger:
+                # the worker never writes TriggerMode, expose-out or timing
+                # properties, whatever the camera exposes (user rule, 2026-11-18).
+                manage_trigger=False,
                 property_snapshot=cam.property_values if cam else {},
                 circular_buffer_mb=self.hw.worker_circular_buffer_mb,
                 live_max_fps=self.hw.live_max_fps,

@@ -116,11 +116,20 @@ class CameraWorkerConfig:
     :attr:`camera_label`" (what every PVCAM worker uses today)."""
     adapter_module: str = _ADAPTER_MODULE
     """Micro-Manager device-adapter module the camera is loaded from. Defaults
-    to ``"PVCAM"``; another adapter (the Orca, PLACEHOLDER (U1)) overrides it."""
+    to ``"PVCAM"``; the EPI Orca (Hamamatsu C11440-22C, Camera Link) overrides it
+    with ``"HamamatsuHam"``."""
     pre_init_props: tuple[tuple[str, str], ...] = ()
     """``(property, value)`` pairs set after ``loadDevice`` but before
-    ``initializeDevice`` (PLACEHOLDER (U1): the Orca's pre-init properties are
-    not known). Empty for PVCAM."""
+    ``initializeDevice``. Empty for PVCAM and for the Orca (the Orca's own
+    defaults are never forced)."""
+    manage_trigger: bool = True
+    """Whether this worker manages the camera's trigger / expose-out / timing
+    properties (PVCAM: ``TriggerMode``, expose-out mode, the property-snapshot's
+    trigger/timing entries). ``True`` keeps the PVCAM/OPM behaviour. ``False`` is
+    the trigger-neutral mode the EPI Orca runs in: no trigger, expose-out or
+    timing property is ever written (whatever the camera exposes), so the camera
+    stays in its own default (internal/software) trigger; exposure still goes
+    through ``setExposure``."""
     geometry: tuple[int, int, str] | None = None
     """Optional ``(height, width, dtype)`` of this camera's frames, for callers
     that cannot snapshot it before spawn (``ReadyMsg`` carries none); consumed
@@ -183,6 +192,9 @@ def _apply_snapshot(mmc: CMMCorePlus, config: CameraWorkerConfig) -> None:
     """
     label = config.camera_label
     for prop, value in config.property_snapshot.items():
+        if not config.manage_trigger and _is_trigger_or_timing_prop(prop):
+            _log(label, f"trigger-neutral: not restoring property {prop!r}")
+            continue
         try:
             mmc.setProperty(label, prop, value)
         except Exception as exc:
@@ -193,6 +205,8 @@ def _apply_snapshot(mmc: CMMCorePlus, config: CameraWorkerConfig) -> None:
         except Exception as exc:
             _log(label, f"could not restore ROI {config.roi}: {exc}")
 
+    if not config.manage_trigger:
+        return
     trigger_mode = preferred_external_trigger_mode(mmc, label)
     if trigger_mode is None:
         _log(label, "no external TriggerMode found; leaving current TriggerMode as-is")
@@ -383,6 +397,15 @@ def _frame_shape(img: np.ndarray) -> tuple[int, int]:
 
 #: Substrings of camera property names worth reporting in ArmedMsg.timing.
 _TIMING_PROP_KEYS = ("Timing", "Trigger", "Expose", "Port", "Readout", "Clear")
+
+
+def _is_trigger_or_timing_prop(prop: str) -> bool:
+    """Whether *prop* is a trigger/expose-out/timing property (see the keys above).
+
+    Used by the trigger-neutral mode (``CameraWorkerConfig.manage_trigger`` False)
+    to refuse writing any such property. ``Exposure`` itself is not one.
+    """
+    return prop != "Exposure" and any(k in prop for k in _TIMING_PROP_KEYS)
 
 
 def _read_camera_timing(mmc: CMMCorePlus, label: str) -> dict[str, str]:
@@ -931,18 +954,25 @@ def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
         mmc.initializeDevice(label)
         _apply_snapshot(mmc, config)
         mmc.setCameraDevice(label)
-        external_mode = preferred_external_trigger_mode(mmc, label)
-        internal_mode = _internal_trigger_mode(
-            mmc, label, config.property_snapshot.get("TriggerMode")
-        )
-        _log(
-            label,
-            f"trigger modes: internal={internal_mode!r} external={external_mode!r}",
-        )
-        expose_out_prop = _expose_out_property(mmc, label)
-        normal_expose_out = (
-            mmc.getProperty(label, expose_out_prop) if expose_out_prop else None
-        )
+        external_mode: str | None = None
+        internal_mode: str | None = None
+        expose_out_prop: str | None = None
+        normal_expose_out: str | None = None
+        if config.manage_trigger:
+            external_mode = preferred_external_trigger_mode(mmc, label)
+            internal_mode = _internal_trigger_mode(
+                mmc, label, config.property_snapshot.get("TriggerMode")
+            )
+            _log(
+                label,
+                f"trigger modes: internal={internal_mode!r} external={external_mode!r}",
+            )
+            expose_out_prop = _expose_out_property(mmc, label)
+            normal_expose_out = (
+                mmc.getProperty(label, expose_out_prop) if expose_out_prop else None
+            )
+        else:
+            _log(label, "trigger-neutral: TriggerMode/expose-out left untouched")
         shm = SharedMemory(name=config.shm_name, create=False)
     except Exception:
         _log(label, f"startup failed:\n{traceback.format_exc()}")
@@ -978,18 +1008,31 @@ def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
                 )
                 try:
                     _wait_for_commit_headroom(config.slot_nbytes, label)
-                    mode: str | None
-                    if cmd.trigger_mode is not None:
-                        mode = _require_trigger_mode(mmc, label, cmd.trigger_mode)
-                    else:
-                        mode = external_mode if cmd.external_trigger else internal_mode
-                    _set_trigger_mode(mmc, label, mode)
-                    _set_expose_out(
-                        mmc,
-                        label,
-                        expose_out_prop,
-                        cmd.expose_out_mode or normal_expose_out,
-                    )
+                    if config.manage_trigger:
+                        mode: str | None
+                        if cmd.trigger_mode is not None:
+                            mode = _require_trigger_mode(mmc, label, cmd.trigger_mode)
+                        else:
+                            mode = (
+                                external_mode if cmd.external_trigger else internal_mode
+                            )
+                        _set_trigger_mode(mmc, label, mode)
+                        _set_expose_out(
+                            mmc,
+                            label,
+                            expose_out_prop,
+                            cmd.expose_out_mode or normal_expose_out,
+                        )
+                    elif (
+                        cmd.external_trigger
+                        or cmd.trigger_mode is not None
+                        or cmd.expose_out_mode is not None
+                    ):
+                        _log(
+                            label,
+                            "trigger-neutral: ignoring the requested trigger/"
+                            "expose-out mode; the camera's own trigger is kept",
+                        )
                     _set_exposure(mmc, label, cmd.exposure_ms)
                     armed_count = cmd.n_images + _ARM_COUNT_PADDING
                     mmc.startSequenceAcquisition(label, armed_count, 0, True)
@@ -1027,8 +1070,9 @@ def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
                 )
                 try:
                     _wait_for_commit_headroom(config.slot_nbytes, label)
-                    _set_trigger_mode(mmc, label, internal_mode)
-                    _set_expose_out(mmc, label, expose_out_prop, normal_expose_out)
+                    if config.manage_trigger:
+                        _set_trigger_mode(mmc, label, internal_mode)
+                        _set_expose_out(mmc, label, expose_out_prop, normal_expose_out)
                     _set_exposure(mmc, label, cmd.exposure_ms)
                     mmc.startContinuousSequenceAcquisition(0)
                     last_timing = _report_timing(mmc, label, last_timing)
@@ -1075,6 +1119,12 @@ def run_camera_worker(config: CameraWorkerConfig, conn: Connection) -> None:
                 # change while a sequence is running.
                 try:
                     for prop, value in cmd.values:
+                        if not config.manage_trigger and _is_trigger_or_timing_prop(
+                            prop
+                        ):
+                            raise RuntimeError(
+                                f"{label} is trigger-neutral: refusing to set {prop!r}"
+                            )
                         mmc.setProperty(label, prop, value)
                     conn.send(PropertiesSetMsg(label))
                 except Exception as exc:
