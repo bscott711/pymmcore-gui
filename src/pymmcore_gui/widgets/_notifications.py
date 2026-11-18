@@ -131,7 +131,8 @@ class NotificationToast(QWidget):
         self.auto_hide_timer.setSingleShot(True)
         self.auto_hide_timer.setInterval(int(self.DURATION * 1000))
         self.auto_hide_timer.timeout.connect(self.fade_out)
-        self.auto_hide_timer.start()
+        if not notification.sticky:  # sticky toasts stay until closed
+            self.auto_hide_timer.start()
 
     def _on_btn_clicked(self) -> None:
         btn = cast("QPushButton", self.sender())
@@ -172,4 +173,5 @@ class NotificationToast(QWidget):
 
     def mousePressEvent(self, a0: Any) -> None:
         """Highlight toast and cancel auto-hide on click."""
-        self.auto_hide_timer.stop()  # Cancel auto-hide
+        if not self.notification.sticky:
+            self.auto_hide_timer.stop()  # Cancel auto-hide

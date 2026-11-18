@@ -22,6 +22,18 @@ awareness, consider making a PR to the lower level library.
 - Lint & Type check: `uv run prek -a`
 - Install pre-commit hooks: `uv run prek install -f`
 
+## Argus stream contracts come from opym
+
+`src/pymmcore_gui/_argus_stream/` imports the wire protocol, the backfill wire
+format and the backfill sender from `opym` (`opym.stream.protocol`, `.bfill`,
+`.bfill_run`, `.backfill_client`), pinned by SHA in `pyproject.toml`. Do not
+copy them back here; change them in the opym repo and bump the pin (`rev`, then
+`uv lock`; the lock diff must hold no other package, and numpy/zarr must not
+move on the rig). The dependency is plain `opym`, not `opym[stream]`, whose
+`zarr>=2.18.7` would move the rig's 2.18.3. The rig's scheduled backfill runs
+`python -m pymmcore_gui._argus_stream.backfill_send` with `--no-sync`: keep that
+module and its `main`.
+
 ## Conventions & Project Principles
 
 - Use `uv` for everything.

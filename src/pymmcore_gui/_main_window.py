@@ -42,6 +42,9 @@ from superqt import QIconifyIcon
 
 from ._argus_stream import ArgusStreamSession, ArgusTunnelManager, StreamState
 from ._argus_stream import _log as argus_log
+from ._design import apply_dock_style
+from ._exceptions import is_persistent_notice
+from ._mda_dock_retention import MdaDockRetention
 from ._mmcore_shutdown import shutdown_mmcore, track_mda_thread
 from ._ndv_viewers import NDVViewersManager
 from ._notification_manager import NotificationManager
@@ -382,6 +385,7 @@ class MicroManagerGUI(QMainWindow):
             CDockManager.eAutoHideFlag.AutoHideFeatureEnabled, True
         )
         self.dock_manager = CDockManager(self)
+        apply_dock_style(self.dock_manager)
 
         self._central = CDockWidget("Viewers", self)
         self._central.setFeature(CDockWidget.DockWidgetFeature.NoTab, True)
@@ -400,6 +404,14 @@ class MicroManagerGUI(QMainWindow):
         # own preview area instead of a single shared central area. Reset
         # fresh every session (not persisted) -- see _ensure_camera_previews.
         self._camera_preview_areas: dict[str, CDockAreaWidget] = {}
+
+        # Bounds how many past runs' MDA viewer tabs (and the display data each
+        # holds in RAM) stay alive; see _on_mda_viewer_created.
+        self._mda_dock_retention = MdaDockRetention(
+            self.dock_manager,
+            self._viewers_manager,
+            lambda: Settings.instance().window.mda_viewer_keep_runs,
+        )
 
         # QTimer.singleShot(0, self._restore_state)
 
@@ -620,9 +632,13 @@ class MicroManagerGUI(QMainWindow):
             ensure_circular_buffer_capacity_async,
             ensure_global_shutter_open,
         )
+        from pymmcore_gui.asi_z_stack.live_offset import restore_live_offset
 
         ensure_global_shutter_open()
         ensure_beam_enabled()
+        # The card forgets its galvo Live offset on power-up; re-apply the saved
+        # one now that the beam is on (a static move is ignored while it is off).
+        restore_live_offset(self._mmc)
         # No other PLogic writes at startup: the Expose Out BNCs are only
         # configured when an All Rows MDA actually runs, so a legacy session
         # sends exactly the proven PLogic programming.
@@ -912,8 +928,11 @@ class MicroManagerGUI(QMainWindow):
         q_viewer = cast("QWidget", ndv_viewer.widget())
 
         sha = str(sequence.uid)[:8]
+        # The run serial keeps names unique when the same sequence is run again
+        # (deleting an old dock must not drop the new dock's dockWidgetsMap entry).
+        serial = self._viewers_manager.run_serial
         suffix = f"-{camera_label}" if camera_label else ""
-        q_viewer.setObjectName(f"ndv-{sha}{suffix}")
+        q_viewer.setObjectName(f"ndv-{sha}-{serial}{suffix}")
         title = f"MDA {sha}" + (f" — {camera_label}" if camera_label else "")
         q_viewer.setWindowTitle(title)
 
@@ -951,12 +970,15 @@ class MicroManagerGUI(QMainWindow):
         # visibly flickering/disappearing every time an MDA started. The
         # viewer is going straight into a dock, not shown as a standalone
         # dialog, so it doesn't need Dialog window flags.
-        dw = CDockWidget(f"ndv-{sha}{suffix}", self)
+        dw = CDockWidget(f"ndv-{sha}-{serial}{suffix}", self)
         # small hack ... we need to retain a pointer to the viewer
         # otherwise the viewer will be garbage collected
         dw._viewer = ndv_viewer
         dw.setWidget(container)
         dw.setFeature(dw.DockWidgetFeature.DockWidgetFloatable, False)
+        # Closing the tab deletes the dock (and with it the viewer and the run's
+        # in-RAM display store); older runs' docks are pruned by the retention
+        # helper. ``register`` runs after the dock is placed, below.
 
         # Route each camera's MDA tab to that camera's own preview area, so
         # multi-camera MDAs don't all pile up as tabs in one shared area.
@@ -964,13 +986,16 @@ class MicroManagerGUI(QMainWindow):
         # or if the tracked area reference has gone stale (e.g. the preview
         # dock was closed/reparented in the meantime).
         area = self._camera_preview_areas.get(camera_label) if camera_label else None
+        placed = False
         if area is not None:
             try:
                 self.dock_manager.addDockWidgetTabToArea(dw, area)
-                return
+                placed = True
             except RuntimeError:
                 pass
-        self.dock_manager.addDockWidgetTabToArea(dw, self._central_dock_area)
+        if not placed:
+            self.dock_manager.addDockWidgetTabToArea(dw, self._central_dock_area)
+        self._mda_dock_retention.register(dw, ndv_viewer, serial, camera_label)
 
     def _on_previewer_created(
         self, dock_widget: CDockWidget, camera_label: str = ""
@@ -1000,5 +1025,8 @@ class MicroManagerGUI(QMainWindow):
                 log.show()
 
         self._notification_manager.show_error_message(
-            str(exc), see_tb, on_action=_open_traceback
+            str(exc),
+            see_tb,
+            on_action=_open_traceback,
+            sticky=is_persistent_notice(exc),
         )

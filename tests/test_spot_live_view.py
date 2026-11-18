@@ -14,12 +14,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pytest
 from CRISPy.spot.live_view import (
-    EDGE_BOX2_COLOR,
     EDGE_BOX_COLOR,
     ROI_COLOR,
-    SETPOINT2_COLOR,
-    SETPOINT_COLOR,
-    SPOT2_COLOR,
     SpotLiveView,
     bayer_to_grey,
     frame_to_qimage,
@@ -28,7 +24,7 @@ from CRISPy.spot.live_view import (
 )
 from CRISPy.spot.spot_frame_shm import LiveFrame
 
-from pymmcore_gui._qt.QtCore import QPoint, QPointF, Qt
+from pymmcore_gui._qt.QtCore import QPoint, QPointF, QRectF, Qt
 from pymmcore_gui._qt.QtGui import QPainter
 
 if TYPE_CHECKING:
@@ -226,15 +222,15 @@ def test_bayer_to_grey_is_fast_enough_and_rejects_3d() -> None:
 
 
 def test_roi_frame_drawn_at_offset_and_native_size(view: SpotLiveView) -> None:
-    view.show_frame(make_frame(roi=(400, 300, 640, 480)))
+    view.show_frame(make_frame(roi=(400, 300, 1200, 900)))
     item = view.pixmap_item
     assert (item.pos().x(), item.pos().y()) == (400, 300)
     pm = item.pixmap()
-    assert (pm.width(), pm.height()) == (640, 480)  # not downsampled
+    assert (pm.width(), pm.height()) == (1200, 900)  # not downsampled
     assert view.sensor == SENSOR
     rect = view.scene.sceneRect()
     assert (rect.width(), rect.height()) == SENSOR
-    # the sensor was fitted to the window (zoom < 1): resampled smoothly ...
+    # the ROI was fitted to the window (zoom < 1): resampled smoothly ...
     assert view.zoom < 1.0
     assert view.view.renderHints() & QPainter.RenderHint.SmoothPixmapTransform
     assert item.transformationMode() == Qt.TransformationMode.SmoothTransformation
@@ -301,63 +297,26 @@ def test_edge_box_overlay_is_dashed_and_distinct_from_the_roi(
     assert not view._edge_box_item.isVisible() and view.edge_box is None
 
 
-def test_edge_box_2_overlay_is_dashed_and_has_its_own_colour(
+def test_the_view_has_one_edge_box_and_one_pair_of_markers(
     view: SpotLiveView,
 ) -> None:
-    assert not view._edge_box2_item.isVisible()
-    assert view.edge_box2 is None
-    view.set_edge_box2((288, 154, 64, 80))
-    assert view._edge_box2_item.isVisible()
-    assert view.edge_box2 == (288, 154, 64, 80)
-    r = view._edge_box2_item.rect()
-    assert (r.x(), r.y(), r.width(), r.height()) == (288, 154, 64, 80)
-    pen = view._edge_box2_item.pen()
-    assert pen.style() == Qt.PenStyle.DashLine and pen.isCosmetic()
-    assert pen.color().name() == EDGE_BOX2_COLOR
-    assert len({EDGE_BOX2_COLOR, EDGE_BOX_COLOR, ROI_COLOR}) == 3
-    assert view._edge_box2_item is not view._edge_box_item
-    assert not view._edge_box_item.isVisible()  # box 1 is independent
-    # the user's box: frames and clear() leave it alone
-    view.show_frame(make_frame(roi=(64, 32, 400, 300)))
-    view.clear()
-    assert view._edge_box2_item.isVisible()
-    assert not view.grab().isNull()  # paints without raising
-    view.set_edge_box2(None)
-    assert not view._edge_box2_item.isVisible() and view.edge_box2 is None
-
-
-def test_secondary_point_and_setpoint_have_their_own_markers(
-    view: SpotLiveView,
-) -> None:
-    assert not view._spot2_item.isVisible()
-    assert not view._setpoint2_item.isVisible()
+    for gone in (
+        "edge_box2",
+        "set_edge_box2",
+        "set_secondary_point",
+        "set_secondary_setpoint",
+        "draw_edge2_button",
+        "edgeBox2Drawn",
+        "edge2DrawModeChanged",
+        "_spot2_item",
+        "_setpoint2_item",
+    ):
+        assert not hasattr(view, gone), gone
+    # the one cross and ring still follow the frame and the panel
     view.set_setpoint((120.0, 90.0))
-    view.set_secondary_point((320.0, 194.25))
-    view.set_secondary_setpoint((320.0, 194.0))
-    assert view._spot2_item.isVisible() and view._setpoint2_item.isVisible()
-    assert view._spot2_item.pos().x() == pytest.approx(320.5)
-    assert view._spot2_item.pos().y() == pytest.approx(194.75)
-    assert view._setpoint2_item.pos().y() == pytest.approx(194.5)
-    assert view._spot2_item.pen().color().name() == SPOT2_COLOR
-    assert view._setpoint2_item.pen().color().name() == SETPOINT2_COLOR
-    assert SETPOINT2_COLOR != SETPOINT_COLOR
-    view.set_secondary_point((320.0, 194.25), ok=False)
-    assert view._spot2_item.pen().color().name() == "#ff9a1f"
-    # the first ring and cross are untouched by the second
-    assert view._setpoint_item.pos().x() == pytest.approx(120.5)
-    assert not view._spot_item.isVisible()
-    # a frame does not move or hide the panel-fed second cross; clear() hides it
     view.show_frame(make_frame(spot=(150.5, 100.0)))
-    assert view._spot_item.isVisible() and view._spot2_item.isVisible()
-    assert not view.grab().isNull()
-    view.clear()
-    assert not view._spot2_item.isVisible()
-    assert view._setpoint2_item.isVisible()  # a zero marker, not frame data
-    view.set_secondary_point(None)
-    view.set_secondary_setpoint(None)
-    assert not view._spot2_item.isVisible()
-    assert not view._setpoint2_item.isVisible()
-    assert view._setpoint_item.isVisible()
+    assert view._setpoint_item.isVisible() and view._spot_item.isVisible()
+    assert not view.grab().isNull()  # paints without raising
 
 
 def test_status_text_says_edge(view: SpotLiveView) -> None:
@@ -378,8 +337,11 @@ def test_pixel_readout_and_status(view: SpotLiveView) -> None:
     assert view.cursor_label.text() == "x 105  y 53  value 77"
     view._on_cursor(None)
     assert view.cursor_label.text() == ""
-    text = view.status_label.text()
-    assert "max" in text and "saturated" in text and "ROI 20x10 at (100, 50)" in text
+    # fps / max / saturation moved to the owner (statsChanged, see
+    # test_stats_signal); the status line is bit depth, ROI and the edge point.
+    assert view.status_label.text() == (
+        "8-bit  |  ROI 20x10 at (100, 50)  |  edge (100.0, 80.0)"
+    )
 
 
 def test_timer_polls_and_repaints_only_new_frames(
@@ -578,71 +540,6 @@ def test_draw_edge_box_emits_even_clamped_values_not_a_roi(
     assert modes == [True, False]
 
 
-def test_draw_edge_box_2_emits_its_own_signal(qtbot: QtBot, view: SpotLiveView) -> None:
-    view.show_frame(make_frame())
-    view.fit()
-    rois: list[tuple] = []
-    boxes: list[tuple] = []
-    view.roiDrawn.connect(lambda *a: rois.append(a))
-    view.edgeBoxDrawn.connect(lambda *a: boxes.append(a))
-    modes: list[bool] = []
-    view.edge2DrawModeChanged.connect(modes.append)
-    view.set_edge2_draw_mode(True)  # the panel's way in
-    assert view.draw_edge2_button.isChecked()
-    assert view.draw_target == "edge2" and view.view.draw_mode
-    assert not view.draw_roi_button.isChecked()
-    assert not view.draw_edge_button.isChecked()
-    with qtbot.waitSignal(view.edgeBox2Drawn, timeout=2000) as sig:
-        _drag(view, qtbot, QPointF(401.0, 301.0), QPointF(2200.0, 1700.0))
-    x, y, w, h = sig.args
-    assert all(v % 2 == 0 for v in (x, y, w, h))
-    assert x + w == SENSOR[0] and y + h == SENSOR[1]  # clamped to the sensor
-    assert rois == [] and boxes == []  # different signals
-    assert not view.draw_edge2_button.isChecked()  # one box per click
-    assert view.draw_target is None and not view.view.draw_mode
-    assert modes == [True, False]
-
-
-def test_draw_edge_box_2_ignores_a_click_and_a_sliver(
-    qtbot: QtBot, view: SpotLiveView
-) -> None:
-    view.show_frame(make_frame())
-    view.fit()
-    got: list[tuple] = []
-    view.edgeBox2Drawn.connect(lambda *a: got.append(a))
-    view.draw_edge2_button.setChecked(True)
-    _drag(view, qtbot, QPointF(500.0, 500.0), QPointF(502.0, 502.0))
-    _drag(view, qtbot, QPointF(500.0, 500.0), QPointF(900.0, 504.0))
-    assert got == []
-    assert view.draw_edge2_button.isChecked()  # still armed
-
-
-def test_all_three_draw_modes_are_exclusive(qtbot: QtBot, view: SpotLiveView) -> None:
-    view.show_frame(make_frame())
-    view.fit()
-    buttons = {
-        "roi": view.draw_roi_button,
-        "edge": view.draw_edge_button,
-        "edge2": view.draw_edge2_button,
-    }
-    for target, button in buttons.items():
-        button.setChecked(True)
-        assert view.draw_target == target and view.view.draw_mode
-        assert [n for n, b in buttons.items() if b.isChecked()] == [target]
-    buttons["edge2"].setChecked(False)
-    assert view.draw_target is None and not view.view.draw_mode
-    # Draw edge box 1 still emits only its own signal after box 2 was armed
-    first: list[tuple] = []
-    second: list[tuple] = []
-    view.edgeBoxDrawn.connect(lambda *a: first.append(a))
-    view.edgeBox2Drawn.connect(lambda *a: second.append(a))
-    view.draw_edge2_button.setChecked(True)
-    view.draw_edge_button.setChecked(True)
-    with qtbot.waitSignal(view.edgeBoxDrawn, timeout=2000):
-        _drag(view, qtbot, QPointF(401.0, 301.0), QPointF(900.0, 700.0))
-    assert len(first) == 1 and second == []
-
-
 def test_draw_edge_box_ignores_a_click_and_a_sliver(
     qtbot: QtBot, view: SpotLiveView
 ) -> None:
@@ -691,10 +588,10 @@ def test_closing_the_window_leaves_draw_modes(qtbot: QtBot, view: SpotLiveView) 
         view.close()
     assert not view.draw_edge_button.isChecked() and view.draw_target is None
     view.show()
-    view.draw_edge2_button.setChecked(True)
+    view.draw_roi_button.setChecked(True)
     with qtbot.waitSignal(view.windowClosed, timeout=1000):
         view.close()
-    assert not view.draw_edge2_button.isChecked() and view.draw_target is None
+    assert not view.draw_roi_button.isChecked() and view.draw_target is None
 
 
 # ---------------------------------------------------------------------------
@@ -792,3 +689,95 @@ def test_real_wheel_event_zooms_around_the_cursor(
     after = view.view.mapToScene(pos)
     assert after.x() == pytest.approx(before.x(), abs=1.5)
     assert after.y() == pytest.approx(before.y(), abs=1.5)
+
+
+# ---------------------------------------------------------------------------
+# camera ROI crop
+# ---------------------------------------------------------------------------
+
+ROI = (400, 300, 640, 480)
+
+
+def _fit_zoom(v: SpotLiveView, w: float, h: float) -> float:
+    vp = v.view.viewport()
+    return min((vp.width() - 4) / w, (vp.height() - 4) / h)
+
+
+def test_roi_frame_crops_the_view(view: SpotLiveView) -> None:
+    view.show_frame(make_frame(roi=ROI))
+    # the scene stays the sensor, the view is the ROI alone (no pan margin)
+    r = view.scene.sceneRect()
+    assert (r.width(), r.height()) == SENSOR
+    r = view.view.sceneRect()
+    assert (r.x(), r.y(), r.width(), r.height()) == ROI
+
+    # Fit shows the ROI: it fills the viewport in one dimension
+    view.fit()
+    assert view.zoom == pytest.approx(_fit_zoom(view, ROI[2], ROI[3]), rel=1e-3)
+    visible = view.view.mapToScene(view.view.viewport().rect()).boundingRect()
+    roi = QRectF(*ROI)
+    assert visible.contains(roi.adjusted(1, 1, -1, -1))
+    assert visible.width() < ROI[2] + 8 or visible.height() < ROI[3] + 8
+
+    # no zooming out past the fit ...
+    z_fit = view.zoom
+    view.view.zoom_by(0.1)
+    assert view.zoom >= z_fit * (1 - 1e-6)
+    # ... but zooming in is free, up to the limit
+    view.view.zoom_by(4.0)
+    assert view.zoom == pytest.approx(4 * z_fit)
+    view.view.zoom_by(1e6)
+    assert view.zoom == pytest.approx(128.0)
+
+
+def test_cropped_view_cannot_pan_off_the_roi(view: SpotLiveView) -> None:
+    view.show_frame(make_frame(roi=ROI))
+    view.view.zoom_by(4.0)
+    hbar, vbar = view.view.horizontalScrollBar(), view.view.verticalScrollBar()
+    roi = QRectF(*ROI)
+    for bar_h, bar_v in (
+        (hbar.minimum(), vbar.minimum()),
+        (hbar.maximum(), vbar.maximum()),
+    ):
+        hbar.setValue(bar_h)
+        vbar.setValue(bar_v)
+        visible = view.view.mapToScene(view.view.viewport().rect()).boundingRect()
+        assert roi.adjusted(-1, -1, 1, 1).contains(visible)
+    # zoomed out to the fit, the letterbox is the only thing beyond the ROI
+    view.fit()
+    assert hbar.maximum() - hbar.minimum() <= 1
+    assert vbar.maximum() - vbar.minimum() <= 1
+
+
+def test_cropped_fit_follows_a_resize(qtbot: QtBot, view: SpotLiveView) -> None:
+    view.show_frame(make_frame(roi=ROI))
+    view.resize(500, 400)
+    qtbot.wait(50)
+    assert view.zoom == pytest.approx(_fit_zoom(view, ROI[2], ROI[3]), rel=1e-3)
+    view.view.zoom_by(0.1)  # the limit follows the new viewport size
+    assert view.zoom == pytest.approx(_fit_zoom(view, ROI[2], ROI[3]), rel=1e-3)
+
+
+def test_full_frame_restores_the_sensor_view(view: SpotLiveView) -> None:
+    view.show_frame(make_frame(roi=ROI))
+    view.show_frame(make_frame(seq=2))
+    r = view.view.sceneRect()
+    margin = max(SENSOR) / 2
+    assert (r.x(), r.y()) == (-margin, -margin)
+    assert (r.width(), r.height()) == (SENSOR[0] + 2 * margin, SENSOR[1] + 2 * margin)
+    assert view.view.min_zoom == 0.02
+    assert view.fit_mode
+    visible = view.view.mapToScene(view.view.viewport().rect()).boundingRect()
+    assert visible.contains(view.scene.sceneRect().adjusted(1, 1, -1, -1))
+    view.view.zoom_by(1e-6)
+    assert view.zoom == pytest.approx(0.02)  # the old floor, not the ROI fit
+
+
+def test_clear_resets_the_crop(view: SpotLiveView) -> None:
+    view.show_frame(make_frame(roi=ROI))
+    view.clear()
+    r = view.view.sceneRect()
+    assert r.width() > SENSOR[0]  # sensor plus margin again
+    assert view.view.min_zoom == 0.02
+    view.show_frame(make_frame(seq=3))  # a later full frame is not cropped
+    assert view.view.sceneRect().width() > SENSOR[0]

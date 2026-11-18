@@ -1,4 +1,5 @@
-"""CRISPy's panels as the GUI builds them: the Spot lock section and its settings.
+"""CRISPy's panels as the GUI builds them: the piezo spot widget, the Z-stage
+hardware panel and the spot settings.
 
 Builds the panels through :class:`CrispWidget` on a small fake core with one CRISP axis
 on a piezo and one on a stage. Run with ``PYTEST_QT_API=pyqt6`` and
@@ -13,6 +14,9 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from CRISPy._section import _Section
+from CRISPy.piezo_ui import PiezoSpotWidget
+from CRISPy.spot.panel import SpotFocusPanel
 from CRISPy.spot.store import get_settings_store, set_settings_store
 from CRISPy.ui import CrispControlPanel
 from pymmcore_plus import DeviceType
@@ -135,17 +139,90 @@ def crisp(
     set_settings_store(None)
 
 
-def _panels(widget: CrispWidget) -> dict[str, CrispControlPanel]:
-    found = widget.findChildren(CrispControlPanel)
-    assert len(found) == 2
-    return {p.controller.actuator_type: p for p in found}
+def _panels(widget: CrispWidget) -> tuple[PiezoSpotWidget, CrispControlPanel]:
+    """The piezo spot widget (camera-only) and the Z-stage (hardware) panel."""
+    piezo = widget.findChildren(PiezoSpotWidget)
+    stage = widget.findChildren(CrispControlPanel)
+    assert len(piezo) == 1 and len(stage) == 1
+    assert piezo[0].controller.actuator_type == "piezo"
+    assert stage[0].controller.actuator_type == "stage"
+    return piezo[0], stage[0]
 
 
-def test_only_the_piezo_panel_has_the_spot_lock_section(crisp: CrispWidget) -> None:
-    panels = _panels(crisp)
-    piezo, stage = panels["piezo"], panels["stage"]
-    assert piezo.spot_section is not None and piezo.spot_panel is not None
-    assert stage.spot_section is None and stage.spot_panel is None
+#: Widgets the hardware panel has: readouts, operation, calibration, dither,
+#: parameters, the Tiger poller and the joystick checkbox.
+HARDWARE_WIDGETS = (
+    "readouts_box",
+    "dither_section",
+    "params_section",
+    "btn_lock",
+    "btn_led",
+    "joystick_chk",
+    "_poller",
+)
+#: The ones the piezo widget does not have: it reads nothing (no poller), lights the
+#: LED and locks through the spot service, and has its own readouts and Joystick box.
+HARDWARE_ONLY = tuple(
+    n for n in HARDWARE_WIDGETS if n not in ("readouts_box", "joystick_chk")
+)
+
+
+def test_the_piezo_widget_is_camera_lock_only(crisp: CrispWidget) -> None:
+    piezo, _ = _panels(crisp)
+    assert isinstance(piezo.panel, SpotFocusPanel)
+    assert piezo.panel._controller is piezo.controller
+    # none of the hardware panel's sections, no poller reading the serial port
+    assert not isinstance(piezo, CrispControlPanel)
+    assert piezo.findChildren(CrispControlPanel) == []
+    for name in HARDWARE_ONLY:
+        assert not hasattr(piezo, name), name
+    assert piezo.findChildren(_Section) == []  # no Dither / Parameters sections
+    # the camera lock's own section buttons, all closed
+    assert set(piezo.panel.section_buttons) == {
+        "camera",
+        "calibration",
+        "diagnostics",
+        "advanced",
+    }
+    assert not any(b.isChecked() for b in piezo.panel.section_buttons.values())
+    # the Joystick box sits in the lock panel's control row, on until the lock runs
+    assert piezo.joystick_chk.isChecked()
+    assert piezo.panel.isAncestorOf(piezo.joystick_chk)
+    # the spot panel is built lazily: no worker, no camera yet
+    assert piezo.panel.service is None
+    assert piezo.panel.edge_box_label.text().startswith("none")
+
+
+def test_the_stage_panel_keeps_its_hardware_sections(
+    crisp: CrispWidget,
+) -> None:
+    _, stage = _panels(crisp)
+    for name in HARDWARE_WIDGETS:
+        assert hasattr(stage, name), name
+    assert not hasattr(stage, "spot_section")
+    assert not hasattr(stage, "spot_panel")
+    assert not hasattr(stage, "panel")
+    assert stage.findChildren(SpotFocusPanel) == []
+    titles = {sec.toggle_btn.text() for sec in stage.findChildren(_Section)}
+    assert {"Dither", "Parameters"} <= titles
+    assert "Camera parameters" not in titles
+
+
+def test_the_stage_panel_still_locks_the_joystick_with_the_crisp_lock(
+    crisp: CrispWidget, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, stage = _panels(crisp)
+    calls: list[bool] = []
+    monkeypatch.setattr(
+        stage.controller, "set_joystick_enabled", lambda on: calls.append(on)
+    )
+    assert stage.joystick_chk.isChecked()
+    stage._update_state("Lock")  # an unlocked -> locked edge disables the wheel
+    assert calls == [False] and not stage.joystick_chk.isChecked()
+    stage._update_state("Lock")  # no new edge: nothing is sent
+    assert calls == [False]
+    stage._update_state("Idle")  # and back
+    assert calls == [False, True] and stage.joystick_chk.isChecked()
 
 
 def test_the_adapter_store_is_installed_and_live(
@@ -186,7 +263,7 @@ def test_the_led_stays_off_limits_while_crisp_locks_across_a_tool(
     crisp: CrispWidget,
 ) -> None:
     """With CRISP in Lock, a tool beginning and ending must not re-enable the LED."""
-    stage = _panels(crisp)["stage"]
+    _, stage = _panels(crisp)
     stage._last_state = "Lock"
     stage._sync_tool_controls()
     assert not stage.btn_led.isEnabled()

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, cast
 
 from CRISPy.spot.settings import SpotFocusSettingsV1
+from opym.stream.protocol import STREAM_PORT
 from platformdirs import user_data_dir
 from pydantic import (
     Base64Bytes,
@@ -160,6 +161,14 @@ class WindowSettingsV1(BaseMMSettings):
     """State of dock_manager dockwidgets"""
     open_widgets: WidgetNames = Field(default_factory=_default_widgets)
     """Set of widgets to load on startup, or when restoring settings."""
+    mda_viewer_keep_runs: int = Field(default=2, ge=1)
+    """Number of newest MDA runs whose viewer tabs are kept open.
+
+    Each run adds one viewer tab per camera, and each tab holds that run's
+    in-RAM display data. When a new run starts, the tabs of older runs beyond
+    this many are deleted (closing a tab also deletes it). The run being
+    acquired always counts, so 2 keeps the current and the previous run.
+    """
 
     @model_validator(mode="before")
     @classmethod
@@ -247,6 +256,11 @@ class SpectralChannelSettingsV1(BaseMMSettings):
     Shorter rolling readout (faster slices) and less data per frame; the
     regions stay in full-sensor coordinates (see ``pymmcore_gui._camera_crop``).
     """
+    region_gap_px: int = Field(default=40, ge=0)
+    """Vertical gap (px) between a camera's top and bottom regions.
+
+    Used when auto-populating sibling regions and by "Center on chip".
+    """
     laser_config_group: str = "Lasers"
     all_lasers_preset: str = "AllLasers"
     channels: list[SpectralChannelConfig] = Field(
@@ -288,7 +302,7 @@ class ArgusStreamSettingsV1(BaseMMSettings):
     ~33 MB/s, so this is ~2.5x the frames per second; the direct link is
     faster than one thread can compress, so frames always go to it raw.
     """
-    local_port: int = 5555
+    local_port: int = STREAM_PORT
     """Local end of the SSH port-forward that the ZMQ DEALER connects to.
 
     With several ``stream_links``, link k's forward listens on
@@ -311,10 +325,11 @@ class ArgusStreamSettingsV1(BaseMMSettings):
     Separate processes are separate TCP connections (and encrypt in
     parallel); several links in one process share its connection.
     """
-    remote_port: int = 5555
+    remote_port: int = STREAM_PORT
     """Port ``opym-receive`` binds to on ``127.0.0.1`` on the Argus side.
 
-    Matches ``opym.stream.receiver.DEFAULT_BIND_ADDR`` (``tcp://127.0.0.1:5555``).
+    Is ``opym.stream.protocol.STREAM_PORT`` (``DEFAULT_BIND_ADDR`` is
+    ``tcp://127.0.0.1:`` plus it).
     """
     buffer_budget_mb: int = 4096
     """RAM budget for buffered-but-unacked volumes before raising an alarm.
@@ -440,6 +455,12 @@ class SpimTimingSettingsV1(BaseMMSettings):
     volume_start_settle_ms: float = 0.0
     """Extra settle before each volume's first slice, for the galvo's jump
     back to the start of the sweep (``SPIMDelayBeforeSide``)."""
+    park_at_start: bool = False
+    """Hold the galvo at the sweep start between volumes (``SPIMState=Armed``)
+    so the mirror has the whole inter-timepoint wait to settle, instead of
+    returning to neutral and snapping to the start. Off until verified on the
+    rig with ``diagnostics.probe_galvo_park``; if the card refuses, parking
+    turns itself off for the run and the acquisition carries on."""
     readout_ms_override: float | None = None
     """Camera rolling readout time in ms; ``None`` uses the value the cameras
     report (PVCAM ``Timing-ReadoutTimeNs``, maximum over cameras)."""
@@ -453,6 +474,21 @@ class SpimTimingSettingsV1(BaseMMSettings):
     """All Rows with the cameras in Level Trigger Overlap: the next frame
     starts exposing while the previous one reads out, so a slice costs about
     readout + exposure instead of 2 x readout + exposure."""
+
+
+class GalvoSettingsV1(BaseMMSettings):
+    """SPIM galvo settings that must survive restarts and power cycles.
+
+    The ASI card forgets its ``SingleAxisYOffset(deg)`` when it powers down, so
+    the app keeps the user's value and re-applies it on every config load (see
+    ``pymmcore_gui.asi_z_stack.live_offset``).
+    """
+
+    live_offset_deg: float = -0.26
+    """SPIM galvo Live offset in degrees, the card's ``SingleAxisYOffset(deg)``.
+    -0.26 deg is -26 um at 100 um/deg. Stored in degrees so the mirror angle is
+    reproduced exactly even if the slope calibration changes. Re-applied (property
+    write plus static mirror move) on every config load."""
 
 
 class SnapshotSettingsV1(BaseMMSettings):
@@ -481,6 +517,7 @@ class SettingsV1(BaseMMSettings):
     spot_focus: SpotFocusSettingsV1 = Field(default_factory=SpotFocusSettingsV1)
     snapshot: SnapshotSettingsV1 = Field(default_factory=SnapshotSettingsV1)
     spim_timing: SpimTimingSettingsV1 = Field(default_factory=SpimTimingSettingsV1)
+    galvo: GalvoSettingsV1 = Field(default_factory=GalvoSettingsV1)
 
     send_error_reports: bool | None = None
     """Whether to send error reports to the developers, None means undecided."""

@@ -12,6 +12,29 @@ from __future__ import annotations
 import logging
 
 logger = logging.getLogger(__name__)
+# Its RotatingFileHandler (``pymmcore-plus-pid*.log``) survives relaunches,
+# unlike stderr, so background failures are also written there.
+_plus_logger = logging.getLogger("pymmcore-plus")
+
+
+def is_persistent_notice(exc: BaseException) -> bool:
+    """Return True if *exc* (or an exception it chains to) asks for a sticky toast.
+
+    An exception class opts in with a ``persistent_notice = True`` attribute. The
+    ``__cause__`` / ``__context__`` chain is followed (cycle-safe, at most 10 deep)
+    so a wrapper such as the one :func:`report_background_exception` builds, or a
+    ``RuntimeError`` raised from the opted-in one, is still recognised.
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    for _ in range(10):
+        if cur is None or id(cur) in seen:
+            return False
+        if getattr(cur, "persistent_notice", False):
+            return True
+        seen.add(id(cur))
+        cur = cur.__cause__ or cur.__context__
+    return False
 
 
 def report_background_exception(exc: BaseException, context: str = "") -> None:
@@ -31,6 +54,12 @@ def report_background_exception(exc: BaseException, context: str = "") -> None:
     """
     message = f"{context}: {exc}" if context else (str(exc) or repr(exc))
     logger.error("background exception (%s)", context or "?", exc_info=exc)
+    try:
+        _plus_logger.error(
+            "background exception (%s): %s", context or "?", message, exc_info=exc
+        )
+    except Exception:  # pragma: no cover - reporting must never itself raise
+        pass
     try:
         from pymmcore_gui import _app
         from pymmcore_gui._qt.QtWidgets import QApplication

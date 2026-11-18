@@ -2,7 +2,7 @@
 
 Argus's ``FRAME`` message carries either one complete volume per ``(t, c)``
 or, once the receiver advertises ``"slabs"``, a run of consecutive z-planes
-of one (see ``_protocol.py``). This module accumulates the z-planes of a
+of one (see ``opym.stream.protocol``). This module accumulates the z-planes of a
 z-stack into one C-contiguous array. In volume mode it reports the volume
 the instant its last plane lands. In slab mode it hands out each run of
 ``slab_planes`` consecutive planes as soon as the run is complete, so the
@@ -37,6 +37,7 @@ class Volume:
     array: np.ndarray
     """``(Z, Y, X)`` C-contiguous array."""
     timestamp: float
+    """Ms since the run started (``runner_time_ms``); NOT the wire ``timestamp``."""
     camera_id: str | int | None
     acq_first_s: float = 0.0
     """Wall clock (``time.time()``) when this volume's first plane arrived."""

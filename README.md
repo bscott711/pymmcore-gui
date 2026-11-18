@@ -66,12 +66,24 @@ Anything skipped is still saved locally. Every option is documented on
 uv run python -m pymmcore_gui._argus_stream.replay <channel .ome.zarr>
 # measure SSH link throughput to the server
 uv run python -m pymmcore_gui._argus_stream.linkbench
+# send finished OME-Zarr runs to Argus over SSH (opym's sender; flags: --help)
+uv run python -m pymmcore_gui._argus_stream.backfill_send --map "S:\\=/mmfs1/..." --dry-run
 ```
 
 Docs for the fork: [CHANGELOG.md](./CHANGELOG.md), the "Deploying to the
 acquisition PC" and "Streaming to Argus over the direct 10 GbE link" sections
 of [CONTRIBUTING.md](./CONTRIBUTING.md), and the module docstrings in
-`src/pymmcore_gui/_argus_stream/` (the wire protocol is in `_protocol.py`).
+`src/pymmcore_gui/_argus_stream/`. The wire protocol, the backfill wire format
+and the backfill sender are not copied here: they are imported from
+[opym](https://github.com/bscott711/opym) (`opym.stream.protocol`,
+`opym.stream.bfill`, `opym.stream.bfill_run`, `opym.stream.backfill_client`),
+pinned by commit SHA in `pyproject.toml` (`[tool.uv.sources]`). To move the pin,
+change `rev`, run `uv lock` and check that the lock diff holds no other package.
+`_argus_stream/backfill_send.py` is only the wrapper that adds this app's
+`ArgusTunnelManager` and Settings to opym's sender. After the rig's `uv sync`,
+the `opym-backfill-send.exe` console script is opym's bare sender (no SSH
+tunnel); the rig must keep using
+`python -m pymmcore_gui._argus_stream.backfill_send`.
 <!-- END fork-specific section -->
 
 ## ✅ Project Status
@@ -264,6 +276,27 @@ If you already have a `CMMCorePlus` instance that you want the GUI to use, you
 can pass it to `create_mmgui(mmcore=my_core)`. By default the GUI will first
 check if there is a global singleton (`CMMCorePlus.instance()`), and if not, it
 will create a new instance.
+
+## Plugins
+
+Other packages can add features to the GUI without patching it. Declare an
+entry point in the `pymmcore_gui.plugins` group; it must resolve to a callable
+that receives the main window (`MicroManagerGUI`):
+
+```toml
+[project.entry-points."pymmcore_gui.plugins"]
+my-plugin = "my_package.plugin:install"
+```
+
+```python
+def install(win):  # win.mmcore is the CMMCorePlus; win.nm shows notifications
+    ...
+```
+
+Install the plugin package into the same environment as pymmcore-gui and
+`mmgui` loads it at startup, after the window is built and before any hardware
+configuration is loaded. A plugin that fails to load is logged and reported as
+a warning; the GUI and other plugins keep going.
 
 ## Prior Work
 

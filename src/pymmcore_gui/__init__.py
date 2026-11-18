@@ -51,9 +51,15 @@ if sys.platform == "win32":
             ctypes.WinDLL(dll)
 
 import pymmcore  # noqa: F401, I001
-from ._app import create_mmgui
-from ._main_window import MicroManagerGUI
-from .actions import ActionInfo, CoreAction, WidgetAction
+from ._log_isolation import isolate_process_logfile
+
+# Must precede the imports below: some of them log at import time, and the shared
+# pymmcore-plus logfile may be locked by another process (see the docstring).
+isolate_process_logfile()
+
+from ._app import create_mmgui  # noqa: E402
+from ._main_window import MicroManagerGUI  # noqa: E402
+from .actions import ActionInfo, CoreAction, WidgetAction  # noqa: E402
 
 __all__ = [
     "ActionInfo",

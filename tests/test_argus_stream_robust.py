@@ -15,12 +15,7 @@ from typing import TYPE_CHECKING, cast
 import msgpack
 import numpy as np
 import pytest
-from psygnal import Signal
-
-from pymmcore_gui._argus_stream import StreamState
-from pymmcore_gui._argus_stream import _log as stream_log
-from pymmcore_gui._argus_stream import _session as session_mod
-from pymmcore_gui._argus_stream._protocol import (
+from opym.stream.protocol import (
     MSG_ACK,
     MSG_CLIENT_LOG,
     MSG_FRAME,
@@ -28,6 +23,11 @@ from pymmcore_gui._argus_stream._protocol import (
     MSG_SESSION_END,
     MSG_SESSION_START,
 )
+from psygnal import Signal
+
+from pymmcore_gui._argus_stream import StreamState
+from pymmcore_gui._argus_stream import _log as stream_log
+from pymmcore_gui._argus_stream import _session as session_mod
 from pymmcore_gui._argus_stream._session import _BufferBudget
 from pymmcore_gui._argus_stream._tunnel import port_busy
 

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from pymmcore_gui.asi_z_stack.camera_handoff import (
     CameraHandoffSnapshot,
+    PropertyInfo,
     _CameraSnapshot,
+    release_cameras_for_workers,
+    snapshot_device_properties,
 )
 from pymmcore_gui.asi_z_stack.camera_worker_service import (
     CameraWorkerService,
@@ -16,8 +19,11 @@ from pymmcore_gui.asi_z_stack.camera_worker_service import (
     _detach_unloadable_config_groups,
     has_camera,
 )
+from pymmcore_gui.asi_z_stack.common import HardwareConstants
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from pymmcore_plus import CMMCorePlus
     from pytestqt.qtbot import QtBot
 
@@ -30,6 +36,9 @@ class _FakePool:
         self, camera_label: str, values: tuple[tuple[str, str], ...]
     ) -> None:
         self.calls.append((camera_label, values))
+
+    def dead_workers(self) -> list[tuple[str, int | None]]:
+        return []
 
 
 @pytest.fixture
@@ -165,6 +174,7 @@ def test_worker_group_table_lists_and_applies_worker_groups(
 ) -> None:
     from qtpy.QtWidgets import QComboBox
 
+    from pymmcore_gui.widgets._worker_group_editor import WorkerPresetDialog
     from pymmcore_gui.widgets._worker_group_preset_table import (
         WorkerGroupPresetTableWidget,
     )
@@ -175,13 +185,26 @@ def test_worker_group_table_lists_and_applies_worker_groups(
     qtbot.addWidget(wdg)
 
     table = wdg.table_wdg
-    rows = {table.item(r, 0).text(): r for r in range(table.rowCount())}
+    rows = {
+        item.text(): r
+        for r in range(table.rowCount())
+        if (item := table.item(r, 0)) is not None
+    }
     assert "Cameras" in rows
     assert len(rows) == len(core.getAvailableConfigGroups()) + 1
 
     combo = table.cellWidget(rows["Cameras"], 1)
     assert isinstance(combo, QComboBox)
     assert combo.currentText() == "Speed"
+
+    # Worker rows are selectable; the edit buttons route to the worker dialog
+    # rather than the stock one (which assumes a core group).
+    table.selectRow(rows["Cameras"])
+    assert {i.row() for i in table.selectedIndexes()} == {rows["Cameras"]}
+    assert wdg.presets_edit_btn.isEnabled()
+    wdg._edit_preset()
+    assert isinstance(wdg._worker_dialog, WorkerPresetDialog)
+    wdg._worker_dialog.close()
 
     combo.textActivated.emit("Sensitivity")
     assert svc.worker_config_groups["Cameras"].current == "Sensitivity"
@@ -204,6 +227,7 @@ def test_snap_arms_internal_trigger_and_drains(core: CMMCorePlus) -> None:
     import numpy as np
 
     pool = MagicMock()
+    pool.dead_workers.return_value = []
     frame = np.zeros((2, 2), dtype="uint16")
     pool.iter_frames.return_value = iter(
         [("Camera-1", 0, frame, {}, 0), ("Camera-2", 0, frame, {}, 0)]
@@ -325,3 +349,626 @@ def test_set_roi_refused_while_live(core: CMMCorePlus) -> None:
     svc._state = CameraWorkerServiceState.LIVE
     with pytest.raises(RuntimeError, match="stop Live/MDA"):
         svc.set_roi("Camera-1", 0, 0, 4, 4)
+
+
+def test_snapshot_device_properties_captures_metadata(core: CMMCorePlus) -> None:
+    info = snapshot_device_properties(core, "Camera")
+
+    assert set(info) == set(core.getDevicePropertyNames("Camera"))
+    assert info["AllowMultiROI"].ptype == "Integer"
+    assert info["AllowMultiROI"].allowed == ("0", "1")
+    assert info["AsyncPropertyFollower"].read_only
+    beads = info["BeadBlurRate"]
+    assert beads.ptype == "Float"
+    assert beads.lower is not None
+    assert beads.upper is not None
+    assert info["AsyncPropertyLeader"].lower is None
+    assert info["Binning"].value == core.getProperty("Camera", "Binning")
+    with pytest.raises(AttributeError):
+        info["Binning"].value = "2"  # type: ignore[misc]
+
+
+def test_release_cameras_records_device_properties(core: CMMCorePlus) -> None:
+    snap = release_cameras_for_workers(core, HardwareConstants())
+
+    assert "Camera" not in core.getLoadedDevices()
+    assert set(snap.device_properties) == {"Camera"}
+    assert "Binning" in snap.device_properties["Camera"]
+
+
+def test_released_device_properties_accessor(core: CMMCorePlus) -> None:
+    svc = _service(core, _FakePool())
+    assert svc.released_device_properties() == {}
+    info = PropertyInfo("1", allowed=("1", "2"))
+    assert svc._snapshot is not None
+    svc._snapshot.device_properties["Camera-1"] = {"Binning": info}
+    assert svc.released_device_properties() == {"Camera-1": {"Binning": info}}
+    svc._snapshot = None
+    assert svc.released_device_properties() == {}
+
+
+_SPEED = (("Camera-1", "Port", "Speed"),)
+_GAIN = (("Camera-1", "Gain", "2"),)
+
+
+def test_define_worker_preset_new_and_overwrite(core: CMMCorePlus) -> None:
+    svc = _service(core, _FakePool())
+    n: list[int] = []
+    svc.workerConfigGroupsChanged.connect(lambda: n.append(1))
+
+    svc.define_worker_preset("Cameras", "Gain", _GAIN)
+    svc.define_worker_preset("Cameras", "Gain", _SPEED, replace="Gain")
+    svc.define_worker_preset("Fresh", "A", _GAIN)
+
+    groups = svc.worker_config_groups
+    assert list(groups["Cameras"].presets) == ["Sensitivity", "Speed", "Gain"]
+    assert groups["Cameras"].presets["Gain"] == _SPEED
+    assert groups["Fresh"].presets == {"A": _GAIN}
+    assert groups["Fresh"].current == ""
+    assert len(n) == 3
+
+
+def test_define_worker_preset_rename_keeps_position_and_current(
+    core: CMMCorePlus,
+) -> None:
+    svc = _service(core, _FakePool())
+    svc.define_worker_preset("Cameras", "Fast", _GAIN, replace="Speed")
+
+    cfg = svc.worker_config_groups["Cameras"]
+    assert list(cfg.presets) == ["Sensitivity", "Fast"]
+    assert cfg.presets["Fast"] == _GAIN
+    assert cfg.current == "Fast"
+
+
+def test_define_worker_preset_validation(core: CMMCorePlus) -> None:
+    svc = _service(core, _FakePool())
+    n: list[int] = []
+    svc.workerConfigGroupsChanged.connect(lambda: n.append(1))
+    before = dict(svc.worker_config_groups["Cameras"].presets)
+
+    with pytest.raises(ValueError):
+        svc.define_worker_preset("", "A", _GAIN)
+    with pytest.raises(ValueError):
+        svc.define_worker_preset("Cameras", "", _GAIN)
+    with pytest.raises(ValueError):
+        svc.define_worker_preset("Cameras", "A", ())
+    with pytest.raises(ValueError):
+        svc.define_worker_preset("Channel", "A", _GAIN)  # core group
+    with pytest.raises(ValueError):
+        svc.define_worker_preset("Cameras", "Speed", _GAIN)  # exists
+    with pytest.raises(ValueError):
+        svc.define_worker_preset("Cameras", "Sensitivity", _GAIN, replace="Speed")
+    with pytest.raises(ValueError):
+        svc.define_worker_preset(
+            "Cameras", "A", (("Camera-1", "Gain", "1"), ("Camera-1", "Gain", "2"))
+        )
+    with pytest.raises(KeyError):
+        svc.define_worker_preset("Cameras", "A", _GAIN, replace="Nope")
+    with pytest.raises(KeyError):
+        svc.define_worker_preset("NewGroup", "A", _GAIN, replace="Nope")
+
+    assert svc.worker_config_groups["Cameras"].presets == before
+    assert "NewGroup" not in svc.worker_config_groups
+    assert n == []
+
+
+def test_delete_worker_preset_and_group(core: CMMCorePlus) -> None:
+    svc = _service(core, _FakePool())
+    n: list[int] = []
+    svc.workerConfigGroupsChanged.connect(lambda: n.append(1))
+
+    svc.delete_worker_preset("Cameras", "Speed")  # the current preset
+    cfg = svc.worker_config_groups["Cameras"]
+    assert list(cfg.presets) == ["Sensitivity"]
+    assert cfg.current == ""
+
+    svc.delete_worker_preset("Cameras", "Sensitivity")  # last one: group goes
+    assert "Cameras" not in svc.worker_config_groups
+
+    with pytest.raises(KeyError):
+        svc.delete_worker_preset("Cameras", "Speed")
+    with pytest.raises(KeyError):
+        svc.delete_worker_group("Cameras")
+    assert len(n) == 2
+
+    svc.define_worker_preset("G", "A", _GAIN)
+    svc.delete_worker_group("G")
+    assert "G" not in svc.worker_config_groups
+    assert len(n) == 4
+
+
+def test_set_worker_group_rename_keeps_position_and_current(
+    core: CMMCorePlus,
+) -> None:
+    svc = _service(core, _FakePool())
+    svc.define_worker_preset("Other", "A", _GAIN)
+    n: list[int] = []
+    svc.workerConfigGroupsChanged.connect(lambda: n.append(1))
+
+    svc.set_worker_group(
+        "Renamed", {"Speed": _SPEED, "Extra": _GAIN}, rename_from="Cameras"
+    )
+
+    assert list(svc.worker_config_groups) == ["Renamed", "Other"]
+    assert list(svc.worker_config_groups["Renamed"].presets) == ["Speed", "Extra"]
+    assert svc.worker_config_groups["Renamed"].current == "Speed"
+    assert len(n) == 1
+
+    svc.set_worker_group("Renamed", {"Only": _GAIN}, rename_from="Renamed")
+    assert svc.worker_config_groups["Renamed"].current == ""
+
+    svc.set_worker_group("Brand", {"A": _GAIN})
+    assert list(svc.worker_config_groups) == ["Renamed", "Other", "Brand"]
+    assert svc.worker_config_groups["Brand"].current == ""
+
+
+def test_set_worker_group_validation(core: CMMCorePlus) -> None:
+    svc = _service(core, _FakePool())
+    svc.define_worker_preset("Other", "A", _GAIN)
+
+    with pytest.raises(ValueError):
+        svc.set_worker_group("", {"A": _GAIN})
+    with pytest.raises(ValueError):
+        svc.set_worker_group("G", {})
+    with pytest.raises(ValueError):
+        svc.set_worker_group("G", {"": _GAIN})
+    with pytest.raises(ValueError):
+        svc.set_worker_group("G", {"A": ()})
+    with pytest.raises(ValueError):
+        svc.set_worker_group("G", {"A": _GAIN + _GAIN})
+    with pytest.raises(ValueError):
+        svc.set_worker_group("Channel", {"A": _GAIN})  # core group
+    with pytest.raises(ValueError):
+        svc.set_worker_group("Other", {"A": _GAIN}, rename_from="Cameras")
+    with pytest.raises(KeyError):
+        svc.set_worker_group("G", {"A": _GAIN}, rename_from="Nope")
+
+    assert list(svc.worker_config_groups) == ["Cameras", "Other"]
+
+
+def _dead_pool() -> object:
+    from unittest.mock import MagicMock
+
+    pool = MagicMock()
+    pool.dead_workers.return_value = [("Camera-1", -1073740791)]
+    return pool
+
+
+@pytest.mark.parametrize("entry", ["mda", "snap", "live"])
+def test_dead_pool_is_refused_with_clear_error(entry: str) -> None:
+    from unittest.mock import MagicMock
+
+    from pymmcore_gui.asi_z_stack.worker_pool import CameraWorkersDeadError
+
+    pool = _dead_pool()
+    svc = _service(MagicMock(), pool)  # type: ignore[arg-type]
+    calls: dict[str, Callable[[], object]] = {
+        "mda": svc.acquire_for_mda,
+        "snap": svc.snap,
+        "live": svc.start_live,
+    }
+    call = calls[entry]
+
+    with pytest.raises(CameraWorkersDeadError, match="Camera-1.*-1073740791"):
+        call()
+
+    assert svc._state is CameraWorkerServiceState.IDLE
+    pool.arm_all.assert_not_called()  # type: ignore[attr-defined]
+    pool.arm_live_all.assert_not_called()  # type: ignore[attr-defined]
+
+
+def test_check_workers_alive_noop_without_pool_or_with_live_pool() -> None:
+    from unittest.mock import MagicMock
+
+    svc = CameraWorkerService()
+    svc.check_workers_alive()  # no pool: no-op
+
+    pool = MagicMock()
+    pool.dead_workers.return_value = []
+    svc = _service(MagicMock(), pool)
+    svc.check_workers_alive()
+
+
+def test_health_tick_logs_state_and_reports_dead_worker_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from pymmcore_gui.asi_z_stack.worker_pool import (
+        CameraWorkerHandle,
+        CameraWorkerPool,
+        CameraWorkersDeadError,
+    )
+
+    def _handle(label: str, process: object) -> CameraWorkerHandle:
+        handle = CameraWorkerHandle(
+            label,
+            None,  # type: ignore[arg-type]
+            height=1,
+            width=1,
+            dtype="uint16",
+            n_slots=1,
+        )
+        handle.process = process  # type: ignore[assignment]
+        return handle
+
+    proc2 = SimpleNamespace(exitcode=None, pid=456)
+    pool = CameraWorkerPool(
+        [
+            _handle("Camera-1", SimpleNamespace(exitcode=None, pid=123)),
+            _handle("Camera-2", proc2),
+        ]
+    )
+    svc = _service(MagicMock(), pool)  # type: ignore[arg-type]
+    report = MagicMock()
+    try:
+        with (
+            patch(
+                "pymmcore_gui.asi_z_stack.camera_worker_service."
+                "report_background_exception",
+                report,
+            ),
+            caplog.at_level(logging.INFO),
+        ):
+            svc._health_tick()
+            assert "state=IDLE" in caplog.text
+            assert "Camera-1 alive pid=123" in caplog.text
+            assert "Camera-2 alive pid=456" in caplog.text
+            report.assert_not_called()
+
+            proc2.exitcode = -1073740791
+            svc._health_tick()
+            svc._health_tick()
+    finally:
+        svc.shutdown()
+
+    report.assert_called_once()
+    exc, context = report.call_args.args
+    assert isinstance(exc, CameraWorkersDeadError)
+    assert exc.dead == [("Camera-2", -1073740791)]
+    assert context == "Camera workers"
+
+
+def _tick_service(pool: object) -> CameraWorkerService:
+    return _service(MagicMock(), pool)  # type: ignore[arg-type]
+
+
+def _live_pool() -> object:
+    from types import SimpleNamespace
+
+    from pymmcore_gui.asi_z_stack.worker_pool import (
+        CameraWorkerHandle,
+        CameraWorkerPool,
+    )
+
+    handle = CameraWorkerHandle(
+        "Camera-1",
+        None,  # type: ignore[arg-type]
+        height=1,
+        width=1,
+        dtype="uint16",
+        n_slots=1,
+    )
+    handle.process = SimpleNamespace(exitcode=None, pid=123)  # type: ignore[assignment]
+    return CameraWorkerPool([handle])
+
+
+def test_health_tick_logs_commit_numbers(caplog: pytest.LogCaptureFixture) -> None:
+    import logging
+
+    gib = 1024**3
+    svc = _tick_service(_live_pool())
+    try:
+        with (
+            patch(
+                "pymmcore_gui.asi_z_stack.camera_worker_service.available_commit_bytes",
+                return_value=40 * gib,
+            ),
+            patch(
+                "pymmcore_gui.asi_z_stack.camera_worker_service.process_private_bytes",
+                return_value=3 * gib,
+            ),
+            caplog.at_level(logging.INFO),
+        ):
+            svc._health_tick()
+        assert "main private=3.0 GiB" in caplog.text
+        assert "system commit available=40.0 GiB" in caplog.text
+
+        caplog.clear()
+        with (
+            patch(
+                "pymmcore_gui.asi_z_stack.camera_worker_service.available_commit_bytes",
+                return_value=None,
+            ),
+            patch(
+                "pymmcore_gui.asi_z_stack.camera_worker_service.process_private_bytes",
+                return_value=None,
+            ),
+            caplog.at_level(logging.INFO),
+        ):
+            svc._health_tick()
+        assert "main private=n/a" in caplog.text
+        assert "system commit available=n/a" in caplog.text
+    finally:
+        svc.shutdown()
+
+
+def test_health_tick_low_commit_warning_once_and_rearms() -> None:
+    from pymmcore_gui._exceptions import is_persistent_notice
+
+    gib = 1024**3
+    svc = _tick_service(_live_pool())
+    report = MagicMock()
+    commit = {"free": 100 * gib}
+    try:
+        with (
+            patch(
+                "pymmcore_gui.asi_z_stack.camera_worker_service."
+                "report_background_exception",
+                report,
+            ),
+            patch(
+                "pymmcore_gui.asi_z_stack.camera_worker_service.available_commit_bytes",
+                side_effect=lambda: commit["free"],
+            ),
+        ):
+
+            def tick(free: int | None) -> None:
+                commit["free"] = free  # type: ignore[assignment]
+                svc._health_tick()
+
+            tick(20 * gib)  # above the 16 GiB low mark: no warning
+            report.assert_not_called()
+            tick(15 * gib)  # below: one warning
+            assert report.call_count == 1
+            exc, context = report.call_args.args
+            assert is_persistent_notice(exc)
+            assert "15.0 GiB" in str(exc)
+            assert context == "System memory"
+            tick(10 * gib)  # still low: not repeated
+            tick(None)  # probe unavailable: neither warns nor re-arms
+            tick(25 * gib)  # recovered, but below the 32 GiB re-arm mark
+            tick(12 * gib)  # low again without re-arm: still silent
+            assert report.call_count == 1
+            tick(40 * gib)  # above 32 GiB: re-armed
+            tick(8 * gib)
+            assert report.call_count == 2
+    finally:
+        svc.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Recovery after a worker error (Live drain, Live/Snap arm)
+# ---------------------------------------------------------------------------
+
+
+class _FakeWorker:
+    """Scripted worker end of a pipe: answers commands, records what it got.
+
+    ``trip_after_arm``: after a successful Arm/ArmLive reply, send the commit
+    ``ErrorMsg`` (the worker's guard fired) and stay idle. ``arm_error``: answer
+    the Arm/ArmLive with that ``ErrorMsg`` instead of ``ArmedMsg``. Otherwise
+    the worker "free-runs" silently. A ``StopCmd`` is always acknowledged.
+    """
+
+    def __init__(
+        self, label: str, *, trip_after_arm: bool = False, arm_error: bool = False
+    ) -> None:
+        import threading
+        from multiprocessing import Pipe
+        from types import SimpleNamespace
+
+        from pymmcore_gui.asi_z_stack.worker_pool import CameraWorkerHandle
+
+        self.label = label
+        self.trip_after_arm = trip_after_arm
+        self.arm_error = arm_error
+        self.received: list[object] = []
+        parent, self._child = Pipe(duplex=True)
+        self._never_ready, self._keep_open = Pipe(duplex=False)
+        self.handle = CameraWorkerHandle(
+            label,
+            None,  # type: ignore[arg-type]
+            height=1,
+            width=1,
+            dtype="uint16",
+            n_slots=1,
+        )
+        self.handle.conn = parent
+        self.handle.process = SimpleNamespace(  # type: ignore[assignment]
+            sentinel=self._never_ready, exitcode=None
+        )
+        self._done = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        from pymmcore_gui.asi_z_stack.worker_messages import (
+            ArmCmd,
+            ArmedMsg,
+            ArmLiveCmd,
+            ErrorMsg,
+            StopCmd,
+            StoppedMsg,
+        )
+
+        err = ErrorMsg(self.label, "CommitHeadroomError", "commit low", "")
+        while not self._done.is_set():
+            if not self._child.poll(0.05):
+                continue
+            cmd = self._child.recv()
+            self.received.append(cmd)
+            if isinstance(cmd, ArmCmd | ArmLiveCmd):
+                if self.arm_error:
+                    self._child.send(err)
+                    continue
+                self._child.send(ArmedMsg(self.label))
+                if self.trip_after_arm:
+                    self._child.send(err)
+            elif isinstance(cmd, StopCmd):
+                self._child.send(StoppedMsg(self.label, 0, cmd.token))
+
+    def n_stops(self) -> int:
+        from pymmcore_gui.asi_z_stack.worker_messages import StopCmd
+
+        return sum(isinstance(c, StopCmd) for c in self.received)
+
+    def close(self) -> None:
+        self._done.set()
+        self._thread.join(2.0)
+
+
+@pytest.fixture
+def fake_workers():  # type: ignore[no-untyped-def]
+    made: list[_FakeWorker] = []
+
+    def _make(label: str, **kw: bool) -> _FakeWorker:
+        w = _FakeWorker(label, **kw)
+        made.append(w)
+        return w
+
+    yield _make
+    for w in made:
+        w.close()
+
+
+def _real_pool_service(
+    workers: list[_FakeWorker],
+) -> tuple[CameraWorkerService, object]:
+    from pymmcore_gui.asi_z_stack.worker_pool import CameraWorkerPool
+
+    pool = CameraWorkerPool([w.handle for w in workers])
+    svc = _service(MagicMock(), pool)  # type: ignore[arg-type]
+    svc.hw = HardwareConstants(worker_arm_timeout_s=2.0, worker_shutdown_timeout_s=2.0)
+    return svc, pool
+
+
+def _join_live(svc: CameraWorkerService) -> None:
+    thread = svc._live_thread
+    assert thread is not None
+    thread.join(5.0)
+    assert not thread.is_alive()
+    assert svc._state is CameraWorkerServiceState.IDLE
+
+
+def test_live_commit_error_on_both_workers_leaves_pool_clean(fake_workers) -> None:  # type: ignore[no-untyped-def]
+    """Both workers trip in Live: the 2nd ErrorMsg must not poison the next arm."""
+    from pymmcore_gui.asi_z_stack.worker_pool import CameraCommitExhaustedError
+
+    w1 = fake_workers("Camera-1", trip_after_arm=True)
+    w2 = fake_workers("Camera-2", trip_after_arm=True)
+    svc, pool = _real_pool_service([w1, w2])
+    with patch(
+        "pymmcore_gui.asi_z_stack.camera_worker_service.report_background_exception"
+    ) as report:
+        svc.start_live()
+        _join_live(svc)
+    report.assert_called_once()
+    assert isinstance(report.call_args.args[0], CameraCommitExhaustedError)
+    assert w1.n_stops() == 1
+    assert w2.n_stops() == 1
+    # The stale second ErrorMsg was drained: a fresh arm succeeds.
+    w1.trip_after_arm = w2.trip_after_arm = False
+    pool.arm_live_all(armed_timeout=2.0)  # type: ignore[attr-defined]
+
+
+def test_live_commit_error_on_one_worker_stops_the_other(fake_workers) -> None:  # type: ignore[no-untyped-def]
+    w1 = fake_workers("Camera-1", trip_after_arm=True)
+    w2 = fake_workers("Camera-2")  # keeps free-running
+    svc, pool = _real_pool_service([w1, w2])
+    with patch(
+        "pymmcore_gui.asi_z_stack.camera_worker_service.report_background_exception"
+    ):
+        svc.start_live()
+        _join_live(svc)
+    assert w1.n_stops() == 1
+    assert w2.n_stops() == 1
+    pool.arm_live_all(armed_timeout=2.0)  # type: ignore[attr-defined]
+
+
+def test_live_drain_recovery_failure_does_not_mask_original_error() -> None:
+    from pymmcore_gui.asi_z_stack.worker_pool import CameraCommitExhaustedError
+
+    pool = MagicMock()
+    pool.dead_workers.return_value = []
+    boom = CameraCommitExhaustedError("commit gone")
+    pool.iter_frames.side_effect = boom
+    pool.stop_and_drain.side_effect = OSError("pipe closed")
+    svc = _service(MagicMock(), pool)
+    svc._state = CameraWorkerServiceState.LIVE
+    errored: list[str] = []
+    svc.liveErrored.connect(errored.append)
+    with patch(
+        "pymmcore_gui.asi_z_stack.camera_worker_service.report_background_exception"
+    ) as report:
+        svc._run_live_drain(pool)
+    pool.stop_and_drain.assert_called_once()
+    assert errored == ["commit gone"]
+    report.assert_called_once_with(boom, "Live view")
+    assert svc._state is CameraWorkerServiceState.IDLE
+
+
+@pytest.mark.parametrize("entry", ["live", "snap"])
+def test_arm_error_from_one_worker_stops_pool_and_reraises(  # type: ignore[no-untyped-def]
+    entry: str, fake_workers
+) -> None:
+    from pymmcore_gui.asi_z_stack.worker_pool import CameraCommitExhaustedError
+
+    w1 = fake_workers("Camera-1", arm_error=True)
+    w2 = fake_workers("Camera-2")  # armed fine and now free-running
+    svc, pool = _real_pool_service([w1, w2])
+    call = svc.start_live if entry == "live" else svc.snap
+    with pytest.raises(CameraCommitExhaustedError, match="commit low"):
+        call()
+    assert svc._state is CameraWorkerServiceState.IDLE
+    assert svc._live_thread is None
+    assert w1.n_stops() == 1
+    assert w2.n_stops() == 1
+    # Both pipes are clean: the next arm works.
+    w1.arm_error = False
+    pool.arm_live_all(armed_timeout=2.0)  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("entry", ["live", "snap"])
+def test_arm_exception_calls_stop_and_drain_and_reraises(entry: str) -> None:
+    pool = MagicMock()
+    pool.dead_workers.return_value = []
+    pool.arm_live_all.side_effect = TimeoutError("armed?")
+    pool.arm_all.side_effect = TimeoutError("armed?")
+    # A failing recovery is logged, not raised over the original error.
+    pool.stop_and_drain.side_effect = OSError("pipe closed")
+    svc = _service(MagicMock(), pool)
+    call = svc.start_live if entry == "live" else svc.snap
+    with pytest.raises(TimeoutError, match="armed\\?"):
+        call()
+    pool.stop_and_drain.assert_called_once()
+    # GUI-thread recovery uses the short timeout, not worker_shutdown_timeout_s.
+    assert pool.stop_and_drain.call_args.kwargs["timeout"] == 3.0
+    assert svc._state is CameraWorkerServiceState.IDLE
+
+
+def test_snap_refuses_to_arm_while_live_drain_thread_is_stuck() -> None:
+    """A drain thread that outlives stop_live still reads the pipes: no 2nd reader."""
+    import threading
+
+    pool = MagicMock()
+    pool.dead_workers.return_value = []
+    svc = _service(MagicMock(), pool)
+    svc.hw = HardwareConstants(worker_shutdown_timeout_s=0.1)
+    release = threading.Event()
+    stuck = threading.Thread(target=release.wait, daemon=True)
+    stuck.start()
+    svc._state = CameraWorkerServiceState.LIVE
+    svc._live_thread = stuck
+    try:
+        with pytest.raises(RuntimeError, match="Live did not stop"):
+            svc.snap()
+        pool.arm_all.assert_not_called()
+        pool.iter_frames.assert_not_called()
+        pool.stop_and_drain.assert_not_called()
+        assert svc._state is CameraWorkerServiceState.LIVE
+    finally:
+        release.set()
+        stuck.join(2.0)

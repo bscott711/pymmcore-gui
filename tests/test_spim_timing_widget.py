@@ -66,3 +66,32 @@ def test_widget_locks_edits_during_mda(mmcore: CMMCorePlus, qtbot: QtBot) -> Non
     assert not widget.settings_box.isEnabled()
     mmcore.mda.events.sequenceFinished.emit(None)
     assert widget.settings_box.isEnabled()
+
+
+def test_park_checkbox_persists_and_locks_during_mda(
+    mmcore: CMMCorePlus, qtbot: QtBot
+) -> None:
+    cfg = SettingsV1.instance().spim_timing
+    assert cfg.park_at_start is False
+    widget = SpimTimingWidget(mmcore=mmcore)
+    qtbot.addWidget(widget)
+    assert not widget.park.isChecked()
+
+    widget.park.setChecked(True)
+    assert cfg.park_at_start is True
+    widget.park.setChecked(False)
+    assert cfg.park_at_start is False
+
+    # loads the saved value
+    cfg.park_at_start = True
+    other = SpimTimingWidget(mmcore=mmcore)
+    qtbot.addWidget(other)
+    assert other.park.isChecked()
+
+    # locked during an MDA (it sits in the settings box), and in legacy mode
+    # it stays usable: parking is independent of the All Rows timing
+    assert widget.park.isEnabled()
+    mmcore.mda.events.sequenceStarted.emit(None, {})
+    assert not widget.park.isEnabled()
+    mmcore.mda.events.sequenceFinished.emit(None)
+    assert widget.park.isEnabled()

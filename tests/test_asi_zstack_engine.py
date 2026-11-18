@@ -17,13 +17,14 @@ from __future__ import annotations
 import logging
 import time
 from typing import TYPE_CHECKING, cast
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import numpy as np
 import pytest
 import useq
 from useq._mda_event import Channel as EventChannel
 
+from pymmcore_gui._settings import SpimTimingSettingsV1
 from pymmcore_gui.asi_z_stack import engine as engine_module
 from pymmcore_gui.asi_z_stack.camera_handoff import CameraHandoffSnapshot
 from pymmcore_gui.asi_z_stack.common import HardwareConstants
@@ -623,6 +624,126 @@ def test_stationary_teardown_restores_galvo_sweep(
     assert _galvo_value(core, "SingleAxisYAmplitude(deg)") == pytest.approx(0.1234)
 
 
+def _setup_stationary_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[MagicMock, ASIStationaryTriggerEngine]:
+    """Stationary engine with PLogic stubbed and a core whose galvo reads back."""
+    for name in (
+        "configure_plogic_for_dual_nrt_pulses",
+        "log_plogic_trigger_chain_state",
+        "summary_metadata",
+    ):
+        monkeypatch.setattr(engine_module, name, MagicMock())
+    monkeypatch.setattr(engine_module.time, "sleep", lambda _s: None)
+    core, engine, _pool = _make_engine(
+        n_cameras=1, n_slices=1, engine_cls=ASIStationaryTriggerEngine
+    )
+    monkeypatch.setattr(engine, "_reclaim_from_workers", MagicMock())
+    core.getLoadedDevices.return_value = ["Scanner:AB:33"]
+    core.getProperty.return_value = "0.1234"
+    core.getGalvoPosition.return_value = (0.05, 0.0)
+    core.getExposure.return_value = 10.0
+    core.getImageWidth.return_value = 2
+    core.getImageHeight.return_value = 2
+    core.getBytesPerPixel.return_value = 2
+    return core, cast("ASIStationaryTriggerEngine", engine)
+
+
+def _call_index(core: MagicMock, name: str, *args: object) -> int:
+    """Index of the last ``core.<name>(*args)`` call in ``core.mock_calls``."""
+    matches = [
+        i for i, c in enumerate(core.mock_calls) if c == getattr(call, name)(*args)
+    ]
+    assert matches, f"no {name}{args} call recorded"
+    return matches[-1]
+
+
+def test_stationary_setup_holds_galvo_at_live_offset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stationary hold uses the Live offset, not a hard-coded 0.0."""
+    core, engine = _setup_stationary_engine(monkeypatch)
+
+    engine.setup_sequence(useq.MDASequence())
+
+    assert _galvo_value(core, "SingleAxisYOffset(deg)") == pytest.approx(0.1234)
+    core.setGalvoPosition.assert_not_called()
+
+
+def test_stationary_teardown_returns_mirror_to_live_offset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    core, engine = _setup_stationary_engine(monkeypatch)
+
+    engine.setup_sequence(useq.MDASequence())
+    engine.teardown_sequence(useq.MDASequence())
+
+    core.setGalvoPosition.assert_called_once_with("Scanner:AB:33", 0.05, 0.1234)
+    move = _call_index(core, "setGalvoPosition", "Scanner:AB:33", 0.05, 0.1234)
+    idle = _call_index(core, "setProperty", "Scanner:AB:33", "SPIMState", "Idle")
+    restore = _call_index(
+        core, "setProperty", "Scanner:AB:33", "SingleAxisYOffset(deg)", "0.1234"
+    )
+    assert idle < move
+    assert restore < move
+
+
+def test_spim_teardown_returns_mirror_to_live_offset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    core, engine = _setup_spim_engine(monkeypatch)
+    monkeypatch.setattr(engine_module.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(engine, "_reclaim_from_workers", MagicMock())
+    core.getLoadedDevices.return_value = ["Scanner:AB:33"]
+    core.getGalvoPosition.return_value = (0.05, 0.3)
+    seq = useq.MDASequence(z_plan=useq.ZAboveBelow(above=10, below=0, step=1))
+
+    engine.setup_sequence(seq)
+    core.setGalvoPosition.assert_not_called()
+    engine.teardown_sequence(seq)
+
+    core.setGalvoPosition.assert_called_once_with("Scanner:AB:33", 0.05, 0.1234)
+    move = _call_index(core, "setGalvoPosition", "Scanner:AB:33", 0.05, 0.1234)
+    idle = _call_index(core, "setProperty", "Scanner:AB:33", "SPIMState", "Idle")
+    restore = _call_index(
+        core, "setProperty", "Scanner:AB:33", "SingleAxisYOffset(deg)", "0.1234"
+    )
+    assert idle < move
+    assert restore < move
+
+
+def _junk_live_offset(_dev: str, prop: str) -> str:
+    """Only the Live slice offset is unreadable; everything else reads 0.1234."""
+    return "junk" if prop == "SingleAxisYOffset(deg)" else "0.1234"
+
+
+def test_stationary_teardown_unreadable_live_offset_skips_move(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    core, engine = _setup_stationary_engine(monkeypatch)
+    core.getProperty.side_effect = _junk_live_offset
+
+    engine.setup_sequence(useq.MDASequence())
+    engine.teardown_sequence(useq.MDASequence())
+
+    core.setGalvoPosition.assert_not_called()
+
+
+def test_spim_teardown_unreadable_live_offset_skips_move(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    core, engine = _setup_spim_engine(monkeypatch)
+    monkeypatch.setattr(engine_module.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(engine, "_reclaim_from_workers", MagicMock())
+    core.getLoadedDevices.return_value = ["Scanner:AB:33"]
+    core.getProperty.side_effect = _junk_live_offset
+
+    engine.setup_sequence(useq.MDASequence())
+    engine.teardown_sequence(useq.MDASequence())
+
+    core.setGalvoPosition.assert_not_called()
+
+
 def test_setup_sequence_rejects_unreachable_top_bottom(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1177,3 +1298,433 @@ def test_all_rows_teardown_restores_card_timing(
         "SPIMNumScansPerSlice",
     ):
         assert restored.get(prop) == "0.1234"
+
+
+# --- Park the galvo at the sweep start between volumes ---
+
+_GALVO = "Scanner:AB:33"
+
+
+def _spim_state_core(
+    core: MagicMock,
+    allowed: tuple[str, ...] = ("Idle", "Armed", "Running"),
+    reject: tuple[str, ...] = (),
+    readback: dict[str, str] | None = None,
+) -> list[str]:
+    """Make ``core`` remember the galvo's SPIMState; return the write log.
+
+    ``reject`` values raise on write (the card refusing a transition);
+    ``readback`` maps a written value to what the card then reports.
+    """
+    state = {"v": "Idle"}
+    writes: list[str] = []
+
+    def set_property(dev: str, prop: str, value: str) -> None:
+        if (dev, prop) == (_GALVO, "SPIMState"):
+            if value in reject:
+                raise RuntimeError(f"card rejected SPIMState={value}")
+            writes.append(value)
+            state["v"] = (readback or {}).get(value, value)
+
+    core.setProperty.side_effect = set_property
+    core.getAllowedPropertyValues.return_value = allowed
+    core.getProperty.side_effect = lambda dev, prop: (
+        state["v"] if prop == "SPIMState" else "0.1234"
+    )
+    return writes
+
+
+def _run_volumes(engine: _ASITriggerEngineBase, pool: MagicMock, n: int) -> None:
+    for t in range(n):
+        _queue_frames(pool, [("cam0", 0), ("cam0", 1)])
+        list(engine.exec_event(useq.MDAEvent(index={"t": t})))
+
+
+def _park_engine(
+    park: bool, **core_kwargs: object
+) -> tuple[MagicMock, ASISPIMEngine, MagicMock, list[str]]:
+    core, engine, pool = _make_engine(n_cameras=1, n_slices=2)
+    writes = _spim_state_core(core, **core_kwargs)  # type: ignore[arg-type]
+    engine = cast("ASISPIMEngine", engine)
+    engine._timing_cfg = SpimTimingSettingsV1(park_at_start=park)
+    return core, engine, pool, writes
+
+
+def test_park_default_is_off() -> None:
+    assert SpimTimingSettingsV1().park_at_start is False
+
+
+def test_park_parks_after_each_volume_and_runs_from_armed() -> None:
+    _core, engine, pool, writes = _park_engine(park=True)
+
+    engine._park_galvo_at_start()  # what setup_sequence does at its end
+    assert writes == ["Armed"]
+    _run_volumes(engine, pool, 2)
+
+    # parked after setup, Running starts each volume, parked again after it
+    assert writes == ["Armed", "Running", "Armed", "Running", "Armed"]
+
+
+def test_park_runs_at_end_of_setup_and_idle_at_teardown(
+    monkeypatch: pytest.MonkeyPatch, settings: object
+) -> None:
+    settings.spim_timing.park_at_start = True  # type: ignore[attr-defined]
+    core, engine = _setup_spim_engine(monkeypatch)
+    writes = _spim_state_core(core)
+    monkeypatch.setattr(engine_module.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(engine, "_reclaim_from_workers", MagicMock())
+    core.getLoadedDevices.return_value = [_GALVO]
+    seq = useq.MDASequence(z_plan=useq.ZAboveBelow(above=10, below=0, step=1))
+
+    engine.setup_sequence(seq)
+    assert writes == ["Armed"]  # volume 1 benefits
+    engine.teardown_sequence(seq)
+
+    assert writes == ["Armed", "Idle"]  # teardown is the neutral return
+
+
+def test_park_off_writes_no_armed_and_changes_nothing() -> None:
+    """Negative control: with parking off the writes are exactly the old ones."""
+    core, engine, pool, writes = _park_engine(park=False)
+
+    engine._park_galvo_at_start()
+    _run_volumes(engine, pool, 2)
+
+    assert writes == ["Running", "Running"]
+    assert "Armed" not in writes
+    core.getAllowedPropertyValues.assert_not_called()
+    # nothing but the two Running writes touched the core's properties
+    assert core.setProperty.call_count == 2
+
+
+def test_park_without_armed_warns_once_and_proceeds(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _core, engine, pool, writes = _park_engine(park=True, allowed=("Idle", "Running"))
+
+    with caplog.at_level(logging.WARNING):
+        engine._park_galvo_at_start()
+        _run_volumes(engine, pool, 2)
+
+    assert writes == ["Running", "Running"]
+    assert engine._park_disabled
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "Armed" in warnings[0].getMessage()
+
+
+def test_park_readback_mismatch_disables_parking() -> None:
+    _core, engine, pool, writes = _park_engine(park=True, readback={"Armed": "Idle"})
+
+    engine._park_galvo_at_start()
+    assert engine._park_disabled
+    _run_volumes(engine, pool, 2)
+
+    assert writes == ["Armed", "Running", "Running"]  # one try, then never again
+
+
+def test_park_write_error_never_raises(caplog: pytest.LogCaptureFixture) -> None:
+    _core, engine, _pool, writes = _park_engine(park=True, reject=("Armed",))
+
+    with caplog.at_level(logging.WARNING):
+        engine._park_galvo_at_start()
+
+    assert writes == []
+    assert engine._park_disabled
+    assert sum(r.levelno == logging.WARNING for r in caplog.records) == 1
+
+
+def test_park_running_rejected_from_armed_goes_via_idle(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    core, engine, pool, writes = _park_engine(park=True)
+    engine._park_galvo_at_start()
+    assert writes == ["Armed"]
+
+    # the card now refuses Running while it is parked (only the first try)
+    first = {"done": False}
+    plain = core.setProperty.side_effect
+
+    def picky(dev: str, prop: str, value: str) -> None:
+        if (dev, prop, value) == (_GALVO, "SPIMState", "Running") and not first["done"]:
+            first["done"] = True
+            raise RuntimeError("Running not accepted from Armed")
+        plain(dev, prop, value)
+
+    core.setProperty.side_effect = picky
+    with caplog.at_level(logging.WARNING):
+        _run_volumes(engine, pool, 2)
+
+    assert writes == ["Armed", "Idle", "Running", "Running"]
+    assert engine._park_disabled  # not parked again after the failure
+    assert sum(r.levelno == logging.WARNING for r in caplog.records) == 1
+
+
+def test_park_flag_resets_each_run(
+    monkeypatch: pytest.MonkeyPatch, settings: object
+) -> None:
+    settings.spim_timing.park_at_start = True  # type: ignore[attr-defined]
+    core, engine = _setup_spim_engine(monkeypatch)
+    writes = _spim_state_core(core)
+    engine._park_disabled = True  # left over from an earlier run
+
+    engine.setup_sequence(useq.MDASequence(channels=["488nm"]))
+
+    assert not engine._park_disabled
+    assert writes == ["Armed"]
+
+
+def test_stationary_engine_never_parks() -> None:
+    core, engine, pool = _make_engine(
+        n_cameras=1, n_slices=2, engine_cls=ASIStationaryTriggerEngine
+    )
+    writes = _spim_state_core(core)
+    _run_volumes(engine, pool, 1)
+    assert writes == ["Running"]
+
+
+# --- failures before the first frame (arm / laser / start) must still clean up ---
+
+
+def _event(t: int) -> useq.MDAEvent:
+    """An event at timepoint ``t`` (validated, so the index type-checks)."""
+    return useq.MDAEvent.model_validate({"index": {"t": t}})
+
+
+def test_exec_event_arm_failure_stops_workers_and_reraises() -> None:
+    """``arm_all`` raising (outside the old ``try``) still drains the pool.
+
+    Without ``stop_and_drain`` a worker that did get its ``ArmCmd`` stays
+    armed and discards the next one, wedging every later run until restart.
+    """
+    _core, engine, pool = _make_engine(n_cameras=2, n_slices=3)
+    err = WorkerDiedError("cam0", -1073741819)
+    pool.arm_all.side_effect = err
+
+    with pytest.raises(WorkerDiedError) as excinfo:
+        list(engine.exec_event(_event(0)))
+
+    assert excinfo.value is err
+    pool.stop_and_drain.assert_called_once()
+
+
+def test_exec_event_prepare_volume_failure_stops_workers_and_reraises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _core, engine, pool = _make_engine(n_cameras=1, n_slices=2)
+    err = RuntimeError("prepare failed")
+
+    def boom(event: useq.MDAEvent) -> dict[str, object]:
+        raise err
+
+    monkeypatch.setattr(engine, "_prepare_volume", boom)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        list(engine.exec_event(_event(0)))
+
+    assert excinfo.value is err
+    pool.arm_all.assert_not_called()
+    pool.stop_and_drain.assert_called_once()
+
+
+def test_exec_event_start_failure_closes_laser_and_stops_workers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_start_volume`` raising after the gated laser went on switches it off."""
+    mock_set_laser_outputs = MagicMock()
+    monkeypatch.setattr(engine_module, "set_laser_outputs", mock_set_laser_outputs)
+    monkeypatch.setattr(time, "sleep", MagicMock())
+
+    core, engine, pool = _make_engine(n_cameras=1, n_slices=2)
+    core.getAvailableConfigGroups.return_value = ["Lasers"]
+    core.getCurrentConfig.return_value = "561nm"
+    err = RuntimeError("start failed")
+
+    def boom() -> None:
+        raise err
+
+    monkeypatch.setattr(engine, "_start_volume", boom)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        list(engine.exec_event(_event(0)))
+
+    assert excinfo.value is err
+    on_values = [call.args[3] for call in mock_set_laser_outputs.call_args_list]
+    assert on_values == [True, False]
+    pool.stop_and_drain.assert_called_once()
+
+
+def test_exec_event_pre_laser_failure_does_not_touch_laser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failing before the laser went on must not switch it off either."""
+    mock_set_laser_outputs = MagicMock()
+    monkeypatch.setattr(engine_module, "set_laser_outputs", mock_set_laser_outputs)
+
+    core, engine, pool = _make_engine(n_cameras=1, n_slices=2)
+    core.getAvailableConfigGroups.return_value = ["Lasers"]
+    core.getCurrentConfig.return_value = "561nm"
+    pool.arm_all.side_effect = RuntimeError("arm failed")
+
+    with pytest.raises(RuntimeError):
+        list(engine.exec_event(_event(0)))
+
+    mock_set_laser_outputs.assert_not_called()
+    pool.stop_and_drain.assert_called_once()
+
+
+def test_exec_event_failure_logs_one_diagnostic_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One ERROR line on the pymmcore-plus logger names the event and the workers."""
+    _core, engine, pool = _make_engine(n_cameras=2, n_slices=3)
+    alive = MagicMock()
+    alive.camera_label = "cam0"
+    alive.process.is_alive.return_value = True
+    alive.process.exitcode = None
+    dead = MagicMock()
+    dead.camera_label = "cam1"
+    dead.process.is_alive.return_value = False
+    dead.process.exitcode = -1073741819
+    pool.workers = [alive, dead]
+    pool.arm_all.side_effect = RuntimeError("arm blew up")
+
+    with caplog.at_level(logging.ERROR, logger="pymmcore-plus"):
+        with pytest.raises(RuntimeError, match="arm blew up"):
+            list(engine.exec_event(_event(7)))
+
+    records = [r for r in caplog.records if r.name == "pymmcore-plus"]
+    assert len(records) == 1
+    rec = records[0]
+    assert rec.levelno == logging.ERROR
+    assert rec.exc_info is not None
+    msg = rec.getMessage()
+    assert "{'t': 7}" in msg
+    assert "{'cam0': 0, 'cam1': 0}" in msg
+    assert "finish_reason" in msg
+    assert "cancel_requested" in msg
+    assert "cam0" in msg
+    assert "alive=True" in msg
+    assert "alive=False" in msg
+    assert "exitcode=-1073741819" in msg
+
+
+def test_exec_event_diagnostic_never_masks_original_error() -> None:
+    """Workers lacking ``process``/``is_alive`` don't break the re-raise."""
+    _core, engine, pool = _make_engine(n_cameras=1, n_slices=2)
+    pool.workers = [object(), MagicMock(camera_label="cam0", process=None)]
+    err = RuntimeError("arm blew up")
+    pool.arm_all.side_effect = err
+
+    with pytest.raises(RuntimeError) as excinfo:
+        list(engine.exec_event(_event(0)))
+
+    assert excinfo.value is err
+
+
+def test_exec_event_cancel_is_not_logged_as_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _core, engine, pool = _make_engine(n_cameras=1, n_slices=3)
+    _queue_frames(pool, [("cam0", i) for i in range(3)])
+    with caplog.at_level(logging.ERROR, logger="pymmcore-plus"):
+        gen = cast(
+            "Generator[object, str | None, None]",
+            engine.exec_event(_event(0)),
+        )
+        next(gen)
+        with pytest.raises(StopIteration):
+            gen.send("cancel")
+
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+def test_exec_event_arm_timeout_propagates_unchanged() -> None:
+    """An arm-ack ``TimeoutError`` is not the "no trigger reached" stall.
+
+    No frame iteration has started, so the zero-frame rewrite (which blames
+    PLogic BNC1) must not apply: the very same exception reaches the runner.
+    """
+    _core, engine, pool = _make_engine(n_cameras=2, n_slices=3)
+    err = TimeoutError("armed")
+    pool.arm_all.side_effect = err
+
+    with pytest.raises(TimeoutError) as excinfo:
+        list(engine.exec_event(_event(0)))
+
+    assert excinfo.value is err
+    assert str(excinfo.value) == "armed"
+    pool.stop_and_drain.assert_called_once()
+
+
+def test_exec_event_laser_off_failure_still_drains_and_runs_after_volume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``set_laser_outputs(..., False)`` raising must not skip the other cleanup."""
+    laser_off = RuntimeError("laser off failed")
+
+    def fake_laser(
+        _plogic: str, _hub: str, _bncs: list[int], on: bool, _cell: int
+    ) -> None:
+        if not on:
+            raise laser_off
+
+    monkeypatch.setattr(engine_module, "set_laser_outputs", fake_laser)
+    monkeypatch.setattr(time, "sleep", MagicMock())
+
+    core, engine, pool = _make_engine(n_cameras=1, n_slices=2)
+    core.getAvailableConfigGroups.return_value = ["Lasers"]
+    core.getCurrentConfig.return_value = "561nm"
+    after_volume = MagicMock()
+    monkeypatch.setattr(engine, "_after_volume", after_volume)
+
+    def boom() -> None:
+        raise RuntimeError("start failed")
+
+    monkeypatch.setattr(engine, "_start_volume", boom)
+
+    with pytest.raises(RuntimeError, match="laser off failed"):
+        list(engine.exec_event(_event(0)))
+
+    pool.stop_and_drain.assert_called_once()
+    after_volume.assert_called_once()
+
+
+@pytest.mark.parametrize("engine_cls", [ASISPIMEngine, ASIStationaryTriggerEngine])
+def test_setup_sequence_refuses_dead_pool_before_hardware(
+    monkeypatch: pytest.MonkeyPatch, engine_cls: type[_ASITriggerEngineBase]
+) -> None:
+    """A dead camera worker fails ``setup_sequence`` before any hardware call."""
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=2, engine_cls=engine_cls)
+    svc = MagicMock()
+    err = WorkerDiedError("Camera-1", -1)
+    svc.check_workers_alive.side_effect = err
+    monkeypatch.setattr(
+        "pymmcore_gui.asi_z_stack.engine.CameraWorkerService.get_active",
+        MagicMock(return_value=svc),
+    )
+    core.reset_mock()  # drop the constructor's reads; only setup_sequence counts
+
+    with pytest.raises(WorkerDiedError) as excinfo:
+        engine.setup_sequence(useq.MDASequence.model_validate({"channels": ["488nm"]}))
+
+    assert excinfo.value is err
+    svc.check_workers_alive.assert_called_once()
+    assert core.mock_calls == []
+
+
+def test_setup_sequence_dead_pool_generic_error_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    core, engine, _pool = _make_engine(n_cameras=1, n_slices=2)
+    svc = MagicMock()
+    svc.check_workers_alive.side_effect = RuntimeError("dead")
+    monkeypatch.setattr(
+        "pymmcore_gui.asi_z_stack.engine.CameraWorkerService.get_active",
+        MagicMock(return_value=svc),
+    )
+
+    with pytest.raises(RuntimeError, match="dead"):
+        engine.setup_sequence(useq.MDASequence())
+
+    core.setProperty.assert_not_called()

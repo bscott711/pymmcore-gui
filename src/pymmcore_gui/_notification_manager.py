@@ -66,9 +66,15 @@ class NotificationManager(QObject):
         *actions: str,
         # callable that receives the selected item, or None if notification is dismissed
         on_action: Callable[[str | None], None] | None = None,
+        # keep the toast until the user closes it (no auto-hide)
+        sticky: bool = False,
     ) -> None:
         notification = Notification(
-            message, severity="warning", actions=actions, on_action=on_action
+            message,
+            severity="warning",
+            actions=actions,
+            on_action=on_action,
+            sticky=sticky,
         )
         self._add_notification(notification)
 
@@ -78,9 +84,15 @@ class NotificationManager(QObject):
         *actions: str,
         # callable that receives the selected item, or None if notification is dismissed
         on_action: Callable[[str | None], None] | None = None,
+        # keep the toast until the user closes it (no auto-hide)
+        sticky: bool = False,
     ) -> None:
         notification = Notification(
-            message, severity="error", actions=actions, on_action=on_action
+            message,
+            severity="error",
+            actions=actions,
+            on_action=on_action,
+            sticky=sticky,
         )
         self._add_notification(notification)
 

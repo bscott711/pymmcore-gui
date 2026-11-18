@@ -132,6 +132,20 @@ launches with whatever is already checked out.
 This deliberately runs *before* `pymmcore_gui` starts, not as an in-app
 auto-updater, so there is never an acquisition in progress for it to disrupt.
 
+The stream code imports its wire protocol and the backfill sender from `opym`
+(pinned in `pyproject.toml`/`uv.lock`), so a change of that pin has an order:
+
+1. Deploy Argus first (pull and restart the receiver; see the opym repo), then
+   the acquisition PC. Every old/new combination of sender and receiver works
+   (the receiver accepts the old FRAME `timestamp` and recovers the time from
+   `acq_first_s`), but the receiver goes first so that the new times are stored.
+2. On the PC, `uv sync` before the first scheduled backfill. The GUI launcher's
+   `uv run` syncs at launch, but the backfill task runs
+   `uv run --no-sync python -m pymmcore_gui._argus_stream.backfill_send ...` and
+   fails with an import error for `opym` until the environment has been synced.
+3. The PC runs whatever branch is checked out there (not necessarily `main`);
+   the change reaches it only through that branch.
+
 Point `origin` at whichever remote that machine can actually reach:
 
 ```powershell

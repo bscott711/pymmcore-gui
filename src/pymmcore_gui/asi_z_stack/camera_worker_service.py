@@ -43,8 +43,11 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, ClassVar
 
-from PyQt6.QtCore import QObject, pyqtSignal
+from pymmcore_plus._logger import logger as _pmp_logger
+from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from superqt.utils import create_worker
+
+from pymmcore_gui._exceptions import report_background_exception
 
 from .camera_handoff import (
     CameraHandoffSnapshot,
@@ -52,16 +55,44 @@ from .camera_handoff import (
     reload_cameras_after_handoff,
 )
 from .camera_worker import CameraWorkerConfig
+from .commit_headroom import available_commit_bytes, format_gib, process_private_bytes
 from .common import HardwareConstants
-from .worker_pool import CameraWorkerHandle, CameraWorkerPool
+from .worker_pool import (
+    CameraCommitExhaustedError,
+    CameraWorkerHandle,
+    CameraWorkerPool,
+    CameraWorkersDeadError,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     import numpy as np
     from pymmcore_plus import CMMCorePlus
 
+    from .camera_handoff import PropertyInfo
+
 logger = logging.getLogger(__name__)
+
+#: Interval of the worker health log line (see CameraWorkerService._health_tick).
+_HEALTH_INTERVAL_MS = 60_000
+
+#: _health_tick reports one sticky warning when the system's available commit
+#: (RAM + page file) drops below the low mark, and re-arms it only once it has
+#: risen above the high mark.
+_COMMIT_WARN_LOW_BYTES = 16 * 1024**3
+_COMMIT_WARN_REARM_BYTES = 32 * 1024**3
+
+#: Recovery wait (s) for ``_recover_pool`` calls made on the GUI thread
+#: (Live start, Snap): short, so a hung worker stalls the GUI for the arm
+#: timeout plus this, not plus ``worker_shutdown_timeout_s``.
+_GUI_RECOVERY_TIMEOUT_S = 3.0
+
+
+class LowSystemCommitWarning(RuntimeError):
+    """The system is close to running out of commit (RAM + page file)."""
+
+    persistent_notice = True
 
 
 def has_camera(mmc: CMMCorePlus) -> bool:
@@ -179,6 +210,9 @@ class CameraWorkerService(QObject):
     frameReady = pyqtSignal(str, int, object, object, int)
     #: (group, preset) after apply_worker_config succeeds.
     workerConfigChanged = pyqtSignal(str, str)
+    #: A structural edit changed the set of worker config groups/presets
+    #: (define/delete/rename); not emitted by apply_worker_config.
+    workerConfigGroupsChanged = pyqtSignal()
     #: New Snap/Live exposure (ms) after set_exposure succeeds.
     exposureChanged = pyqtSignal(float)
     liveStateChanged = pyqtSignal(bool)
@@ -203,6 +237,14 @@ class CameraWorkerService(QObject):
         self._liveFrameAvailable.connect(self._deliver_live_frame)
         self.hw = HardwareConstants()
         self._mmc: CMMCorePlus | None = None
+        #: Periodic worker health line; started once the pool is ready.
+        self._health_timer = QTimer(self)
+        self._health_timer.setInterval(_HEALTH_INTERVAL_MS)
+        self._health_timer.timeout.connect(self._health_tick)
+        #: Labels of dead workers already reported by _health_tick.
+        self._reported_dead: set[str] = set()
+        #: True while the low-commit warning has been shown and not yet re-armed.
+        self._commit_warned = False
         #: Exposure read from the main-process core once, in begin_release,
         #: while a camera was still loaded there -- a best-effort fallback
         #: for code that would otherwise call the now-cameraless main-process
@@ -253,6 +295,19 @@ class CameraWorkerService(QObject):
     def worker_config_groups(self) -> dict[str, WorkerConfigGroup]:
         """Config groups moved off the main-process core at :meth:`begin_release`."""
         return self._worker_config_groups
+
+    def released_device_properties(self) -> dict[str, dict[str, PropertyInfo]]:
+        """Property metadata of every released device, captured at release time.
+
+        Returns
+        -------
+        dict[str, dict[str, PropertyInfo]]
+            Device label -> property name -> metadata; ``{}`` when there is no
+            snapshot.
+        """
+        if self._snapshot is None:
+            return {}
+        return self._snapshot.device_properties
 
     def roi(self, camera_label: str) -> tuple[int, int, int, int]:
         """*camera_label*'s current hardware ROI, ``(x, y, w, h)`` on the sensor.
@@ -390,6 +445,8 @@ class CameraWorkerService(QObject):
             with self._lock:
                 self._pool = pool  # type: ignore[assignment]
                 self._state = CameraWorkerServiceState.IDLE
+            self._reported_dead.clear()
+            self._health_timer.start()
             logger.info(
                 f"Persistent camera worker pool ready: {snapshot.camera_labels}."
             )
@@ -476,6 +533,7 @@ class CameraWorkerService(QObject):
         and joins its drain thread *before* tearing down the pool -- see the
         module docstring's threading invariant for why that order matters.
         """
+        self._health_timer.stop()
         self.stop_live(timeout=timeout)
         with self._lock:
             pool = self._pool
@@ -502,11 +560,94 @@ class CameraWorkerService(QObject):
             logger.info("Persistent camera worker service shut down.")
 
     # ------------------------------------------------------------------
+    # Liveness
+    # ------------------------------------------------------------------
+
+    def check_workers_alive(self) -> None:
+        """Raise :class:`CameraWorkersDeadError` if any worker process is dead.
+
+        Dead workers are never respawned (a native PVCAM crash may leave the
+        driver unusable), so refuse clearly instead of failing later with a
+        generic arm error. No-op when there is no pool. Logs one error line.
+        """
+        with self._lock:
+            pool = self._pool
+        if pool is None:
+            return
+        dead = pool.dead_workers()
+        if not dead:
+            return
+        _pmp_logger.error(
+            "Camera worker(s) dead, refusing: "
+            + ", ".join(f"{label} (exit code {code})" for label, code in dead)
+        )
+        raise CameraWorkersDeadError(dead)
+
+    def _health_tick(self) -> None:
+        """Log one worker health line; report newly dead workers once. Never raises."""
+        try:
+            with self._lock:
+                pool = self._pool
+                state = self._state
+            if pool is None:
+                return
+            parts = []
+            for worker in pool.workers:
+                process = worker.process
+                if worker.is_dead():
+                    parts.append(
+                        f"{worker.camera_label} DEAD "
+                        f"exitcode={getattr(process, 'exitcode', None)}"
+                    )
+                else:
+                    parts.append(
+                        f"{worker.camera_label} alive "
+                        f"pid={getattr(process, 'pid', None)}"
+                    )
+            commit_free = available_commit_bytes()
+            logger.info(
+                f"camera workers: state={state.name} "
+                + ", ".join(parts)
+                + f"; main private={format_gib(process_private_bytes())}"
+                + f", system commit available={format_gib(commit_free)}"
+            )
+            self._check_commit_warning(commit_free)
+            newly_dead = [
+                (label, code)
+                for label, code in pool.dead_workers()
+                if label not in self._reported_dead
+            ]
+            if newly_dead:
+                self._reported_dead.update(label for label, _ in newly_dead)
+                exc = CameraWorkersDeadError(newly_dead)
+                _pmp_logger.error(f"Camera worker(s) died: {exc}")
+                report_background_exception(exc, "Camera workers")
+        except Exception:
+            logger.exception("Camera worker health check failed.")
+
+    def _check_commit_warning(self, commit_free: int | None) -> None:
+        """One sticky warning below the low mark; re-armed above the high mark."""
+        if commit_free is None:
+            return
+        if commit_free >= _COMMIT_WARN_REARM_BYTES:
+            self._commit_warned = False
+        elif commit_free < _COMMIT_WARN_LOW_BYTES and not self._commit_warned:
+            self._commit_warned = True
+            exc = LowSystemCommitWarning(
+                f"System commit (RAM + page file) is low: {format_gib(commit_free)} "
+                "available. Camera acquisition will be stopped if it runs out; "
+                "close MDA viewer tabs or other memory-heavy programs."
+            )
+            _pmp_logger.error(str(exc))
+            report_background_exception(exc, "System memory")
+
+    # ------------------------------------------------------------------
     # Live
     # ------------------------------------------------------------------
 
     def start_live(self) -> None:
         """Arm both workers for free-running acquisition and start the drain thread."""
+        self.check_workers_alive()
         with self._lock:
             state = self._state
             pool = self._pool
@@ -518,10 +659,16 @@ class CameraWorkerService(QObject):
             )
         # Explicit exposure: an MDA may have left the cameras at a channel's
         # exposure (All Rows mode sets it per channel).
-        pool.arm_live_all(
-            armed_timeout=self.hw.worker_arm_timeout_s,
-            exposure_ms=self.last_known_exposure_ms,
-        )
+        try:
+            pool.arm_live_all(
+                armed_timeout=self.hw.worker_arm_timeout_s,
+                exposure_ms=self.last_known_exposure_ms,
+            )
+        except BaseException:
+            # A worker may have armed (or errored) while another did not: stop
+            # and drain so the next attempt starts from idle, empty pipes.
+            self._recover_pool(pool, _GUI_RECOVERY_TIMEOUT_S)
+            raise
         with self._lock:
             self._state = CameraWorkerServiceState.LIVE
             self._live_thread = threading.Thread(
@@ -555,6 +702,26 @@ class CameraWorkerService(QObject):
             logger.warning("Live drain thread did not exit; pipes left undrained.")
         with self._lock:
             self._live_thread = None
+
+    def _recover_pool(
+        self, pool: CameraWorkerPool, timeout: float | None = None
+    ) -> None:
+        """Best-effort ``stop_and_drain`` after a failure; never raises.
+
+        Only call from the thread that owns the pool's pipes. A failure here
+        is logged so it cannot mask the error being handled. *timeout*
+        defaults to ``worker_shutdown_timeout_s``.
+        """
+        try:
+            pool.stop_and_drain(
+                timeout=(
+                    timeout
+                    if timeout is not None
+                    else self.hw.worker_shutdown_timeout_s
+                )
+            )
+        except Exception:
+            logger.warning("Camera worker pool recovery failed.", exc_info=True)
 
     def _run_live_drain(self, pool: CameraWorkerPool) -> None:
         """Background-thread body: drain frames until stopped, then flip to IDLE.
@@ -592,7 +759,16 @@ class CameraWorkerService(QObject):
                     self._liveFrameAvailable.emit(camera_label)
         except Exception as exc:
             logger.error("Live streaming stopped unexpectedly.", exc_info=True)
+            # Both workers usually hit the same error (shared system commit):
+            # stop the survivor and discard the second, still-queued ErrorMsg
+            # so the next Live/Snap/MDA arm is not refused by a stale error.
+            # This thread is the pipes' only reader here.
+            self._recover_pool(pool)
             self.liveErrored.emit(str(exc))
+            if isinstance(exc, CameraCommitExhaustedError):
+                # liveErrored has no listener; without this the live view would
+                # just stop with no visible reason.
+                report_background_exception(exc, "Live view")
         finally:
             with self._lock:
                 if self._state is CameraWorkerServiceState.LIVE:
@@ -621,6 +797,7 @@ class CameraWorkerService(QObject):
         (a plain, same-thread Qt connection) as each frame arrives -- no
         cross-thread marshaling needed here, unlike the Live drain thread.
         """
+        self.check_workers_alive()
         with self._lock:
             if self._state is CameraWorkerServiceState.MDA:
                 raise RuntimeError("Cannot Snap while an MDA is running.")
@@ -630,17 +807,30 @@ class CameraWorkerService(QObject):
             raise RuntimeError("Camera worker service has no active pool.")
         if was_live:
             self.stop_live()
+            with self._lock:
+                still_live = self._state is CameraWorkerServiceState.LIVE
+            if still_live:
+                # The drain thread did not finish: it still reads the pipes,
+                # and a second reader would corrupt both streams.
+                raise RuntimeError(
+                    "Cannot Snap: Live did not stop (the drain thread is still "
+                    "running). Try again in a moment."
+                )
 
         frames: dict[str, np.ndarray] = {}
         needed = set(self.camera_labels)
         # Internal trigger: outside an MDA nothing fires the external one, so
         # an externally-triggered Snap just times out with zero frames.
-        pool.arm_all(
-            1,
-            armed_timeout=self.hw.worker_arm_timeout_s,
-            external_trigger=False,
-            exposure_ms=self.last_known_exposure_ms,
-        )
+        try:
+            pool.arm_all(
+                1,
+                armed_timeout=self.hw.worker_arm_timeout_s,
+                external_trigger=False,
+                exposure_ms=self.last_known_exposure_ms,
+            )
+        except BaseException:
+            self._recover_pool(pool, _GUI_RECOVERY_TIMEOUT_S)
+            raise
         try:
             for camera_label, slice_idx, img, meta, remaining in pool.iter_frames(
                 stall_timeout_s=timeout
@@ -662,6 +852,7 @@ class CameraWorkerService(QObject):
 
     def acquire_for_mda(self) -> CameraWorkerPool:
         """Return the persistent pool for exclusive MDA use, stopping Live first."""
+        self.check_workers_alive()
         with self._lock:
             if self._state is CameraWorkerServiceState.MDA:
                 raise RuntimeError(
@@ -721,6 +912,194 @@ class CameraWorkerService(QObject):
         self._set_camera_properties(per_camera, main_process)
         cfg.current = preset
         self.workerConfigChanged.emit(group, preset)
+
+    # Structural edits of worker_config_groups. They never touch hardware, so
+    # they are allowed in every state (including during an MDA).
+
+    @staticmethod
+    def _validated_settings(
+        settings: Sequence[tuple[str, str, str]], where: str
+    ) -> tuple[tuple[str, str, str], ...]:
+        """Normalize *settings* to a tuple of 3-tuples, rejecting bad input."""
+        normalized = tuple((str(d), str(p), str(v)) for d, p, v in settings)
+        if not normalized:
+            raise ValueError(f"{where}: a preset needs at least one setting.")
+        pairs = [(d, p) for d, p, _ in normalized]
+        if len(set(pairs)) != len(pairs):
+            raise ValueError(f"{where}: duplicate (device, property) pair.")
+        return normalized
+
+    def _check_group_name_free(self, group: str) -> None:
+        """Raise ``ValueError`` if *group* clashes with a core or worker group."""
+        if self._mmc is not None and group in self._mmc.getAvailableConfigGroups():
+            raise ValueError(f"{group!r} is already a config group of the core.")
+        if group in self._worker_config_groups:
+            raise ValueError(f"{group!r} is already a worker config group.")
+
+    def define_worker_preset(
+        self,
+        group: str,
+        preset: str,
+        settings: Sequence[tuple[str, str, str]],
+        *,
+        replace: str | None = None,
+    ) -> None:
+        """Create or overwrite *preset* of *group*, creating the group if needed.
+
+        Nothing is applied to hardware. ``replace=preset`` overwrites that
+        preset's settings in place; ``replace=<old name>`` renames it in place
+        (same position, and ``current`` follows the rename).
+
+        Parameters
+        ----------
+        group : str
+            Worker group name; created if it does not exist.
+        preset : str
+            The (new) preset name.
+        settings : Sequence[tuple[str, str, str]]
+            ``(device, property, value)`` settings of the preset.
+        replace : str | None
+            Name of an existing preset of *group* that *preset* replaces.
+
+        Raises
+        ------
+        ValueError
+            Empty names or settings, *group* is a new name that clashes with a
+            main-process core group, *preset* already exists and is not
+            *replace*, or *settings* repeats a (device, property) pair.
+        KeyError
+            *replace* is not a preset of *group*.
+        """
+        if not group or not preset:
+            raise ValueError("Group and preset names must not be empty.")
+        where = f"{group}/{preset}"
+        new_settings = self._validated_settings(settings, where)
+        cfg = self._worker_config_groups.get(group)
+        if cfg is None:
+            self._check_group_name_free(group)
+        if replace is not None and (cfg is None or replace not in cfg.presets):
+            raise KeyError(replace)
+        if cfg is not None and preset in cfg.presets and preset != replace:
+            raise ValueError(f"Preset {preset!r} already exists in group {group!r}.")
+
+        if cfg is None:
+            self._worker_config_groups[group] = WorkerConfigGroup(
+                presets={preset: new_settings}, current=""
+            )
+        elif replace is None:
+            cfg.presets[preset] = new_settings
+        else:
+            cfg.presets = {
+                (preset if name == replace else name): (
+                    new_settings if name == replace else old
+                )
+                for name, old in cfg.presets.items()
+            }
+            if cfg.current == replace:
+                cfg.current = preset
+        self.workerConfigGroupsChanged.emit()
+
+    def delete_worker_preset(self, group: str, preset: str) -> None:
+        """Remove *preset* from *group*; removing the last preset removes the group.
+
+        Parameters
+        ----------
+        group : str
+            A key of :attr:`worker_config_groups`.
+        preset : str
+            One of that group's presets.
+
+        Raises
+        ------
+        KeyError
+            Unknown *group* or *preset*.
+        """
+        cfg = self._worker_config_groups[group]
+        if preset not in cfg.presets:
+            raise KeyError(preset)
+        del cfg.presets[preset]
+        if cfg.current == preset:
+            cfg.current = ""
+        if not cfg.presets:
+            del self._worker_config_groups[group]
+        self.workerConfigGroupsChanged.emit()
+
+    def delete_worker_group(self, group: str) -> None:
+        """Remove the whole worker config *group*.
+
+        Parameters
+        ----------
+        group : str
+            A key of :attr:`worker_config_groups`.
+
+        Raises
+        ------
+        KeyError
+            Unknown *group*.
+        """
+        del self._worker_config_groups[group]
+        self.workerConfigGroupsChanged.emit()
+
+    def set_worker_group(
+        self,
+        group: str,
+        presets: Mapping[str, Sequence[tuple[str, str, str]]],
+        *,
+        rename_from: str | None = None,
+    ) -> None:
+        """Replace a whole worker group's presets (Add/Edit Group).
+
+        With *rename_from* the old group is replaced by *group* at the same
+        position. The group keeps its ``current`` preset if it still exists
+        (an existing group is replaced the same way when *group* names it);
+        a new group starts with ``current == ""``. Nothing is applied to
+        hardware.
+
+        Parameters
+        ----------
+        group : str
+            The group's (new) name.
+        presets : Mapping[str, Sequence[tuple[str, str, str]]]
+            Preset name -> ``(device, property, value)`` settings.
+        rename_from : str | None
+            Existing worker group that *group* replaces.
+
+        Raises
+        ------
+        ValueError
+            Empty names, no presets, empty or duplicate-pair settings, or
+            *group* clashes with a core group or another worker group.
+        KeyError
+            *rename_from* is not a worker group.
+        """
+        if not group:
+            raise ValueError("Group name must not be empty.")
+        if rename_from is not None and rename_from not in self._worker_config_groups:
+            raise KeyError(rename_from)
+        if not presets:
+            raise ValueError(f"{group}: a group needs at least one preset.")
+        new_presets: dict[str, tuple[tuple[str, str, str], ...]] = {}
+        for name, settings in presets.items():
+            if not name:
+                raise ValueError(f"{group}: preset names must not be empty.")
+            new_presets[name] = self._validated_settings(settings, f"{group}/{name}")
+        replaced = rename_from if rename_from is not None else group
+        old = self._worker_config_groups.get(replaced)
+        if old is None or replaced != group:
+            self._check_group_name_free(group)
+        current = old.current if old is not None and old.current in new_presets else ""
+        new_cfg = WorkerConfigGroup(presets=new_presets, current=current)
+
+        if old is None:
+            self._worker_config_groups[group] = new_cfg
+        else:
+            self._worker_config_groups = {
+                (group if name == replaced else name): (
+                    new_cfg if name == replaced else cfg
+                )
+                for name, cfg in self._worker_config_groups.items()
+            }
+        self.workerConfigGroupsChanged.emit()
 
     def set_exposure(self, exposure_ms: float) -> None:
         """Set every worker-owned camera's exposure for Snap/Live.

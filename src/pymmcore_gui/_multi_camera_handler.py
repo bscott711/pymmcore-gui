@@ -150,6 +150,7 @@ class MultiCameraHandler:
                 handler_for_path(path, zarr_compression=self._zarr_compression),
                 name=_sanitize(label),
                 backlog_budget_bytes=self._backlog_budget_bytes,
+                finish_reason=lambda: self._mmc.mda.status.finish_reason,
             )
         writer = self._writers[label]
         if label not in self._started:

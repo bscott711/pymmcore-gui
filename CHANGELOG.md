@@ -17,6 +17,90 @@ upstream.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-07
+
+### Changed
+
+- **The stream imports opym instead of copying it.** `_argus_stream/_protocol.py`,
+  `_bfill.py` and `_bfill_run.py` are deleted; the wire protocol, the backfill
+  wire format and the backfill sender come from `opym` (pinned by commit SHA).
+  `backfill_send.py` is now a wrapper around `opym.stream.backfill_client` that
+  supplies the `ArgusTunnelManager` and the Settings; `python -m
+  pymmcore_gui._argus_stream.backfill_send` takes the same flags as before. The
+  `opym-backfill-send` console script is removed from this package (opym owns
+  it). Deploy order and the `uv sync` the PC needs: CONTRIBUTING.md,
+  "Deploying to the acquisition PC".
+- **FRAME `timestamp` is epoch seconds** (the volume's `acq_first_s`), not
+  milliseconds since the run began, so Argus stores real acquisition times
+  (`runner_time_ms` stays in the frame metadata for the local save).
+
+### Added
+
+- **Alignment: co-align N spectral-region layers against a reference**
+  (`feat(alignment)`).
+- **Spectral ROI settings:** a gap setting between regions, a "Center on chip"
+  action, and clamping of regions to the sensor.
+- **Worker-owned config groups are editable** in the Config Groups panel (an
+  edit API plus unselectable worker-owned rows); released cameras and worker
+  groups are kept in the saved config.
+- **Live galvo offset is remembered** across restarts and re-applied when a
+  config loads; the galvo is held at the Live offset and returned to it after
+  an MDA, and moves statically when the offset changes.
+- **Tested against CRISPy `feat/piezo-led-joystick-on-ui-polish`** (its
+  `PiezoSpotWidget`, replacing `piezo_panel.PiezoSpotPanel`). The CRISPy panel
+  and spot-focus tests were rewritten for it; keep the `../CRISPy` checkout on
+  that branch.
+- **Park the galvo at the sweep start between volumes** (optional, **off by
+  default**). Timing tab: "Park at sweep start" (`park_at_start`). After setup
+  and after each volume the engine writes `SPIMState=Armed` to the galvo, so the
+  mirror sits at the sweep start for the whole inter-timepoint wait instead of
+  returning to neutral and snapping to the start; `Running` still starts each
+  volume and teardown still returns it to neutral (Idle). The mechanism is not
+  yet verified on hardware: check it first with `probe_galvo_park`, then run
+  3-5 timepoints at a 10 s interval and watch the mirror. If the card lacks
+  `Armed`, does not read it back, or refuses `Running` from `Armed` (the engine
+  then goes via Idle), one warning is logged and parking turns itself off for
+  that run; the acquisition is never aborted. With the box unticked no extra
+  property is written.
+- **Plugin loader.** `create_mmgui` now loads every entry point in the
+  `pymmcore_gui.plugins` group and calls it with the main window, after the
+  window is built and before any config is loaded. A plugin that fails to load
+  or raises is logged and shown as a warning; it does not stop the GUI or the
+  other plugins.
+- **`plugins` extra.** `uv sync --extra plugins` installs the PEACH-PIT plugin
+  (`peach-pit-plugin`) as an editable sibling checkout at
+  `../peach-pit-plugin` (Python 3.11+ only). CRISPy stays a core dependency
+  because `_settings.py` imports it at module level.
+- **`probe_galvo_park`** (bench diagnostic in `asi_z_stack/diagnostics.py`): tries
+  parking the galvo at the sweep start between volumes, via `SPIMState=Armed`
+  or an Idle offset write, so the mechanism can be chosen on the rig before
+  any engine change.
+- **Galvo control in Stage Control.** A group per galvo device (and the ASI
+  `Scanner:AB:33` if it is loaded) sets the Live offset
+  `SingleAxisYOffset(deg)`, the reference the Z stack sweeps around. The
+  offset is shown in um-equivalent with the degrees beside it, with a step
+  size, -/+ buttons and "Go to 0". Writes are clamped to the card's property
+  limits, the display follows the card, and the group is locked while an MDA
+  runs.
+
+### Fixed
+
+- **The pymmcore-plus logfile is isolated before package imports**, so an
+  early import no longer writes to the shared log.
+- **Unselected dock tab text is readable in dark mode.**
+- **Stage Control galvo offset now moves the mirror in Live.** Writing
+  `SingleAxisYOffset(deg)` only sets the sweep centre and never moved an idle
+  mirror; each offset write now also does a static `setGalvoPosition` on axis B
+  (the slice axis, X kept) and shows the mirror's read-back position in the
+  group. Stationary-trigger z-stacks hold the galvo at the Live offset instead
+  of 0, and MDA teardown returns the mirror to the Live offset. Rig-unverified.
+- **The galvo Live offset is remembered across restarts.** The ASI card comes up
+  with `SingleAxisYOffset(deg)` at 0 after a restart or power cycle. The value
+  set in Stage Control is now saved in the app settings (default -26 um, stored
+  as -0.26 deg) and re-applied to the card (property write plus static mirror
+  move) on every config load, whether or not Stage Control is open. Never
+  applied during an MDA. Rig-unverified.
+
 ## [0.2.0] - 2026-10-30
 
 ### Breaking changes
@@ -290,6 +374,7 @@ save.
 - The former working branch `feat/mda-ux-perf-fixes` was landed on `main` in #19
   and is frozen. `main` is the base branch for pull requests from here on.
 
-[Unreleased]: https://github.com/bscott711/pymmcore-gui/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/bscott711/pymmcore-gui/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/bscott711/pymmcore-gui/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/bscott711/pymmcore-gui/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/bscott711/pymmcore-gui/releases/tag/v0.1.0

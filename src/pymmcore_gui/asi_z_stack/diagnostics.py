@@ -246,5 +246,84 @@ def poll_camera_and_plogic_during_live_scan(
         logger.info("Camera TriggerMode restored to pre-scan value(s).")
 
 
+def probe_galvo_park(
+    mode: str = "armed",
+    amplitude_deg: float = 0.5,
+    hold_s: float = 6.0,
+    galvo_label: str = _HW.galvo_a_label,
+) -> dict[str, str]:
+    """Find out how to park the galvo at the sweep start between volumes.
+
+    Watch the mirror while this runs; it logs each step with a timestamp. The
+    galvo's offset and amplitude are restored and ``SPIMState`` is put back to
+    ``Idle`` at the end. Cameras, lasers and PLogic are not touched, so run it
+    with lasers off and no acquisition running.
+
+    ``mode="armed"``: write ``SPIMState=Armed`` and hold. Does the mirror go to
+    the sweep start (offset - amplitude/2)? Is ``Running`` then accepted from
+    ``Armed``?
+
+    ``mode="offset"``: stay in ``Idle`` and write ``SingleAxisYOffset`` to the
+    sweep start, hold, then write the centre back. Does the mirror jump back to
+    the centre as soon as the offset is restored?
+    """
+    if mode not in ("armed", "offset"):
+        raise ValueError("mode must be 'armed' or 'offset'")
+    off_prop, amp_prop = "SingleAxisYOffset(deg)", "SingleAxisYAmplitude(deg)"
+    saved = {p: mmc.getProperty(galvo_label, p) for p in (off_prop, amp_prop)}
+    centre = float(saved[off_prop])
+    start = centre - amplitude_deg / 2
+    result: dict[str, str] = {
+        "SPIMState allowed": str(
+            mmc.getAllowedPropertyValues(galvo_label, "SPIMState")
+        ),
+        "centre_deg": f"{centre:.4f}",
+        "start_deg": f"{start:.4f}",
+    }
+    for prop in mmc.getDevicePropertyNames(galvo_label):  # any position readbacks
+        if "position" in prop.lower():
+            result[prop] = mmc.getProperty(galvo_label, prop)
+    t0 = time.time()
+
+    def step(msg: str) -> None:
+        logger.info(f"  [{time.time() - t0:6.2f}s] {msg}")
+
+    try:
+        mmc.setProperty(galvo_label, "SPIMState", "Idle")
+        mmc.setProperty(galvo_label, amp_prop, str(amplitude_deg))
+        step(f"Idle, centre={centre:.4f} deg, amplitude={amplitude_deg} deg")
+        time.sleep(hold_s / 2)
+        if mode == "armed":
+            mmc.setProperty(galvo_label, "SPIMState", "Armed")
+            result["state after Armed"] = mmc.getProperty(galvo_label, "SPIMState")
+            step(
+                f"Armed (readback {result['state after Armed']!r}): does the "
+                f"mirror go to {start:.4f} deg?"
+            )
+            time.sleep(hold_s)
+            try:
+                mmc.setProperty(galvo_label, "SPIMState", "Running")
+                result["Running from Armed"] = "accepted"
+            except Exception as exc:
+                result["Running from Armed"] = f"rejected: {exc}"
+            step(f"Running from Armed: {result['Running from Armed']}")
+            time.sleep(hold_s / 2)
+        else:
+            mmc.setProperty(galvo_label, off_prop, f"{start:.6f}")
+            step(f"Idle, offset written to the sweep start {start:.4f} deg")
+            time.sleep(hold_s)
+            mmc.setProperty(galvo_label, off_prop, f"{centre:.6f}")
+            step(f"offset restored to centre {centre:.4f} deg: does it jump?")
+            time.sleep(hold_s / 2)
+    finally:
+        mmc.setProperty(galvo_label, "SPIMState", "Idle")
+        for prop, value in saved.items():
+            mmc.setProperty(galvo_label, prop, value)
+        step("restored offset/amplitude, SPIMState=Idle")
+    for key, value in result.items():
+        logger.info(f"  {key}: {value}")
+    return result
+
+
 if __name__ == "__main__":
     sweep_backplane_ttl_addrs()

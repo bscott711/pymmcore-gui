@@ -23,15 +23,17 @@ from pymmcore_gui._qt.QtWidgets import (
     QWidget,
 )
 from pymmcore_gui._settings import SettingsV1, SpectralChannelConfig
-from pymmcore_gui._spectral_channel_handler import next_fft_friendly, roi_origin
+from pymmcore_gui._spectral_channel_handler import (
+    centered_positions,
+    clamp_position,
+    next_fft_friendly,
+    roi_origin,
+    sensor_size,
+)
 
 if TYPE_CHECKING:
     from pymmcore_gui._main_window import MicroManagerGUI
     from pymmcore_gui.widgets.image_preview._pygfx_preview import PygfxPreview
-
-# Vertical gap between a "top" region and its "bottom" sibling when a region
-# is auto-populated onto the opposite half of the same (or other) camera.
-_BOTTOM_BUFFER_PX = 40
 
 
 class _ChannelRow(QGroupBox):
@@ -185,14 +187,33 @@ class SpectralChannelConfigWidget(QWidget):
         w, h = self._initial_size(spectral.channels)
         self.width_spin.setValue(w)
         self.height_spin.setValue(h)
-        self.width_spin.editingFinished.connect(self._maybe_extend_for_fft)
-        self.height_spin.editingFinished.connect(self._maybe_extend_for_fft)
+        self.width_spin.editingFinished.connect(self._on_size_edited)
+        self.height_spin.editingFinished.connect(self._on_size_edited)
+
+        # Vertical gap between a camera's top and bottom regions.
+        self.gap_spin = QSpinBox()
+        self.gap_spin.setRange(0, 100_000)
+        self.gap_spin.setValue(spectral.region_gap_px)
+        self.gap_spin.setToolTip(
+            "Vertical space between the top region's bottom edge and the bottom "
+            "region's top edge. Used by 'Center on chip' and when sibling "
+            "regions are auto-populated after drawing the first one."
+        )
+        self.center_button = QPushButton("Center on chip")
+        self.center_button.setToolTip(
+            "Place every camera's top/bottom regions centered on its sensor, "
+            "separated by the gap, using the shared size."
+        )
+        self.center_button.clicked.connect(self._center_on_chip)
 
         size_row = QHBoxLayout()
         size_row.addWidget(QLabel("w"))
         size_row.addWidget(self.width_spin)
         size_row.addWidget(QLabel("h"))
         size_row.addWidget(self.height_spin)
+        size_row.addWidget(QLabel("gap"))
+        size_row.addWidget(self.gap_spin)
+        size_row.addWidget(self.center_button)
         size_box = QGroupBox("Shared ROI size (px) — all regions share one size")
         size_box.setLayout(size_row)
 
@@ -209,6 +230,9 @@ class SpectralChannelConfigWidget(QWidget):
                 lambda _checked=False, r=row: self._on_draw_button_clicked(r)
             )
             row.move_button.clicked.connect(lambda _checked=False, r=row: self._move(r))
+            row.camera.currentTextChanged.connect(lambda _t, r=row: self._clamp_row(r))
+            for spin in (row.x_spin, row.y_spin):
+                spin.editingFinished.connect(lambda r=row: self._clamp_row(r))
         self._apply_button_states()
 
         save_button = QPushButton("Save")
@@ -248,6 +272,85 @@ class SpectralChannelConfigWidget(QWidget):
     def _size(self) -> tuple[int, int]:
         return self.width_spin.value(), self.height_spin.value()
 
+    @property
+    def _gap(self) -> int:
+        return self.gap_spin.value()
+
+    def _on_size_edited(self) -> None:
+        self._maybe_extend_for_fft()
+        self._clamp_all()
+
+    def _sensor(self, camera_label: str) -> tuple[int, int] | None:
+        return sensor_size(self._mmc, camera_label)
+
+    def _clamp_row(self, row: _ChannelRow) -> None:
+        """Pull *row*'s position inside its camera's sensor (size permitting).
+
+        Does nothing until a size is set or if the sensor size is unknown.
+        """
+        size = self._size
+        if not all(size):
+            return
+        sensor = self._sensor(row.camera.currentText())
+        if sensor is None:
+            return
+        pos = row.position
+        clamped = clamp_position(pos, size, sensor)
+        if clamped != pos:
+            row.set_position(*clamped)
+
+    def _clamp_all(self) -> None:
+        for row in self._rows:
+            self._clamp_row(row)
+
+    def _oversized_rows(self) -> list[str]:
+        """Names of rows whose shared size cannot fit on their camera's sensor."""
+        w, h = self._size
+        bad: list[str] = []
+        for row in self._rows:
+            sensor = self._sensor(row.camera.currentText())
+            if sensor is not None and (w > sensor[0] or h > sensor[1]):
+                bad.append(f"{row.channel_name} (sensor {sensor[0]}x{sensor[1]})")
+        return bad
+
+    def _center_on_chip(self) -> None:
+        """Center each camera's top/bottom regions on its sensor, split by the gap."""
+        size = self._size
+        if not all(size):
+            QMessageBox.information(
+                self,
+                "Set a ROI size first",
+                "Enter the shared width and height before centering on the chip.",
+            )
+            return
+        problems: list[str] = []
+        for row in self._rows:
+            label = row.camera.currentText()
+            sensor = self._sensor(label)
+            if sensor is None:
+                problems.append(f"{row.channel_name}: sensor size of {label} unknown")
+                continue
+            placed = centered_positions(sensor, size, self._gap)
+            if placed is None:
+                problems.append(
+                    f"{row.channel_name}: {size[0]}x{size[1]} regions with a "
+                    f"{self._gap} px gap don't fit on {sensor[0]}x{sensor[1]}"
+                )
+                continue
+            x, y_top, y_bottom = placed
+            top = row.position_combo.currentText() == "top"
+            row.set_position(x, y_top if top else y_bottom)
+        if not self._synced:
+            self._synced = True
+            self._apply_button_states()
+        self._refresh_all_overlays()
+        if problems:
+            QMessageBox.warning(
+                self,
+                "Could not center every region",
+                "\n".join(problems),
+            )
+
     def _maybe_extend_for_fft(self) -> None:
         """Offer to pad the shared size up to the next FFT-friendly size."""
         w, h = self._size
@@ -278,6 +381,7 @@ class SpectralChannelConfigWidget(QWidget):
             )
         self.width_spin.setValue(new_w)
         self.height_spin.setValue(new_h)
+        self._clamp_all()
 
     # ------------------------------------------------------------------
     # Draw / move on the live view
@@ -374,7 +478,7 @@ class SpectralChannelConfigWidget(QWidget):
 
         Same splitter position (top/bottom), other camera -> identical rect.
         Opposite splitter position -> same x, y shifted by the region height
-        plus a fixed buffer (down for top->bottom, up for bottom->top).
+        plus the gap (down for top->bottom, up for bottom->top).
         """
         x, y, _w, h = rect
         source_position = source_row.position_combo.currentText()
@@ -384,9 +488,9 @@ class SpectralChannelConfigWidget(QWidget):
             if row.position_combo.currentText() == source_position:
                 row.set_position(x, y)
             elif source_position == "top":
-                row.set_position(x, y + h + _BOTTOM_BUFFER_PX)
+                row.set_position(x, y + h + self._gap)
             else:
-                row.set_position(x, max(0, y - h - _BOTTOM_BUFFER_PX))
+                row.set_position(x, max(0, y - h - self._gap))
 
     def _clear_all(self) -> None:
         """Reset every region to undrawn and return to the pristine state."""
@@ -410,6 +514,7 @@ class SpectralChannelConfigWidget(QWidget):
             self._synced = True
             self._apply_button_states()
         self._maybe_extend_for_fft()
+        self._clamp_all()
         self._refresh_all_overlays()
 
     def _on_rect_moved(
@@ -417,6 +522,7 @@ class SpectralChannelConfigWidget(QWidget):
     ) -> None:
         x, y, _w, _h = rect
         row.set_position(x, y)
+        self._clamp_row(row)
         self._refresh_camera_overlays(preview, row.camera.currentText())
 
     def _refresh_camera_overlays(
@@ -446,7 +552,17 @@ class SpectralChannelConfigWidget(QWidget):
                 self._refresh_camera_overlays(preview, camera_label)
 
     def _save(self) -> None:
+        if oversized := self._oversized_rows():
+            QMessageBox.warning(
+                self,
+                "ROI size too large",
+                f"The shared size {self._size[0]}x{self._size[1]} px is larger "
+                "than the sensor for:\n" + "\n".join(oversized),
+            )
+            return
+        self._clamp_all()
         settings = SettingsV1.instance()
+        settings.spectral.region_gap_px = self._gap
         crop_before = settings.spectral.enabled and settings.spectral.crop_camera_roi
         rects_before = [c.rect for c in settings.spectral.channels]
         settings.spectral.enabled = self.master_enabled.isChecked()

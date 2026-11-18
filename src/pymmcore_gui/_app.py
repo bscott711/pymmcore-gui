@@ -13,6 +13,7 @@ from superqt.utils import WorkerBase
 
 from pymmcore_gui import __version__
 from pymmcore_gui._main_window import ICON, RESOURCES, MicroManagerGUI
+from pymmcore_gui._plugins import load_plugins
 from pymmcore_gui._qt.QtCore import (
     QCoreApplication,
     QPointF,
@@ -56,40 +57,6 @@ APP_ID = f"{ORG_DOMAIN}.{ORG_NAME}.{APP_NAME}.{APP_VERSION}"
 TESTING = bool(os.getenv("PYTEST_VERSION"))
 IS_FROZEN = getattr(sys, "frozen", False)
 _QAPP: MMQApplication | None = None
-
-
-def _isolate_process_logfile() -> None:
-    """Point this process's pymmcore-plus logger at its own logfile.
-
-    ``pymmcore_plus`` configures a single shared ``RotatingFileHandler`` at
-    import time (see ``pymmcore_plus._logger``). Any *other* process that
-    also imports pymmcore_plus without overriding ``PYMM_LOG_FILE`` --
-    another pymmcore-gui instance, a leftover process, a Jupyter kernel --
-    opens its own handle on that exact file. On Windows, when this
-    process's handler tries to rotate on rollover, the rename fails with a
-    ``PermissionError`` if any of those other handles are still open.
-    Giving this process its own PID-suffixed logfile removes it from that
-    contention entirely (mirrors the same fix applied to camera worker
-    subprocesses in ``asi_z_stack.worker_pool``).
-    """
-    from pymmcore_plus import configure_logging
-    from pymmcore_plus._logger import current_logfile
-    from pymmcore_plus._logger import logger as _pymmcore_plus_logger
-
-    current = current_logfile(_pymmcore_plus_logger)
-    if current is None:
-        return  # file logging disabled (e.g. PYMM_LOG_FILE=0, or under pytest)
-    # Detach *and* close every existing handler ourselves first: configure_logging()
-    # removes old handlers by iterating `logger.handlers` while calling
-    # `removeHandler()` on that same live list, which skips every other handler
-    # once there's more than one -- leaving a stale, already-closed handler
-    # attached that would error (or silently reopen the shared file) on the
-    # next log call. Clearing the list ourselves first makes that loop a no-op.
-    for handler in list(_pymmcore_plus_logger.handlers):
-        _pymmcore_plus_logger.removeHandler(handler)
-        handler.close()
-    unique = current.with_name(f"{current.stem}-pid{os.getpid()}{current.suffix}")
-    configure_logging(file=unique)
 
 
 def _set_osx_app_name(app_title: str) -> None:
@@ -173,8 +140,6 @@ def create_mmgui(
         False, the event loop will not be started, and the caller is responsible for
         starting it with `QApplication.instance().exec()`.
     """
-    _isolate_process_logfile()
-
     global _QAPP
     # Note: in practice this should almost never be None,
     # but in the case of testing, it's conceivable that it could be.
@@ -204,6 +169,13 @@ def create_mmgui(
 
     _set_status("Building interface...")
     win = MicroManagerGUI(mmcore=mmcore)
+
+    # Plugins (entry-point group ``pymmcore_gui.plugins``) get the fully built
+    # window -- Plugins menu and ``win.mmcore`` exist -- but run before any
+    # configuration is loaded, so they can hook core signals such as
+    # ``systemConfigurationLoaded`` and see the config load below.
+    _set_status("Loading plugins...")
+    load_plugins(win)
 
     def _show_main_window() -> None:
         win.restore_state(show=True)
