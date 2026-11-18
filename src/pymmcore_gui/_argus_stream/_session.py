@@ -98,6 +98,7 @@ from pymmcore_gui._spectral_channel_handler import (
     roi_origin,
 )
 from pymmcore_gui._vendored.mda_handlers._util import position_sizes
+from pymmcore_gui.epi._mode import ScopeMode, current_mode
 
 from . import _log
 from ._tunnel import link_endpoints
@@ -1441,6 +1442,8 @@ class ArgusStreamSession:
             argus = self._get_settings().argus_stream
             if not argus.enabled or self._mmc.mda.is_running():
                 return False
+            if current_mode() is ScopeMode.EPI:
+                return False  # EPI runs are never streamed
             settings = self._get_settings()
             geometry = _camera_geometry(cast("SummaryMetaV1", {}), self._mmc)
             active_spectral = _active_spectral_channels(
@@ -1483,6 +1486,12 @@ class ArgusStreamSession:
         argus = settings.argus_stream
         if not argus.enabled:
             self._emit_state(StreamState.DISABLED, "")
+            self._worker = None
+            return
+        if current_mode() is ScopeMode.EPI:
+            # Explicit skip: sequenceStarted fires for any engine, and the Argus
+            # header would describe OPM geometry, not the Orca.
+            self._emit_state(StreamState.SKIPPED, "EPI mode: runs are not streamed")
             self._worker = None
             return
 

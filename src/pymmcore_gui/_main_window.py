@@ -297,6 +297,7 @@ class MicroManagerGUI(QMainWindow):
         self._viewers_manager.mdaViewerCreated.connect(self._on_mda_viewer_created)
         self._viewers_manager.previewViewerCreated.connect(self._on_previewer_created)
         self._wire_epi_camera_service()
+        self._wire_epi_engine()
         self._notification_manager = NotificationManager(self)
         if app := QApplication.instance():
             if hasattr(app, "exceptionRaised"):
@@ -769,6 +770,12 @@ class MicroManagerGUI(QMainWindow):
         ctrl.epi_service_provider = epi_service_provider(self, _on_created)
         ctrl.epi_service_peek = get_epi_service
         ctrl.extra_preconditions.append(epi_camera_precondition)
+
+    def _wire_epi_engine(self) -> None:
+        """Hook the EPI MDA engine into the mode controller (built on EPI entry)."""
+        from pymmcore_gui.epi._engine import EpiMDAEngine
+
+        self.mode_controller.epi_engine_factory = lambda mmc: EpiMDAEngine(mmc)
 
     def _add_menubar(self, name: str, menu_entry: MenuDictValue) -> None:
         mb = cast("QMenuBar", self.menuBar())

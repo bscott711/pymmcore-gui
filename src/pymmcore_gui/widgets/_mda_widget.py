@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+from pymmcore_plus import CMMCorePlus
 from pymmcore_widgets import MDAWidget
 from pymmcore_widgets.useq_widgets import PYMMCW_METADATA_KEY
 
@@ -26,6 +27,7 @@ from pymmcore_gui._spectral_channel_handler import (
     regions_outside_roi,
 )
 from pymmcore_gui._vendored.mda_handlers import handler_for_path
+from pymmcore_gui.epi._engine import check_epi_sequence, with_epi_metadata
 from pymmcore_gui.epi._mode import ScopeMode, current_mode, epi_engine_available
 from pymmcore_gui.epi._tiger_guard import EPI_CHANNEL_GROUP
 
@@ -45,12 +47,21 @@ if TYPE_CHECKING:
 _GENERATION = re.compile(r"^(.*?)(?:_(\d{3,}))?$")
 
 
-def _epi_precheck(sequence: useq.MDASequence) -> str | None:
+def _epi_precheck(
+    sequence: useq.MDASequence, mmc: CMMCorePlus | None = None
+) -> str | None:
     """Return why *sequence* may not run in the current mode, or ``None``.
 
     In OPM, a sequence with an ``EPI LEDs`` channel is refused (the OPM engine
-    would run it against the lasers). In EPI, every MDA is refused until the EPI
-    engine is hooked up. Step 4 fills in the EPI-side sequence validation.
+    would run it against the lasers). In EPI, the sequence must be a v1 EPI
+    acquisition (the same validation the EPI engine runs in ``setup_sequence``).
+
+    Parameters
+    ----------
+    sequence : useq.MDASequence
+        The sequence about to run.
+    mmc : CMMCorePlus | None
+        The core (to find the loaded LEDs); the singleton when ``None``.
     """
     if current_mode() is ScopeMode.OPM:
         if any(ch.group == EPI_CHANNEL_GROUP for ch in sequence.channels):
@@ -60,8 +71,8 @@ def _epi_precheck(sequence: useq.MDASequence) -> str | None:
             )
         return None
     if not epi_engine_available():
-        return "EPI MDA is not available yet."
-    return None
+        return "EPI MDA is not available: no EPI engine is installed."
+    return check_epi_sequence(mmc or CMMCorePlus.instance(), sequence)
 
 
 def _with_generation(base: Path, n: int) -> Path:
@@ -111,9 +122,12 @@ class GuiMDAWidget(MDAWidget):
         ),
     ) -> None:
         sequence = self.value()
-        if (problem := _epi_precheck(sequence)) is not None:
+        if (problem := _epi_precheck(sequence, self._mmc)) is not None:
             QMessageBox.warning(self, "Cannot start the acquisition", problem)
             return
+        if current_mode() is ScopeMode.EPI:
+            # D11: the per-run LED map travels with the sequence (EPI only).
+            sequence = with_epi_metadata(sequence, self._mmc)
         if isinstance(output, str | Path):
             writer_cfg = SettingsV1.instance().mda_writer
             zarr_compression = writer_cfg.zarr_compression

@@ -16,6 +16,7 @@ single writer built directly from the original path.
 
 from __future__ import annotations
 
+import logging
 import re
 from inspect import signature
 from typing import TYPE_CHECKING, Any
@@ -31,6 +32,8 @@ if TYPE_CHECKING:
     import numpy as np
     import useq
     from pymmcore_plus.metadata import FrameMetaV1, SummaryMetaV1
+
+logger = logging.getLogger("pymmcore_gui")
 
 # Known (possibly compound) output extensions, longest first so that
 # ``.ome.tiff`` is matched before ``.tiff``.
@@ -103,6 +106,16 @@ def physical_camera_labels(mmcore: CMMCorePlus) -> list[str]:
     unmodified once the service is active.
     """
     from pymmcore_gui.asi_z_stack.camera_worker_service import CameraWorkerService
+    from pymmcore_gui.epi._mode import ScopeMode, current_mode
+
+    if current_mode() is ScopeMode.EPI:
+        # EPI acquires only on the Orca, held by its own service (never the OPM pair).
+        from pymmcore_gui.epi._camera_service import get_epi_service
+
+        if (epi_svc := get_epi_service()) is not None and epi_svc.camera_labels:
+            return list(epi_svc.camera_labels)
+        logger.warning("EPI mode but no EPI camera service: no camera labels")
+        return []
 
     if (svc := CameraWorkerService.get_active()) is not None:
         return list(svc.camera_labels)

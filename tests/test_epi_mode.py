@@ -856,12 +856,14 @@ def test_epi_precheck_values() -> None:
     set_active_controller(_OpmCtrl())
     assert _epi_precheck(_laser_sequence()) is None
     assert "EPI mode" in (_epi_precheck(_led_sequence()) or "")
-    # EPI: refused until the engine factory exists (Step 4)
+    # EPI: refused without an engine factory; with one, the v1 validation runs
+    # (the demo core has no TGLED, so the LED is "not loaded"; the accepting
+    # cases are in test_epi_engine.py)
     set_active_controller(_EpiCtrl())
-    assert _epi_precheck(_led_sequence()) == "EPI MDA is not available yet."
+    assert "no EPI engine" in (_epi_precheck(_led_sequence()) or "")
     ctrl = SimpleNamespace(mode=ScopeMode.EPI, epi_engine_factory=lambda m: None)
     set_active_controller(ctrl)
-    assert _epi_precheck(_led_sequence()) is None
+    assert "not loaded" in (_epi_precheck(_led_sequence()) or "")
 
 
 @pytest.fixture
@@ -877,12 +879,17 @@ def mda_widget(mmcore: CMMCorePlus, qtbot: QtBot) -> GuiMDAWidget:
         (None, _laser_sequence, True),
         (_OpmCtrl(), _laser_sequence, True),
         (_OpmCtrl(), _led_sequence, False),  # EPI LEDs channel in OPM
-        (_EpiCtrl(), _laser_sequence, False),  # no EPI engine yet
+        (_EpiCtrl(), _laser_sequence, False),  # no EPI engine hooked up
         (_EpiCtrl(), _led_sequence, False),
         (
             SimpleNamespace(mode=ScopeMode.EPI, epi_engine_factory=lambda m: None),
+            _laser_sequence,
+            False,  # EPI runs only EPI LEDs channels
+        ),
+        (
+            SimpleNamespace(mode=ScopeMode.EPI, epi_engine_factory=lambda m: None),
             _led_sequence,
-            True,  # Step 4 hooked the engine up
+            False,  # demo core: the LED is not loaded (accepting case: test_epi_engine)
         ),
     ],
 )

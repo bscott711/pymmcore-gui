@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     from PyQt6.QtCore import QObject
 
     from pymmcore_gui._settings import EpiCameraSettingsV1
+    from pymmcore_gui.asi_z_stack.worker_pool import CameraWorkerPool
 
 logger = logging.getLogger("pymmcore_gui")
 
@@ -158,6 +159,36 @@ class EpiCameraWorkerService(CameraWorkerService):
         """Close the Live LED when Live ends on its own (error, dead worker)."""
         if not live and self.state is not CameraWorkerServiceState.LIVE:
             close_live_led()
+
+    # ------------------------------------------------------------ the EPI MDA
+
+    def claim_for_run(self) -> CameraWorkerPool:
+        """Take the pool for one EPI MDA run (state ``MDA``), stopping Live first.
+
+        Not ``acquire_for_mda``: the EPI engine never calls the OPM service's
+        method. :meth:`release_from_mda` ends the claim. While claimed, Snap, Live
+        and camera-property changes are refused, so nothing else reads the pipes.
+
+        Raises
+        ------
+        RuntimeError
+            A worker is dead, the pool is missing, or the service is busy/not ready.
+        """
+        self.check_workers_alive()
+        with self._lock:
+            was_live = self._state is CameraWorkerServiceState.LIVE
+        if was_live:
+            self.stop_live()
+            close_live_led()
+        with self._lock:
+            pool = self._pool
+            if self._state is not CameraWorkerServiceState.IDLE or pool is None:
+                raise RuntimeError(
+                    "The Orca camera is not ready for an MDA "
+                    f"(state={self._state.name})."
+                )
+            self._state = CameraWorkerServiceState.MDA
+        return pool
 
 
 # ---------------------------------------------------------------- the registry
